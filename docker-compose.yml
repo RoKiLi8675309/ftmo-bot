@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  # --- PostgreSQL: Tuned for 128GB RAM Workstation ---
+  # Stores Tick Data (High Fidelity) and Trade History
+  trading-db:
+    image: postgres:17-alpine
+    container_name: trading-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-trading_db}
+    # AUDIT FIX: Hardware-Specific Tuning (i7-13700K + 128GB RAM)
+    # 1. shared_buffers=32GB (25% of RAM) -> Maximizes cache hits for backtests
+    # 2. synchronous_commit=on -> SAFETY FIRST for Financial Data
+    # 3. max_parallel_workers=16 -> Utilizes all P-Cores for aggregation queries
+    command: >
+      postgres
+      -c shared_buffers=32GB
+      -c effective_cache_size=80GB
+      -c maintenance_work_mem=2GB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=64MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=64MB
+      -c min_wal_size=1GB
+      -c max_wal_size=4GB
+      -c max_worker_processes=16
+      -c max_parallel_workers_per_gather=4
+      -c max_parallel_workers=16
+      -c max_parallel_maintenance_workers=4
+      -c synchronous_commit=on
+    ports:
+      - "5432:5432"
+    volumes:
+      - ftmo_bot_postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Redis: DURABILITY ENABLED for "VPIN & Risk" Persistence ---
+  # Stores Real-time State, VPIN Buckets, and Risk Flags
+  trading-redis:
+    image: redis:7-alpine
+    container_name: trading-redis
+    # AUDIT FIX:
+    # 1. --appendonly yes: Critical for VPIN state survival (AOF persistence)
+    # 2. --save 60 1: Snapshots RDB every 60s if 1 key changes (Aggressive backup)
+    # 3. maxmemory 10gb: Prevents OOM given the high volume of tick streams
+    command: >
+      redis-server
+      --appendonly yes
+      --save 900 1
+      --save 300 10
+      --save 60 1
+      --maxmemory 10gb
+      --maxmemory-policy allkeys-lru
+      --tcp-keepalive 60
+    ports:
+      - "6379:6379"
+    volumes:
+      - ftmo_bot_redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  ftmo_bot_postgres_data:
+  ftmo_bot_redis_data:

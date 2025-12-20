@@ -1,0 +1,47 @@
+name: algo_env_stable
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - cuda-toolkit=12.1
+  - pip
+  # --- CORE MATH (STRICT PINS) ---
+  - numpy<2.0 # HARDENED: Pin numpy to prevent River compatibility issues
+  - pandas>=2.0.0
+  - scipy>=1.10.0
+  - scikit-learn<1.3.0 # HARDENED: Strict Pin for River compatibility
+  - statsmodels
+  - pandas-ta
+  # --- ONLINE LEARNING CORE ---
+  - river>=0.21.0 # REQUIRED: Updated for ARFClassifier and ADWIN
+  # --- OPTIMIZATION & INFRASTRUCTURE ---
+  - optuna>=3.0.0
+  - redis-py>=4.5.0 # HARDENED: CRITICAL for ExponentialBackoff/Retry support
+  - pyarrow
+  - psycopg2
+  - sqlalchemy
+  - quantstats
+  - joblib
+  - pyyaml
+  - python-dotenv
+  - tqdm
+  - schedule
+  - streamlit # Dashboard dependency
+  - plotly
+  # --- HARDWARE OPTIMIZATION ---
+  - psutil # REQUIRED: For CPU Affinity Pinning (P-Cores)
+  - numba>=0.57.0 # REQUIRED: For JIT compiled Hurst Exponent
+  - mpmath # REQUIRED: Fix for SymPy broken dependency
+  # --- FTMO NEWS COMPLIANCE ---
+  - lxml # REQUIRED: Fast XML parsing for Forex Factory feed
+  - beautifulsoup4 # REQUIRED: HTML parsing fallback
+  - pip:
+    - cloudscraper # REQUIRED: Bypass Cloudflare on Forex Factory HTML
+    - requests # REQUIRED: HTTP polling
+    # MetaTrader5 is excluded here as it's Windows-only; manually install on Windows
