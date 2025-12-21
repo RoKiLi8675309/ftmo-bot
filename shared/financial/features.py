@@ -4,11 +4,11 @@
 # PATH: shared/financial/features.py
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional)
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk metrics.
-# AUDIT REMEDIATION (PHASE 2):
-#   - ADDED: StreamingIndicators (Recursive RSI, MACD, ATR).
-#   - ADDED: AdaptiveTripleBarrier (Volatility Adaptive Labeling).
-#   - REMOVED: RandomUnderSampler logic dependencies (Cleared path for Weighted Learning).
-#   - UPDATED: OnlineFeatureEngineer to ingest High/Low data.
+# AUDIT REMEDIATION (PHASE 2 - INDENTATION FIX):
+#   - FIXED: Strict indentation for root-level utility functions.
+#   - FIXED: Replaced river.stats.EWMean with local RecursiveEMA to fix TypeError.
+#   - RETAINED: StreamingIndicators (Recursive RSI, MACD, ATR).
+#   - RETAINED: AdaptiveTripleBarrier (Volatility Adaptive Labeling).
 # CRITICAL: Python 3.9 Compatible. Graceful degradation if ML libs missing.
 # =============================================================================
 from __future__ import annotations
@@ -35,9 +35,9 @@ try:
 except ImportError:
     SCIPY_AVAILABLE = False
 
-# River / Sklearn imports
+# River / Sklearn imports (Guarded)
 try:
-    from river import stats, utils, linear_model
+    from river import linear_model
     from sklearn.isotonic import IsotonicRegression
     ML_AVAILABLE = True
 except ImportError:
@@ -45,38 +45,54 @@ except ImportError:
 
 logger = logging.getLogger("Features")
 
-# --- 1. STREAMING INDICATORS (PHASE 2 NEW) ---
+# --- 0. HELPER MATH KERNELS (ROBUST) ---
+class RecursiveEMA:
+    """
+    Dependency-free Exponential Moving Average.
+    Solves compatibility issues with changing River API signatures.
+    Formula: S_t = alpha * Y_t + (1 - alpha) * S_{t-1}
+    """
+    def __init__(self, alpha: float):
+        self.alpha = alpha
+        self.value = None
+
+    def update(self, x: float):
+        if self.value is None:
+            self.value = x
+        else:
+            self.value = self.alpha * x + (1 - self.alpha) * self.value
+    
+    def get(self) -> float:
+        return self.value if self.value is not None else 0.0
+
+# --- 1. STREAMING INDICATORS (PHASE 2) ---
 class StreamingIndicators:
     """
-    Recursive implementation of technical indicators using River's streaming stats.
-    Replaces static lag features with state-aware momentum and volatility tracking.
+    Recursive implementation of technical indicators.
+    Uses local RecursiveEMA to ensure stability.
     """
     def __init__(self, rsi_period=14, macd_fast=12, macd_slow=26, macd_sig=9, atr_period=14):
-        if not ML_AVAILABLE:
-            return
-
+        # We don't strictly need ML_AVAILABLE for this anymore, but we keep the guard if needed elsewhere
+        
         # MACD Components
-        self.ema_fast = stats.EWMean(alpha=2 / (macd_fast + 1))
-        self.ema_slow = stats.EWMean(alpha=2 / (macd_slow + 1))
-        self.macd_signal = stats.EWMean(alpha=2 / (macd_sig + 1))
+        self.ema_fast = RecursiveEMA(alpha=2 / (macd_fast + 1))
+        self.ema_slow = RecursiveEMA(alpha=2 / (macd_slow + 1))
+        self.macd_signal = RecursiveEMA(alpha=2 / (macd_sig + 1))
 
         # RSI Components
         self.rsi_period = rsi_period
-        self.rsi_avg_gain = stats.EWMean(alpha=1 / rsi_period)
-        self.rsi_avg_loss = stats.EWMean(alpha=1 / rsi_period)
+        self.rsi_avg_gain = RecursiveEMA(alpha=1 / rsi_period)
+        self.rsi_avg_loss = RecursiveEMA(alpha=1 / rsi_period)
         self.prev_price = None
 
         # ATR Components (Volatility)
-        self.atr_mean = stats.EWMean(alpha=1 / atr_period)
+        self.atr_mean = RecursiveEMA(alpha=1 / atr_period)
         self.prev_close = None
 
     def update(self, price: float, high: float, low: float) -> Dict[str, float]:
         """
         Updates recursive state and returns current indicator values.
         """
-        if not ML_AVAILABLE:
-            return {'rsi': 50.0, 'macd_line': 0.0, 'macd_hist': 0.0, 'atr': 0.001}
-
         features = {}
 
         # 1. MACD Calculation
@@ -102,7 +118,7 @@ class StreamingIndicators:
             avg_loss = self.rsi_avg_loss.get()
             
             if avg_loss == 0:
-                rsi = 100.0
+                rsi = 100.0 if avg_gain > 0 else 50.0
             else:
                 rs = avg_gain / avg_loss
                 rsi = 100.0 - (100.0 / (1.0 + rs))
@@ -128,12 +144,11 @@ class StreamingIndicators:
 
         return features
 
-# --- 2. ADAPTIVE TRIPLE BARRIER (PHASE 2 NEW) ---
+# --- 2. ADAPTIVE TRIPLE BARRIER (PHASE 2) ---
 class AdaptiveTripleBarrier:
     """
     Volatility-Adaptive Labeling.
-    Unlike fixed pips, barriers expand/contract based on ATR.
-    Prevents stopping out in high volatility or undershooting in low volatility.
+    Barriers expand/contract based on ATR.
     """
     def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0):
         self.buffer = deque()
@@ -177,8 +192,6 @@ class AdaptiveTripleBarrier:
             label = None
 
             # 1. Did price hit TP? (Bullish assumption for label 1)
-            # Note: For simplicity in Phase 2, we label '1' if a Long would win.
-            # The model learns "Is Long Good?". Short logic is inverse or separate.
             if current_high >= trade['tp']:
                 label = 1 # SUCCESS
 
@@ -188,7 +201,7 @@ class AdaptiveTripleBarrier:
 
             # 3. Timeout?
             elif trade['age'] >= self.time_limit:
-                label = 0 # TIMEOUT (Treat as Fail to enforce high-velocity setups)
+                label = 0 # TIMEOUT (Treat as Fail)
 
             if label is not None:
                 resolved.append((trade['features'], label))
@@ -225,7 +238,6 @@ class ProbabilityCalibrator:
 class MetaLabeler:
     """
     Secondary model that learns whether a primary signal resulted in profit.
-    Acts as a profitability gatekeeper.
     """
     def __init__(self):
         self.model = None
@@ -238,7 +250,6 @@ class MetaLabeler:
         if not ML_AVAILABLE or primary_action == 0:
             return
 
-        # Target: 1 if profitable, 0 if loss
         y_meta = 1 if outcome_pnl > 0 else 0
         
         try:
@@ -277,7 +288,7 @@ class MetaLabeler:
                 clean[k] = 0.0
         return clean
 
-# --- 5. ONLINE FEATURE ENGINEER (UPDATED PHASE 2) ---
+# --- 5. ONLINE FEATURE ENGINEER (PHASE 2) ---
 class OnlineFeatureEngineer:
     def __init__(self, window_size: int = 50):
         self.window_size = window_size
@@ -285,13 +296,13 @@ class OnlineFeatureEngineer:
         self.volumes = deque(maxlen=window_size)
         self.returns = deque(maxlen=window_size)
         
-        # Phase 2: Integrated Streaming Indicators
+        # Phase 2: Integrated Streaming Indicators (Uses RecursiveEMA)
         self.indicators = StreamingIndicators()
         
-        # Legacy/Context components
+        # Legacy components
         self.entropy = EntropyMonitor(window=window_size)
         self.vpin = VPINMonitor(bucket_size=1000)
-        self.frac_diff = IncrementalFracDiff(d=0.3, window=window_size) # Adjusted d per config
+        self.frac_diff = IncrementalFracDiff(d=0.3, window=window_size)
         self.vol_monitor = VolatilityMonitor(window=20)
         self.last_price = None
 
@@ -397,8 +408,7 @@ class OnlineFeatureEngineer:
 # --- 6. STREAMING TRIPLE BARRIER (LEGACY COMPATIBILITY) ---
 class StreamingTripleBarrier:
     """
-    Maintained for backward compatibility with existing tests.
-    New code should use AdaptiveTripleBarrier.
+    Maintained for legacy compatibility.
     """
     def __init__(self, vol_multiplier: float = 2.0, barrier_len: int = 50, horizon_ticks: int = 100):
         self.vol_multiplier = vol_multiplier
