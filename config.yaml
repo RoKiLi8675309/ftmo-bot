@@ -1,26 +1,25 @@
 # =============================================================================
-# config.yaml – FTMO COMPLIANCE MODE V27.13 (FOREX PLAN REMEDIATION)
-# STATUS: OPTIMIZED FOR TEMPORAL INTEGRITY
-# REMEDIATION AUDIT LOG:
-# 1. REALISM: Enforced $5 Commissions and 0-2 pip Slippage.
-# 2. ML: Removed RandomUnderSampler (Purged). Implemented Lag Features.
-# 3. RISK: Fractional Kelly (0.5x) for reduced Drawdown.
-# 4. EXCLUSION: News Sentiment removed per user directive.
-# 5. CONSTRAINT: Added 'min_trades_optimization' to purge inactive strategies.
-# 6. ADJUSTMENT: Raised Probability Thresholds (0.75) to filter noise.
+# config.yaml – FTMO COMPLIANCE MODE V28.0 (PHASE 2 REMEDIATION)
+# STATUS: PHASE 2 - NON-LINEAR ADAPTIVE ENSEMBLES
+# REMEDIATION AUDIT LOG (Phase 2):
+# 1. ARCHITECTURE: Adaptive Random Forest (ARF) with Weighted Learning.
+# 2. DATA: Recursive Streaming Indicators (RSI, MACD, ATR).
+# 3. WARM-UP: Enforced 1000-candle Burn-In Period.
+# 4. RISK: Volatility-Adjusted Sizing (Kelly-Vol).
+# 5. IMBALANCE: Class Weights (10:1) instead of Sampling.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
 env:
-  initial_balance: 50000.0 # Default balance for risk calculations
+  initial_balance: 100000.0 # Default balance for FTMO Challenge
 
 # --- LOGGING CONFIGURATION ---
 logging:
-  level: "INFO" # UNFREEZE: Set to INFO to ensure visibility.
-  file_path: "ftmo_bot.log" # Filename only (shared.py handles path)
+  level: "INFO" 
+  file_path: "ftmo_bot.log"
   max_size_mb: 10
   backup_count: 5
-  human_friendly: true # Enable Emoji Logs
+  human_friendly: true
   trade_audit_file: "trade_audit.jsonl"
 
 # --- BROKER CONNECTION (Windows Producer) ---
@@ -35,31 +34,27 @@ redis:
   host: "localhost"
   port: 6379
   db: 0
-  # Stream Keys
-  price_data_stream: "price_data_stream" # The stream for TICK data (Carries Context)
+  price_data_stream: "price_data_stream"
   candle_stream_key_prefix: "stream:new_candle"
-  trade_request_stream: "trade_request_stream" # Engine -> Producer
+  trade_request_stream: "trade_request_stream"
   closed_trade_stream_key: "stream:closed_trades"
   account_info_key: "bot:account_info"
-  
-  # Persistence Keys
   position_state_key_prefix: "bot:positions"
   monitor_features_prefix: "monitor:features:"
   engine_state_key: 'bot:engine_state'
   
-  # Risk & Operational Keys
   risk_keys:
     daily_pnl: "risk:daily_pnl"
     consecutive_losses: "risk:consecutive_losses"
     last_deal_time: "risk:last_deal_time"
     pause_trading_flag: "risk:pause_trading"
-    daily_starting_equity: "risk:daily_starting_equity" # The Midnight Snapshot
-    current_equity: "risk:current_equity" # Real-time equity (Source: Producer)
-    kill_switch_active: "bot:state:kill_switch_active" # Manual/Auto Kill Switch
-    midnight_freeze: "bot:state:freeze" # The Watchman Flag
+    daily_starting_equity: "risk:daily_starting_equity"
+    current_equity: "risk:current_equity"
+    kill_switch_active: "bot:state:kill_switch_active"
+    midnight_freeze: "bot:state:freeze"
     last_reset_date: "risk:last_reset_date"
-    penalty_box_prefix: "risk:penalty_box:" # Prefix for locked assets
-    
+    penalty_box_prefix: "risk:penalty_box:"
+  
   heartbeat_key: "producer:heartbeat"
 
 postgres:
@@ -68,182 +63,171 @@ postgres:
   db: "trading_db"
   user: "postgres"
   password: "password"
-  # DSN constructed dynamically in shared/core/config.py
 
 # --- PRODUCER SETTINGS ---
 producer:
-  tick_interval_seconds: 0.1 # Reduced for Microstructure fidelity
+  tick_interval_seconds: 0.1
   process_priority: "HIGH"
-  midnight_freeze_seconds: 300 # 5 minutes buffer for "Rollover"
-  d1_update_interval: 60 # Frequency of D1 Context Refresh
+  midnight_freeze_seconds: 300
+  d1_update_interval: 60
 
-# --- DATA SETTINGS (INFORMATION THEORETIC) ---
+# --- DATA SETTINGS ---
 data:
-  sampling_method: "volume" # CHANGED: 'volume' bars instead of 'time'
-  volume_bar_threshold: 1000 # Threshold for bar sampling (ensures normality)
+  sampling_method: "volume"
+  volume_bar_threshold: 1000 # Adaptive thresholding logic applies in code
   download_start_date: "2020-01-01"
   num_candles_producer: 50000
   num_candles_train: 35000
   num_candles_wfo: 10000
   num_candles_backtest: 1000
 
-# --- FEATURE ENGINEERING (The "Golden Six" Inputs) ---
+# --- FEATURE ENGINEERING (Phase 2: Recursive Indicators) ---
 features:
   use_causal_features: true
   n_jobs: 20
   use_cache: true
-  window_size: 50
+  window_size: 50 # Base window for diffs
   
-  # Components
+  # Phase 2: Recursive Indicators Parameters
+  rsi_period: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  atr_period: 14
+  
+  # Legacy & Context
   d1_ema_period: 200
   entropy_window: 100
-  entropy_threshold: 0.65 # REMEDIATION: Relaxed from 0.90 to allow trading
+  entropy_threshold: 0.70 # Moderately relaxed to allow feature learning
   ofi_alpha: 0.1
-  dsp_period: 20
-  er_period: 10 # Efficiency Ratio Period
   
   fractional_differentiation:
-    d: 0.3 # CHANGED: 0.3 guarantees stationarity + memory preservation
+    d: 0.3
     window: 30
 
-  # --- CONTEXT AWARENESS FLAGS ---
-  cyclical_time: true # Hour/Day Sine/Cosine
-  session_awareness: true # London/NY Overlap flags
-  cluster_context: true # USD Index Proxy from Portfolio
-  d1_context: true # Daily Support/Resistance Injection
+  # Context Flags
+  cyclical_time: true
+  session_awareness: true
+  cluster_context: true
+  d1_context: true
 
-# --- MICROSTRUCTURE FILTERS (Strategy Gates) ---
+# --- MICROSTRUCTURE FILTERS ---
 microstructure:
-  # VPIN: Volume-Synchronized Probability of Informed Trading
-  vpin_bucket_size: 1000 # Matched to Volume Bar threshold
-  vpin_threshold: 0.75 # RELAXED: from 0.70 to 0.75 to capture more volatility
-  
-  # Efficiency Ratio (Kaufman)
-  er_threshold_noise: 0.40 # Below this is chop/noise
-  er_threshold_trend: 0.60 # Above this is trend
+  vpin_bucket_size: 1000
+  vpin_threshold: 0.75
+  er_threshold_noise: 0.40
+  er_threshold_trend: 0.60
+  hurst_threshold_mean_revert: 0.45
+  hurst_threshold_random_low: 0.45
+  hurst_threshold_random_high: 0.55
+  hurst_threshold_trend: 0.55
 
-  # Hurst Regime Thresholds
-  hurst_threshold_mean_revert: 0.45 # Below this: Mean Reversion (Fade)
-  hurst_threshold_random_low: 0.45 # Random Walk Range Low
-  hurst_threshold_random_high: 0.55 # Random Walk Range High
-  hurst_threshold_trend: 0.55 # Above this: Trending (Follow)
-
-# --- RISK MANAGEMENT (FTMO Compliance) ---
+# --- RISK MANAGEMENT (FTMO Kelly-Vol) ---
 risk_management:
   account_currency: "USD"
-  risk_timezone: "Europe/Prague" # FTMO Server Time (CE(S)T)
+  risk_timezone: "Europe/Prague"
   
-  # Sizing (Risk-Constrained Kelly)
-  sizing_method: "rck" # CHANGED: 'rck' (Risk Constrained Kelly) or 'fixed'
-  risk_per_trade_percent: 0.5 # Base Risk (0.5%)
+  # Phase 2 Sizing: Volatility Adjusted (Risk Amount / (ATR * Value))
+  sizing_method: "kelly_volatility" 
+  base_risk_per_trade_percent: 0.5 # 0.5% Hard Risk (Section 5.1)
   max_leverage: 30
-  commission_per_lot_rt: 5.0 # CHANGED: $5.00 Round Turn (Grok Recommendation)
+  commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  # Kelly Criterion
+  # Constraints
+  max_daily_loss_pct: 0.05
+  max_total_loss_pct: 0.10
+  max_risk_percent: 1.0 # Cap single trade risk
+  hard_stop_equity_usd: 80000.0
+  max_trades_per_day: 20
+  
+  # Kelly Settings
   kelly_enabled: true
-  kelly_fraction: 0.50 # CHANGED: 0.5x Fraction per Grok Report
+  kelly_fraction: 0.50
   kelly_window: 20
   
-  # CPPI (Safe Equity Cushion)
+  # CPPI Cushion
   cppi_enabled: true
-  cppi_floor_pct: 0.08 # 8% drawdown is the "Floor" (leaving 2% buffer for FTMO 10% limit)
-  cppi_multiplier: 2.0 # Aggressiveness of allocation above floor
-  
-  # Limits (Hard)
-  max_daily_loss_pct: 0.05 # 5% Daily Hard Limit
-  max_total_loss_pct: 0.10 # 10% Total Hard Limit
-  max_risk_percent: 1.0 # Absolute Cap per trade
-  hard_stop_equity_usd: 80000.0 # Absolute Equity Floor (Panic Stop)
-  max_trades_per_day: 20 # INCREASED: Allow more frequency
-  
-  # Soft Limits (Defense Mode)
-  soft_limit_pct: 0.04 # 4% Soft Limit (Trigger for dampener)
-  soft_limit_exponent: 2.0
-  safety_buffer_pct: 0.90 # Stop trading at 90% of Daily Limit
-  pre_emptive_sigma_mult: 3.0 # Volatility multiplier for projection
-  dampener_gamma: 1.5
+  cppi_floor_pct: 0.08
+  cppi_multiplier: 2.0
 
-  # HRP / Portfolio
-  correlation_penalty_threshold: 0.70
-  
-  # Trade Constraints
+  # Execution Guardrails
   min_lot_size: 0.01
   max_lot_size: 50.0
-  min_stop_loss_pips: 2.0 # Prevents noise-trading
-  max_loss_usd: 1000.0 # Cap per trade
+  min_stop_loss_pips: 2.0
+  max_loss_usd: 1000.0
   
-  # Dynamic Management
-  atr_multiplier: 2.0
-  stop_loss_atr_mult: 2.0
-  take_profit_atr_mult: 3.0
+  # Adaptive Stops (Based on ATR)
+  stop_loss_atr_mult: 1.0 # Section 5.2
+  take_profit_atr_mult: 2.0 # Section 5.2 (Reward > Risk)
 
-# --- TRADING PORTFOLIO ("The Golden Six") ---
+# --- TRADING PORTFOLIO ---
 trading:
   symbols:
-    - "EURUSD" # The Liquidity Anchor
-    - "GBPJPY" # The Alpha Generator
-    - "AUDCAD" # The Commodity Hedge
-    - "EURGBP" # The Mean Reverter
-    - "USDCHF" # The Negative Correlate
-    - "AUDJPY" # The Risk Sentiment Proxy
-  
-  # Auxiliary pairs needed for cross-rate calc (Quote -> USD)
+    - "EURUSD"
+    - "GBPJPY"
+    - "AUDCAD"
+    - "EURGBP"
+    - "USDCHF"
+    - "AUDJPY"
   auxiliary_symbols:
     - "GBPUSD"
     - "USDCAD"
     - "USDJPY"
-  timeframe: "M5" # Used for reference, but Engine now uses Volume Bars
+  timeframe: "M5" # Reference only, Volume Bars used internally
   magic_number: 621001
   slippage: 5
 
-# --- FTMO NEWS FILTER ---
+# --- NEWS FILTER ---
 news_filter:
-  enabled: false # DISABLED: User Directive "I do not care about news sentiment"
+  enabled: false
   primary_url: "http://nfs.faireconomy.media/ff_calendar_thisweek.xml"
   backup_url: "https://www.forexfactory.com/calendar"
   buffer_minutes_before: 2
   buffer_minutes_after: 2
   restricted_events: {}
 
-# --- WFO (WALK FORWARD OPTIMIZATION) ---
+# --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 200 # OPTIMIZATION: Increased for High-Concurrency hardware
+  n_trials: 200
   train_years: 2
   test_months: 6
-  min_trades_optimization: 30 # AUDIT REMEDIATION: Minimum trades to prevent "Zombie" strategies
+  min_trades_optimization: 30
 
-# --- ONLINE LEARNING (River ARF) ---
+# --- ONLINE LEARNING (Phase 2: ARF + Weighted Learning) ---
 online_learning:
   model_type: "ARFClassifier"
-  n_models: 40 # Ensemble size
+  n_models: 20 # Reduced from 40 for faster adaptation (Section 6, Step 3)
   
-  # REMEDIATION: Hyper-Reactive Settings for M5/Volume Bars
-  grace_period: 15 # CHANGED: 15 (adapts in minutes)
-  delta: 0.01 # CHANGED: 0.01 (high sensitivity to drift)
+  # Warm-up (Section 3.2)
+  burn_in_periods: 1000 # Minimum candles before training/trading
   
-  # BALANCE & META-LABELING
-  # REMOVED: undersample_ratio (Toxic for time-series)
-  meta_labeling_threshold: 0.60 # Secondary filter confidence
-
-  # OPTIMIZATION
-  metric: "GeometricMean" # CHANGED: Better for imbalanced classes (Trade vs Hold)
-  max_features: 'log2' # CHANGED: Decorrelates trees
-  lambda_value: 6 # CHANGED: Poisson Bootstrap strength
+  # Drift & Adaptation
+  grace_period: 50 # Increased from 15 to allow stable tree growth (Section 6, Step 3)
+  delta: 0.01
   
-  learning_horizon_sec: 300 # 5 Minutes
-  # AUDIT FIX: Raised to 0.75 (Step 5) to force high precision without sampling
+  # Weighted Learning (Section 3.3)
+  positive_class_weight: 10.0 # Weight for 'BUY' signals
+  negative_class_weight: 1.0  # Weight for 'HOLD'/'LOSS' signals
+  
+  # Meta Labeling
+  meta_labeling_threshold: 0.60
+  
+  # Optimization
+  metric: "Precision" # Changed to Precision per Section 6 Step 3 code
+  max_features: 'log2'
+  lambda_value: 6
+  
+  learning_horizon_sec: 300
   min_calibrated_probability: 0.75 
 
-  # TBM (Labeling)
+  # TBM (Adaptive)
   tbm:
-    horizon_minutes: 120 # REMEDIATION: Reduced from 1440 to 120 for M5 trading
-    barrier_width: 1.0 # REMEDIATION: Relaxed from 2.0 to 1.0 for more activity
+    horizon_minutes: 60 # 12 candles on M5 (Section 6, Step 4)
+    barrier_width: 2.0 # Multiplier for ATR (TP)
     min_profit_pips: 2.0
-    sl_width: 2.0
-    tp_width: 2.0
 
-# --- FORENSIC AUDIT (Simulation Settings) ---
+# --- FORENSIC AUDIT ---
 forensic_audit:
   enforce_spread: true
   spread_pips:
@@ -251,6 +235,5 @@ forensic_audit:
     GBPJPY: 2.5
     AUDJPY: 2.0
     EURGBP: 1.8
-  # ADDED: Realism Factors
-  max_slippage_pips: 2.0 # RANDOM 0-2 pips
-  commission_per_lot: 5.0 # $5 per lot
+  max_slippage_pips: 2.0
+  commission_per_lot: 5.0

@@ -1,14 +1,13 @@
+# =============================================================================
 # FILENAME: shared/financial/risk.py
 # ENVIRONMENT: DUAL COMPATIBILITY (Windows Py3.9 & Linux Py3.11)
 # PATH: shared/financial/risk.py
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
-# AUDIT REMEDIATION (GROK): 
-#   - IMPLEMENTED PositionSizer (0.1% Base Risk) to cut Drawdowns.
-#   - ADDED Detailed Debug Logging for Sizing.
-#   - HARDENED Correlation Penalty.
-#   - COMPATIBILITY: Accepts injected market_prices for precise conversion.
-#   - PROBLEM #5 (Target Misalignment): Added 10% Circuit Breaker in FTMORiskMonitor.
+# AUDIT REMEDIATION (PHASE 2):
+#   - SIZING: Implemented "Kelly-Vol" (Volatility Adjusted Risk).
+#   - STOPS: Adaptive SL/TP based on recursive ATR.
+#   - CONSTRAINTS: Hardened 0.5% Risk Per Trade limit.
 # CRITICAL: Python 3.9 Compatible.
 # =============================================================================
 from __future__ import annotations
@@ -40,7 +39,7 @@ logger = logging.getLogger("RiskManager")
 class RiskManager:
     """
     Stateless utilities for Pip value calculations, Exchange Rates,
-    and Advanced Position Sizing (RCK, CPPI).
+    and Advanced Position Sizing (Kelly-Vol, CPPI).
     """
     STANDARD_LOT_UNITS = 100_000
 
@@ -121,12 +120,12 @@ class RiskManager:
         conf: float,
         volatility: float,
         active_correlations: int = 0,
-        market_prices: Optional[Dict[str, float]] = None
+        market_prices: Optional[Dict[str, float]] = None,
+        atr: Optional[float] = None
     ) -> Tuple[Trade, float]:
         """
-        Calculates position size using Risk-Constrained Kelly (RCK) and CPPI Cushion.
-        GROK FIX: Implements strict Fractional Kelly (0.5x) and logging.
-        PROBLEM #1: Replaced Legacy Logic with PositionSizer (0.1% Base Risk).
+        Calculates position size using Volatility-Adjusted Kelly (Kelly-Vol).
+        Phase 2 Logic: Size is inversely proportional to ATR.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -161,43 +160,47 @@ class RiskManager:
         # Kelly Formula: K = W - (1-W)/R
         raw_kelly = win_rate - ((1 - win_rate) / rr_ratio)
         
-        # GROK REMEDIATION: Fractional Kelly
-        # Reduces exposure to 50% (or config value) of optimal to reduce volatility
+        # Fractional Kelly (Configurable, default 0.5)
         kelly_fraction = risk_conf.get('kelly_fraction', 0.5)
-        kelly_pct = raw_kelly * kelly_fraction
-        
-        # LG-2 Strict Non-Negative enforcement
-        kelly_pct = max(0.0, kelly_pct)
+        kelly_pct = max(0.0, raw_kelly * kelly_fraction)
 
         # --- CORRELATION PENALTY ---
         # Reduce size if we already hold correlated positions
         if active_correlations > 0:
             penalty_factor = 1.0 / (1.0 + (0.5 * active_correlations))
             kelly_pct *= penalty_factor
-            # logger.debug(f"⛓️ Correlation Penalty {symbol}: {active_correlations} peers -> x{penalty_factor:.2f}")
 
-        # --- FINAL SIZING (PositionSizer Logic) ---
-        # Baseline Risk: 0.1% per trade (Problem #1 Remediation)
-        base_risk_pct = 0.001 
+        # --- FINAL SIZING (Kelly-Vol Logic) ---
+        # Base Risk: 0.5% per trade (Section 5.1 of Plan)
+        # We target a specific dollar risk, then adjust volume based on ATR stop distance.
         
-        # We take the MAXIMUM of (Kelly * Balance) and (Base Risk * Balance) to ensure we trade small but scale up
-        # BUT we cap it at risk_budget_usd (CPPI) to prevent ruin.
+        base_risk_pct = risk_conf.get('base_risk_per_trade_percent', 0.5) / 100.0
         
-        kelly_risk_usd = balance * kelly_pct
-        base_risk_usd = balance * base_risk_pct
-        
-        # Dynamic Sizing: Use Kelly if high confidence, else Base Risk
+        # Dynamic Sizing: Scale risk by Kelly confidence if high confidence
+        # But cap it strictly at the Risk Budget
         if conf > 0.7:
-             target_risk_usd = kelly_risk_usd
+             # If high confidence, we can approach the Kelly limit, but bounded by base risk * scalar
+             # For Phase 2 stability, we stick to Base Risk as the anchor, potentially sizing DOWN 
+             # if confidence is low, rather than sizing UP aggressively.
+             target_risk_usd = balance * base_risk_pct
         else:
-             target_risk_usd = base_risk_usd
+             # Lower confidence = reduced risk
+             target_risk_usd = balance * (base_risk_pct * 0.5)
 
         # Risk Constraint: Min(Target, CPPI, Hard Max)
         final_risk_usd = min(target_risk_usd, risk_budget_usd)
 
-        # Calculate Stop Loss Distance
-        atr_mult = risk_conf.get('stop_loss_atr_mult', 2.0)
-        stop_dist = price * volatility * atr_mult
+        # --- ADAPTIVE STOP LOSS (ATR Based) ---
+        # If ATR is provided (from recursive indicators), use it.
+        # Fallback to percentage volatility if missing.
+        atr_mult_sl = risk_conf.get('stop_loss_atr_mult', 1.0)
+        atr_mult_tp = risk_conf.get('take_profit_atr_mult', 2.0)
+
+        if atr and atr > 0:
+            stop_dist = atr * atr_mult_sl
+        else:
+            # Fallback: Volatility * Price * Mult
+            stop_dist = price * volatility * 2.0
 
         # Convert Risk USD to Lots
         pip_val, _ = RiskManager.get_pip_info(symbol)
@@ -232,15 +235,14 @@ class RiskManager:
         actual_risk_usd = lots * loss_per_lot
 
         # Construct Trade Object Template
-        tp_mult = risk_conf.get('take_profit_atr_mult', 3.0)
         trade = Trade(
             symbol=symbol, 
             action="HOLD", 
             volume=lots,
             entry_price=price,
             stop_loss=stop_dist,
-            take_profit=stop_dist * tp_mult,
-            comment=f"K:{kelly_pct:.2f}|C:{cushion:.0f}"
+            take_profit=stop_dist * (atr_mult_tp / atr_mult_sl), # Maintain R:R ratio
+            comment=f"K:{kelly_pct:.2f}|C:{cushion:.0f}|ATR"
         )
         
         return trade, actual_risk_usd
@@ -354,7 +356,6 @@ class PortfolioRiskManager:
 class FTMORiskMonitor:
     """
     Monitors account health against FTMO's strict drawdown limits.
-    PROBLEM #5 (Target Misalignment): Implemented 10% Circuit Breaker (Profit Target).
     """
     def __init__(self, initial_balance: float, max_daily_loss_pct: float, redis_client):
         self.initial_balance = initial_balance

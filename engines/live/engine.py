@@ -1,13 +1,14 @@
+# =============================================================================
 # FILENAME: engines/live/engine.py
 # ENVIRONMENT: Linux/WSL2 (Python 3.11)
 # PATH: engines/live/engine.py
 # DEPENDENCIES: shared, engines.live.dispatcher, engines.live.predictor
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates bars, generates signals, checks risk, executes trades.
 # COMPLIANCE: FTMO Rules, Session Guards, News Filters.
-# REMEDIATION:
-# - Fixed Portfolio Logic Gap (Updates Returns & Correlations).
-# - Accurate Dollar Risk Logging.
-# - CV-1: Injects Live Market Prices into RiskManager for precise conversion.
+# AUDIT REMEDIATION (PHASE 2):
+# - WARM-UP GATE: Enforces strict burn-in period (signals 'WARMUP' are ignored).
+# - PORTFOLIO: Maintains correlation matrix updates even during warm-up.
+# - RISK: Passes 'atr' from signal metadata to RiskManager for adaptive stops.
 # =============================================================================
 import logging
 import time
@@ -54,7 +55,7 @@ class LiveTradingEngine:
     """
     def __init__(self):
         self.shutdown_flag = False
-       
+        
         # 1. Infrastructure
         self.stream_mgr = RedisStreamManager(
             host=CONFIG['redis']['host'],
@@ -62,7 +63,7 @@ class LiveTradingEngine:
             db=0,
             decode_responses=True
         )
-        self.stream_mgr.ensure_consumer_group()
+        self.stream_mgr.ensure_group()
 
         # 2. Risk & Compliance
         initial_bal = CONFIG['env'].get('initial_balance', 100000.0)
@@ -74,7 +75,7 @@ class LiveTradingEngine:
         self.portfolio_mgr = PortfolioRiskManager(symbols=CONFIG['trading']['symbols'])
         self.session_guard = SessionGuard()
         self.news_monitor = NewsEventMonitor()
-       
+        
         # 3. Data Aggregation (Volume Bars)
         self.aggregators = {}
         for sym in CONFIG['trading']['symbols']:
@@ -100,7 +101,7 @@ class LiveTradingEngine:
         # Throttle correlation updates (heavy calc)
         self.last_corr_update = time.time()
         
-        # AUDIT FIX: Live Price Cache for Risk Calculations
+        # Live Price Cache for Risk Calculations
         self.latest_prices = {}
 
     def process_tick(self, tick_data: dict):
@@ -132,26 +133,29 @@ class LiveTradingEngine:
         """
         Triggered when a Volume Bar is closed.
         """
-        logger.info(f"{LogSymbols.VPIN} New Bar: {bar.symbol} | Vol: {bar.volume:.0f} | Close: {bar.close}")
-
         # 1. Update Portfolio Risk State (Returns)
-        # AUDIT FIX: Update returns and matrix for HRP/Correlation logic
+        # Even during Warm-up, we must build the correlation matrix history.
         try:
             # Simple return calculation: (Close - Open) / Open
-            # NOTE: For volume bars, Open/Close are reliable snapshots
             ret = (bar.close - bar.open) / bar.open if bar.open > 0 else 0.0
             self.portfolio_mgr.update_returns(bar.symbol, ret)
-           
+            
             # Periodically rebuild correlation matrix (e.g., every 60 seconds)
             if time.time() - self.last_corr_update > 60:
                 self.portfolio_mgr.update_correlation_matrix()
                 self.last_corr_update = time.time()
         except Exception as e:
             logger.error(f"Portfolio Update Error: {e}")
-       
+        
         # 2. Get Signal
         signal = self.predictor.process_bar(bar.symbol, bar)
         if not signal: return
+
+        # --- PHASE 2: WARM-UP GATE ---
+        # Strictly ignore signals during burn-in.
+        if signal.action == "WARMUP":
+            # Logging is handled inside Predictor to reduce noise
+            return
 
         # 3. Validate Signal
         if signal.action == "HOLD":
@@ -163,9 +167,11 @@ class LiveTradingEngine:
         if not self._check_risk_gates(bar.symbol):
             return
 
-        # 5. Calculate Size (RCK + CPPI)
-        # Need current volatility from features
+        # 5. Calculate Size (Kelly-Vol)
+        # Need current volatility from features (passed in signal metadata)
         volatility = signal.meta_data.get('volatility', 0.001)
+        # ATR is now critical for Phase 2 sizing
+        current_atr = signal.meta_data.get('atr', 0.001) 
 
         # Count correlations
         active_corrs = self.portfolio_mgr.get_correlation_count(
@@ -181,16 +187,17 @@ class LiveTradingEngine:
             account_equity=self.ftmo_guard.equity,
             account_currency="USD",
             win_rate=0.55,
-            risk_reward_ratio=1.5
+            risk_reward_ratio=2.0 # Updated to 2.0 per config
         )
 
-        # AUDIT FIX: Pass latest_prices to RiskManager for precise conversion
+        # Calculate Size
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=signal.confidence,
-            volatility=volatility,
+            volatility=volatility, # Used for Kelly
             active_correlations=active_corrs,
-            market_prices=self.latest_prices
+            market_prices=self.latest_prices,
+            atr=current_atr # Phase 2: Explicitly pass ATR for stop distances
         )
 
         if trade_intent.volume <= 0:
@@ -233,7 +240,7 @@ class LiveTradingEngine:
         """
         logger.info(f"{LogSymbols.SUCCESS} Engine Loop Started. Waiting for data on '{CONFIG['redis']['price_data_stream']}'...")
         self.is_warm = True
-       
+        
         # Redis XREAD configuration
         stream_key = CONFIG['redis']['price_data_stream']
         group = self.stream_mgr.group_name
@@ -262,9 +269,8 @@ class LiveTradingEngine:
                             self.process_tick(data)
                             # Ack immediately
                             self.stream_mgr.r.xack(stream_key, group, message_id)
-               
+                
                 # Update local equity cache periodically for accurate RCK sizing
-                # (This assumes Producer is updating the Redis key)
                 try:
                     cached_eq = self.stream_mgr.r.get(CONFIG['redis']['risk_keys']['current_equity'])
                     if cached_eq:
