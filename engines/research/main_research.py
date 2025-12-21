@@ -177,18 +177,25 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
 
         # 2. Define Objective
         def objective(trial):
-            # Define Search Space (Aligned with new Config)
+            # Define Search Space (Relaxed for Activity)
             params = CONFIG['online_learning'].copy()
             params.update({
                 'n_models': trial.suggest_int('n_models', 10, 50, step=10),
                 'grace_period': trial.suggest_int('grace_period', 10, 100),
                 'delta': trial.suggest_float('delta', 0.001, 0.1, log=True),
-                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.85, 0.99), # Relaxed lower bound
+                
+                # REMEDIATION STEP 1: RELAX ENTRY FILTER
+                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.55, 0.85),
+                
+                # Feature Engineering Review
+                'feature_window': trial.suggest_int('feature_window', 50, 200),
+                
                 'tbm': {
-                    'barrier_width': trial.suggest_float('barrier_width', 1.0, 3.0),
-                    'horizon_minutes': trial.suggest_int('horizon_minutes', 60, 1440)
+                    # REMEDIATION STEP 2: WIDEN BARRIER RANGE (Allow tighter stops/targets)
+                    'barrier_width': trial.suggest_float('barrier_width', 0.5, 2.5),
+                    'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 480) # Reduced horizon for M5
                 },
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.55, 0.70)
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.51, 0.65)
             })
             
             # Instantiate Pipeline locally

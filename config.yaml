@@ -96,7 +96,7 @@ features:
   # Components
   d1_ema_period: 200
   entropy_window: 100
-  entropy_threshold: 0.90 # RELAXED: from 0.95 to 0.90 to allow more trades
+  entropy_threshold: 0.65 # RELAXED: from 0.90 to 0.65 to allow more trades
   ofi_alpha: 0.1
   dsp_period: 20
   er_period: 10 # Efficiency Ratio Period
@@ -235,8 +235,8 @@ online_learning:
 
   # TBM (Labeling)
   tbm:
-    horizon_minutes: 1440 # 24h horizon
-    barrier_width: 2.0 # Volatility multiplier
+    horizon_minutes: 120 # 2 Hours (120 min)
+    barrier_width: 1.0 # RELAXED: from 2.0 to 1.0
     min_profit_pips: 2.0
     sl_width: 2.0
     tp_width: 2.0
