@@ -1,11 +1,12 @@
 # =============================================================================
-# config.yaml – FTMO COMPLIANCE MODE V27.10 (GROK AUDIT FIXES)
+# config.yaml – FTMO COMPLIANCE MODE V27.11 (GROK AUDIT FIXES)
 # STATUS: OPTIMIZED FOR PROFITABILITY & REALISM
 # REMEDIATION AUDIT LOG:
 # 1. REALISM: Enforced $5 Commissions and 0-2 pip Slippage.
 # 2. ML: Active RandomUnderSampler (0.5) and Profitability Meta-Labeling.
 # 3. RISK: Fractional Kelly (0.5x) for reduced Drawdown.
 # 4. EXCLUSION: News Sentiment removed per user directive.
+# 5. CONSTRAINT: Added 'min_trades_optimization' to purge inactive strategies.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -39,12 +40,12 @@ redis:
   trade_request_stream: "trade_request_stream" # Engine -> Producer
   closed_trade_stream_key: "stream:closed_trades"
   account_info_key: "bot:account_info"
- 
+  
   # Persistence Keys
   position_state_key_prefix: "bot:positions"
   monitor_features_prefix: "monitor:features:"
   engine_state_key: 'bot:engine_state'
- 
+  
   # Risk & Operational Keys
   risk_keys:
     daily_pnl: "risk:daily_pnl"
@@ -57,7 +58,7 @@ redis:
     midnight_freeze: "bot:state:freeze" # The Watchman Flag
     last_reset_date: "risk:last_reset_date"
     penalty_box_prefix: "risk:penalty_box:" # Prefix for locked assets
-   
+    
   heartbeat_key: "producer:heartbeat"
 
 postgres:
@@ -91,7 +92,7 @@ features:
   n_jobs: 20
   use_cache: true
   window_size: 50
- 
+  
   # Components
   d1_ema_period: 200
   entropy_window: 100
@@ -99,7 +100,7 @@ features:
   ofi_alpha: 0.1
   dsp_period: 20
   er_period: 10 # Efficiency Ratio Period
- 
+  
   fractional_differentiation:
     d: 0.3 # CHANGED: 0.3 guarantees stationarity + memory preservation
     window: 30
@@ -115,7 +116,7 @@ microstructure:
   # VPIN: Volume-Synchronized Probability of Informed Trading
   vpin_bucket_size: 1000 # Matched to Volume Bar threshold
   vpin_threshold: 0.75 # RELAXED: from 0.70 to 0.75 to capture more volatility
- 
+  
   # Efficiency Ratio (Kaufman)
   er_threshold_noise: 0.40 # Below this is chop/noise
   er_threshold_trend: 0.60 # Above this is trend
@@ -130,31 +131,31 @@ microstructure:
 risk_management:
   account_currency: "USD"
   risk_timezone: "Europe/Prague" # FTMO Server Time (CE(S)T)
- 
+  
   # Sizing (Risk-Constrained Kelly)
   sizing_method: "rck" # CHANGED: 'rck' (Risk Constrained Kelly) or 'fixed'
   risk_per_trade_percent: 0.5 # Base Risk (0.5%)
   max_leverage: 30
   commission_per_lot_rt: 5.0 # CHANGED: $5.00 Round Turn (Grok Recommendation)
   contract_size: 100000
- 
+  
   # Kelly Criterion
   kelly_enabled: true
   kelly_fraction: 0.50 # CHANGED: 0.5x Fraction per Grok Report
   kelly_window: 20
- 
+  
   # CPPI (Safe Equity Cushion)
   cppi_enabled: true
   cppi_floor_pct: 0.08 # 8% drawdown is the "Floor" (leaving 2% buffer for FTMO 10% limit)
   cppi_multiplier: 2.0 # Aggressiveness of allocation above floor
- 
+  
   # Limits (Hard)
   max_daily_loss_pct: 0.05 # 5% Daily Hard Limit
   max_total_loss_pct: 0.10 # 10% Total Hard Limit
   max_risk_percent: 1.0 # Absolute Cap per trade
   hard_stop_equity_usd: 80000.0 # Absolute Equity Floor (Panic Stop)
   max_trades_per_day: 20 # INCREASED: Allow more frequency
- 
+  
   # Soft Limits (Defense Mode)
   soft_limit_pct: 0.04 # 4% Soft Limit (Trigger for dampener)
   soft_limit_exponent: 2.0
@@ -164,13 +165,13 @@ risk_management:
 
   # HRP / Portfolio
   correlation_penalty_threshold: 0.70
- 
+  
   # Trade Constraints
   min_lot_size: 0.01
   max_lot_size: 50.0
   min_stop_loss_pips: 2.0 # Prevents noise-trading
   max_loss_usd: 1000.0 # Cap per trade
- 
+  
   # Dynamic Management
   atr_multiplier: 2.0
   stop_loss_atr_mult: 2.0
@@ -185,7 +186,7 @@ trading:
     - "EURGBP" # The Mean Reverter
     - "USDCHF" # The Negative Correlate
     - "AUDJPY" # The Risk Sentiment Proxy
- 
+  
   # Auxiliary pairs needed for cross-rate calc (Quote -> USD)
   auxiliary_symbols:
     - "GBPUSD"
@@ -209,16 +210,17 @@ wfo:
   n_trials: 200 # OPTIMIZATION: Increased for High-Concurrency hardware
   train_years: 2
   test_months: 6
+  min_trades_optimization: 30 # AUDIT REMEDIATION: Minimum trades to prevent "Zombie" strategies
 
 # --- ONLINE LEARNING (River ARF) ---
 online_learning:
   model_type: "ARFClassifier"
   n_models: 40 # Ensemble size
- 
+  
   # REMEDIATION: Hyper-Reactive Settings for M5/Volume Bars
   grace_period: 15 # CHANGED: 15 (adapts in minutes)
   delta: 0.01 # CHANGED: 0.01 (high sensitivity to drift)
- 
+  
   # BALANCE & META-LABELING
   undersample_ratio: 0.5 # ADDED: Balance classes to avoid 'Hold' bias
   meta_labeling_threshold: 0.60 # Secondary filter confidence
@@ -227,7 +229,7 @@ online_learning:
   metric: "GeometricMean" # CHANGED: Better for imbalanced classes (Trade vs Hold)
   max_features: 'log2' # CHANGED: Decorrelates trees
   lambda_value: 6 # CHANGED: Poisson Bootstrap strength
- 
+  
   learning_horizon_sec: 300 # 5 Minutes
   min_calibrated_probability: 0.6
 

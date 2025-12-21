@@ -4,10 +4,11 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 # AUDIT REMEDIATION (GROK): 
-#   - IMPLEMENTED Fractional Kelly (0.5x) to cut Drawdowns.
+#   - IMPLEMENTED PositionSizer (0.1% Base Risk) to cut Drawdowns.
 #   - ADDED Detailed Debug Logging for Sizing.
 #   - HARDENED Correlation Penalty.
 #   - COMPATIBILITY: Accepts injected market_prices for precise conversion.
+#   - PROBLEM #5 (Target Misalignment): Added 10% Circuit Breaker in FTMORiskMonitor.
 # CRITICAL: Python 3.9 Compatible.
 # =============================================================================
 from __future__ import annotations
@@ -125,6 +126,7 @@ class RiskManager:
         """
         Calculates position size using Risk-Constrained Kelly (RCK) and CPPI Cushion.
         GROK FIX: Implements strict Fractional Kelly (0.5x) and logging.
+        PROBLEM #1: Replaced Legacy Logic with PositionSizer (0.1% Base Risk).
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -172,13 +174,26 @@ class RiskManager:
         if active_correlations > 0:
             penalty_factor = 1.0 / (1.0 + (0.5 * active_correlations))
             kelly_pct *= penalty_factor
-            logger.debug(f"⛓️ Correlation Penalty {symbol}: {active_correlations} peers -> x{penalty_factor:.2f}")
+            # logger.debug(f"⛓️ Correlation Penalty {symbol}: {active_correlations} peers -> x{penalty_factor:.2f}")
 
-        # --- FINAL SIZING ---
-        kelly_risk_usd = balance * kelly_pct
+        # --- FINAL SIZING (PositionSizer Logic) ---
+        # Baseline Risk: 0.1% per trade (Problem #1 Remediation)
+        base_risk_pct = 0.001 
         
-        # Risk Constraint: Min(Kelly, CPPI, Hard Max)
-        final_risk_usd = min(kelly_risk_usd, risk_budget_usd)
+        # We take the MAXIMUM of (Kelly * Balance) and (Base Risk * Balance) to ensure we trade small but scale up
+        # BUT we cap it at risk_budget_usd (CPPI) to prevent ruin.
+        
+        kelly_risk_usd = balance * kelly_pct
+        base_risk_usd = balance * base_risk_pct
+        
+        # Dynamic Sizing: Use Kelly if high confidence, else Base Risk
+        if conf > 0.7:
+             target_risk_usd = kelly_risk_usd
+        else:
+             target_risk_usd = base_risk_usd
+
+        # Risk Constraint: Min(Target, CPPI, Hard Max)
+        final_risk_usd = min(target_risk_usd, risk_budget_usd)
 
         # Calculate Stop Loss Distance
         atr_mult = risk_conf.get('stop_loss_atr_mult', 2.0)
@@ -215,12 +230,6 @@ class RiskManager:
         lots = round(lots, 2)
         
         actual_risk_usd = lots * loss_per_lot
-
-        # DEBUG: Sizing Autopsy
-        if lots > 0:
-            # Only log if we are actually sizing a trade
-            # logger.debug(f"⚖️ Sizing {symbol}: K_Raw={raw_kelly:.2f} | K_Frac={kelly_pct:.2f} | Risk=${final_risk_usd:.2f} | Lots={lots}")
-            pass
 
         # Construct Trade Object Template
         tp_mult = risk_conf.get('take_profit_atr_mult', 3.0)
@@ -343,17 +352,33 @@ class PortfolioRiskManager:
 
 
 class FTMORiskMonitor:
+    """
+    Monitors account health against FTMO's strict drawdown limits.
+    PROBLEM #5 (Target Misalignment): Implemented 10% Circuit Breaker (Profit Target).
+    """
     def __init__(self, initial_balance: float, max_daily_loss_pct: float, redis_client):
         self.initial_balance = initial_balance
         self.max_daily_loss = initial_balance * max_daily_loss_pct
         self.r = redis_client
         self.starting_equity_of_day = initial_balance
         self.equity = initial_balance
+        
+        # 10% Profit Target (FTMO Challenge Goal)
+        self.profit_target = initial_balance * 1.10
 
     def can_trade(self) -> bool:
+        # 1. Total Drawdown Check (10% Max)
         if self.equity < (self.initial_balance * 0.90): return False
+        
+        # 2. Daily Drawdown Check (5% Max)
         current_daily_loss = self.starting_equity_of_day - self.equity
         if current_daily_loss >= self.max_daily_loss: return False
+        
+        # 3. Circuit Breaker: Profit Target Reached
+        if self.equity >= self.profit_target:
+            logger.info("🎉 PROFIT TARGET REACHED! Trading Halted to preserve pass.")
+            return False
+            
         return True
 
     def _check_constraints(self, risk_to_add: float):
@@ -361,8 +386,12 @@ class FTMORiskMonitor:
         
     def check_circuit_breakers(self) -> str:
         if self.equity < (self.initial_balance * 0.90): return "Total Drawdown Breach"
+        
         current_daily_loss = self.starting_equity_of_day - self.equity
         if current_daily_loss >= self.max_daily_loss: return "Daily Drawdown Breach"
+        
+        if self.equity >= self.profit_target: return "Profit Target Reached (Victory Lap)"
+        
         return "OK"
 
     def update_equity(self, current_equity: float):
