@@ -1,13 +1,14 @@
+# =============================================================================
 # FILENAME: engines/live/predictor.py
 # ENVIRONMENT: Linux/WSL2 (Python 3.11)
 # PATH: engines/live/predictor.py
 # DEPENDENCIES: shared, river, numpy
 # DESCRIPTION: Online Learning Kernel. Manages ARF models, Feature Engineering,
 # Labeling (TBM), and Signal Calibration.
-# AUDIT REMEDIATION (GROK):
-# 1. IMBALANCE: Added RandomUnderSampler to handle class imbalance (99% Hold).
-# 2. META-LABELING: Added MetaLabeler to filter trades by profitability.
-# 3. VERBOSE LOGGING: Added reasons for signal rejection.
+# AUDIT REMEDIATION (FOREX PLAN):
+# 1. PURGED: RandomUnderSampler removed (restores time-series integrity).
+# 2. IMBALANCE: Handled via Probability Thresholding (Step 5).
+# 3. MEMORY: Relies on Feature Engineering lags rather than sampling.
 # =============================================================================
 import logging
 import pickle
@@ -21,7 +22,7 @@ from typing import Dict, Any, List, Optional, Tuple
 # Third-Party ML Imports
 try:
     from river import forest, compose, preprocessing, metrics, drift, linear_model, multioutput
-    from river.imblearn import RandomUnderSampler
+    # AUDIT FIX: Removed RandomUnderSampler import as it destroys time-series autocorrelation
 except ImportError:
     print("CRITICAL: 'river' library not found. Install with: pip install river>=0.21.0")
     import sys
@@ -61,7 +62,7 @@ class MultiAssetPredictor:
         self.symbols = symbols
         self.models_dir = Path("models")
         self.models_dir.mkdir(exist_ok=True)
-       
+        
         # 1. State Containers
         self.feature_engineers = {s: OnlineFeatureEngineer(window_size=CONFIG['features']['window_size']) for s in symbols}
         self.labelers = {s: StreamingTripleBarrier(
@@ -84,23 +85,19 @@ class MultiAssetPredictor:
         self._load_state()
 
     def _init_models(self):
+        """
+        Initializes the machine learning pipelines.
+        AUDIT FIX: Removed RandomUnderSampler. The model now sees the full,
+        unbroken time series to preserve autoregressive features.
+        """
         conf = CONFIG['online_learning']
         
-        # Define Sampling Strategy for Imbalance
-        # 0 (Hold) is majority. 1 (Buy) and -1 (Sell) are minority.
-        # GROK REMEDIATION: Strict balancing (0.5 for majority, 0.25 for minority)
-        undersample_ratio = conf.get('undersample_ratio', 0.5)
-        # Approx distribution: Keep 50% Hold, 25% Buy, 25% Sell
-        sampler = RandomUnderSampler(
-            desired_dist={0: undersample_ratio, 1: (1 - undersample_ratio)/2, -1: (1 - undersample_ratio)/2},
-            seed=42
-        )
-
         for sym in self.symbols:
             # Primary Model: Directional (Buy/Sell/Hold)
+            # We use a Pipeline with StandardScaler.
+            # Imbalance is now handled by the decision threshold (Step 5), not sampling.
             self.models[sym] = compose.Pipeline(
                 preprocessing.StandardScaler(),
-                sampler, # Handles class imbalance on-the-fly
                 forest.ARFClassifier(
                     n_models=conf['n_models'],
                     grace_period=conf['grace_period'],
@@ -128,7 +125,7 @@ class MultiAssetPredictor:
         labeler = self.labelers[symbol]
         model = self.models[symbol]
         meta_labeler = self.meta_labelers[symbol]
-       
+        
         # Extract Real Flow
         buy_vol = getattr(bar, 'buy_vol', bar.volume / 2.0)
         sell_vol = getattr(bar, 'sell_vol', bar.volume / 2.0)
@@ -141,7 +138,7 @@ class MultiAssetPredictor:
             buy_vol=buy_vol,
             sell_vol=sell_vol
         )
-       
+        
         if features is None: return None
 
         if context_d1:
@@ -164,7 +161,7 @@ class MultiAssetPredictor:
                     if stored_ts < timestamp_in:
                         self.pending_features[symbol].popleft() # Stale
                         continue
-                   
+                    
                     if stored_ts == timestamp_in:
                         # TRAIN PRIMARY MODEL
                         y_primary = outcome_label # -1, 0, 1
@@ -184,7 +181,7 @@ class MultiAssetPredictor:
                         
                         self.pending_features[symbol].popleft()
                         break
-                   
+                    
                     if stored_ts > timestamp_in:
                         break
 
@@ -224,8 +221,9 @@ class MultiAssetPredictor:
             # Store for future training
             self.pending_features[symbol].append((features, bar.timestamp, current_pred_action))
 
-            # Decision Logic
-            min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
+            # Decision Logic (Step 5: Handling Imbalance without Sampling)
+            # We strictly enforce a high probability threshold to filter noise.
+            min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.70) # Raised to 0.70 recommended
             volatility = features.get('volatility', 0.001)
 
             if current_pred_action != 0:
@@ -238,8 +236,8 @@ class MultiAssetPredictor:
                         logger.debug(f"🚫 {symbol} Meta-Labeler Rejected: Pred={current_pred_action}, Prob={confidence:.2f}")
                         return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
                 else:
-                    return Signal(symbol, "HOLD", confidence, {"reason": "Low Confidence"})
-           
+                    return Signal(symbol, "HOLD", confidence, {"reason": f"Low Confidence ({confidence:.2f} < {min_conf})"})
+            
             return Signal(symbol, "HOLD", confidence, {})
 
         except Exception as e:

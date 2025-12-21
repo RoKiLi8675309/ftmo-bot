@@ -1,10 +1,12 @@
+# =============================================================================
 # FILENAME: shared/financial/features.py
 # ENVIRONMENT: DUAL COMPATIBILITY (Windows Py3.9 & Linux Py3.11)
 # PATH: shared/financial/features.py
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional)
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk metrics.
-# AUDIT REMEDIATION (GROK):
-#   - ADDED: MetaLabeler class for profitability filtering.
+# AUDIT REMEDIATION (FOREX PLAN):
+#   - ADDED: Explicit Autoregressive Lags (Lag 1-3) to OnlineFeatureEngineer.
+#   - RETAINED: MetaLabeler for profitability filtering.
 #   - FIXED: Robust OFI and NaN sanitization.
 # CRITICAL: Python 3.9 Compatible. Graceful degradation if ML libs missing.
 # =============================================================================
@@ -66,7 +68,7 @@ class ProbabilityCalibrator:
             return raw_prob
 
 
-# --- 2. META LABELER (GROK REMEDIATION) ---
+# --- 2. META LABELER ---
 class MetaLabeler:
     """
     Secondary model that learns whether a primary signal (Buy/Sell) actually
@@ -207,6 +209,21 @@ class OnlineFeatureEngineer:
 
         self.last_price = price
 
+        # --- AUDIT FIX: Explicit Autoregressive Lags (Step 3) ---
+        # Since we removed the Sampler, we must feed history manually
+        # to the linear model to restore 'Memory'.
+        lags = {}
+        # Ensure we have enough history. 
+        # returns[-1] is current t. returns[-2] is t-1 (Lag 1).
+        if len(self.returns) >= 4:
+            lags['return_lag_1'] = self.returns[-2]
+            lags['return_lag_2'] = self.returns[-3]
+            lags['return_lag_3'] = self.returns[-4]
+        else:
+            lags['return_lag_1'] = 0.0
+            lags['return_lag_2'] = 0.0
+            lags['return_lag_3'] = 0.0
+
         raw_features = {
             'frac_diff': fd_price,
             'volatility': volatility_val,
@@ -219,6 +236,8 @@ class OnlineFeatureEngineer:
             'price_z': price_z,
             'volume_z': volume_z,
             'price_raw': price,
+            'return_raw': ret,
+            **lags,
             **time_feats
         }
 

@@ -1,13 +1,13 @@
 # =============================================================================
-# config.yaml – FTMO COMPLIANCE MODE V27.12 (GROK AUDIT FIXES)
-# STATUS: OPTIMIZED FOR PROFITABILITY & REALISM
+# config.yaml – FTMO COMPLIANCE MODE V27.13 (FOREX PLAN REMEDIATION)
+# STATUS: OPTIMIZED FOR TEMPORAL INTEGRITY
 # REMEDIATION AUDIT LOG:
 # 1. REALISM: Enforced $5 Commissions and 0-2 pip Slippage.
-# 2. ML: Active RandomUnderSampler (0.5) and Profitability Meta-Labeling.
+# 2. ML: Removed RandomUnderSampler (Purged). Implemented Lag Features.
 # 3. RISK: Fractional Kelly (0.5x) for reduced Drawdown.
 # 4. EXCLUSION: News Sentiment removed per user directive.
 # 5. CONSTRAINT: Added 'min_trades_optimization' to purge inactive strategies.
-# 6. ADJUSTMENT: Relaxed TBM barriers for M5 scalping logic.
+# 6. ADJUSTMENT: Raised Probability Thresholds (0.75) to filter noise.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -223,7 +223,7 @@ online_learning:
   delta: 0.01 # CHANGED: 0.01 (high sensitivity to drift)
   
   # BALANCE & META-LABELING
-  undersample_ratio: 0.5 # ADDED: Balance classes to avoid 'Hold' bias
+  # REMOVED: undersample_ratio (Toxic for time-series)
   meta_labeling_threshold: 0.60 # Secondary filter confidence
 
   # OPTIMIZATION
@@ -232,7 +232,8 @@ online_learning:
   lambda_value: 6 # CHANGED: Poisson Bootstrap strength
   
   learning_horizon_sec: 300 # 5 Minutes
-  min_calibrated_probability: 0.6
+  # AUDIT FIX: Raised to 0.75 (Step 5) to force high precision without sampling
+  min_calibrated_probability: 0.75 
 
   # TBM (Labeling)
   tbm:
