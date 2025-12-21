@@ -24,13 +24,16 @@ from shared.financial.risk import (
 
 from shared.financial.features import (
     OnlineFeatureEngineer,
-    StreamingTripleBarrier,
+    StreamingTripleBarrier, # Kept for legacy compatibility if needed
+    AdaptiveTripleBarrier,  # PHASE 2: New Volatility-Adaptive Labeler
+    StreamingIndicators,    # PHASE 2: New Recursive Indicators
     ProbabilityCalibrator,
     VPINMonitor,
     enrich_with_d1_data,
     calculate_hurst,
     IncrementalFracDiff,
-    VolatilityMonitor
+    VolatilityMonitor,
+    MetaLabeler             # PHASE 2: Exposed for Research pipeline
 )
 
 # --- TRANSFORMERS (Safe) ---
