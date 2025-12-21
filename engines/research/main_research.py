@@ -8,6 +8,7 @@
 #   - FEATURE: Implemented full Walk-Forward Optimization (WFO) to replace placeholders.
 #   - TELEMETRY: Enhanced logging to identify "Zombie" parameter sets (Low Activity).
 #   - DEPLOYMENT: Added Auto-Deployment of WFO parameters to config.yaml.
+#   - ADJUSTMENT: Tuned Search Space for Swing-Scalping (Higher Barriers to beat Spread).
 # =============================================================================
 
 import sys
@@ -177,25 +178,23 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
 
         # 2. Define Objective
         def objective(trial):
-            # Define Search Space (Relaxed for Activity)
+            # Define Search Space (Adjusted for Profitability)
             params = CONFIG['online_learning'].copy()
             params.update({
                 'n_models': trial.suggest_int('n_models', 10, 50, step=10),
                 'grace_period': trial.suggest_int('grace_period', 10, 100),
                 'delta': trial.suggest_float('delta', 0.001, 0.1, log=True),
                 
-                # REMEDIATION STEP 1: RELAX ENTRY FILTER
-                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.55, 0.85),
-                
-                # Feature Engineering Review
-                'feature_window': trial.suggest_int('feature_window', 50, 200),
+                # Keep entropy relaxed to ensure activity
+                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.60, 0.85), 
                 
                 'tbm': {
-                    # REMEDIATION STEP 2: WIDEN BARRIER RANGE (Allow tighter stops/targets)
-                    'barrier_width': trial.suggest_float('barrier_width', 0.5, 2.5),
-                    'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 480) # Reduced horizon for M5
+                    # REMEDIATION: Force wider targets (1.5 - 3.5 sigma) to beat spread costs
+                    'barrier_width': trial.suggest_float('barrier_width', 1.5, 3.5),
+                    # REMEDIATION: Longer horizon to allow trades to play out (2h - 8h)
+                    'horizon_minutes': trial.suggest_int('horizon_minutes', 120, 480) 
                 },
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.51, 0.65)
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.55, 0.70)
             })
             
             # Instantiate Pipeline locally
@@ -229,13 +228,19 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("sharpe", metrics['sharpe'])
             
-            # CRITICAL CONSTRAINT: Abandon if fewer than 30 trades
-            # This ensures statistical significance and avoids overfitting to noise.
+            # CRITICAL CONSTRAINT 1: Activity (Min Trades)
             min_trades = CONFIG.get('wfo', {}).get('min_trades_optimization', 30)
             if metrics['total_trades'] < min_trades:
                 trial.set_user_attr("pruned", True)
-                trial.set_user_attr("autopsy", f"PRUNED: Only {metrics['total_trades']} trades (Min required: {min_trades}). System too conservative.")
+                trial.set_user_attr("autopsy", f"PRUNED: Only {metrics['total_trades']} trades. System inactive.")
                 return -100.0 # Heavy Penalty
+
+            # CRITICAL CONSTRAINT 2: Profitability (Profit Factor)
+            # Stop optimizing losers. If active (>50 trades) but losing money, kill it.
+            if metrics['total_trades'] > 50 and metrics['profit_factor'] < 0.9:
+                trial.set_user_attr("pruned", True)
+                trial.set_user_attr("autopsy", f"PRUNED: Active but Losing (PF {metrics['profit_factor']:.2f}).")
+                return -100.0
 
             # Generate Autopsy if result is poor (Debugging)
             if metrics['score'] < 0.5 or broker.is_blown:

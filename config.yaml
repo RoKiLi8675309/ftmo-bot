@@ -1,5 +1,5 @@
 # =============================================================================
-# config.yaml – FTMO COMPLIANCE MODE V27.11 (GROK AUDIT FIXES)
+# config.yaml – FTMO COMPLIANCE MODE V27.12 (GROK AUDIT FIXES)
 # STATUS: OPTIMIZED FOR PROFITABILITY & REALISM
 # REMEDIATION AUDIT LOG:
 # 1. REALISM: Enforced $5 Commissions and 0-2 pip Slippage.
@@ -7,6 +7,7 @@
 # 3. RISK: Fractional Kelly (0.5x) for reduced Drawdown.
 # 4. EXCLUSION: News Sentiment removed per user directive.
 # 5. CONSTRAINT: Added 'min_trades_optimization' to purge inactive strategies.
+# 6. ADJUSTMENT: Relaxed TBM barriers for M5 scalping logic.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -96,7 +97,7 @@ features:
   # Components
   d1_ema_period: 200
   entropy_window: 100
-  entropy_threshold: 0.65 # RELAXED: from 0.90 to 0.65 to allow more trades
+  entropy_threshold: 0.65 # REMEDIATION: Relaxed from 0.90 to allow trading
   ofi_alpha: 0.1
   dsp_period: 20
   er_period: 10 # Efficiency Ratio Period
@@ -235,8 +236,8 @@ online_learning:
 
   # TBM (Labeling)
   tbm:
-    horizon_minutes: 120 # 2 Hours (120 min)
-    barrier_width: 1.0 # RELAXED: from 2.0 to 1.0
+    horizon_minutes: 120 # REMEDIATION: Reduced from 1440 to 120 for M5 trading
+    barrier_width: 1.0 # REMEDIATION: Relaxed from 2.0 to 1.0 for more activity
     min_profit_pips: 2.0
     sl_width: 2.0
     tp_width: 2.0
