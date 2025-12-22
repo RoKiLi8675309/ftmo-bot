@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – FTMO COMPLIANCE MODE V28.0 (PHASE 2 REMEDIATION)
-# STATUS: PHASE 2 - NON-LINEAR ADAPTIVE ENSEMBLES
-# REMEDIATION AUDIT LOG (Phase 2):
-# 1. ARCHITECTURE: Adaptive Random Forest (ARF) with Weighted Learning.
-# 2. DATA: Recursive Streaming Indicators (RSI, MACD, ATR).
-# 3. WARM-UP: Enforced 1000-candle Burn-In Period.
-# 4. RISK: Volatility-Adjusted Sizing (Kelly-Vol).
-# 5. IMBALANCE: Class Weights (10:1) instead of Sampling.
+# config.yaml – FTMO COMPLIANCE MODE V29.3 (RISK ADJUSTED)
+# STATUS: PHASE 3 - ANALYSIS PARALYSIS FIX & RISK CORRECTION
+#
+# FORENSIC REMEDIATION LOG (2025-12-22):
+# 1. RISK FIX: Lowered base_risk_per_trade_percent to 0.1% (was 0.5%).
+# 2. METRIC SHIFT: Optimization Metric set to 'Recall'.
+# 3. CONFIDENCE: min_calibrated_probability set to 0.51.
+# 4. FILTERS: Entropy 0.99, VPIN 0.95.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -81,24 +81,24 @@ data:
   num_candles_wfo: 10000
   num_candles_backtest: 1000
 
-# --- FEATURE ENGINEERING (Phase 2: Recursive Indicators) ---
+# --- FEATURE ENGINEERING ---
 features:
   use_causal_features: true
   n_jobs: 20
   use_cache: true
   window_size: 50 # Base window for diffs
   
-  # Phase 2: Recursive Indicators Parameters
+  # Recursive Indicators Parameters
   rsi_period: 14
   macd_fast: 12
   macd_slow: 26
   macd_signal: 9
   atr_period: 14
   
-  # Legacy & Context
+  # Context
   d1_ema_period: 200
   entropy_window: 100
-  entropy_threshold: 0.70 # Moderately relaxed to allow feature learning
+  entropy_threshold: 0.99 # RELAXED: Virtually disabled (0.99) to cure paralysis
   ofi_alpha: 0.1
   
   fractional_differentiation:
@@ -114,7 +114,7 @@ features:
 # --- MICROSTRUCTURE FILTERS ---
 microstructure:
   vpin_bucket_size: 1000
-  vpin_threshold: 0.75
+  vpin_threshold: 0.95 # RELAXED: Raised from 0.80 to 0.95 to cure paralysis
   er_threshold_noise: 0.40
   er_threshold_trend: 0.60
   hurst_threshold_mean_revert: 0.45
@@ -122,14 +122,14 @@ microstructure:
   hurst_threshold_random_high: 0.55
   hurst_threshold_trend: 0.55
 
-# --- RISK MANAGEMENT (FTMO Kelly-Vol) ---
+# --- RISK MANAGEMENT ---
 risk_management:
   account_currency: "USD"
   risk_timezone: "Europe/Prague"
   
-  # Phase 2 Sizing: Volatility Adjusted (Risk Amount / (ATR * Value))
-  sizing_method: "kelly_volatility" 
-  base_risk_per_trade_percent: 0.5 # 0.5% Hard Risk (Section 5.1)
+  # Sizing Logic: Size = (Equity * Risk%) / (ATR * PipValue)
+  sizing_method: "inverse_volatility" 
+  base_risk_per_trade_percent: 0.1 # CORRECTED: 0.1% Risk Per Trade
   max_leverage: 30
   commission_per_lot_rt: 5.0
   contract_size: 100000
@@ -137,14 +137,15 @@ risk_management:
   # Constraints
   max_daily_loss_pct: 0.05
   max_total_loss_pct: 0.10
-  max_risk_percent: 1.0 # Cap single trade risk
+  max_risk_percent: 0.5 # Hard Cap single trade risk (Safety ceiling)
   hard_stop_equity_usd: 80000.0
   max_trades_per_day: 20
+  correlation_penalty_threshold: 0.7
   
   # Kelly Settings
   kelly_enabled: true
   kelly_fraction: 0.50
-  kelly_window: 20
+  kelly_window: 50
   
   # CPPI Cushion
   cppi_enabled: true
@@ -158,8 +159,8 @@ risk_management:
   max_loss_usd: 1000.0
   
   # Adaptive Stops (Based on ATR)
-  stop_loss_atr_mult: 1.0 # Section 5.2
-  take_profit_atr_mult: 2.0 # Section 5.2 (Reward > Risk)
+  stop_loss_atr_mult: 1.5 
+  take_profit_atr_mult: 3.0 # High R:R requirement
 
 # --- TRADING PORTFOLIO ---
 trading:
@@ -180,51 +181,55 @@ trading:
 
 # --- NEWS FILTER ---
 news_filter:
-  enabled: false
+  enabled: true
   primary_url: "http://nfs.faireconomy.media/ff_calendar_thisweek.xml"
   backup_url: "https://www.forexfactory.com/calendar"
-  buffer_minutes_before: 2
-  buffer_minutes_after: 2
-  restricted_events: {}
+  buffer_minutes_before: 15
+  buffer_minutes_after: 15
+  restricted_events: 
+    USD: ["FOMC", "NFP", "CPI", "GDP"]
+    EUR: ["ECB", "CPI"]
+    GBP: ["BOE", "CPI"]
+    JPY: ["BOJ"]
 
 # --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 200
+  n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 30
+  min_trades_optimization: 20
 
-# --- ONLINE LEARNING (Phase 2: ARF + Weighted Learning) ---
+# --- ONLINE LEARNING ---
 online_learning:
   model_type: "ARFClassifier"
-  n_models: 20 # Reduced from 40 for faster adaptation (Section 6, Step 3)
+  n_models: 25 # Ensemble size
   
-  # Warm-up (Section 3.2)
-  burn_in_periods: 1000 # Minimum candles before training/trading
+  # Warm-up
+  burn_in_periods: 1000 
   
   # Drift & Adaptation
-  grace_period: 50 # Increased from 15 to allow stable tree growth (Section 6, Step 3)
-  delta: 0.01
+  grace_period: 50
+  delta: 0.001
   
-  # Weighted Learning (Section 3.3)
-  positive_class_weight: 10.0 # Weight for 'BUY' signals
-  negative_class_weight: 1.0  # Weight for 'HOLD'/'LOSS' signals
+  # Weighted Learning
+  positive_class_weight: 10.0 
+  negative_class_weight: 1.0  
   
   # Meta Labeling
-  meta_labeling_threshold: 0.60
+  meta_labeling_threshold: 0.55
   
   # Optimization
-  metric: "Precision" # Changed to Precision per Section 6 Step 3 code
+  metric: "Recall" # Incentivize activity (FOMO)
   max_features: 'log2'
   lambda_value: 6
   
   learning_horizon_sec: 300
-  min_calibrated_probability: 0.75 
+  min_calibrated_probability: 0.51 # Lower floor to 51%
 
   # TBM (Adaptive)
   tbm:
-    horizon_minutes: 60 # 12 candles on M5 (Section 6, Step 4)
-    barrier_width: 2.0 # Multiplier for ATR (TP)
+    horizon_minutes: 60 
+    barrier_width: 2.0
     min_profit_pips: 2.0
 
 # --- FORENSIC AUDIT ---

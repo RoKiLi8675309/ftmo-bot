@@ -5,11 +5,12 @@
 # DEPENDENCIES: shared, engines.live.dispatcher, engines.live.predictor
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates bars, generates signals, checks risk, executes trades.
 # COMPLIANCE: FTMO Rules, Session Guards, News Filters.
-# AUDIT REMEDIATION (PHASE 2):
-# - WARM-UP GATE: Enforces strict burn-in period (signals 'WARMUP' are ignored).
-# - PORTFOLIO: Maintains correlation matrix updates even during warm-up.
-# - RISK: Passes 'atr' from signal metadata to RiskManager for adaptive stops.
-# - FORCE UPDATE: Implements 'Aggressive Mode' to force 1 trade per day per pair.
+#
+# FORENSIC REMEDIATION LOG (2025-12-22):
+# 1. AUTO-DETECT: Retrieves real account size from Redis to scale CPPI logic.
+# 2. REMOVED AGGRESSIVE MODE: Deleted daily trade counters and forced trade logic.
+# 3. WARM-UP GATE: Enforces strict burn-in period.
+# 4. RISK: Passes 'atr' from signal metadata to RiskManager.
 # =============================================================================
 import logging
 import time
@@ -106,10 +107,6 @@ class LiveTradingEngine:
         # Live Price Cache for Risk Calculations
         self.latest_prices = {}
 
-        # FORCE TRADE LOGIC: Track trades per day to enforce 1/day/pair
-        self.daily_trades = defaultdict(int)
-        self.last_reset_date = datetime.now().date()
-
     def process_tick(self, tick_data: dict):
         """
         Handles a single raw tick from Redis.
@@ -139,13 +136,6 @@ class LiveTradingEngine:
         """
         Triggered when a Volume Bar is closed.
         """
-        # 0. Daily Reset Logic for Forced Trades
-        current_date = datetime.fromtimestamp(bar.timestamp).date()
-        if current_date > self.last_reset_date:
-            self.daily_trades.clear()
-            self.last_reset_date = current_date
-            logger.info(f"{LogSymbols.RESET} Daily trade counters reset for {current_date}")
-
         # 1. Update Portfolio Risk State (Returns)
         try:
             # Simple return calculation: (Close - Open) / Open
@@ -159,43 +149,31 @@ class LiveTradingEngine:
         except Exception as e:
             logger.error(f"Portfolio Update Error: {e}")
         
-        # 2. Determine Aggression (Force Trade)
-        # If we haven't traded this symbol today, we activate Aggressive Mode
-        aggressive_mode = (self.daily_trades[bar.symbol] == 0)
-        
-        if aggressive_mode:
-            # We log this sparingly to avoid spam, but distinct enough to know why it traded
-            # logger.debug(f"⚡ AGGRESSIVE MODE ACTIVE for {bar.symbol} (0 trades today)")
-            pass
-
-        # 3. Get Signal (Pass Aggressive Flag)
-        signal = self.predictor.process_bar(bar.symbol, bar, aggressive=aggressive_mode)
+        # 2. Get Signal
+        signal = self.predictor.process_bar(bar.symbol, bar)
         if not signal: return
 
         # --- PHASE 2: WARM-UP GATE ---
-        # Strictly ignore signals during burn-in.
         if signal.action == "WARMUP":
             return
 
-        # 4. Validate Signal
+        # 3. Validate Signal
         if signal.action == "HOLD":
             return
 
-        logger.info(f"{LogSymbols.SIGNAL} SIGNAL: {signal.action} {bar.symbol} (Conf: {signal.confidence:.2f}) | Forced: {aggressive_mode}")
+        logger.info(f"{LogSymbols.SIGNAL} SIGNAL: {signal.action} {bar.symbol} (Conf: {signal.confidence:.2f})")
 
-        # 5. Check Risk & Compliance Gates (Pass Aggressive Flag)
-        if not self._check_risk_gates(bar.symbol, aggressive=aggressive_mode):
+        # 4. Check Risk & Compliance Gates
+        if not self._check_risk_gates(bar.symbol):
             return
 
-        # 6. Calculate Size (Kelly-Vol)
-        # Need current volatility from features (passed in signal metadata)
+        # 5. Calculate Size (Kelly-Vol)
         volatility = signal.meta_data.get('volatility', 0.001)
-        # ATR is now critical for Phase 2 sizing
         current_atr = signal.meta_data.get('atr', 0.001) 
 
         # Count correlations
         active_corrs = self.portfolio_mgr.get_correlation_count(
-            bar.symbol,
+            bar.symbol, 
             threshold=CONFIG['risk_management']['correlation_penalty_threshold']
         )
 
@@ -207,8 +185,18 @@ class LiveTradingEngine:
             account_equity=self.ftmo_guard.equity,
             account_currency="USD",
             win_rate=0.55,
-            risk_reward_ratio=2.0 # Updated to 2.0 per config
+            risk_reward_ratio=2.0 
         )
+
+        # --- AUTO-DETECT: Retrieve Account Size from Redis ---
+        # Windows Producer sets 'bot:account_size' on startup.
+        # This overrides the 'initial_balance' in config for CPPI calculations.
+        try:
+            cached_size = self.stream_mgr.r.get("bot:account_size")
+            account_size = float(cached_size) if cached_size else None
+        except:
+            account_size = None
+        # -----------------------------------------------------
 
         # Calculate Size
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
@@ -217,7 +205,8 @@ class LiveTradingEngine:
             volatility=volatility, # Used for Kelly
             active_correlations=active_corrs,
             market_prices=self.latest_prices,
-            atr=current_atr # Phase 2: Explicitly pass ATR for stop distances
+            atr=current_atr, # Phase 2: Explicitly pass ATR for stop distances
+            account_size=account_size # AUTO-DETECT: Pass actual size
         )
 
         if trade_intent.volume <= 0:
@@ -226,37 +215,28 @@ class LiveTradingEngine:
 
         trade_intent.action = signal.action
 
-        # 7. Dispatch
-        if self.dispatcher.send_order(trade_intent, risk_usd):
-            # Only increment daily counter if dispatch was successful
-            self.daily_trades[bar.symbol] += 1
+        # 6. Dispatch
+        self.dispatcher.send_order(trade_intent, risk_usd)
 
-    def _check_risk_gates(self, symbol: str, aggressive: bool = False) -> bool:
+    def _check_risk_gates(self, symbol: str) -> bool:
         """
         Runs the gauntlet of safety checks.
-        If 'aggressive' is True, we bypass non-critical gates to ensure daily volume.
         """
         # 1. FTMO Hard Limits (CRITICAL - NEVER BYPASS)
-        # Bypassing this would lose the funded account.
         if not self.ftmo_guard.can_trade():
             logger.warning(f"{LogSymbols.LOCK} FTMO Guard: Trading Halted (Drawdown).")
             return False
 
-        # If Aggressive (Forced Trade), bypass optional filters
-        if aggressive:
-            return True
-
-        # 2. Session Time (Optional)
+        # 2. Session Time
         if not self.session_guard.is_trading_allowed():
-            # logger.debug("Session Guard: Market Closed/Rollover.")
             return False
 
-        # 3. Penalty Box (Optional)
+        # 3. Penalty Box
         if self.portfolio_mgr.check_penalty_box(symbol):
             logger.warning(f"{LogSymbols.LOCK} {symbol} is in Penalty Box.")
             return False
 
-        # 4. News Blackout (Optional)
+        # 4. News Blackout
         if not self.news_monitor.check_trade_permission(symbol):
              return False
 

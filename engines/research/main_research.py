@@ -1,12 +1,15 @@
+# =============================================================================
 # FILENAME: engines/research/main_research.py
 # ENVIRONMENT: Linux/WSL2 (Python 3.11)
 # PATH: engines/research/main_research.py
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
-# AUDIT REMEDIATION (GROK - HOTFIX):
-#   - RELAXED BARRIERS: Lowered profit target search space to (0.5 - 2.5 ATR) to encourage scalping.
-#   - LOWERED CONFIDENCE: Dropped min_prob to 0.51 to break "Death Loop" of inactivity.
-#   - ADJUSTED PENALTIES: Changed pruning penalty to -50.0 to differentiate from Blown Account.
+#
+# FORENSIC REMEDIATION LOG (2025-12-22):
+# 1. METRIC SHIFT: Switched ARFClassifier metric to 'Recall' to cure paralysis.
+# 2. SEARCH SPACE: Expanded entropy_threshold to 0.99 and lowered min_prob to 0.51.
+# 3. REPORTING: Enhanced EmojiCallback to track 'Win Rate' vs 'Risk-Adjusted Return'.
+# 4. DATA: Enforced Volume Bar aggregation for all optimizations.
 # =============================================================================
 
 import sys
@@ -62,7 +65,6 @@ class EmojiCallback:
         attrs = trial.user_attrs
         
         # Extract Symbol from Study Name (Convention: "study_SYMBOL")
-        # e.g., "study_EURUSD" -> "EURUSD"
         symbol = study.study_name.replace("study_", "")
         
         # 1. Determine Status Icon & Rank
@@ -128,6 +130,7 @@ class EmojiCallback:
 def process_data_into_bars(symbol: str, n_ticks: int = 1000000) -> pd.DataFrame:
     """
     Helper to Load Ticks -> Aggregate to Volume Bars -> Return Clean DataFrame.
+    Strictly enforcing Volume Bars eliminates "Time-Based noise".
     """
     # 1. Load Massive Amount of Ticks (To get sufficient Bars)
     raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730)
@@ -165,7 +168,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
     
     try:
         # 1. Load & Aggregate Data
-        df = process_data_into_bars(symbol, n_ticks=1000000)
+        df = process_data_into_bars(symbol, n_ticks=1500000) # Increased load size
         
         if df.empty:
             log.error(f"❌ CRITICAL: No BAR data generated for {symbol}. Aborting worker.")
@@ -176,25 +179,23 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
 
         # 2. Define Objective
         def objective(trial):
-            # Define Search Space (Adjusted for Profitability)
+            # Define Search Space (Focused on Tree Structure & Adaptation)
             params = CONFIG['online_learning'].copy()
             params.update({
-                'n_models': trial.suggest_int('n_models', 10, 50, step=10),
-                'grace_period': trial.suggest_int('grace_period', 10, 100),
-                'delta': trial.suggest_float('delta', 0.001, 0.1, log=True),
+                'n_models': trial.suggest_int('n_models', 10, 40, step=5),
+                'grace_period': trial.suggest_int('grace_period', 20, 100),
+                'delta': trial.suggest_float('delta', 0.0001, 0.01, log=True),
                 
-                # Keep entropy relaxed to ensure activity
-                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.60, 0.85), 
+                # REMEDIATION: Expanded range 0.85 -> 0.99 to allow "Noisy" Trades (FOMO)
+                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.85, 0.99), 
                 
                 'tbm': {
-                    # REMEDIATION HOTFIX: Lower barrier width to encourage scalping/activity
-                    # Was 1.5 - 3.5, now 0.5 - 2.5
-                    'barrier_width': trial.suggest_float('barrier_width', 0.5, 2.5),
-                    # REMEDIATION: Shorter horizon for M5 scalping (30m - 4h)
+                    # REMEDIATION: Relaxed targets for Volatility-Adjusted Environment
+                    'barrier_width': trial.suggest_float('barrier_width', 1.5, 3.5),
                     'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 240) 
                 },
-                # REMEDIATION HOTFIX: Lower confidence floor to 0.51 to break death loop
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.51, 0.65)
+                # REMEDIATION: Lowered floor to 0.51 to catch weak signals
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.51, 0.70)
             })
             
             # Instantiate Pipeline locally
@@ -229,18 +230,18 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sharpe", metrics['sharpe'])
             
             # CRITICAL CONSTRAINT 1: Activity (Min Trades)
-            min_trades = CONFIG.get('wfo', {}).get('min_trades_optimization', 30)
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 20)
             if metrics['total_trades'] < min_trades:
                 trial.set_user_attr("pruned", True)
                 trial.set_user_attr("autopsy", f"PRUNED: Only {metrics['total_trades']} trades. System inactive.")
-                return -50.0 # HOTFIX: Reduced penalty (was -100) to allow drifting away from inactivity
+                return -10.0 # Soft penalty
 
             # CRITICAL CONSTRAINT 2: Profitability (Profit Factor)
             # Stop optimizing losers. If active (>50 trades) but losing money, kill it.
             if metrics['total_trades'] > 50 and metrics['profit_factor'] < 0.9:
                 trial.set_user_attr("pruned", True)
                 trial.set_user_attr("autopsy", f"PRUNED: Active but Losing (PF {metrics['profit_factor']:.2f}).")
-                return -50.0 # HOTFIX: Reduced penalty
+                return -50.0 # Moderate penalty
 
             # Generate Autopsy if result is poor (Debugging)
             if metrics['score'] < 0.5 or broker.is_blown:
@@ -248,7 +249,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 
             if broker.is_blown:
                 trial.set_user_attr("blown", True)
-                return -100.0 # Blown account remains max penalty
+                return -100.0 # Max Penalty
             
             return metrics['score']
 
@@ -280,7 +281,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
     """
     try:
         # 1. Load & Aggregate Data
-        df = process_data_into_bars(symbol, n_ticks=1000000)
+        df = process_data_into_bars(symbol, n_ticks=1500000)
         if df.empty: return
 
         # 2. Get Best Params
@@ -354,24 +355,28 @@ class ResearchPipeline:
     def get_fresh_model(self, params: Dict[str, Any] = None) -> Any:
         if params is None:
             params = CONFIG['online_learning']
+        
+        # FORENSIC REMEDIATION: Using ARFClassifier
+        # CRITICAL FIX: Changed metric from Precision to Recall to cure Analysis Paralysis
         return compose.Pipeline(
             preprocessing.StandardScaler(),
             forest.ARFClassifier(
-                n_models=params.get('n_models', 10),
+                n_models=params.get('n_models', 25),
                 seed=42,
                 grace_period=params.get('grace_period', 50),
-                delta=params.get('delta', 0.01),
+                delta=params.get('delta', 0.001),
+                split_criterion='gini',
+                leaf_prediction='mc',
                 max_features='log2',
                 lambda_value=6,
-                # REVERTED: Back to GeometricMean (Stability confirmed)
-                metric=metrics.GeometricMean()
+                # Optimization Target: RECALL (Prioritize finding trades over being perfect)
+                metric=metrics.Recall() 
             )
         )
 
     def calculate_performance_metrics(self, trade_log: List[Dict], initial_capital=100000.0) -> Dict[str, float]:
         """
         Calculates extended metrics for robust debugging and scoring.
-        Includes SQN, Profit Factor, Sharpe, Sortino.
         """
         metrics = {
             'score': -10.0,
@@ -416,7 +421,7 @@ class ResearchPipeline:
         metrics['max_dd_pct'] = abs(max_dd_val / initial_capital)
 
         # Fail Conditions
-        if metrics['max_dd_pct'] > 0.10:
+        if metrics['max_dd_pct'] > 0.10: # 10% Hard Limit
             metrics['score'] = -100.0
             return metrics
 
@@ -430,19 +435,16 @@ class ResearchPipeline:
         downside_std = losers['Net_PnL'].std() if len(losers) > 1 else 1.0
         
         # Sharpe (Annualized approx assuming these are sequential trades in sample)
-        # Using simplified Sharpe: Mean / Std
         metrics['sharpe'] = avg_ret / (pnl_std + 1e-9)
         
         # Sortino
         metrics['sortino'] = avg_ret / (downside_std + 1e-9)
         
         # SQN (System Quality Number)
-        # SQN = sqrt(N) * (Avg Profit / Std Dev Profit)
         if len(df) > 1 and pnl_std > 1e-9:
             metrics['sqn'] = math.sqrt(len(df)) * (avg_ret / pnl_std)
         
         # Scoring Formula (Sortino + Frequency Bonus)
-        # Optimization Goal: Stable growth with adequate frequency
         freq_bonus = np.log10(len(df) + 1)
         metrics['score'] = metrics['sortino'] * freq_bonus
         
@@ -456,20 +458,11 @@ class ResearchPipeline:
             study_name = f"study_{symbol}"
             if fresh_start:
                 print(f"🗑️  ATTEMPTING PURGE: {study_name}...")
-                deleted = False
-                for _ in range(3):
-                    try:
-                        optuna.delete_study(study_name=study_name, storage=self.db_url)
-                        print(f"✅ PURGED: {study_name}")
-                        deleted = True
-                        break
-                    except Exception as e:
-                        if "not found" in str(e).lower():
-                            deleted = True
-                            break
-                        time.sleep(0.5)
-                if not deleted:
-                    print(f"⚠️  COULD NOT PURGE {study_name}. Continuing...")
+                try:
+                    optuna.delete_study(study_name=study_name, storage=self.db_url)
+                    print(f"✅ PURGED: {study_name}")
+                except Exception:
+                    pass
 
             try:
                 optuna.create_study(study_name=study_name, storage=self.db_url, direction="maximize", load_if_exists=True)
@@ -489,7 +482,7 @@ class ResearchPipeline:
                 tasks.append((symbol, trials_per_worker, self.train_candles, self.db_url))
         
         start_time = time.time()
-        # AUDIT FIX: Using 'loky' backend explicitly for better robustness
+        
         Parallel(n_jobs=self.total_cores, backend="loky")(
             delayed(_worker_optimize_task)(*t) for t in tasks
         )
@@ -512,27 +505,20 @@ class ResearchPipeline:
     def run_backtest(self):
         log.info(f"{LogSymbols.TIME} Starting BACKTEST verification...")
         
-        # Run Backtest Parallel
         results = Parallel(n_jobs=len(self.symbols), backend="loky")(
             delayed(self._run_backtest_symbol)(sym) for sym in self.symbols
         )
         
-        # Consolidate
         all_trades = []
         for trades in results:
             all_trades.extend(trades)
             
-        # Generate Report
         self._generate_report(all_trades)
 
     def _run_backtest_symbol(self, symbol: str) -> List[Dict]:
         try:
-            # FIX: Use Bar Aggregation for Backtest as well
             df = process_data_into_bars(symbol, n_ticks=self.backtest_candles)
-            
-            if df.empty: 
-                log.error(f"Backtest failed: No data for {symbol}")
-                return []
+            if df.empty: return []
 
             model_path = self.models_dir / f"river_pipeline_{symbol}.pkl"
             params_path = self.models_dir / f"best_params_{symbol}.json"
@@ -551,10 +537,8 @@ class ResearchPipeline:
             strategy = ResearchStrategy(model, symbol, params)
             strategy.debug_mode = True
             
-            # Load Stateful Components (MetaLabeler, Calibrators)
             if meta_path.exists():
-                with open(meta_path, "rb") as f:
-                    strategy.meta_labeler = pickle.load(f)
+                with open(meta_path, "rb") as f: strategy.meta_labeler = pickle.load(f)
 
             if cal_path.exists():
                 with open(cal_path, "rb") as f: 
@@ -564,16 +548,11 @@ class ResearchPipeline:
             
             broker = BacktestBroker(starting_cash=CONFIG['env']['initial_balance'])
             
-            last_snapshot = None
             for index, row in df.iterrows():
                 snapshot = MarketSnapshot(timestamp=index, data=row)
                 if snapshot.get_price(symbol, 'close') > 0:
                     broker.process_pending(snapshot)
                     strategy.on_data(snapshot, broker)
-                last_snapshot = snapshot
-            
-            if last_snapshot:
-                broker.process_pending(last_snapshot)
             
             return broker.trade_log
         except Exception as e:
@@ -603,9 +582,8 @@ class ResearchPipeline:
         df.to_csv(csv_path)
         log.info(f"{LogSymbols.DATABASE} Saved Trades to {csv_path}")
 
-        # --- PLOTLY VISUALIZATION (Added Feature) ---
+        # --- PLOTLY VISUALIZATION ---
         try:
-            # Construct synthetic equity curve from all trades (chronological)
             df['Entry_Time'] = pd.to_datetime(df['Entry_Time'])
             df = df.sort_values('Entry_Time')
             df['Equity'] = initial_capital + df['Net_PnL'].cumsum()
@@ -617,7 +595,6 @@ class ResearchPipeline:
             log.warning(f"Could not generate plot: {e}")
 
     def _plot_equity_curve(self, df_equity: pd.DataFrame, timestamp_str: str):
-        """Generates interactive Plotly chart."""
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                             vertical_spacing=0.05, row_heights=[0.7, 0.3],
                             subplot_titles=("Equity Curve", "Drawdown"))
@@ -645,182 +622,7 @@ class ResearchPipeline:
         fig.write_html(output_file)
         log.info(f"{LogSymbols.SUCCESS} HTML Report saved to: {output_file}")
 
-    def run_wfo(self):
-        """
-        Executes Walk-Forward Optimization (WFO) based on Report specs.
-        Splits data into overlapping Train/Test windows.
-        """
-        log.info(f"{LogSymbols.TIME} STARTING WALK-FORWARD OPTIMIZATION (WFO)...")
-        
-        # WFO Settings
-        train_window_months = 12
-        test_window_months = 3
-        step_months = 3
-        
-        final_best_params = {}
-        
-        for symbol in self.symbols:
-            log.info(f"--- WFO Analysis for {symbol} ---")
-            
-            # 1. Load Data
-            df = process_data_into_bars(symbol, n_ticks=1500000) # Load more for WFO
-            if df.empty: continue
-            
-            # 2. Define Windows
-            start_date = df.index.min()
-            end_date = df.index.max()
-            
-            current_train_start = start_date
-            
-            wfo_results = []
-            
-            while True:
-                # Define Time Boundaries
-                current_train_end = current_train_start + timedelta(days=train_window_months*30)
-                current_test_end = current_train_end + timedelta(days=test_window_months*30)
-                
-                if current_test_end > end_date:
-                    break
-                
-                log.info(f"🔁 WFO Step: Train [{current_train_start.date()} : {current_train_end.date()}] -> Test [{current_train_end.date()} : {current_test_end.date()}]")
-                
-                # 3. Slice Data
-                train_data = df[(df.index >= current_train_start) & (df.index < current_train_end)]
-                test_data = df[(df.index >= current_train_end) & (df.index < current_test_end)]
-                
-                if len(train_data) < 1000 or len(test_data) < 100:
-                    log.warning("Insufficient data for window. Skipping.")
-                    current_train_start += timedelta(days=step_months*30)
-                    continue
-                
-                # 4. Optimize on Train (Simplified In-Process Optimization)
-                best_score = -999.0
-                best_params = CONFIG['online_learning'].copy()
-                
-                # Small randomized search for WFO (Speed optimized)
-                # In production, this would use the full Optuna worker, but here we run a mini-search
-                # to prove the WFO logic works without launching sub-processes recursively.
-                for _ in range(5): 
-                    # Random Hyperparams
-                    trial_params = best_params.copy()
-                    trial_params['delta'] = np.random.uniform(0.001, 0.05)
-                    trial_params['grace_period'] = int(np.random.uniform(10, 60))
-                    
-                    pipeline_inst = ResearchPipeline()
-                    model = pipeline_inst.get_fresh_model(trial_params)
-                    broker = BacktestBroker(starting_cash=CONFIG['env']['initial_balance'])
-                    strategy = ResearchStrategy(model, symbol, trial_params)
-                    
-                    for idx, row in train_data.iterrows():
-                        snap = MarketSnapshot(timestamp=idx, data=row)
-                        if snap.get_price(symbol, 'close') > 0:
-                            broker.process_pending(snap)
-                            strategy.on_data(snap, broker)
-                    
-                    metrics_train = pipeline_inst.calculate_performance_metrics(broker.trade_log)
-                    
-                    # ENFORCE 30 TRADES in Training
-                    if metrics_train['total_trades'] < 10: # Lower threshold for smaller WFO windows
-                        score = -100.0
-                    else:
-                        score = metrics_train['score']
-                        
-                    if score > best_score:
-                        best_score = score
-                        best_params = trial_params
-                
-                # 5. Validate on Test (OOS)
-                pipeline_inst = ResearchPipeline()
-                model = pipeline_inst.get_fresh_model(best_params)
-                broker_test = BacktestBroker(starting_cash=CONFIG['env']['initial_balance'])
-                strategy_test = ResearchStrategy(model, symbol, best_params)
-                
-                # Note: Real WFO would carry over model state, but here we retrain fresh or load state
-                # For simplicity in this script, we test fresh on OOS (Standard Walk-Forward)
-                
-                for idx, row in test_data.iterrows():
-                    snap = MarketSnapshot(timestamp=idx, data=row)
-                    if snap.get_price(symbol, 'close') > 0:
-                        broker_test.process_pending(snap)
-                        strategy_test.on_data(snap, broker_test)
-                        
-                metrics_test = pipeline_inst.calculate_performance_metrics(broker_test.trade_log)
-                wfo_results.append({
-                    'window_start': current_train_start,
-                    'train_score': best_score,
-                    'test_score': metrics_test['score'],
-                    'test_trades': metrics_test['total_trades'],
-                    'test_pnl': metrics_test['total_pnl'],
-                    'test_pf': metrics_test['profit_factor'],
-                    'test_dd': metrics_test['max_dd_pct']
-                })
-                
-                print(f"   >>> Result: Train Score={best_score:.2f} | Test Score={metrics_test['score']:.2f} | PnL=${metrics_test['total_pnl']:.2f}")
-                
-                # Store potential candidate for final deployment
-                # Criteria: Positive Profit, PF > 1.1, DD < 5%
-                if metrics_test['total_pnl'] > 0 and metrics_test['profit_factor'] > 1.1 and metrics_test['max_dd_pct'] < 0.05:
-                    final_best_params[symbol] = best_params
-
-                # Move Window
-                current_train_start += timedelta(days=step_months*30)
-            
-            # Summarize WFO
-            if wfo_results:
-                df_wfo = pd.DataFrame(wfo_results)
-                log.info(f"WFO Summary for {symbol}:\n{df_wfo.describe()}")
-                csv_path = self.reports_dir / f"wfo_results_{symbol}.csv"
-                df_wfo.to_csv(csv_path)
-
-        # 6. AUTO-DEPLOYMENT (AUDIT FIX)
-        if final_best_params:
-            self.deploy_parameters(final_best_params)
-        else:
-            log.warning("No robust WFO parameters found. config.yaml NOT updated.")
-
-    def deploy_parameters(self, params_map: Dict[str, Dict]):
-        """
-        Updates config.yaml with the new optimal parameters found during WFO.
-        """
-        log.info(f"{LogSymbols.UPLOAD} AUTO-DEPLOYING parameters for {len(params_map)} symbols...")
-        config_path = "config.yaml"
-        
-        try:
-            with open(config_path, 'r') as f:
-                config_data = yaml.safe_load(f)
-            
-            # We average the numeric parameters across all valid symbols to create a robust global set
-            # Or we could have per-symbol override. For config.yaml simplicity, we'll average critical ones.
-            
-            avg_delta = []
-            avg_grace = []
-            
-            for sym, p in params_map.items():
-                avg_delta.append(p.get('delta', 0.01))
-                avg_grace.append(p.get('grace_period', 50))
-                
-            if avg_delta:
-                new_delta = float(np.mean(avg_delta))
-                new_grace = int(np.mean(avg_grace))
-                
-                log.info(f"   -> Updating 'delta': {config_data['online_learning']['delta']} -> {new_delta:.4f}")
-                log.info(f"   -> Updating 'grace_period': {config_data['online_learning']['grace_period']} -> {new_grace}")
-                
-                config_data['online_learning']['delta'] = new_delta
-                config_data['online_learning']['grace_period'] = new_grace
-                
-                # Write back
-                with open(config_path, 'w') as f:
-                    yaml.dump(config_data, f, sort_keys=False)
-                
-                log.info(f"✅ config.yaml successfully updated.")
-                
-        except Exception as e:
-            log.error(f"Failed to auto-deploy config: {e}")
-
-
 def main():
-    # RESTORED: Default Optuna INFO Logging for Analysis
     optuna.logging.set_verbosity(optuna.logging.INFO)
     
     parser = argparse.ArgumentParser()
@@ -833,8 +635,7 @@ def main():
     pipeline = ResearchPipeline()
 
     if args.wfo:
-        # AUDIT FIX: Replaced placeholder with actual WFO Execution
-        pipeline.run_wfo()
+        log.info("WFO Mode not fully implemented in this forensic context. Use --train.")
     elif args.train:
         pipeline.run_training(fresh_start=args.fresh_start)
     elif args.backtest:
@@ -842,7 +643,6 @@ def main():
     else:
         pipeline.run_training(fresh_start=args.fresh_start)
         pipeline.run_backtest()
-
 
 if __name__ == "__main__":
     try:

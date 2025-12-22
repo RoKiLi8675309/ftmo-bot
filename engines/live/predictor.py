@@ -5,17 +5,20 @@
 # DEPENDENCIES: shared, river, numpy
 # DESCRIPTION: Online Learning Kernel. Manages ARF models, Feature Engineering,
 # Labeling (Adaptive Triple Barrier), and Weighted Learning.
-# AUDIT REMEDIATION (PHASE 2):
-# 1. WEIGHTED LEARNING: Implemented sample_weight (10:1) in model training.
-# 2. ADAPTIVE BARRIERS: Integrated AdaptiveTripleBarrier for ATR-based labeling.
-# 3. WARM-UP: Enforced 'burn_in_periods' gate.
-# 4. FORCE UPDATE: Added 'aggressive' bypass to process_bar for daily activity enforcement.
+#
+# FORENSIC REMEDIATION LOG (2025-12-22):
+# 1. REMOVED AGGRESSIVE MODE: Deleted 'aggressive' parameter and logic.
+# 2. WEIGHTED LEARNING: Implemented sample_weight (10:1) in model training.
+# 3. ADAPTIVE BARRIERS: Integrated AdaptiveTripleBarrier for ATR-based labeling.
+# 4. WARM-UP: Enforced 'burn_in_periods' gate.
+# 5. PARALYSIS FIX: Lowered confidence floor (0.51) and relaxed Entropy (0.99).
 # =============================================================================
 import logging
 import pickle
 import os
 import json
 import time
+import math
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -33,7 +36,7 @@ from shared import (
     CONFIG,
     LogSymbols,
     OnlineFeatureEngineer,
-    AdaptiveTripleBarrier, # PHASE 2: Replaces StreamingTripleBarrier
+    AdaptiveTripleBarrier, 
     ProbabilityCalibrator,
     enrich_with_d1_data,
     VolumeBar
@@ -71,7 +74,7 @@ class MultiAssetPredictor:
         self.labelers = {s: AdaptiveTripleBarrier(
             horizon_ticks=tbm_conf['horizon_minutes'], # Converted to ticks implicitly by usage
             risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'],
-            reward_mult=CONFIG['online_learning']['tbm']['barrier_width'] # Uses barrier width as TP mult
+            reward_mult=tbm_conf['barrier_width'] # Uses barrier width as TP mult
         ) for s in symbols}
 
         # 2. Models (River ARF)
@@ -95,8 +98,6 @@ class MultiAssetPredictor:
         
         for sym in self.symbols:
             # Primary Model: Adaptive Random Forest
-            # NOTE: RandomUnderSampler removed per Phase 2 Audit to preserve time-series integrity.
-            # Imbalance is handled via sample_weight in process_bar().
             self.models[sym] = compose.Pipeline(
                 preprocessing.StandardScaler(),
                 forest.ARFClassifier(
@@ -107,7 +108,7 @@ class MultiAssetPredictor:
                     leaf_prediction='mc',
                     max_features='log2',
                     lambda_value=conf['lambda_value'],
-                    metric=metrics.Precision() # Optimized for Precision (False Positive reduction)
+                    metric=metrics.Recall() # Optimization Target: RECALL (Prioritize finding trades)
                 )
             )
 
@@ -115,11 +116,9 @@ class MultiAssetPredictor:
             self.meta_labelers[sym] = MetaLabeler()
             self.calibrators[sym] = ProbabilityCalibrator()
 
-    def process_bar(self, symbol: str, bar: VolumeBar, context_d1: Dict[str, Any] = None, aggressive: bool = False) -> Optional[Signal]:
+    def process_bar(self, symbol: str, bar: VolumeBar, context_d1: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        ARGS:
-            aggressive (bool): If True, filters are relaxed to force a daily trade.
         """
         if symbol not in self.symbols: return None
 
@@ -173,8 +172,6 @@ class MultiAssetPredictor:
                 # Train Primary Model
                 model.learn_one(stored_feats, outcome_label, sample_weight=weight)
 
-                # Meta-Training omitted here for speed (Phase 2 audit)
-
         # 3. Add CURRENT Bar as new Trade Opportunity
         current_atr = features.get('atr', 0.0)
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
@@ -182,16 +179,17 @@ class MultiAssetPredictor:
         # 4. Inference
         current_pred_action = 0
         try:
-            # Forensic Filters
-            # BYPASS if aggressive (Forced Entry)
-            if not aggressive:
-                entropy_val = features.get('entropy', 0.0)
-                if entropy_val > CONFIG['features']['entropy_threshold']:
-                    return Signal(symbol, "HOLD", 0.0, {"reason": f"Max Entropy ({entropy_val:.2f})"})
+            # Forensic Filters (RELAXED)
+            entropy_val = features.get('entropy', 0.0)
+            # Use Configured Threshold (0.99 for FOMO mode)
+            entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.99)
+            if entropy_val > entropy_thresh:
+                return Signal(symbol, "HOLD", 0.0, {"reason": f"Max Entropy ({entropy_val:.2f})"})
 
-                vpin_val = features.get('vpin', 0.0)
-                if vpin_val > CONFIG['microstructure']['vpin_threshold']:
-                    return Signal(symbol, "HOLD", 0.0, {"reason": f"Toxic VPIN ({vpin_val:.2f})"})
+            vpin_val = features.get('vpin', 0.0)
+            # Relaxed VPIN (0.95)
+            if vpin_val > 0.95: 
+                return Signal(symbol, "HOLD", 0.0, {"reason": f"Toxic VPIN ({vpin_val:.2f})"})
 
             # Primary Prediction
             pred_class = model.predict_one(features)
@@ -204,8 +202,8 @@ class MultiAssetPredictor:
             except:
                 current_pred_action = 0
 
-            # Meta-Labeling Check
-            meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.60)
+            # Meta-Labeling Check (Bypass for now if needed, but logic is in strategy.py)
+            meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.55)
             is_profitable = meta_labeler.predict(
                 features, 
                 current_pred_action, 
@@ -213,34 +211,19 @@ class MultiAssetPredictor:
             )
 
             # Decision Logic
-            min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.75) 
+            min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.51) 
             volatility = features.get('volatility', 0.001)
 
-            # --- FORCE TRADE LOGIC (AGGRESSIVE) ---
-            if aggressive:
-                # Lower threshold significantly to force a trade if direction matches
-                force_threshold = 0.40
-                
-                # If prediction is 1 OR confidence is decent (even if pred says 0)
-                if current_pred_action == 1 or confidence > force_threshold:
-                     return Signal(symbol, "BUY", confidence, {
-                         "meta_ok": True, 
-                         "volatility": volatility, 
-                         "atr": current_atr,
-                         "forced": True
-                     })
-            
-            # --- STANDARD LOGIC ---
-            else:
-                if current_pred_action == 1: 
-                    if confidence > min_conf:
-                        if is_profitable:
-                            return Signal(symbol, "BUY", confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr})
-                        else:
-                            logger.debug(f"🚫 {symbol} Meta-Labeler Rejected: Prob={confidence:.2f}")
-                            return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
+            # --- STANDARD PURE AI LOGIC ---
+            if current_pred_action == 1: 
+                if confidence > min_conf:
+                    if is_profitable:
+                        return Signal(symbol, "BUY", confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr})
                     else:
-                        return Signal(symbol, "HOLD", confidence, {"reason": f"Low Confidence ({confidence:.2f} < {min_conf})"})
+                        # logger.debug(f"🚫 {symbol} Meta-Labeler Rejected: Prob={confidence:.2f}")
+                        return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
+                else:
+                    return Signal(symbol, "HOLD", confidence, {"reason": f"Low Confidence ({confidence:.2f} < {min_conf})"})
             
             return Signal(symbol, "HOLD", confidence, {})
 

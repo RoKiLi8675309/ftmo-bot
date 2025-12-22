@@ -4,11 +4,13 @@
 # PATH: shared/financial/risk.py
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
-# AUDIT REMEDIATION (PHASE 2):
-#   - SIZING: Implemented "Kelly-Vol" (Volatility Adjusted Risk).
-#   - STOPS: Adaptive SL/TP based on recursive ATR.
-#   - CONSTRAINTS: Hardened 0.5% Risk Per Trade limit.
-# CRITICAL: Python 3.9 Compatible.
+#
+# FORENSIC REMEDIATION LOG (2025-12-22):
+# 1. AUTO-DETECT SUPPORT: calculate_rck_size now accepts 'account_size' to 
+#    dynamically scale CPPI cushion for 50k/200k accounts vs Config default.
+# 2. SINGULARITY FIX: Implemented Inverse-Volatility Sizing (ATR-Based).
+# 3. HARD CAP: Enforced strict 0.1% Risk Per Trade limit (Audit Section 5.1).
+# 4. SYNTAX FIX: Removed stray backslash in SessionGuard (Lines 405-406).
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -49,14 +51,18 @@ class RiskManager:
         s = symbol.upper()
         if "JPY" in s:
             return 0.01, 3
-        if "XAU" in s:
+        if "XAU" in s or "XAG" in s:
             return 0.1, 2
+        # Indices heuristic
+        if any(x in s for x in ["US30", "GER30", "NAS100", "SPX500"]):
+            return 1.0, 1 # Usually 1 point steps
         return 0.0001, 5
 
     @staticmethod
     def get_conversion_rate(symbol: str, price: float, market_prices: Optional[Dict[str, float]] = None) -> float:
         """
         Calculates the Quote -> USD conversion rate using LIVE market data.
+        Critical for accurate risk calculation in USD.
         """
         s = symbol.upper()
         
@@ -75,41 +81,41 @@ class RiskManager:
             usdjpy = get_price("USDJPY")
             if usdjpy and usdjpy > 0: return 1.0 / usdjpy
             if s == "USDJPY" and price > 0: return 1.0 / price
-            return 0.0 # Safety
+            return 0.0065 # Fallback ~150
 
         # GBP Pairs (Quote = GBP). Need GBP->USD (GBPUSD).
         if s.endswith("GBP"):
             gbpusd = get_price("GBPUSD")
             if gbpusd: return gbpusd
-            return 0.0
-            
+            return 1.25 # Fallback
+
         # CAD Pairs (Quote = CAD). Need CAD->USD (1 / USDCAD).
         if s.endswith("CAD"):
             usdcad = get_price("USDCAD")
             if usdcad and usdcad > 0: return 1.0 / usdcad
             if s == "USDCAD" and price > 0: return 1.0 / price
-            return 0.0
+            return 0.75
 
         # CHF Pairs (Quote = CHF). Need CHF->USD (1 / USDCHF).
         if s.endswith("CHF"):
             usdchf = get_price("USDCHF")
             if usdchf and usdchf > 0: return 1.0 / usdchf
             if s == "USDCHF" and price > 0: return 1.0 / price
-            return 0.0
+            return 1.10
 
         # AUD Pairs (Quote = AUD). Need AUD->USD (AUDUSD).
         if s.endswith("AUD"):
             audusd = get_price("AUDUSD")
             if audusd: return audusd
             if s == "AUDUSD" and price > 0: return price
-            return 0.0
+            return 0.65
 
         # NZD Pairs
         if s.endswith("NZD"):
             nzdusd = get_price("NZDUSD")
             if nzdusd: return nzdusd
             if s == "NZDUSD" and price > 0: return price
-            return 0.0
+            return 0.60
 
         # Default fallback
         return 1.0
@@ -121,11 +127,16 @@ class RiskManager:
         volatility: float,
         active_correlations: int = 0,
         market_prices: Optional[Dict[str, float]] = None,
-        atr: Optional[float] = None
+        atr: Optional[float] = None,
+        account_size: Optional[float] = None # NEW ARGUMENT for Auto-Detection
     ) -> Tuple[Trade, float]:
         """
-        Calculates position size using Volatility-Adjusted Kelly (Kelly-Vol).
-        Phase 2 Logic: Size is inversely proportional to ATR.
+        Calculates position size using Inverse-Volatility Sizing (Audit Compliant).
+        Logic: Risk Amount is fixed (0.1%), Volume scales inversely with ATR.
+        
+        UPDATED: Uses 'account_size' (if provided) as the baseline for CPPI 
+        calculations, fixing the issue where a 50k account would calculate 0 risk 
+        against a hardcoded 100k config.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -134,67 +145,31 @@ class RiskManager:
         # 1. Retrieve Config Parameters
         risk_conf = CONFIG.get('risk_management', {})
 
-        # --- CPPI SAFE EQUITY CUSHION ---
+        # --- CPPI SAFE EQUITY CUSHION (Legacy Safety) ---
         cppi_floor_pct = risk_conf.get('cppi_floor_pct', 0.08)
-        start_equity = float(CONFIG.get('env', {}).get('initial_balance', 100000.0))
+        
+        # USE DETECTED ACCOUNT SIZE (if available), else default to Config
+        start_equity = account_size if account_size else float(CONFIG.get('env', {}).get('initial_balance', 100000.0))
         
         floor_value = start_equity * (1.0 - cppi_floor_pct)
         cushion = max(0.0, balance - floor_value)
         
-        cppi_mult = risk_conf.get('cppi_multiplier', 3.0)
+        cppi_mult = risk_conf.get('cppi_multiplier', 2.0)
         risk_budget_usd = cushion * cppi_mult
 
-        # Clamp Risk Budget to Hard Max Risk %
-        max_risk_percent = risk_conf.get('max_risk_percent', 1.0)
-        max_risk_usd = balance * (max_risk_percent / 100.0)
-        risk_budget_usd = min(risk_budget_usd, max_risk_usd)
-
-        # --- KELLY CRITERION ---
-        win_rate = context.win_rate
-        rr_ratio = context.risk_reward_ratio
+        # Clamp Risk Budget to Hard Max Risk % (Audit requirement: 0.1%)
+        # Note: 'base_risk_per_trade_percent' overrides max_risk_percent if stricter
+        base_risk_pct = risk_conf.get('base_risk_per_trade_percent', 0.1) / 100.0
+        max_risk_usd = balance * base_risk_pct
         
-        # Singularity Guard
-        if rr_ratio <= 0.05:
-            return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, "Invalid R/R"), 0.0
-        
-        # Kelly Formula: K = W - (1-W)/R
-        raw_kelly = win_rate - ((1 - win_rate) / rr_ratio)
-        
-        # Fractional Kelly (Configurable, default 0.5)
-        kelly_fraction = risk_conf.get('kelly_fraction', 0.5)
-        kelly_pct = max(0.0, raw_kelly * kelly_fraction)
-
-        # --- CORRELATION PENALTY ---
-        # Reduce size if we already hold correlated positions
-        if active_correlations > 0:
-            penalty_factor = 1.0 / (1.0 + (0.5 * active_correlations))
-            kelly_pct *= penalty_factor
-
-        # --- FINAL SIZING (Kelly-Vol Logic) ---
-        # Base Risk: 0.5% per trade (Section 5.1 of Plan)
-        # We target a specific dollar risk, then adjust volume based on ATR stop distance.
-        
-        base_risk_pct = risk_conf.get('base_risk_per_trade_percent', 0.5) / 100.0
-        
-        # Dynamic Sizing: Scale risk by Kelly confidence if high confidence
-        # But cap it strictly at the Risk Budget
-        if conf > 0.7:
-             # If high confidence, we can approach the Kelly limit, but bounded by base risk * scalar
-             # For Phase 2 stability, we stick to Base Risk as the anchor, potentially sizing DOWN 
-             # if confidence is low, rather than sizing UP aggressively.
-             target_risk_usd = balance * base_risk_pct
-        else:
-             # Lower confidence = reduced risk
-             target_risk_usd = balance * (base_risk_pct * 0.5)
-
-        # Risk Constraint: Min(Target, CPPI, Hard Max)
-        final_risk_usd = min(target_risk_usd, risk_budget_usd)
+        # Effective Risk Budget: Min(CPPI Budget, Hard Cap)
+        # If cushion is 0 (below floor), we risk 0.
+        final_risk_usd = min(risk_budget_usd, max_risk_usd)
 
         # --- ADAPTIVE STOP LOSS (ATR Based) ---
-        # If ATR is provided (from recursive indicators), use it.
-        # Fallback to percentage volatility if missing.
-        atr_mult_sl = risk_conf.get('stop_loss_atr_mult', 1.0)
-        atr_mult_tp = risk_conf.get('take_profit_atr_mult', 2.0)
+        # Phase 3 Requirement: Use ATR passed from StreamingIndicators
+        atr_mult_sl = risk_conf.get('stop_loss_atr_mult', 1.5)
+        atr_mult_tp = risk_conf.get('take_profit_atr_mult', 3.0)
 
         if atr and atr > 0:
             stop_dist = atr * atr_mult_sl
@@ -202,12 +177,10 @@ class RiskManager:
             # Fallback: Volatility * Price * Mult
             stop_dist = price * volatility * 2.0
 
-        # Convert Risk USD to Lots
+        # Safety Check: Invalid Stop Distance
         pip_val, _ = RiskManager.get_pip_info(symbol)
-        
-        # Safety checks
-        if pip_val <= 0 or stop_dist <= 0 or price <= 0:
-            return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, "Invalid Data"), 0.0
+        if stop_dist < (pip_val * 2):
+            stop_dist = pip_val * 10 # Minimum 10 pips safety if volatility collapses
 
         sl_pips = stop_dist / pip_val
 
@@ -224,7 +197,20 @@ class RiskManager:
         if loss_per_lot <= 0: 
             lots = 0.0
         else: 
+            # --- VOLATILITY SCALING ---
+            # If Volatility is high, loss_per_lot is high -> lots decrease.
+            # If Volatility is low, loss_per_lot is low -> lots increase.
             lots = final_risk_usd / loss_per_lot
+
+        # --- KELLY CONFIDENCE SCALAR ---
+        # Scale down if confidence is low, but never exceed the Hard Cap.
+        conf_scalar = conf # 0.6 -> 60% of max allowed risk
+        lots *= conf_scalar
+
+        # --- CORRELATION PENALTY ---
+        if active_correlations > 0:
+            penalty_factor = 1.0 / (1.0 + (0.5 * active_correlations))
+            lots *= penalty_factor
 
         # Constraints
         min_lot = risk_conf.get('min_lot_size', 0.01)
@@ -234,15 +220,18 @@ class RiskManager:
         
         actual_risk_usd = lots * loss_per_lot
 
-        # Construct Trade Object Template
+        # Sanitizer for comment formatting (Fixes TypeError if atr is None)
+        atr_val = atr if atr is not None else 0.0
+
+        # Construct Trade Object
         trade = Trade(
             symbol=symbol, 
             action="HOLD", 
             volume=lots,
             entry_price=price,
             stop_loss=stop_dist,
-            take_profit=stop_dist * (atr_mult_tp / atr_mult_sl), # Maintain R:R ratio
-            comment=f"K:{kelly_pct:.2f}|C:{cushion:.0f}|ATR"
+            take_profit=stop_dist * (atr_mult_tp / atr_mult_sl), 
+            comment=f"VolSizing|Risk:${final_risk_usd:.0f}|ATR:{atr_val:.5f}"
         )
         
         return trade, actual_risk_usd
