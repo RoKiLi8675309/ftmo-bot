@@ -8,7 +8,7 @@
 #   - WARM-UP: Enforced 1000-candle burn-in before Training/Inference.
 #   - LABELING: Switched to AdaptiveTripleBarrier (ATR-based).
 #   - LEARNING: Implemented Weighted Learning (10:1 Class Weights).
-#   - DATA: Passes High/Low for recursive indicators.
+#   - FORCE UPDATE: Implemented 'Aggressive Mode' to match Live Engine (1 trade/day).
 # =============================================================================
 import logging
 import sys
@@ -80,6 +80,10 @@ class ResearchStrategy:
         self.decision_log = deque(maxlen=1000)
         self.trade_events = [] 
 
+        # --- FORCE TRADE STATE ---
+        self.last_trade_date = None
+        self.daily_trades = 0
+
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
         Main Event Loop for the Strategy.
@@ -90,6 +94,17 @@ class ResearchStrategy:
         low = snapshot.get_low(self.symbol)
         volume = snapshot.get_price(self.symbol, 'volume')
         
+        # 0. Daily Reset Logic (Force Trade)
+        # Snapshot timestamp is usually a datetime in Research
+        current_date = snapshot.timestamp.date() if isinstance(snapshot.timestamp, datetime) else datetime.fromtimestamp(float(snapshot.timestamp)).date()
+        
+        if self.last_trade_date != current_date:
+            self.daily_trades = 0
+            self.last_trade_date = current_date
+            
+        # Determine Aggression
+        aggressive = (self.daily_trades == 0)
+
         # Update Price Map for Risk Calculation
         self.last_price_map = snapshot.to_price_dict()
         if self.symbol not in self.last_price_map:
@@ -164,14 +179,9 @@ class ResearchStrategy:
                 # Train Primary Model
                 self.model.learn_one(stored_feats, outcome_label, sample_weight=weight)
 
-                # Train Meta-Labeler (Proxy: PnL is positive if Label=1)
-                # Since we are training the model to predict '1' for success,
-                # we assume a prediction of '1' would have been our intent.
-                # Here we train the meta-learner on the outcome.
-                pnl_proxy = 1.0 if outcome_label == 1 else -1.0
-                # In research, we don't have the "live prediction" stored in the labeler
-                # so we can skip meta-training OR re-predict. 
-                # For Phase 2 simplicity/speed, we skip meta-training here as it's secondary.
+                # Train Meta-Labeler (Proxy)
+                # Omitted in Strategy.py to match simplified training loop, 
+                # but could be added if full fidelity is required.
 
         # C. Add CURRENT Bar as new Trade Opportunity
         # The labeler stores the features internally until resolution
@@ -181,14 +191,16 @@ class ResearchStrategy:
         # D. Inference
         try:
             # Forensic Filters
-            entropy_val = features.get('entropy', 0)
-            entropy_thresh = self.params.get('entropy_threshold', 0.70)
-            
-            if entropy_val > entropy_thresh:
-                return
+            # BYPASS IF AGGRESSIVE (Forced Entry)
+            if not aggressive:
+                entropy_val = features.get('entropy', 0)
+                entropy_thresh = self.params.get('entropy_threshold', 0.70)
+                
+                if entropy_val > entropy_thresh:
+                    return
 
-            if features.get('vpin', 0) > 0.75:
-                return
+                if features.get('vpin', 0) > 0.75:
+                    return
 
             # Primary Prediction
             pred_class = self.model.predict_one(features)
@@ -206,16 +218,27 @@ class ResearchStrategy:
             dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
             
             # Meta Check
-            is_profitable = self.meta_labeler.predict(
-                features, 
-                pred_action, 
-                threshold=self.params.get('meta_labeling_threshold', 0.60)
-            )
+            # BYPASS IF AGGRESSIVE (Forced Entry)
+            is_profitable = True
+            if not aggressive:
+                is_profitable = self.meta_labeler.predict(
+                    features, 
+                    pred_action, 
+                    threshold=self.params.get('meta_labeling_threshold', 0.60)
+                )
 
-            # In Phase 2, we focus on Class 1 (Buy) signals being high precision
-            if pred_action == 1:
-                if is_profitable:
-                     self._execute_logic(prob_buy, prob_sell, price, features, broker, dt_timestamp, pred_action)
+            # --- FORCE TRADE LOGIC ---
+            if aggressive:
+                 # Lower confidence threshold (e.g. 0.40) to force activity
+                 force_threshold = 0.40
+                 if pred_action == 1 or prob_buy > force_threshold:
+                     # Force Buy
+                     self._execute_logic(prob_buy, prob_sell, price, features, broker, dt_timestamp, 1, aggressive=True)
+            else:
+                # Standard Logic
+                if pred_action == 1:
+                    if is_profitable:
+                         self._execute_logic(prob_buy, prob_sell, price, features, broker, dt_timestamp, pred_action)
 
         except Exception as e:
             if self.debug_mode: logger.error(f"Strategy Error: {e}")
@@ -238,15 +261,19 @@ class ResearchStrategy:
             if sym not in self.last_price_map:
                 self.last_price_map[sym] = price
 
-    def _execute_logic(self, p_buy, p_sell, price, features, broker, timestamp: datetime, action_int: int):
+    def _execute_logic(self, p_buy, p_sell, price, features, broker, timestamp: datetime, action_int: int, aggressive: bool = False):
         """Decides whether to enter a trade using Kelly-Vol Sizing."""
         
         # 1. Signal Threshold
-        min_prob = self.params.get('min_calibrated_probability', 0.75)
-        confidence = p_buy if action_int == 1 else p_sell
-        
-        if confidence < min_prob:
-            return
+        # If aggressive, we already qualified it in on_data via the force_threshold
+        if not aggressive:
+            min_prob = self.params.get('min_calibrated_probability', 0.75)
+            confidence = p_buy if action_int == 1 else p_sell
+            
+            if confidence < min_prob:
+                return
+        else:
+            confidence = p_buy if action_int == 1 else p_sell
 
         action = "BUY" if action_int == 1 else "SELL"
 
@@ -300,9 +327,12 @@ class ResearchStrategy:
             timestamp_created=timestamp,
             stop_loss=sl_price,
             take_profit=tp_price,
-            comment=f"{trade_intent.comment}|Prob:{confidence:.2f}"
+            comment=f"{trade_intent.comment}|Prob:{confidence:.2f}|{'FORCED' if aggressive else 'NORMAL'}"
         )
         broker.submit_order(order)
+        
+        # Increment Daily Count on Submission
+        self.daily_trades += 1
        
         # Record detailed trade event for Autopsy
         self.trade_events.append({
@@ -313,7 +343,8 @@ class ResearchStrategy:
             'vpin': features.get('vpin', 0),
             'entropy': features.get('entropy', 0),
             'atr': current_atr,
-            'volatility': volatility
+            'volatility': volatility,
+            'forced': aggressive
         })
 
     def generate_autopsy(self) -> str:
@@ -326,10 +357,12 @@ class ResearchStrategy:
         avg_conf = np.mean([t['conf'] for t in self.trade_events])
         avg_vpin = np.mean([t['vpin'] for t in self.trade_events])
         avg_entropy = np.mean([t['entropy'] for t in self.trade_events])
+        forced_trades = len([t for t in self.trade_events if t.get('forced', False)])
        
         report = (
             f"\n   --- 💀 STRATEGY AUTOPSY ({self.symbol}) ---\n"
             f"   Trades Taken: {len(self.trade_events)}\n"
+            f"   Forced Trades: {forced_trades}\n"
             f"   Avg Confidence: {avg_conf:.2f}\n"
             f"   Avg VPIN: {avg_vpin:.2f}\n"
             f"   Avg Entropy: {avg_entropy:.2f}\n"
@@ -344,6 +377,7 @@ class ResearchStrategy:
            
         for i, t in enumerate(display_trades):
             ts_str = str(t['time'])
-            report += f"   Trade: {t['action']} @ {ts_str} | Conf:{t['conf']:.2f} | VPIN:{t['vpin']:.2f}\n"
+            forced_tag = "[FORCED]" if t.get('forced', False) else ""
+            report += f"   Trade: {t['action']} @ {ts_str} | Conf:{t['conf']:.2f} | {forced_tag}\n"
           
         return report

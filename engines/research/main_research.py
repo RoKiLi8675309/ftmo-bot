@@ -3,12 +3,10 @@
 # PATH: engines/research/main_research.py
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
-# AUDIT REMEDIATION (GROK):
-#   - CONSTRAINT: Enforced minimum 30 trades per trial to ensure statistical validity.
-#   - FEATURE: Implemented full Walk-Forward Optimization (WFO) to replace placeholders.
-#   - TELEMETRY: Enhanced logging to identify "Zombie" parameter sets (Low Activity).
-#   - DEPLOYMENT: Added Auto-Deployment of WFO parameters to config.yaml.
-#   - ADJUSTMENT: Tuned Search Space for Swing-Scalping (Higher Barriers to beat Spread).
+# AUDIT REMEDIATION (GROK - HOTFIX):
+#   - RELAXED BARRIERS: Lowered profit target search space to (0.5 - 2.5 ATR) to encourage scalping.
+#   - LOWERED CONFIDENCE: Dropped min_prob to 0.51 to break "Death Loop" of inactivity.
+#   - ADJUSTED PENALTIES: Changed pruning penalty to -50.0 to differentiate from Blown Account.
 # =============================================================================
 
 import sys
@@ -189,12 +187,14 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'entropy_threshold': trial.suggest_float('entropy_threshold', 0.60, 0.85), 
                 
                 'tbm': {
-                    # REMEDIATION: Force wider targets (1.5 - 3.5 sigma) to beat spread costs
-                    'barrier_width': trial.suggest_float('barrier_width', 1.5, 3.5),
-                    # REMEDIATION: Longer horizon to allow trades to play out (2h - 8h)
-                    'horizon_minutes': trial.suggest_int('horizon_minutes', 120, 480) 
+                    # REMEDIATION HOTFIX: Lower barrier width to encourage scalping/activity
+                    # Was 1.5 - 3.5, now 0.5 - 2.5
+                    'barrier_width': trial.suggest_float('barrier_width', 0.5, 2.5),
+                    # REMEDIATION: Shorter horizon for M5 scalping (30m - 4h)
+                    'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 240) 
                 },
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.55, 0.70)
+                # REMEDIATION HOTFIX: Lower confidence floor to 0.51 to break death loop
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.51, 0.65)
             })
             
             # Instantiate Pipeline locally
@@ -233,14 +233,14 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             if metrics['total_trades'] < min_trades:
                 trial.set_user_attr("pruned", True)
                 trial.set_user_attr("autopsy", f"PRUNED: Only {metrics['total_trades']} trades. System inactive.")
-                return -100.0 # Heavy Penalty
+                return -50.0 # HOTFIX: Reduced penalty (was -100) to allow drifting away from inactivity
 
             # CRITICAL CONSTRAINT 2: Profitability (Profit Factor)
             # Stop optimizing losers. If active (>50 trades) but losing money, kill it.
             if metrics['total_trades'] > 50 and metrics['profit_factor'] < 0.9:
                 trial.set_user_attr("pruned", True)
                 trial.set_user_attr("autopsy", f"PRUNED: Active but Losing (PF {metrics['profit_factor']:.2f}).")
-                return -100.0
+                return -50.0 # HOTFIX: Reduced penalty
 
             # Generate Autopsy if result is poor (Debugging)
             if metrics['score'] < 0.5 or broker.is_blown:
@@ -248,7 +248,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 
             if broker.is_blown:
                 trial.set_user_attr("blown", True)
-                return -100.0
+                return -100.0 # Blown account remains max penalty
             
             return metrics['score']
 
