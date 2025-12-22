@@ -7,11 +7,10 @@
 #
 # FORENSIC REMEDIATION LOG (2025-12-22):
 # 1. METRIC SHIFT: Switched ARFClassifier metric to 'Recall' to cure paralysis.
-# 2. SEARCH SPACE: Expanded entropy_threshold to 0.99 and lowered min_prob to 0.51.
+# 2. DATA SCALING: Increased training data load to 2,000,000 ticks (Rec #3).
 # 3. REPORTING: Enhanced EmojiCallback to track 'Win Rate' vs 'Risk-Adjusted Return'.
-# 4. DATA: Enforced Volume Bar aggregation for all optimizations.
+# 4. OPTIMIZATION FIX: Replaced Hard Pruning with Soft Penalties (Gradient Descent).
 # =============================================================================
-
 import sys
 import os
 import argparse
@@ -54,7 +53,6 @@ setup_logging("Research")
 log = logging.getLogger("Research")
 
 # --- 1. TELEMETRY & REPORTING UTILS ---
-
 class EmojiCallback:
     """
     Injects FTMO-style Emojis and RICH TELEMETRY into Optuna Trial reporting.
@@ -126,14 +124,14 @@ class EmojiCallback:
             print(autopsy_msg, flush=True)
             log.info(autopsy_msg)
 
-
-def process_data_into_bars(symbol: str, n_ticks: int = 1000000) -> pd.DataFrame:
+def process_data_into_bars(symbol: str, n_ticks: int = 2000000) -> pd.DataFrame:
     """
     Helper to Load Ticks -> Aggregate to Volume Bars -> Return Clean DataFrame.
     Strictly enforcing Volume Bars eliminates "Time-Based noise".
+    UPDATED: Default n_ticks increased to 2M per recommendation.
     """
     # 1. Load Massive Amount of Ticks (To get sufficient Bars)
-    raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730)
+    raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2) # Double days for safety
     
     if raw_ticks.empty:
         return pd.DataFrame()
@@ -155,7 +153,6 @@ def process_data_into_bars(symbol: str, n_ticks: int = 1000000) -> pd.DataFrame:
     
     return df_bars
 
-
 # --- 2. WORKER FUNCTIONS (ISOLATED PROCESSES) ---
 
 def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url: str) -> None:
@@ -167,8 +164,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
     optuna.logging.set_verbosity(optuna.logging.INFO)
     
     try:
-        # 1. Load & Aggregate Data
-        df = process_data_into_bars(symbol, n_ticks=1500000) # Increased load size
+        # 1. Load & Aggregate Data (Using updated 2M limit)
+        df = process_data_into_bars(symbol, n_ticks=2000000) 
         
         if df.empty:
             log.error(f"❌ CRITICAL: No BAR data generated for {symbol}. Aborting worker.")
@@ -182,20 +179,22 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             # Define Search Space (Focused on Tree Structure & Adaptation)
             params = CONFIG['online_learning'].copy()
             params.update({
-                'n_models': trial.suggest_int('n_models', 10, 40, step=5),
+                'n_models': trial.suggest_int('n_models', 10, 45, step=5),
                 'grace_period': trial.suggest_int('grace_period', 20, 100),
                 'delta': trial.suggest_float('delta', 0.0001, 0.01, log=True),
                 
                 # REMEDIATION: Expanded range 0.85 -> 0.99 to allow "Noisy" Trades (FOMO)
-                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.85, 0.99), 
+                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.85, 0.99),
+                # NEW: Allow optimizing VPIN threshold dynamically
+                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.75, 0.95),
                 
                 'tbm': {
                     # REMEDIATION: Relaxed targets for Volatility-Adjusted Environment
                     'barrier_width': trial.suggest_float('barrier_width', 1.5, 3.5),
                     'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 240) 
                 },
-                # REMEDIATION: Lowered floor to 0.51 to catch weak signals
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.51, 0.70)
+                # REMEDIATION: Lowered floor to 0.50 to catch weak signals
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.50, 0.70)
             })
             
             # Instantiate Pipeline locally
@@ -229,19 +228,41 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("sharpe", metrics['sharpe'])
             
-            # CRITICAL CONSTRAINT 1: Activity (Min Trades)
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 20)
-            if metrics['total_trades'] < min_trades:
+            # --- CRITICAL FIX: SOFT PENALTY (GRADIENT DESCENT) ---
+            # Instead of a hard prune returning -10.0, we apply a scaled penalty.
+            # This allows Optuna to see "15 trades" as better than "0 trades".
+            
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 5) # Default lowered to 5
+            total_trades = metrics['total_trades']
+            final_score = metrics['score']
+            
+            if total_trades < min_trades:
                 trial.set_user_attr("pruned", True)
-                trial.set_user_attr("autopsy", f"PRUNED: Only {metrics['total_trades']} trades. System inactive.")
-                return -10.0 # Soft penalty
+                
+                # Calculate Deficit
+                deficit = min_trades - total_trades
+                
+                # Penalty: -0.5 per missing trade.
+                # 0 trades = -2.5 penalty (if min is 5).
+                # 4 trades = -0.5 penalty.
+                penalty = deficit * 0.5
+                
+                final_score -= penalty
+                
+                trial.set_user_attr("autopsy", f"LOW ACTIVITY: {total_trades}/{min_trades} trades. Soft Penalty applied: -{penalty:.2f}")
+                
+                # If 0 trades, ensure score is low enough to discourage but not break gradient
+                if total_trades == 0:
+                    final_score = -5.0 
+
+                return final_score
 
             # CRITICAL CONSTRAINT 2: Profitability (Profit Factor)
-            # Stop optimizing losers. If active (>50 trades) but losing money, kill it.
+            # Stop optimizing losers. If active (>50 trades) but losing money, penalize heavily.
             if metrics['total_trades'] > 50 and metrics['profit_factor'] < 0.9:
                 trial.set_user_attr("pruned", True)
                 trial.set_user_attr("autopsy", f"PRUNED: Active but Losing (PF {metrics['profit_factor']:.2f}).")
-                return -50.0 # Moderate penalty
+                return -5.0 # Moderate penalty, not -10.0
 
             # Generate Autopsy if result is poor (Debugging)
             if metrics['score'] < 0.5 or broker.is_blown:
@@ -249,9 +270,9 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 
             if broker.is_blown:
                 trial.set_user_attr("blown", True)
-                return -100.0 # Max Penalty
+                return -50.0 # Max Penalty
             
-            return metrics['score']
+            return final_score
 
         # 3. Connect to Shared Study
         study_name = f"study_{symbol}"
@@ -274,14 +295,13 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
         import traceback
         traceback.print_exc()
 
-
 def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_dir: Path) -> None:
     """
     Trains the Final Production Model using the Best Params found.
     """
     try:
-        # 1. Load & Aggregate Data
-        df = process_data_into_bars(symbol, n_ticks=1500000)
+        # 1. Load & Aggregate Data (Using updated 2M limit)
+        df = process_data_into_bars(symbol, n_ticks=2000000)
         if df.empty: return
 
         # 2. Get Best Params
@@ -311,6 +331,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         for index, row in df.iterrows():
             snapshot = MarketSnapshot(timestamp=index, data=row)
             if snapshot.get_price(symbol, 'close') == 0: continue
+            
             broker.process_pending(snapshot)
             strategy.on_data(snapshot, broker)
 
@@ -332,7 +353,6 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
     except Exception as e:
         log.error(f"CRITICAL FINALIZE ERROR ({symbol}): {e}")
 
-
 # --- 3. MAIN PIPELINE CLASS ---
 
 class ResearchPipeline:
@@ -344,7 +364,7 @@ class ResearchPipeline:
         self.reports_dir.mkdir(exist_ok=True)
         
         # Increased Tick counts to ensure Bar generation works
-        self.train_candles = CONFIG['data'].get('num_candles_train', 1000000)
+        self.train_candles = CONFIG['data'].get('num_candles_train', 2000000)
         self.backtest_candles = CONFIG['data'].get('num_candles_backtest', 500000)
         
         self.db_url = CONFIG['wfo']['db_url']
@@ -391,6 +411,7 @@ class ResearchPipeline:
             'avg_win': 0.0,
             'avg_loss': 0.0
         }
+        
         if not trade_log:
             return metrics
 
@@ -463,7 +484,6 @@ class ResearchPipeline:
                     print(f"✅ PURGED: {study_name}")
                 except Exception:
                     pass
-
             try:
                 optuna.create_study(study_name=study_name, storage=self.db_url, direction="maximize", load_if_exists=True)
             except Exception as e:
@@ -476,7 +496,6 @@ class ResearchPipeline:
         trials_per_worker = math.ceil(total_trials_per_symbol / workers_per_symbol)
         
         log.info(f"DISTRIBUTION: {workers_per_symbol} workers/symbol | {trials_per_worker} trials/worker")
-
         for symbol in self.symbols:
             for _ in range(workers_per_symbol):
                 tasks.append((symbol, trials_per_worker, self.train_candles, self.db_url))
@@ -491,7 +510,7 @@ class ResearchPipeline:
         duration = time.time() - start_time
         log.info(f"{LogSymbols.SUCCESS} Swarm Optimization Complete in {duration:.2f}s")
         log.info(f"{LogSymbols.DATABASE} Finalizing Models & Artifacts...")
-
+        
         Parallel(n_jobs=len(self.symbols), backend="loky")(
             delayed(_worker_finalize_task)(
                 sym, 
@@ -539,7 +558,6 @@ class ResearchPipeline:
             
             if meta_path.exists():
                 with open(meta_path, "rb") as f: strategy.meta_labeler = pickle.load(f)
-
             if cal_path.exists():
                 with open(cal_path, "rb") as f: 
                     cals = pickle.load(f)
@@ -630,10 +648,11 @@ def main():
     parser.add_argument('--backtest', action='store_true')
     parser.add_argument('--fresh-start', action='store_true')
     parser.add_argument('--wfo', action='store_true')
+    
     args = parser.parse_args()
-
+    
     pipeline = ResearchPipeline()
-
+    
     if args.wfo:
         log.info("WFO Mode not fully implemented in this forensic context. Use --train.")
     elif args.train:

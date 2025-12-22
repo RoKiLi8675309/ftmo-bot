@@ -8,10 +8,12 @@
 #
 # FORENSIC REMEDIATION LOG (2025-12-22):
 # 1. REMOVED AGGRESSIVE MODE: Deleted 'aggressive' parameter and logic.
-# 2. WEIGHTED LEARNING: Implemented sample_weight (10:1) in model training.
+# 2. WEIGHTED LEARNING: Implemented sample_weight (5.0) in model training.
 # 3. ADAPTIVE BARRIERS: Integrated AdaptiveTripleBarrier for ATR-based labeling.
 # 4. WARM-UP: Enforced 'burn_in_periods' gate.
-# 5. PARALYSIS FIX: Lowered confidence floor (0.51) and relaxed Entropy (0.99).
+# 5. PARALYSIS FIX: Lowered confidence floor (0.50) and relaxed Entropy (0.85+).
+# 6. FILTER FIX: VPIN threshold now dynamic (0.85) instead of hardcoded (0.95).
+# 7. LOGGING: Added Rejection Stats to track "Analysis Paralysis" reasons.
 # =============================================================================
 import logging
 import pickle
@@ -41,6 +43,7 @@ from shared import (
     enrich_with_d1_data,
     VolumeBar
 )
+
 # New Feature Import
 from shared.financial.features import MetaLabeler
 
@@ -86,6 +89,10 @@ class MultiAssetPredictor:
         self.burn_in_counters = {s: 0 for s in symbols}
         self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 1000)
 
+        # 4. Forensic Stats (Refinement #5)
+        self.rejection_stats = {s: defaultdict(int) for s in symbols}
+        self.bar_counters = {s: 0 for s in symbols}
+
         # Initialize Models
         self._init_models()
         self._load_state()
@@ -111,7 +118,7 @@ class MultiAssetPredictor:
                     metric=metrics.Recall() # Optimization Target: RECALL (Prioritize finding trades)
                 )
             )
-
+            
             # Meta Model: Profitability Filter
             self.meta_labelers[sym] = MetaLabeler()
             self.calibrators[sym] = ProbabilityCalibrator()
@@ -121,12 +128,15 @@ class MultiAssetPredictor:
         Actual entry point called by Engine.
         """
         if symbol not in self.symbols: return None
-
+        
         fe = self.feature_engineers[symbol]
         labeler = self.labelers[symbol]
         model = self.models[symbol]
         meta_labeler = self.meta_labelers[symbol]
+        stats = self.rejection_stats[symbol]
         
+        self.bar_counters[symbol] += 1
+
         # Extract Real Flow
         buy_vol = getattr(bar, 'buy_vol', bar.volume / 2.0)
         sell_vol = getattr(bar, 'sell_vol', bar.volume / 2.0)
@@ -163,8 +173,8 @@ class MultiAssetPredictor:
         if resolved_labels:
             for (stored_feats, outcome_label) in resolved_labels:
                 # --- PHASE 2: WEIGHTED LEARNING ---
-                # Positive (1) = 10.0, Negative (0) = 1.0
-                w_pos = CONFIG['online_learning'].get('positive_class_weight', 10.0)
+                # Positive (1) = 5.0, Negative (0) = 1.0 (Balanced for Precision/Recall)
+                w_pos = CONFIG['online_learning'].get('positive_class_weight', 5.0)
                 w_neg = CONFIG['online_learning'].get('negative_class_weight', 1.0)
                 
                 weight = w_pos if outcome_label == 1 else w_neg
@@ -181,14 +191,21 @@ class MultiAssetPredictor:
         try:
             # Forensic Filters (RELAXED)
             entropy_val = features.get('entropy', 0.0)
-            # Use Configured Threshold (0.99 for FOMO mode)
-            entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.99)
+            
+            # Use Configured Threshold (0.85 for relaxed mode, default 0.99 in features logic)
+            entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.85)
+            
             if entropy_val > entropy_thresh:
+                stats['High Entropy'] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"Max Entropy ({entropy_val:.2f})"})
 
             vpin_val = features.get('vpin', 0.0)
-            # Relaxed VPIN (0.95)
-            if vpin_val > 0.95: 
+            
+            # REMEDIATION #1: Dynamic VPIN Threshold (Fixes Hardcoded 0.95)
+            vpin_thresh = CONFIG['microstructure'].get('vpin_threshold', 0.85)
+            
+            if vpin_val > vpin_thresh: 
+                stats['High VPIN'] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"Toxic VPIN ({vpin_val:.2f})"})
 
             # Primary Prediction
@@ -202,7 +219,7 @@ class MultiAssetPredictor:
             except:
                 current_pred_action = 0
 
-            # Meta-Labeling Check (Bypass for now if needed, but logic is in strategy.py)
+            # Meta-Labeling Check
             meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.55)
             is_profitable = meta_labeler.predict(
                 features, 
@@ -211,7 +228,7 @@ class MultiAssetPredictor:
             )
 
             # Decision Logic
-            min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.51) 
+            min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.50) 
             volatility = features.get('volatility', 0.001)
 
             # --- STANDARD PURE AI LOGIC ---
@@ -220,11 +237,19 @@ class MultiAssetPredictor:
                     if is_profitable:
                         return Signal(symbol, "BUY", confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr})
                     else:
+                        stats['Meta Rejected'] += 1
                         # logger.debug(f"🚫 {symbol} Meta-Labeler Rejected: Prob={confidence:.2f}")
                         return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
                 else:
+                    stats['Low Confidence'] += 1
                     return Signal(symbol, "HOLD", confidence, {"reason": f"Low Confidence ({confidence:.2f} < {min_conf})"})
+            else:
+                stats['Model Predicted 0'] += 1
             
+            # Periodic Rejection Log (Refinement #5)
+            if self.bar_counters[symbol] % 100 == 0:
+                logger.info(f"🔍 {symbol} Rejections (Last 100): {dict(stats)}")
+
             return Signal(symbol, "HOLD", confidence, {})
 
         except Exception as e:
@@ -258,7 +283,7 @@ class MultiAssetPredictor:
                         self.models[sym] = pickle.load(f)
                     loaded_count += 1
                 except Exception: pass
-
+            
             if meta_path.exists():
                 try:
                     with open(meta_path, "rb") as f:

@@ -8,7 +8,7 @@
 # FORENSIC REMEDIATION LOG (2025-12-22):
 # 1. TEMPORAL INTEGRITY: Implemented RecursiveEMA for stateful, O(1) indicators.
 # 2. INDICATORS: Added StreamingIndicators class (RSI, MACD, ATR).
-# 3. LABELING: Added AdaptiveTripleBarrier (ATR-Based) for dynamic targets.
+# 3. LABELING: AdaptiveTripleBarrier updated with DRIFT LOGIC (Soft Labeling).
 # 4. MATH: Fixed indentation and type safety in recursive calculations.
 # =============================================================================
 from __future__ import annotations
@@ -144,18 +144,24 @@ class StreamingIndicators:
 
         return features
 
-# --- 2. ADAPTIVE TRIPLE BARRIER (PHASE 2 CORE) ---
+# --- 2. ADAPTIVE TRIPLE BARRIER (PHASE 2 CORE + DRIFT LOGIC) ---
 
 class AdaptiveTripleBarrier:
     """
-    Volatility-Adaptive Labeling.
-    Barriers expand/contract based on ATR to normalize target difficulty.
+    Volatility-Adaptive Labeling with Soft Drift Detection.
+    Barriers expand/contract based on ATR.
+    
+    OPTIMIZATION UPDATE (Section 3.3):
+    If the vertical barrier (timeout) is hit, we check for 'Drift'.
+    If price moved > drift_threshold * ATR in the favorable direction, we label it as 1.
+    This prevents 'Hold' bias in low-volatility regimes.
     """
-    def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0):
+    def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.2):
         self.buffer = deque()
         self.time_limit = horizon_ticks
         self.risk_mult = risk_mult
         self.reward_mult = reward_mult
+        self.drift_threshold = drift_threshold
 
     def add_trade_opportunity(self, features: Dict[str, float], entry_price: float, current_atr: float, timestamp: float):
         """
@@ -172,19 +178,24 @@ class AdaptiveTripleBarrier:
             'entry': entry_price,
             'tp': take_profit,
             'sl': stop_loss,
+            'atr': current_atr, # Stored for Drift Calculation
             'start_time': timestamp,
             'age': 0
         })
 
-    def resolve_labels(self, current_high: float, current_low: float) -> List[Tuple[Dict[str, float], int]]:
+    def resolve_labels(self, current_high: float, current_low: float, current_close: float = None) -> List[Tuple[Dict[str, float], int]]:
         """
         Checks active trades against current price action.
         Returns list of (features, label).
-        Label 1 = Success (TP Hit)
-        Label 0 = Failure (SL Hit or Timeout)
+        Label 1 = Success (TP Hit OR Positive Drift)
+        Label 0 = Failure (SL Hit OR No Drift)
         """
         resolved = []
         active = deque()
+        
+        # Fallback if close not provided (use mid of high/low)
+        if current_close is None:
+            current_close = (current_high + current_low) / 2.0
 
         while self.buffer:
             trade = self.buffer.popleft()
@@ -193,19 +204,25 @@ class AdaptiveTripleBarrier:
             label = None
 
             # 1. Did price hit TP? (Bullish assumption for label 1)
-            # Note: For Short logic, this would need to be inverted, but Phase 3 is primarily Long-Optimized logic
-            # or generalized. Assuming '1' means "Correct Direction". 
-            # If the model predicts direction, we assume this barrier logic aligns with 'Buy'.
             if current_high >= trade['tp']:
-                label = 1 # SUCCESS
+                label = 1 # HARD SUCCESS
 
             # 2. Did price hit SL?
             elif current_low <= trade['sl']:
                 label = 0 # FAILURE
 
-            # 3. Timeout?
+            # 3. Timeout? (Vertical Barrier)
             elif trade['age'] >= self.time_limit:
-                label = 0 # TIMEOUT (Treat as Fail for strictness)
+                # --- DRIFT LOGIC (Soft Labeling) ---
+                # Calculate movement relative to entry
+                drift = current_close - trade['entry']
+                # Threshold to consider this a "Win" (e.g. 0.2 * ATR)
+                drift_req = trade['atr'] * self.drift_threshold
+                
+                if drift > drift_req:
+                    label = 1 # SOFT SUCCESS (Captured Momentum)
+                else:
+                    label = 0 # TIMEOUT (True Noise)
 
             if label is not None:
                 resolved.append((trade['features'], label))

@@ -7,10 +7,11 @@
 #
 # FORENSIC REMEDIATION LOG (2025-12-22):
 # 1. AUTO-DETECT SUPPORT: calculate_rck_size now accepts 'account_size' to 
-#    dynamically scale CPPI cushion for 50k/200k accounts vs Config default.
+#    dynamically scale CPPI logic.
 # 2. SINGULARITY FIX: Implemented Inverse-Volatility Sizing (ATR-Based).
-# 3. HARD CAP: Enforced strict 0.1% Risk Per Trade limit (Audit Section 5.1).
-# 4. SYNTAX FIX: Removed stray backslash in SessionGuard (Lines 405-406).
+# 3. ATR FALLBACK: Added robust fallback for zero ATR to prevent trade rejection.
+# 4. MIN STOP: Increased minimum stop distance to 5 pips to avoid noise.
+# 5. LOGGING: Added debug log when ATR fallback is triggered.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -171,16 +172,19 @@ class RiskManager:
         atr_mult_sl = risk_conf.get('stop_loss_atr_mult', 1.5)
         atr_mult_tp = risk_conf.get('take_profit_atr_mult', 3.0)
 
+        # AUDIT FIX: ATR Fallback Logic to prevent zero-size trades
         if atr and atr > 0:
             stop_dist = atr * atr_mult_sl
         else:
-            # Fallback: Volatility * Price * Mult
-            stop_dist = price * volatility * 2.0
+            # Fallback 0.1% of price if ATR missing or zero
+            stop_dist = price * 0.001 * atr_mult_sl
+            # REFINEMENT: Log fallback usage for debugging
+            logger.debug(f"{symbol}: ATR Fallback Used (ATR={atr})")
 
-        # Safety Check: Invalid Stop Distance
+        # Safety Check: Invalid Stop Distance (Minimum 5 pips)
         pip_val, _ = RiskManager.get_pip_info(symbol)
-        if stop_dist < (pip_val * 2):
-            stop_dist = pip_val * 10 # Minimum 10 pips safety if volatility collapses
+        if stop_dist < (pip_val * 5):
+            stop_dist = pip_val * 10 # Minimum 10 pips safety if volatility collapses or data is flat
 
         sl_pips = stop_dist / pip_val
 
@@ -236,7 +240,6 @@ class RiskManager:
         
         return trade, actual_risk_usd
 
-
 class HierarchicalRiskParity:
     """
     Allocates portfolio weights based on hierarchical clustering of asset correlations.
@@ -280,6 +283,7 @@ class HierarchicalRiskParity:
         link = link.astype(int)
         sort_ix = pd.Series([link[-1, 0], link[-1, 1]])
         num_items = link[-1, 3]
+
         while sort_ix.max() >= num_items:
             sort_ix.index = range(0, sort_ix.shape[0] * 2, 2)
             df0 = sort_ix[sort_ix >= num_items]
@@ -291,7 +295,6 @@ class HierarchicalRiskParity:
             sort_ix = sort_ix.sort_index()
             sort_ix.index = range(sort_ix.shape[0])
         return sort_ix.tolist()
-
 
 class PortfolioRiskManager:
     """
@@ -320,6 +323,7 @@ class PortfolioRiskManager:
     def get_correlation_count(self, symbol: str, threshold: float = 0.7) -> int:
         if self.correlation_matrix.empty or symbol not in self.correlation_matrix.columns:
             return 0
+        
         count = 0
         for held_symbol in self.active_positions:
             if held_symbol == symbol: continue
@@ -340,7 +344,6 @@ class PortfolioRiskManager:
     def add_to_penalty_box(self, symbol: str, duration_minutes: int = 60):
         self.penalty_box[symbol] = time.time() + (duration_minutes * 60)
         logger.warning(f"🚫 {symbol} added to Penalty Box for {duration_minutes}m")
-
 
 class FTMORiskMonitor:
     """
@@ -387,7 +390,6 @@ class FTMORiskMonitor:
     def update_equity(self, current_equity: float):
         self.equity = current_equity
 
-
 class SessionGuard:
     def __init__(self):
         risk_conf = CONFIG.get('risk_management', {})
@@ -396,6 +398,7 @@ class SessionGuard:
             self.market_tz = pytz.timezone(tz_str)
         except Exception:
             self.market_tz = pytz.timezone('Europe/Prague')
+            
         self.friday_cutoff = dt_time(19, 0)
         self.monday_start = dt_time(1, 0)
         self.rollover_start = dt_time(23, 50)
@@ -405,9 +408,12 @@ class SessionGuard:
         now_local = datetime.now(self.market_tz)
         weekday = now_local.weekday()
         current_time = now_local.time()
+
         if weekday == 5: return False
         if weekday == 6 and current_time < self.monday_start: return False
         if weekday == 4 and current_time > self.friday_cutoff: return False
+        
         if current_time >= self.rollover_start or current_time <= self.rollover_end:
             return False
+            
         return True

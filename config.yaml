@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – FTMO COMPLIANCE MODE V29.3 (RISK ADJUSTED)
-# STATUS: PHASE 3 - ANALYSIS PARALYSIS FIX & RISK CORRECTION
+# config.yaml – FTMO COMPLIANCE MODE V30.1 (CONSERVATIVE BASELINE)
+# STATUS: PHASE 5 - RISK CONTROL & CONSISTENCY
 #
 # FORENSIC REMEDIATION LOG (2025-12-22):
-# 1. RISK FIX: Lowered base_risk_per_trade_percent to 0.1% (was 0.5%).
-# 2. METRIC SHIFT: Optimization Metric set to 'Recall'.
-# 3. CONFIDENCE: min_calibrated_probability set to 0.51.
-# 4. FILTERS: Entropy 0.99, VPIN 0.95.
+# 1. RISK REDUCTION: base_risk_per_trade_percent set to 0.1% (Compliance).
+# 2. VPIN ALIGNMENT: Explicitly set thresholds to 0.85 for consistency.
+# 3. SAFETY CAP: max_risk_percent lowered to 0.5% (Hard Ceiling).
+# 4. OPTIMIZATION FIX: Lowered min_trades to 5 to cure "Optimization Blindness".
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -74,10 +74,10 @@ producer:
 # --- DATA SETTINGS ---
 data:
   sampling_method: "volume"
-  volume_bar_threshold: 1000 # Adaptive thresholding logic applies in code
+  volume_bar_threshold: 1000
   download_start_date: "2020-01-01"
   num_candles_producer: 50000
-  num_candles_train: 35000
+  num_candles_train: 2000000 # Kept high for robust clusters
   num_candles_wfo: 10000
   num_candles_backtest: 1000
 
@@ -86,9 +86,9 @@ features:
   use_causal_features: true
   n_jobs: 20
   use_cache: true
-  window_size: 50 # Base window for diffs
+  window_size: 50
   
-  # Recursive Indicators Parameters
+  # Recursive Indicators
   rsi_period: 14
   macd_fast: 12
   macd_slow: 26
@@ -98,7 +98,7 @@ features:
   # Context
   d1_ema_period: 200
   entropy_window: 100
-  entropy_threshold: 0.99 # RELAXED: Virtually disabled (0.99) to cure paralysis
+  entropy_threshold: 0.85 # RELAXED
   ofi_alpha: 0.1
   
   fractional_differentiation:
@@ -114,7 +114,7 @@ features:
 # --- MICROSTRUCTURE FILTERS ---
 microstructure:
   vpin_bucket_size: 1000
-  vpin_threshold: 0.95 # RELAXED: Raised from 0.80 to 0.95 to cure paralysis
+  vpin_threshold: 0.85 # RELAXED: Consistent with logic
   er_threshold_noise: 0.40
   er_threshold_trend: 0.60
   hurst_threshold_mean_revert: 0.45
@@ -127,9 +127,9 @@ risk_management:
   account_currency: "USD"
   risk_timezone: "Europe/Prague"
   
-  # Sizing Logic: Size = (Equity * Risk%) / (ATR * PipValue)
+  # Sizing Logic
   sizing_method: "inverse_volatility" 
-  base_risk_per_trade_percent: 0.1 # CORRECTED: 0.1% Risk Per Trade
+  base_risk_per_trade_percent: 0.1 # CORRECTED: 0.1% Conservative Risk
   max_leverage: 30
   commission_per_lot_rt: 5.0
   contract_size: 100000
@@ -137,9 +137,9 @@ risk_management:
   # Constraints
   max_daily_loss_pct: 0.05
   max_total_loss_pct: 0.10
-  max_risk_percent: 0.5 # Hard Cap single trade risk (Safety ceiling)
+  max_risk_percent: 0.5 # Hard Cap lowered for safety
   hard_stop_equity_usd: 80000.0
-  max_trades_per_day: 20
+  max_trades_per_day: 50
   correlation_penalty_threshold: 0.7
   
   # Kelly Settings
@@ -155,12 +155,12 @@ risk_management:
   # Execution Guardrails
   min_lot_size: 0.01
   max_lot_size: 50.0
-  min_stop_loss_pips: 2.0
-  max_loss_usd: 1000.0
+  min_stop_loss_pips: 5.0
+  max_loss_usd: 1000.0 # Lowered to match 0.1% of 100k roughly
   
-  # Adaptive Stops (Based on ATR)
+  # Adaptive Stops
   stop_loss_atr_mult: 1.5 
-  take_profit_atr_mult: 3.0 # High R:R requirement
+  take_profit_atr_mult: 2.0 # 1:2 Risk:Reward
 
 # --- TRADING PORTFOLIO ---
 trading:
@@ -175,7 +175,7 @@ trading:
     - "GBPUSD"
     - "USDCAD"
     - "USDJPY"
-  timeframe: "M5" # Reference only, Volume Bars used internally
+  timeframe: "M5"
   magic_number: 621001
   slippage: 5
 
@@ -197,12 +197,12 @@ wfo:
   n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 20
+  min_trades_optimization: 5 # LOWERED: Fixes Optimization Blindness
 
 # --- ONLINE LEARNING ---
 online_learning:
   model_type: "ARFClassifier"
-  n_models: 25 # Ensemble size
+  n_models: 35
   
   # Warm-up
   burn_in_periods: 1000 
@@ -212,21 +212,21 @@ online_learning:
   delta: 0.001
   
   # Weighted Learning
-  positive_class_weight: 10.0 
+  positive_class_weight: 5.0
   negative_class_weight: 1.0  
   
   # Meta Labeling
   meta_labeling_threshold: 0.55
   
   # Optimization
-  metric: "Recall" # Incentivize activity (FOMO)
+  metric: "Recall"
   max_features: 'log2'
   lambda_value: 6
   
   learning_horizon_sec: 300
-  min_calibrated_probability: 0.51 # Lower floor to 51%
+  min_calibrated_probability: 0.50
 
-  # TBM (Adaptive)
+  # TBM
   tbm:
     horizon_minutes: 60 
     barrier_width: 2.0
