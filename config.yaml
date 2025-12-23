@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – FTMO PROFIT MODE V35.1 (REMEDIATION PATCH)
-# STATUS: SNIPER MODE V2 (BALANCED WEIGHTS)
+# config.yaml – FTMO PROFIT MODE V35.2 (SNIPER HARDENING)
+# STATUS: SNIPER MODE V2 (NEUTRAL WEIGHTS)
 #
 # REMEDIATION LOG (2025-12-23):
-# 1. WEIGHTS: Reduced positive_class_weight (10.0 -> 2.0) to stop hallucinations.
-# 2. FILTERS: Relaxed Entropy/VPIN (0.85 -> 0.95) to stop data starvation.
-# 3. RISK: Lowered Kelly Fraction (0.25 -> 0.15) for survival.
+# 1. WEIGHTS: Set positive_class_weight to 1.0. Profit magnitude now drives learning.
+# 2. FILTERS: Relaxed Entropy/VPIN (0.96) to prevent data starvation.
+# 3. RISK: Lowered Kelly Fraction (0.15) for survival.
 # 4. GATING: Maintained Volatility Gate but allowed valid high-entropy setups.
 # =============================================================================
 
@@ -212,9 +212,9 @@ online_learning:
   grace_period: 200
   delta: 0.00001
   
-  # CRITICAL FIX: REBALANCED WEIGHTS
-  # 10.0 caused hallucinations. 2.0 encourages signals but respects noise.
-  positive_class_weight: 2.0
+  # CRITICAL FIX: NEUTRAL WEIGHTS
+  # 1.0 ensures we let profit magnitude determine importance, not arbitrary multipliers.
+  positive_class_weight: 1.0
   negative_class_weight: 1.0
   
   meta_labeling_threshold: 0.60

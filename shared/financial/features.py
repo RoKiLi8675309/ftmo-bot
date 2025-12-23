@@ -156,9 +156,9 @@ class AdaptiveTripleBarrier:
     Barriers expand/contract based on ATR.
     
     FIXED: Generates -1 labels for downside breaks to enable Shorting.
-    AUDIT FIX: Default drift_threshold lowered to 0.05 to enable learning in low-vol regimes.
+    AUDIT FIX: Drift Threshold Hardened to 0.50 to purge soft-label noise (Poison Data Fix).
     """
-    def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.05):
+    def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.50):
         self.buffer = deque()
         self.time_limit = horizon_ticks
         self.risk_mult = risk_mult

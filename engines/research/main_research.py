@@ -10,6 +10,7 @@
 # 2. VISIBILITY: EmojiCallback prints 'Autopsy' for PRUNED trials (Gate Rejections).
 # 3. METRIC: Optimized for SQN + Profit Factor (Sustainable Alpha).
 # 4. DATA: Enforced 2M tick load for robust Volume Bar generation.
+# 5. SNIPER FLOOR: Hardened min_calibrated_probability to > 0.60.
 # =============================================================================
 import sys
 import os
@@ -204,8 +205,9 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                     'barrier_width': trial.suggest_float('barrier_width', 1.0, 3.0),
                     'horizon_minutes': trial.suggest_int('horizon_minutes', 15, 120)
                 },
-                # REMEDIATION (Step 3): Lowered floor to 0.51 to allow trading
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.51, 0.65)
+                # SNIPER MODE: Hardened Probability Floor (>0.60)
+                # We stop the bot from guessing on coin flips (0.51).
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.60, 0.75)
             })
             
             # Instantiate Pipeline locally

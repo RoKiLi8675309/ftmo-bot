@@ -6,7 +6,7 @@
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
 # AUDIT REMEDIATION (SNIPER MODE):
-# 1. VOLATILITY GATE: Hard block on trading if ATR < 3x Spread (Configurable).
+# 1. VOLATILITY GATE: Hardened block on trading. ATR must be > 4.0x Spread.
 # 2. DISCOVERY SAFETY: Removed "Random" exploration. Only trades on Bias (>0.45) or Breakout.
 # 3. RISK ALIGNMENT: Passes 'atr' explicitly to RiskManager for Volatility Targeting.
 # 4. AUTOPSY: Enhanced reporting to track Gate rejections.
@@ -93,7 +93,10 @@ class ResearchStrategy:
         # Load Gate settings from config (Sniper Mode)
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 3.0)
+        
+        # SNIPER HARDENING: Default increased from 3.0 to 4.0
+        # If the market is dead (low ATR relative to spread), we stay out.
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 4.0)
         
         # Load Spread Assumptions for Gating
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
@@ -179,7 +182,8 @@ class ResearchStrategy:
                 # --- PROFIT WEIGHTED LEARNING ---
                 # We reward "Big Wins" and punish "Churn" (Neutral Reinforcement)
                 
-                w_pos = self.params.get('positive_class_weight', 2.0)
+                # Default to 1.0 (Neutral) if not specified, driven by profit magnitude
+                w_pos = self.params.get('positive_class_weight', 1.0)
                 w_neg = self.params.get('negative_class_weight', 1.0)
                 
                 base_weight = w_pos if outcome_label != 0 else w_neg
@@ -211,7 +215,7 @@ class ResearchStrategy:
             spread_cost = spread_pips * pip_size
             
             # Gate Requirement: ATR must be > K * Spread
-            # e.g., if Spread is 1.5 pips, ATR must be > 4.5 pips.
+            # e.g., if Spread is 1.5 pips, ATR must be > 6.0 pips (at 4.0x ratio).
             if current_atr < (spread_cost * self.min_atr_spread_ratio):
                 gate_passed = False
 
