@@ -5,11 +5,9 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional)
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
-# AUDIT REMEDIATION (SNIPER MODE):
-# 1. STATIONARITY: Added Log Returns (log_ret) & Volatility Ratios (vol_ratio).
-# 2. NORMALIZATION: MACD and Oscillators normalized by Price/ATR.
-# 3. PHYSICS: Candle Body/Wick ratios to detect exhaustion/impulse.
-# 4. ROBUSTNESS: Enhanced NaN/Inf sanitization for River stability.
+# AUDIT REMEDIATION (SNIPER MODE - HOTFIX):
+# 1. RESTORED: 'atr' and 'volatility' keys. Critical for Strategy Gates & Risk Manager.
+# 2. RETAINED: Stationary features (atr_pct, log_ret) for the ML Model.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -468,6 +466,11 @@ class OnlineFeatureEngineer:
 
         # Construct Final Feature Vector
         raw_features = {
+            # --- CRITICAL FIX: RESTORE RAW ATR/VOL FOR GATE & RISK ---
+            'atr': current_atr, 
+            'volatility': volatility_val,
+            # ---------------------------------------------------------
+
             # Stationary Technicals
             'rsi_norm': rsi_norm,
             'macd_norm': macd_norm,
