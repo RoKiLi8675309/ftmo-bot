@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional)
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
-# FORENSIC REMEDIATION LOG (2025-12-23):
-# 1. ROBUSTNESS: Fixed NaN propagation in Indicators.
-# 2. LABELING FIX: AdaptiveTripleBarrier now outputs -1 for Downside moves (Sell Signals).
-# 3. SAFETY: Zero-division protection in VPIN and Entropy.
-# 4. AUDIT FIX: Lowered drift_threshold to 0.05 to resolve Labeling Failure.
+# AUDIT REMEDIATION (PROFIT FOCUS):
+# 1. ADDED: Lagged Returns (t-1 to t-5) for tree memory.
+# 2. ADDED: Candle Physics (Body/Wick ratios) for Price Action.
+# 3. FIXED: Robust sanitization for infinite values.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -100,11 +99,11 @@ class StreamingIndicators:
         # 1. MACD Calculation
         self.ema_fast.update(price)
         self.ema_slow.update(price)
-        macd_line = self.ema_fast.get() - self.ema_slow.get()
-        self.macd_signal.update(macd_line)
-        histogram = macd_line - self.macd_signal.get()
+        self.macd_line = self.ema_fast.get() - self.ema_slow.get()
+        self.macd_signal.update(self.macd_line)
+        histogram = self.macd_line - self.macd_signal.get()
 
-        features['macd_line'] = macd_line
+        features['macd_line'] = self.macd_line
         features['macd_hist'] = histogram
 
         # 2. RSI Calculation
@@ -187,13 +186,13 @@ class AdaptiveTripleBarrier:
             'age': 0
         })
 
-    def resolve_labels(self, current_high: float, current_low: float, current_close: float = None) -> List[Tuple[Dict[str, float], int]]:
+    def resolve_labels(self, current_high: float, current_low: float, current_close: float = None) -> List[Tuple[Dict[str, float], int, float]]:
         """
         Checks active trades against current price action.
-        Returns list of (features, label).
+        Returns list of (features, label, realized_return).
         
         Label 1  = UP Move (Buy Signal)
-        Label -1 = DOWN Move (Sell Signal) - FIXED
+        Label -1 = DOWN Move (Sell Signal)
         Label 0  = Noise/Hold
         """
         resolved = []
@@ -208,14 +207,17 @@ class AdaptiveTripleBarrier:
             trade['age'] += 1
             
             label = None
+            realized_ret = 0.0
 
             # 1. Did price hit Upper Barrier?
             if current_high >= trade['tp']:
                 label = 1   # BUY SIGNAL
+                realized_ret = (trade['tp'] - trade['entry']) / trade['entry']
             
             # 2. Did price hit Lower Barrier?
             elif current_low <= trade['sl']:
-                label = -1  # SELL SIGNAL (FIX: Changed from 0 to -1)
+                label = -1  # SELL SIGNAL
+                realized_ret = (trade['entry'] - trade['sl']) / trade['entry'] # Positive return for short
             
             # 3. Timeout? (Vertical Barrier)
             elif trade['age'] >= self.time_limit:
@@ -228,13 +230,16 @@ class AdaptiveTripleBarrier:
                 
                 if drift > drift_req:
                     label = 1   # SOFT BUY (Upward Drift)
+                    realized_ret = (current_close - trade['entry']) / trade['entry']
                 elif drift < -drift_req:
                     label = -1  # SOFT SELL (Downward Drift)
+                    realized_ret = (trade['entry'] - current_close) / trade['entry']
                 else:
                     label = 0   # TIMEOUT (True Noise)
+                    realized_ret = 0.0
 
             if label is not None:
-                resolved.append((trade['features'], label))
+                resolved.append((trade['features'], label, realized_ret))
             else:
                 active.append(trade)
         
@@ -362,11 +367,11 @@ class OnlineFeatureEngineer:
         self.volumes.append(volume)
         
         # Returns
+        ret = 0.0
         if self.last_price and self.last_price > 0:
             ret = math.log(price / self.last_price) if price > 0 else 0.0
             self.returns.append(ret)
         else:
-            ret = 0.0
             self.returns.append(0.0)
 
         # 1. Update Recursive Indicators (Phase 2 Core)
@@ -428,6 +433,23 @@ class OnlineFeatureEngineer:
 
         self.last_price = price
 
+        # --- PROFIT FIX: FEATURE ENRICHMENT ---
+        # 1. Lagged Returns (Memory)
+        lagged_feats = {}
+        r_list = list(self.returns)
+        for i in range(1, 6): # Lag 1 to 5
+            if len(r_list) > i:
+                lagged_feats[f'ret_lag_{i}'] = r_list[-(i+1)]
+            else:
+                lagged_feats[f'ret_lag_{i}'] = 0.0
+
+        # 2. Candle Physics (Price Action)
+        body = abs(price - self.prices[-2]) if len(self.prices) > 1 else 0.0
+        upper_wick = high - max(price, self.prices[-2]) if len(self.prices) > 1 else 0.0
+        lower_wick = min(price, self.prices[-2]) - low if len(self.prices) > 1 else 0.0
+        
+        candle_range = high - low if high != low else 1e-9
+        
         raw_features = {
             # Recursive Technicals
             'rsi': tech_feats['rsi'],
@@ -448,6 +470,10 @@ class OnlineFeatureEngineer:
             'cum_ofi': cum_ofi,
             'regime': regime_val,
             'vol_breakout': vol_breakout,
+            
+            # Candle Physics
+            'body_pct': body / candle_range,
+            'wick_ratio': (upper_wick + lower_wick) / candle_range,
             # -----------------------------
 
             # Normalized
@@ -455,6 +481,7 @@ class OnlineFeatureEngineer:
             'volume_z': volume_z,
             'return_raw': ret,
             
+            **lagged_feats,
             **time_feats
         }
 

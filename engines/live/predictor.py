@@ -6,11 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages ARF models, Feature Engineering,
 # Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# FORENSIC REMEDIATION LOG (2025-12-23):
-# 1. SHORT SELLING ENABLED: Logic updated to execute on prediction class -1.
-# 2. WEIGHTED LEARNING: Implemented sample_weight (5.0) in model training.
-# 3. PARALYSIS FIX: Lowered confidence floor (0.50) and relaxed Entropy (0.85+).
-# 4. FILTER FIX: VPIN threshold now dynamic (0.85) instead of hardcoded (0.95).
+# AUDIT REMEDIATION (PROFIT WEIGHTED LEARNING):
+# 1. FIXED: Implemented Profit-Weighted Learning in Live loop.
+# 2. ADDED: Lagged Features support.
+# 3. TUNED: Relaxed VPIN/Entropy to 0.85 default.
 # =============================================================================
 import logging
 import pickle
@@ -165,19 +164,26 @@ class MultiAssetPredictor:
             return Signal(symbol, "WARMUP", 0.0, {"remaining": remaining})
 
         # 2. Delayed Training (Label Resolution via Adaptive Barrier)
+        # UPDATED: Unpack realized_ret
         resolved_labels = labeler.resolve_labels(bar.high, bar.low)
         
         if resolved_labels:
-            for (stored_feats, outcome_label) in resolved_labels:
-                # --- PHASE 2: WEIGHTED LEARNING ---
-                # Positive/Negative (Actionable) = 5.0, Noise (0) = 1.0
+            for (stored_feats, outcome_label, realized_ret) in resolved_labels:
+                # --- PROFIT WEIGHTED LEARNING ---
                 w_pos = CONFIG['online_learning'].get('positive_class_weight', 5.0)
                 w_neg = CONFIG['online_learning'].get('negative_class_weight', 1.0)
                 
-                weight = w_pos if outcome_label != 0 else w_neg
+                base_weight = w_pos if outcome_label != 0 else w_neg
+                
+                # Scale by Log Return Magnitude
+                # log(1 + 1.0) = 0.69 (Big Win). log(1 + 0.1) = 0.09 (Small Win)
+                ret_scalar = math.log1p(abs(realized_ret) * 100.0)
+                ret_scalar = max(0.5, ret_scalar)
+                
+                final_weight = base_weight * ret_scalar
                 
                 # Train Primary Model
-                model.learn_one(stored_feats, outcome_label, sample_weight=weight)
+                model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
 
         # 3. Add CURRENT Bar as new Trade Opportunity
         current_atr = features.get('atr', 0.0)

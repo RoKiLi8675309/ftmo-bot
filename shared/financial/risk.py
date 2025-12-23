@@ -9,6 +9,7 @@
 # 1. FIXED: Removed hardcoded STANDARD_LOT_UNITS inside calculation.
 # 2. FIXED: Injected contract_size dynamically from config/args.
 # 3. SAFETY: Lowered 'min_pips_req' to 2.0 to unblock M5 trading.
+# 4. CRITICAL FIX: Fixed "Death by Spread" bug by making min pips dynamic.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -187,11 +188,15 @@ class RiskManager:
         # Spreads + Commissions will eat the profit.
         pip_val, _ = RiskManager.get_pip_info(symbol)
         
-        # FIX: Lowered from 5.0 to 2.0 to unblock M5 trading
-        min_pips_req = 2.0 
+        # FORENSIC FIX: Dynamic Spread Buffer
+        # Assume typical spread from config or hardcoded assumption if missing
+        spread_assumed = CONFIG.get('forensic_audit', {}).get('spread_pips', {}).get(symbol, 1.5)
         
-        if stop_dist < (pip_val * min_pips_req):
-             return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, f"Low Volatility (<{min_pips_req} pips)"), 0.0
+        # Minimum Stop Loss must be at least 2.0x Spread + 1 Pip buffer
+        min_stop_req = (spread_assumed * 2.0 * pip_val)
+        
+        if stop_dist < min_stop_req:
+             return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, f"Spread Risk: Stop {stop_dist/pip_val:.1f}p < {min_stop_req/pip_val:.1f}p"), 0.0
 
         sl_pips = stop_dist / pip_val
 

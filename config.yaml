@@ -1,12 +1,11 @@
 # =============================================================================
-# config.yaml – FTMO GROWTH MODE V33.1 (FORENSIC FIX)
-# STATUS: PHASE 8 - PARALYSIS REMEDIATION & M5 TUNING
+# config.yaml – FTMO PROFIT MODE V34.0 (AUDIT FIXED)
+# STATUS: PHASE 9 - PROFIT WEIGHTED LEARNING & RISK FIX
 #
 # REMEDIATION LOG (2025-12-23):
-# 1. OPTIMIZATION: Relaxed TBM horizon (30m) and barrier (1.5) for M5 granularity.
-# 2. DISCOVERY: Lowered min_calibrated_probability to 0.40 to bootstrap learning.
-# 3. SAFETY: Reduced min_trades_optimization to 5 to prevent premature pruning.
-# 4. LEVERAGE: Retained max_lot_size=10.0 and removed toxic pairs.
+# 1. RISK: Fixed "Death by Spread" (min_stop_loss now dynamic).
+# 2. LEARNING: Enabled Profit-Weighted Samples.
+# 3. FEATURES: Added Lagged Returns & Candle Physics.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -115,7 +114,7 @@ features:
 # --- MICROSTRUCTURE FILTERS ---
 microstructure:
   vpin_bucket_size: 1000
-  vpin_threshold: 0.90
+  vpin_threshold: 0.85 # RELAXED: From 0.90 to 0.85
   er_threshold_noise: 0.30
   er_threshold_trend: 0.60
   hurst_threshold_mean_revert: 0.45
@@ -155,23 +154,21 @@ risk_management:
 
   # Execution Guardrails
   min_lot_size: 0.01
-  max_lot_size: 10.0  # SAFETY CLAMP: Prevent low-vol blowouts
-  min_stop_loss_pips: 5.0
+  max_lot_size: 10.0
+  min_stop_loss_pips: 5.0 # Deprecated in code by dynamic calc, kept for legacy config compat
   max_loss_usd: 2000.0
   
-  # Adaptive Stops
-  stop_loss_atr_mult: 1.5
-  take_profit_atr_mult: 3.0  # High R:R
+  # Adaptive Stops (Optimized for M5)
+  stop_loss_atr_mult: 2.0 # WIDENED: Give trades room to breathe
+  take_profit_atr_mult: 3.0 # High R:R
 
 # --- TRADING PORTFOLIO ---
 trading:
   symbols:
-    # WINNERS RETAINED
     - "GBPJPY"
     - "AUDJPY"
     - "EURUSD"
     - "USDCHF"
-    # TOXIC PAIRS REMOVED (EURGBP, AUDCAD)
   
   auxiliary_symbols:
     - "GBPUSD"
@@ -200,7 +197,7 @@ wfo:
   n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 5  # AUDIT FIX: Lowered from 10 to prevent early pruning
+  min_trades_optimization: 5
 
 # --- ONLINE LEARNING ---
 online_learning:
@@ -212,6 +209,7 @@ online_learning:
   grace_period: 50
   delta: 0.001
   
+  # Base weights (Scalar applied dynamically based on Profit in code)
   positive_class_weight: 10.0
   negative_class_weight: 1.0
   
@@ -222,11 +220,11 @@ online_learning:
   lambda_value: 6
   
   learning_horizon_sec: 300
-  min_calibrated_probability: 0.40  # AUDIT FIX: Lowered from 0.50 to bootstrap discovery
+  min_calibrated_probability: 0.40
   
   tbm:
-    horizon_minutes: 30   # AUDIT FIX: Lowered from 120 for M5/Volume bars
-    barrier_width: 1.5    # AUDIT FIX: Lowered from 3.0 for M5/Volume bars
+    horizon_minutes: 30
+    barrier_width: 1.5
     min_profit_pips: 5.0
 
 # --- FORENSIC AUDIT ---

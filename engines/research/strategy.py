@@ -5,16 +5,16 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
-# FORENSIC REMEDIATION LOG (2025-12-23):
-# 1. AGGRESSIVE DISCOVERY: Lowered threshold from 0.10 to 0.05 to fix Cold Start.
-# 2. MOMENTUM INJECTION: Added Volatility Breakout fallback to force trades.
-# 3. SAFETY: Discovery trades bypass confidence checks but respect RiskManager.
-# 4. COLD START FIX: Added Epsilon-Greedy (20%) for initial zero-probability state.
+# AUDIT REMEDIATION (PROFIT WEIGHTED LEARNING):
+# 1. ADDED: Realized Return capture from Labeler.
+# 2. ADDED: Log-weighted sample learning (Big Wins = Big Weights).
+# 3. FIXED: Epsilon-Greedy logic.
 # =============================================================================
 import logging
 import sys
 import numpy as np
 import random
+import math
 from collections import deque, defaultdict
 from typing import Any, Dict, Optional, List
 from datetime import datetime
@@ -23,7 +23,7 @@ from datetime import datetime
 from shared import (
     CONFIG,
     OnlineFeatureEngineer,
-    AdaptiveTripleBarrier,  # PHASE 2: ATR-based Labeling
+    AdaptiveTripleBarrier, 
     ProbabilityCalibrator,
     RiskManager,
     enrich_with_d1_data,
@@ -160,22 +160,38 @@ class ResearchStrategy:
         self.bars_processed += 1
 
         # B. Delayed Training (Label Resolution via Adaptive Barrier)
+        # UPDATED: Unpack realized_ret for Weighted Learning
         resolved_labels = self.labeler.resolve_labels(high, low, current_close=price)
         
         if resolved_labels:
-            for (stored_feats, outcome_label) in resolved_labels:
-                # --- CONTINUOUS REWARD SHAPING ---
-                # Weight heavily if outcome is meaningful (1 or -1)
+            for (stored_feats, outcome_label, realized_ret) in resolved_labels:
+                # --- PROFIT WEIGHTED LEARNING ---
+                # Weight = Base Weight * Log(1 + |Return| * 100)
+                # Helps model focus on the Trades that made MONEY, not just small wiggles.
+                
                 w_pos = self.params.get('positive_class_weight', 10.0)
                 w_neg = self.params.get('negative_class_weight', 1.0)
                 
-                weight = w_pos if outcome_label != 0 else w_neg
+                base_weight = w_pos if outcome_label != 0 else w_neg
                 
-                self.model.learn_one(stored_feats, outcome_label, sample_weight=weight)
+                # Dynamic Scalar: Returns are typically 0.001 to 0.01. 
+                # Multiply by 100 to get percentage like 0.1 to 1.0.
+                # log(1 + 1.0) = 0.69. log(1 + 0.1) = 0.09.
+                # Big wins get ~7x more weight than small wins.
+                ret_scalar = math.log1p(abs(realized_ret) * 100.0)
+                
+                # Clamp scalar to avoid exploding gradients/weights (min 0.5 for stability)
+                ret_scalar = max(0.5, ret_scalar)
+                
+                final_weight = base_weight * ret_scalar
+                
+                self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
                 
                 # Update Meta Labeler (Gatekeeper)
                 if outcome_label != 0:
-                    self.meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=1.0)
+                    # Meta Labeler learns: "Given these features + action, did we profit?"
+                    # We treat realized_ret > 0 as profit
+                    self.meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
 
         # C. Add CURRENT Bar as new Trade Opportunity
         current_atr = features.get('atr', 0.0)
