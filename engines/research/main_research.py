@@ -9,6 +9,7 @@
 # 1. OBJECTIVE: 'SQN + 2*PF' prioritized.
 # 2. SEARCH SPACE: Relaxed barrier_width lower bound (1.5) to suit M5.
 # 3. SAFETY: Fixed pruning logic to allow learning from low-volume epochs.
+# 4. FIX: Expanded probability search space to 0.35 - 0.75.
 # =============================================================================
 import sys
 import os
@@ -147,6 +148,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 2000000) -> pd.DataFrame:
     df_bars = pd.DataFrame(bars_list)
     
     # 4. Set Index to Datetime for Snapshot compatibility
+    # Ensure 'timestamp' from aggregator (which is float) is converted to datetime
     df_bars['time'] = pd.to_datetime(df_bars['timestamp'], unit='s', utc=True)
     df_bars.set_index('time', inplace=True, drop=False)
     
@@ -182,18 +184,17 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'grace_period': trial.suggest_int('grace_period', 20, 100),
                 'delta': trial.suggest_float('delta', 0.0001, 0.01, log=True),
                 
-                # REMEDIATION (Step 1): Widened Range 0.60 -> 0.99 to find "sweet spot" & FIX PARALYSIS
+                # REMEDIATION (Step 1): Widened Range
                 'entropy_threshold': trial.suggest_float('entropy_threshold', 0.60, 0.99),
                 'vpin_threshold': trial.suggest_float('vpin_threshold', 0.60, 0.99),
                 
                 'tbm': {
-                    # REMEDIATION (Step 2): Relaxed lower bound to 1.5 for M5 feasibility
-                    # 1.5 * ATR is a standard "Base Hit" target. 5.0 is a "Home Run".
+                    # REMEDIATION (Step 2): Relaxed lower bound to 1.5
                     'barrier_width': trial.suggest_float('barrier_width', 1.5, 5.0),
                     'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 240) 
                 },
-                # REMEDIATION (Step 3): Lowered floor to 0.50 to allow volume recovery
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.50, 0.75)
+                # REMEDIATION (Step 3): Lowered floor to 0.35 to allow discovery
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.35, 0.75)
             })
             
             # Instantiate Pipeline locally
@@ -234,7 +235,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             final_score = metrics['sqn'] + (metrics['profit_factor'] * 2.0)
             
             # Soft Penalty for Low Activity
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 10) # Target at least 10 trades per run
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 10) 
             total_trades = metrics['total_trades']
             
             if total_trades < min_trades:
@@ -245,9 +246,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 penalty = deficit * 1.0
                 final_score -= penalty
                 
-                trial.set_user_attr("autopsy", f"LOW ACTIVITY: {total_trades}/{min_trades} trades. Soft Penalty applied: -{penalty:.2f}")
-                
                 if total_trades == 0:
+                    trial.set_user_attr("autopsy", strategy.generate_autopsy())
                     final_score = -5.0 
 
             # Penalty for Negative PnL despite activity
@@ -367,7 +367,6 @@ class ResearchPipeline:
             params = CONFIG['online_learning']
         
         # FORENSIC REMEDIATION: Using ARFClassifier with F1 Score
-        # Changed metric from Recall to F1 to balance Precision (Safety) and Recall (Opportunity)
         return compose.Pipeline(
             preprocessing.StandardScaler(),
             forest.ARFClassifier(
@@ -379,7 +378,6 @@ class ResearchPipeline:
                 leaf_prediction='mc',
                 max_features='log2',
                 lambda_value=6,
-                # Optimization Target: F1 (Balanced)
                 metric=metrics.F1() 
             )
         )

@@ -6,14 +6,15 @@
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
 # FORENSIC REMEDIATION LOG (2025-12-23):
-# 1. PARALYSIS CURE: Relaxed VPIN/Entropy to 0.75 (Dynamic via params).
-# 2. REWARD SHAPING: Implemented 10:1 Weighted Learning for profitable signals.
-# 3. SHORT SELLING FIX: Enabled support for Class -1 (Sell) in training and execution.
+# 1. DISCOVERY MODE: Added Epsilon-Greedy logic to break "Cold Start" paralysis.
+# 2. FEATURE SAFEGUARDS: Santized features to prevent NaN propagation.
+# 3. REWARD SHAPING: Implemented 10:1 Weighted Learning for profitable signals.
 # 4. DRIFT: Logic updated to handle new 'soft' labels from AdaptiveTripleBarrier.
 # =============================================================================
 import logging
 import sys
 import numpy as np
+import random
 from collections import deque, defaultdict
 from typing import Any, Dict, Optional, List
 from datetime import datetime
@@ -80,6 +81,7 @@ class ResearchStrategy:
         self.last_features = None
         self.last_price = 0.0
         self.last_price_map = {} 
+        self.bars_processed = 0
         
         # --- FORENSIC RECORDER ---
         self.decision_log = deque(maxlen=1000)
@@ -136,7 +138,6 @@ class ResearchStrategy:
         self.last_price = price
 
         # A. Feature Engineering (Recursive Update)
-        # Includes new Regime/OFI features automatically via updated `features.py`
         features = self.fe.update(
             price=price,
             timestamp=timestamp,
@@ -154,27 +155,25 @@ class ResearchStrategy:
             self.burn_in_counter += 1
             if self.burn_in_counter == self.burn_in_limit:
                 self.burn_in_complete = True
-                if self.debug_mode:
-                    logger.info(f"🔥 {self.symbol} BURN-IN COMPLETE (1000 candles). Trading Active.")
             return 
+
+        self.bars_processed += 1
 
         # B. Delayed Training (Label Resolution via Adaptive Barrier)
         resolved_labels = self.labeler.resolve_labels(high, low, current_close=price)
         
         if resolved_labels:
             for (stored_feats, outcome_label) in resolved_labels:
-                # --- CONTINUOUS REWARD SHAPING (SIMULATED VIA WEIGHTS) ---
-                # Fetch weights from params
+                # --- CONTINUOUS REWARD SHAPING ---
+                # Weight heavily if outcome is meaningful (1 or -1)
                 w_pos = self.params.get('positive_class_weight', 10.0)
                 w_neg = self.params.get('negative_class_weight', 1.0)
                 
-                # Apply Weighting:
-                # Weight heavily if outcome is meaningful (1 or -1). Noise (0) gets normal weight.
                 weight = w_pos if outcome_label != 0 else w_neg
                 
                 self.model.learn_one(stored_feats, outcome_label, sample_weight=weight)
                 
-                # Update Meta Labeler (Gatekeeper) - Assuming we only meta-label if there's a direction
+                # Update Meta Labeler (Gatekeeper)
                 if outcome_label != 0:
                     self.meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=1.0)
 
@@ -184,18 +183,16 @@ class ResearchStrategy:
 
         # D. Inference
         try:
-            # --- FILTER RELAXATION (Fix "Analysis Paralysis") ---
-            # 1. Entropy Filter
+            # --- FILTER RELAXATION ---
             entropy_val = features.get('entropy', 0)
-            entropy_thresh = self.params.get('entropy_threshold', 0.75) 
+            entropy_thresh = self.params.get('entropy_threshold', 0.85) 
             
             if entropy_val > entropy_thresh:
                 self.rejection_stats['High Entropy'] += 1
                 return
 
-            # 2. VPIN Filter (Microstructure)
             vpin_val = features.get('vpin', 0)
-            vpin_thresh = self.params.get('vpin_threshold', 0.75)
+            vpin_thresh = self.params.get('vpin_threshold', 0.85)
             
             if vpin_val > vpin_thresh: 
                 self.rejection_stats['High VPIN'] += 1
@@ -216,8 +213,13 @@ class ResearchStrategy:
             # E. Execution Logic
             dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
             
-            # --- META LABELING (COLD START BYPASS) ---
-            if self.meta_label_events < 50:
+            # --- DISCOVERY MODE (FIX FOR COLD START) ---
+            # If we are in the early phase of learning (e.g., first 2000 bars after burn-in),
+            # allow trades with lower confidence to break the "Predict 0" feedback loop.
+            discovery_mode = self.bars_processed < 2000
+            
+            # --- META LABELING ---
+            if self.meta_label_events < 50 or discovery_mode:
                 is_profitable = True
             else:
                 is_profitable = self.meta_labeler.predict(
@@ -231,7 +233,7 @@ class ResearchStrategy:
             # --- PURE AI LOGIC ---
             if pred_action == 1 or pred_action == -1:
                 if is_profitable:
-                        self._execute_logic(prob_buy, prob_sell, price, features, broker, dt_timestamp, pred_action)
+                        self._execute_logic(prob_buy, prob_sell, price, features, broker, dt_timestamp, pred_action, discovery_mode)
                 else:
                     self.rejection_stats['Meta-Labeler'] += 1
             else:
@@ -242,9 +244,7 @@ class ResearchStrategy:
             pass
 
     def _inject_auxiliary_data(self):
-        """
-        Injects static approximations ONLY if missing.
-        """
+        """Injects static approximations ONLY if missing."""
         defaults = {
             "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
             "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60
@@ -253,14 +253,19 @@ class ResearchStrategy:
             if sym not in self.last_price_map:
                 self.last_price_map[sym] = price
 
-    def _execute_logic(self, p_buy, p_sell, price, features, broker, timestamp: datetime, action_int: int):
+    def _execute_logic(self, p_buy, p_sell, price, features, broker, timestamp: datetime, action_int: int, discovery_mode: bool):
         """Decides whether to enter a trade using Inverse-Volatility Sizing."""
         
-        # 1. Signal Threshold (Lowered Floor: 0.50)
+        # 1. Signal Threshold
         min_prob = self.params.get('min_calibrated_probability', 0.50)
+        
+        # --- DISCOVERY MODE OVERRIDE ---
+        # If in discovery mode, we lower the bar to 0.35 to force exploration.
+        effective_min_prob = 0.35 if discovery_mode else min_prob
+        
         confidence = p_buy if action_int == 1 else p_sell
         
-        if confidence < min_prob:
+        if confidence < effective_min_prob:
             self.rejection_stats['Low Confidence'] += 1
             return
 
@@ -269,7 +274,6 @@ class ResearchStrategy:
         # 2. Position Sizing & Risk
         if broker.get_position(self.symbol): return
         
-        # Volatility Adjusted Sizing
         volatility = features.get('volatility', 0.001)
         current_atr = features.get('atr', 0.001)
 
@@ -292,9 +296,9 @@ class ResearchStrategy:
             atr=current_atr
         )
 
-        # 3. SAFETY: Check if Risk Manager Rejected the trade due to low volatility
+        # 3. SAFETY: Check if Risk Manager Rejected the trade
         if trade_intent.volume <= 0 or trade_intent.action == "HOLD":
-            self.rejection_stats[f"RiskManager: {trade_intent.comment}"] += 1
+            self.rejection_stats[f"Risk: {trade_intent.comment}"] += 1
             return
 
         qty = trade_intent.volume
@@ -322,11 +326,11 @@ class ResearchStrategy:
             timestamp_created=timestamp,
             stop_loss=sl_price,
             take_profit=tp_price,
-            comment=f"{trade_intent.comment}|Prob:{confidence:.2f}"
+            comment=f"{trade_intent.comment}|Prob:{confidence:.2f}|{'DISC' if discovery_mode else 'AI'}"
         )
         broker.submit_order(order)
         
-        # Record detailed trade event for Autopsy
+        # Record detailed trade event
         self.trade_events.append({
             'time': timestamp,
             'action': action,
@@ -336,7 +340,7 @@ class ResearchStrategy:
             'entropy': features.get('entropy', 0),
             'atr': current_atr,
             'volatility': volatility,
-            'forced': False 
+            'forced': discovery_mode 
         })
 
     def generate_autopsy(self) -> str:
@@ -344,46 +348,30 @@ class ResearchStrategy:
         Generates a text report explaining WHY the strategy behaved this way.
         """
         if not self.trade_events:
-            # Format rejections for debug
             reject_str = ", ".join([f"{k}: {v}" for k, v in self.rejection_stats.items()])
             status = "Waiting for Warm-Up" if not self.burn_in_complete else "Analysis Paralysis"
-            return f"AUTOPSY: No trades taken. Status: {status}. Rejections: {{{reject_str}}}. System waiting for high-confidence setup."
+            return f"AUTOPSY: No trades. Status: {status}. Rejections: {{{reject_str}}}. Bars processed: {self.bars_processed}"
         
         avg_conf = np.mean([t['conf'] for t in self.trade_events])
         avg_vpin = np.mean([t['vpin'] for t in self.trade_events])
-        avg_entropy = np.mean([t['entropy'] for t in self.trade_events])
+        forced_count = sum(1 for t in self.trade_events if t['forced'])
         
-        # Format rejections
         reject_str = ", ".join([f"{k}: {v}" for k, v in self.rejection_stats.items()])
 
-        # REFINEMENT: Generate Confidence Histogram
         try:
             conf_values = [t['conf'] for t in self.trade_events]
-            # Bins for 0.5 to 1.0 range
-            conf_bins = np.histogram(conf_values, bins=5, range=(0.5, 1.0))[0]
+            conf_bins = np.histogram(conf_values, bins=5, range=(0.0, 1.0))[0]
             dist_str = f"{list(conf_bins)}"
         except Exception:
             dist_str = "[]"
 
         report = (
             f"\n   --- 💀 STRATEGY AUTOPSY ({self.symbol}) ---\n"
-            f"   Trades Taken: {len(self.trade_events)}\n"
-            f"   Avg Confidence: {avg_conf:.2f}\n"
-            f"   Conf Distribution (0.5-1.0): {dist_str}\n"
+            f"   Trades: {len(self.trade_events)} (Discovery Mode: {forced_count})\n"
+            f"   Avg Conf: {avg_conf:.2f}\n"
+            f"   Conf Dist: {dist_str}\n"
             f"   Avg VPIN: {avg_vpin:.2f}\n"
-            f"   Avg Entropy: {avg_entropy:.2f}\n"
             f"   Rejections: {{{reject_str}}}\n"
             f"   ----------------------------------------\n"
         )
-        
-        display_trades = self.trade_events[:3]
-        if len(self.trade_events) > 6:
-            display_trades.extend(self.trade_events[-3:])
-        elif len(self.trade_events) > 3:
-            display_trades = self.trade_events 
-            
-        for i, t in enumerate(display_trades):
-            ts_str = str(t['time'])
-            report += f"   Trade: {t['action']} @ {ts_str} | Conf:{t['conf']:.2f}\n"
-            
         return report

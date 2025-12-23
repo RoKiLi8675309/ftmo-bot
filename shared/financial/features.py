@@ -6,9 +6,9 @@
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
 # FORENSIC REMEDIATION LOG (2025-12-23):
-# 1. NEW FEATURES: Added Regime (Hurst), Cumulative OFI, and Volatility Breakout.
-# 2. ROBUSTNESS: Enhanced OnlineFeatureEngineer to track internal EMA/Windows.
-# 3. LABELING FIX: AdaptiveTripleBarrier now outputs -1 for Downside moves (Sell Signals).
+# 1. ROBUSTNESS: Fixed NaN propagation in Indicators.
+# 2. LABELING FIX: AdaptiveTripleBarrier now outputs -1 for Downside moves (Sell Signals).
+# 3. SAFETY: Zero-division protection in VPIN and Entropy.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -56,6 +56,9 @@ class RecursiveEMA:
         self.value = None
 
     def update(self, x: float):
+        if x is None or math.isnan(x):
+            return # Skip bad values
+            
         if self.value is None:
             self.value = x
         else:
@@ -135,7 +138,7 @@ class StreamingIndicators:
             features['atr'] = self.atr_mean.get()
         else:
             # First tick fallback
-            features['atr'] = high - low if (high > 0 and low > 0) else 0.001
+            features['atr'] = high - low if (high > 0 and low > 0 and high != low) else 0.001
 
         # Update State
         self.prev_price = price
@@ -163,7 +166,8 @@ class AdaptiveTripleBarrier:
         """
         Registers a potential trade setup (Hypothetical entry at current bar).
         """
-        if current_atr <= 0: return
+        # Ensure ATR is valid to prevent zero-width barriers
+        if current_atr <= 0: current_atr = entry_price * 0.0001 
 
         # Dynamic Barriers based on ATR
         # Upper Barrier (Profit for Buy, Stop for Sell)
