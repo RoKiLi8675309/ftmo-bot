@@ -7,9 +7,9 @@
 #
 # FORENSIC REMEDIATION LOG (2025-12-23):
 # 1. OBJECTIVE: 'SQN + 2*PF' prioritized.
-# 2. SEARCH SPACE: Relaxed barrier_width lower bound (1.5) to suit M5.
+# 2. SEARCH SPACE: Reduced barrier/horizon ranges for M5/Volume bars (0.5-3.0 width, 10-60m horizon).
 # 3. SAFETY: Fixed pruning logic to allow learning from low-volume epochs.
-# 4. FIX: Expanded probability search space to 0.35 - 0.75.
+# 4. FIX: Expanded probability search space to 0.20 - 0.75 to enable cold-start learning.
 # =============================================================================
 import sys
 import os
@@ -25,7 +25,7 @@ import optuna
 import numpy as np
 import pandas as pd
 import psutil
-import yaml # Required for Auto-Deployment
+import yaml  # Required for Auto-Deployment
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pathlib import Path
@@ -53,6 +53,7 @@ setup_logging("Research")
 log = logging.getLogger("Research")
 
 # --- 1. TELEMETRY & REPORTING UTILS ---
+
 class EmojiCallback:
     """
     Injects FTMO-style Emojis and RICH TELEMETRY into Optuna Trial reporting.
@@ -131,7 +132,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 2000000) -> pd.DataFrame:
     UPDATED: Default n_ticks increased to 2M per recommendation.
     """
     # 1. Load Massive Amount of Ticks (To get sufficient Bars)
-    raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2) # Double days for safety
+    raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2)  # Double days for safety
     
     if raw_ticks.empty:
         return pd.DataFrame()
@@ -166,7 +167,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
     
     try:
         # 1. Load & Aggregate Data (Using updated 2M limit)
-        df = process_data_into_bars(symbol, n_ticks=2000000) 
+        df = process_data_into_bars(symbol, n_ticks=2000000)
         
         if df.empty:
             log.error(f"❌ CRITICAL: No BAR data generated for {symbol}. Aborting worker.")
@@ -189,12 +190,12 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'vpin_threshold': trial.suggest_float('vpin_threshold', 0.60, 0.99),
                 
                 'tbm': {
-                    # REMEDIATION (Step 2): Relaxed lower bound to 1.5
-                    'barrier_width': trial.suggest_float('barrier_width', 1.5, 5.0),
-                    'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 240) 
+                    # REMEDIATION (Step 2): Reduced range for M5/Volume bars
+                    'barrier_width': trial.suggest_float('barrier_width', 0.5, 3.0),  # Changed from 1.5-5.0
+                    'horizon_minutes': trial.suggest_int('horizon_minutes', 10, 60)   # Changed from 30-240
                 },
-                # REMEDIATION (Step 3): Lowered floor to 0.35 to allow discovery
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.35, 0.75)
+                # REMEDIATION (Step 3): Lowered floor to 0.20 to allow discovery
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.2, 0.75) # Changed from 0.35-0.75
             })
             
             # Instantiate Pipeline locally
@@ -235,7 +236,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             final_score = metrics['sqn'] + (metrics['profit_factor'] * 2.0)
             
             # Soft Penalty for Low Activity
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 10) 
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 10)
             total_trades = metrics['total_trades']
             
             if total_trades < min_trades:
@@ -248,11 +249,11 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 
                 if total_trades == 0:
                     trial.set_user_attr("autopsy", strategy.generate_autopsy())
-                    final_score = -5.0 
+                    final_score = -5.0
 
             # Penalty for Negative PnL despite activity
             if total_trades > 5 and metrics['total_pnl'] < 0:
-                 final_score -= 2.0 # Discourage losing strategies
+                 final_score -= 2.0  # Discourage losing strategies
 
             # Generate Autopsy if result is poor (Debugging)
             if final_score < 0.5 or broker.is_blown:
@@ -260,7 +261,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 
             if broker.is_blown:
                 trial.set_user_attr("blown", True)
-                return -50.0 # Max Penalty
+                return -50.0  # Max Penalty
             
             return final_score
 
@@ -378,7 +379,7 @@ class ResearchPipeline:
                 leaf_prediction='mc',
                 max_features='log2',
                 lambda_value=6,
-                metric=metrics.F1() 
+                metric=metrics.F1()
             )
         )
 
@@ -430,14 +431,14 @@ class ResearchPipeline:
         metrics['max_dd_pct'] = abs(max_dd_val / initial_capital)
 
         # Fail Conditions
-        if metrics['max_dd_pct'] > 0.10: # 10% Hard Limit
+        if metrics['max_dd_pct'] > 0.10:  # 10% Hard Limit
             metrics['score'] = -100.0
             return metrics
-
+        
         avg_ret = df['Net_PnL'].mean()
         if avg_ret <= 0:
             metrics['score'] = -1.0
-            # return metrics # Let it continue to calculate SQN for debugging
+            # return metrics  # Let it continue to calculate SQN for debugging
 
         # Volatility Based Metrics
         pnl_std = df['Net_PnL'].std() if len(df) > 1 else 1.0
@@ -465,12 +466,13 @@ class ResearchPipeline:
         for symbol in self.symbols:
             study_name = f"study_{symbol}"
             if fresh_start:
-                print(f"🗑️  ATTEMPTING PURGE: {study_name}...")
+                print(f"🗑️ ATTEMPTING PURGE: {study_name}...")
                 try:
                     optuna.delete_study(study_name=study_name, storage=self.db_url)
                     print(f"✅ PURGED: {study_name}")
                 except Exception:
                     pass
+            
             try:
                 optuna.create_study(study_name=study_name, storage=self.db_url, direction="maximize", load_if_exists=True)
             except Exception as e:
@@ -483,6 +485,7 @@ class ResearchPipeline:
         trials_per_worker = math.ceil(total_trials_per_symbol / workers_per_symbol)
         
         log.info(f"DISTRIBUTION: {workers_per_symbol} workers/symbol | {trials_per_worker} trials/worker")
+
         for symbol in self.symbols:
             for _ in range(workers_per_symbol):
                 tasks.append((symbol, trials_per_worker, self.train_candles, self.db_url))
@@ -531,11 +534,12 @@ class ResearchPipeline:
             meta_path = self.models_dir / f"meta_model_{symbol}.pkl"
             cal_path = self.models_dir / f"calibrators_{symbol}.pkl"
 
-            if not model_path.exists(): 
+            if not model_path.exists():
                 log.error(f"Model missing for {symbol}")
                 return []
 
             with open(model_path, "rb") as f: model = pickle.load(f)
+            
             params = CONFIG['online_learning'].copy()
             if params_path.exists():
                 with open(params_path, "r") as f: params.update(json.load(f))
@@ -570,7 +574,7 @@ class ResearchPipeline:
             return
 
         df = pd.DataFrame(trade_log)
-        initial_capital = 100000.0 # Assumed start
+        initial_capital = 100000.0  # Assumed start
         
         # Metrics
         total_pnl = df['Net_PnL'].sum()

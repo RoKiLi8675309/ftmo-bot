@@ -9,6 +9,7 @@
 # 1. ROBUSTNESS: Fixed NaN propagation in Indicators.
 # 2. LABELING FIX: AdaptiveTripleBarrier now outputs -1 for Downside moves (Sell Signals).
 # 3. SAFETY: Zero-division protection in VPIN and Entropy.
+# 4. AUDIT FIX: Lowered drift_threshold to 0.05 to resolve Labeling Failure.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -57,7 +58,7 @@ class RecursiveEMA:
 
     def update(self, x: float):
         if x is None or math.isnan(x):
-            return # Skip bad values
+            return  # Skip bad values
             
         if self.value is None:
             self.value = x
@@ -154,8 +155,9 @@ class AdaptiveTripleBarrier:
     Barriers expand/contract based on ATR.
     
     FIXED: Generates -1 labels for downside breaks to enable Shorting.
+    AUDIT FIX: Default drift_threshold lowered to 0.05 to enable learning in low-vol regimes.
     """
-    def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.2):
+    def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.05):
         self.buffer = deque()
         self.time_limit = horizon_ticks
         self.risk_mult = risk_mult
@@ -167,7 +169,7 @@ class AdaptiveTripleBarrier:
         Registers a potential trade setup (Hypothetical entry at current bar).
         """
         # Ensure ATR is valid to prevent zero-width barriers
-        if current_atr <= 0: current_atr = entry_price * 0.0001 
+        if current_atr <= 0: current_atr = entry_price * 0.0001
 
         # Dynamic Barriers based on ATR
         # Upper Barrier (Profit for Buy, Stop for Sell)
@@ -178,9 +180,9 @@ class AdaptiveTripleBarrier:
         self.buffer.append({
             'features': features,
             'entry': entry_price,
-            'tp': upper_barrier,   # Top Barrier
-            'sl': lower_barrier,   # Bottom Barrier
-            'atr': current_atr,    # Stored for Drift Calculation
+            'tp': upper_barrier,    # Top Barrier
+            'sl': lower_barrier,    # Bottom Barrier
+            'atr': current_atr,     # Stored for Drift Calculation
             'start_time': timestamp,
             'age': 0
         })
@@ -190,9 +192,9 @@ class AdaptiveTripleBarrier:
         Checks active trades against current price action.
         Returns list of (features, label).
         
-        Label  1 = UP Move (Buy Signal)
+        Label 1  = UP Move (Buy Signal)
         Label -1 = DOWN Move (Sell Signal) - FIXED
-        Label  0 = Noise/Hold
+        Label 0  = Noise/Hold
         """
         resolved = []
         active = deque()
@@ -209,32 +211,33 @@ class AdaptiveTripleBarrier:
 
             # 1. Did price hit Upper Barrier?
             if current_high >= trade['tp']:
-                label = 1 # BUY SIGNAL
-
+                label = 1   # BUY SIGNAL
+            
             # 2. Did price hit Lower Barrier?
             elif current_low <= trade['sl']:
-                label = -1 # SELL SIGNAL (FIX: Changed from 0 to -1)
-
+                label = -1  # SELL SIGNAL (FIX: Changed from 0 to -1)
+            
             # 3. Timeout? (Vertical Barrier)
             elif trade['age'] >= self.time_limit:
                 # --- DRIFT LOGIC (Soft Labeling) ---
                 # Calculate movement relative to entry
                 drift = current_close - trade['entry']
+                
                 # Threshold to consider this a signal
                 drift_req = trade['atr'] * self.drift_threshold
                 
                 if drift > drift_req:
-                    label = 1 # SOFT BUY (Upward Drift)
+                    label = 1   # SOFT BUY (Upward Drift)
                 elif drift < -drift_req:
-                    label = -1 # SOFT SELL (Downward Drift)
+                    label = -1  # SOFT SELL (Downward Drift)
                 else:
-                    label = 0 # TIMEOUT (True Noise)
+                    label = 0   # TIMEOUT (True Noise)
 
             if label is not None:
                 resolved.append((trade['features'], label))
             else:
                 active.append(trade)
-
+        
         self.buffer = active
         return resolved
 
@@ -294,7 +297,7 @@ class MetaLabeler:
 
     def predict(self, features: Dict[str, float], primary_action: int, threshold: float = 0.55) -> bool:
         if not ML_AVAILABLE or primary_action == 0:
-            return False 
+            return False
             
         try:
             augmented_features = features.copy()
@@ -307,7 +310,7 @@ class MetaLabeler:
             return prob_profit > threshold
         except Exception as e:
             logger.error(f"MetaLabeler Predict Error: {e}")
-            return False 
+            return False
 
     def _sanitize(self, features: Dict[str, float]) -> Dict[str, float]:
         clean = {}
@@ -345,7 +348,7 @@ class OnlineFeatureEngineer:
 
     def update(self, price: float, timestamp: float, volume: float, 
                high: Optional[float] = None, low: Optional[float] = None,
-               buy_vol: float = 0.0, sell_vol: float = 0.0, 
+               buy_vol: float = 0.0, sell_vol: float = 0.0,
                time_feats: Dict[str, float] = None) -> Dict[str, float]:
         
         if time_feats is None:
@@ -482,6 +485,7 @@ class StreamingTripleBarrier:
         self.history.append(price)
         resolved = []
         to_remove = []
+
         for origin_ts, params in self.pending_events.items():
             if price >= params['top']:
                 resolved.append((1, origin_ts))
@@ -506,6 +510,7 @@ class StreamingTripleBarrier:
                 'bot': price - width,
                 'expiry': timestamp + (self.horizon_ticks * 60)
             }
+        
         return resolved
 
 class EntropyMonitor:
@@ -516,6 +521,7 @@ class EntropyMonitor:
         self.buffer.append(x)
         if len(self.buffer) < 10: return 0.5
         if np.std(list(self.buffer)) < 1e-9: return 0.0
+        
         try:
             hist, _ = np.histogram(self.buffer, bins=10, density=True)
             ent = entropy(hist)
@@ -556,7 +562,7 @@ class VPINMonitor:
             self.sell_vol = 0.0
         
         if not self.buckets: return 0.5
-
+        
         total_vol = 0.0
         diff_vol = 0.0
         for b_buy, b_sell in self.buckets:
@@ -601,6 +607,7 @@ def calculate_hurst(ts):
     n = len(ts)
     if n < 20: return 0.5
     if np.std(ts) < 1e-9: return 0.5
+    
     lags = np.arange(2, 20)
     tau = np.zeros(len(lags))
     for i in range(len(lags)):
@@ -611,6 +618,7 @@ def calculate_hurst(ts):
             tau[i] = 1e-9
         else:
             tau[i] = std_diff
+    
     x = np.log(lags.astype(np.float64))
     y = np.log(tau)
     A = np.column_stack((x, np.ones(len(x))))
@@ -619,9 +627,13 @@ def calculate_hurst(ts):
 
 def enrich_with_d1_data(features: Dict[str, float], d1_data: Dict[str, float], current_price: float) -> Dict[str, float]:
     if not d1_data: return features
+    
     prev_high = d1_data.get('high', 0)
     prev_low = d1_data.get('low', 0)
+    
     if prev_high == 0: return features
+    
     features['dist_d1_high'] = (prev_high - current_price) / current_price
     features['dist_d1_low'] = (current_price - prev_low) / current_price
+    
     return features
