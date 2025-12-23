@@ -9,6 +9,7 @@
 # 1. AGGRESSIVE DISCOVERY: Lowered threshold from 0.10 to 0.05 to fix Cold Start.
 # 2. MOMENTUM INJECTION: Added Volatility Breakout fallback to force trades.
 # 3. SAFETY: Discovery trades bypass confidence checks but respect RiskManager.
+# 4. COLD START FIX: Added Epsilon-Greedy (20%) for initial zero-probability state.
 # =============================================================================
 import logging
 import sys
@@ -221,22 +222,32 @@ class ResearchStrategy:
             discovery_triggered = False
 
             if is_discovery and effective_action == 0:
-                # AGGRESSIVE: If model is even 5% confident in a direction, take it.
-                # AUDIT FIX: Lowered from 0.10 to 0.05 to break analysis paralysis
-                bias_buy = prob_buy > 0.05
-                bias_sell = prob_sell > 0.05
+                max_prob = max(prob_buy, prob_sell)
                 
-                if bias_buy and prob_buy > prob_sell:
-                    effective_action = 1
-                    discovery_triggered = True
-                elif bias_sell and prob_sell > prob_buy:
-                    effective_action = -1
-                    discovery_triggered = True
+                # 1. Cold Start Epsilon-Greedy (20% Random Exploration)
+                # Fixes paralysis when model probabilities are exactly 0.0 (fresh model)
+                if max_prob == 0.0:
+                    if random.random() < 0.2:  # 20% chance to force trade
+                        effective_action = random.choice([1, -1])
+                        discovery_triggered = True
                 
-                # FALLBACK: MOMENTUM INJECTION
-                # If model is totally asleep (prob < 0.05), use Volatility Breakout to force feed.
-                # If volatility is expanding, trade in direction of current bar return.
-                elif not discovery_triggered and features.get('vol_breakout', 0) > 0:
+                # 2. Weak Signal Amplification (Bias Check)
+                # Only runs if model has some opinion (max_prob > 0)
+                else:
+                    # AGGRESSIVE: If model is even 5% confident in a direction, take it.
+                    bias_buy = prob_buy > 0.05
+                    bias_sell = prob_sell > 0.05
+                    
+                    if bias_buy and prob_buy > prob_sell:
+                        effective_action = 1
+                        discovery_triggered = True
+                    elif bias_sell and prob_sell > prob_buy:
+                        effective_action = -1
+                        discovery_triggered = True
+                
+                # 3. Fallback: Momentum Injection (Volatility Breakout)
+                # If neither epsilon nor bias triggered, but volatility is high, trade the trend.
+                if not discovery_triggered and features.get('vol_breakout', 0) > 0:
                     ret = features.get('return_raw', 0)
                     if ret > 0:
                         effective_action = 1
