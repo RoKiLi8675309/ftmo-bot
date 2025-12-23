@@ -10,6 +10,7 @@
 # 2. REWARD SHAPING: Implemented 10:1 Weighted Learning for profitable signals.
 # 3. AUTOPSY: Enhanced rejection tracking with 'Analysis Paralysis' detection.
 # 4. DRIFT: Logic updated to handle new 'soft' labels from AdaptiveTripleBarrier.
+# 5. AUDIT FIX: Added visibility into Burn-In progress.
 # =============================================================================
 import logging
 import sys
@@ -74,6 +75,7 @@ class ResearchStrategy:
         # 5. Warm-up State
         self.burn_in_limit = params.get('burn_in_periods', 1000)
         self.burn_in_counter = 0
+        self.burn_in_complete = False
         
         # State
         self.last_features = None
@@ -151,6 +153,10 @@ class ResearchStrategy:
         # --- WARM-UP GATE ---
         if self.burn_in_counter < self.burn_in_limit:
             self.burn_in_counter += 1
+            if self.burn_in_counter == self.burn_in_limit:
+                self.burn_in_complete = True
+                if self.debug_mode:
+                    logger.info(f"🔥 {self.symbol} BURN-IN COMPLETE (1000 candles). Trading Active.")
             return 
 
         # B. Delayed Training (Label Resolution via Adaptive Barrier)
@@ -343,7 +349,8 @@ class ResearchStrategy:
         if not self.trade_events:
             # Format rejections for debug
             reject_str = ", ".join([f"{k}: {v}" for k, v in self.rejection_stats.items()])
-            return f"AUTOPSY: No trades taken. Rejections: {{{reject_str}}}. System likely waiting for high-confidence setup or Burn-In."
+            status = "Waiting for Warm-Up" if not self.burn_in_complete else "Analysis Paralysis"
+            return f"AUTOPSY: No trades taken. Status: {status}. Rejections: {{{reject_str}}}. System waiting for high-confidence setup."
         
         avg_conf = np.mean([t['conf'] for t in self.trade_events])
         avg_vpin = np.mean([t['vpin'] for t in self.trade_events])

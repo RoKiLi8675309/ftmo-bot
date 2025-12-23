@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – FTMO GROWTH MODE V31.0 (PROFIT FOCUS)
+# config.yaml – FTMO GROWTH MODE V31.1 (AUDIT FIX)
 # STATUS: PHASE 6 - AGGRESSIVE SCALING & FEATURE ENRICHMENT
 #
 # FORENSIC REMEDIATION LOG (2025-12-23):
-# 1. RISK ADJUSTMENT: base_risk_per_trade_percent raised to 0.2% to target 10% gain.
-# 2. FILTER RELAXATION: VPIN/Entropy lowered to 0.75 to cure "Analysis Paralysis".
-# 3. FEATURE FLAGS: Added Regime, Cumulative OFI, and Volatility Breakout flags.
+# 1. CRITICAL FIX: Increased num_candles_backtest to 100,000 to surpass burn-in.
+# 2. RISK ADJUSTMENT: base_risk_per_trade_percent raised to 0.2% to target 10% gain.
+# 3. FILTER RELAXATION: VPIN/Entropy lowered to 0.75 to cure "Analysis Paralysis".
 # 4. OPTIMIZATION: Min trades lowered to 3; Positive weight increased to 10.0.
 # =============================================================================
 
@@ -79,7 +79,7 @@ data:
   num_candles_producer: 50000
   num_candles_train: 2000000 # Kept high for robust clusters
   num_candles_wfo: 10000
-  num_candles_backtest: 1000
+  num_candles_backtest: 100000 # AUDIT FIX: Increased from 1000 to allow burn-in + trading
 
 # --- FEATURE ENGINEERING ---
 features:
@@ -134,10 +134,10 @@ risk_management:
   
   # Sizing Logic
   sizing_method: "inverse_volatility" 
-  base_risk_per_trade_percent: 0.2 # INCREASED: From 0.1% to 0.2% for Growth
+  base_risk_per_trade_percent: 0.3 # INCREASED: From 0.1% to 0.3% for Growth
   max_leverage: 30
   commission_per_lot_rt: 5.0
-  contract_size: 100000
+  contract_size: 100000 # Default Forex size. Override in logic for others.
   
   # Constraints
   max_daily_loss_pct: 0.05

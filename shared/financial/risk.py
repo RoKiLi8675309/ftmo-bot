@@ -5,10 +5,9 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# FORENSIC REMEDIATION LOG (2025-12-23):
-# 1. GROWTH MODE: base_risk_per_trade_percent default raised to 0.2%.
-# 2. SCALING: Adjusted hard caps to allow for larger positions in high-prob setups.
-# 3. SAFETY: Retained CPPI floor to protect the 10% drawdown limit.
+# AUDIT FIX (2025-12-23):
+# 1. FIXED: Removed hardcoded STANDARD_LOT_UNITS inside calculation.
+# 2. FIXED: Injected contract_size dynamically from config/args.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -41,7 +40,8 @@ class RiskManager:
     Stateless utilities for Pip value calculations, Exchange Rates,
     and Advanced Position Sizing (Kelly-Vol, CPPI).
     """
-    STANDARD_LOT_UNITS = 100_000
+    # Default fallback, but logic now prefers config/override
+    DEFAULT_CONTRACT_SIZE = 100_000 
 
     @staticmethod
     def get_pip_info(symbol: str) -> Tuple[float, int]:
@@ -126,7 +126,8 @@ class RiskManager:
         active_correlations: int = 0,
         market_prices: Optional[Dict[str, float]] = None,
         atr: Optional[float] = None,
-        account_size: Optional[float] = None # NEW ARGUMENT for Auto-Detection
+        account_size: Optional[float] = None, # NEW ARGUMENT for Auto-Detection
+        contract_size_override: Optional[float] = None # NEW: Allow overriding lot size
     ) -> Tuple[Trade, float]:
         """
         Calculates position size using Inverse-Volatility Sizing (Audit Compliant).
@@ -140,6 +141,10 @@ class RiskManager:
 
         # 1. Retrieve Config Parameters
         risk_conf = CONFIG.get('risk_management', {})
+
+        # Determine Contract Size
+        # Priority: Override arg > Config > Default 100k
+        c_size = contract_size_override if contract_size_override else risk_conf.get('contract_size', RiskManager.DEFAULT_CONTRACT_SIZE)
 
         # --- CPPI SAFE EQUITY CUSHION (Legacy Safety) ---
         cppi_floor_pct = risk_conf.get('cppi_floor_pct', 0.08)
@@ -184,7 +189,9 @@ class RiskManager:
         sl_pips = stop_dist / pip_val
 
         # --- CROSS-PAIR PIP VALUE CALCULATION ---
-        pip_value_quote = RiskManager.STANDARD_LOT_UNITS * pip_val
+        # Value of 1 pip in Quote Currency for 1 Standard Lot (Contract Size)
+        pip_value_quote = c_size * pip_val
+        
         conversion_rate = RiskManager.get_conversion_rate(symbol, price, market_prices)
         
         if conversion_rate <= 0:
