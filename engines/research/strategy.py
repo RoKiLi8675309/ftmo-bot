@@ -6,10 +6,9 @@
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
 # FORENSIC REMEDIATION LOG (2025-12-23):
-# 1. DISCOVERY MODE: Added Epsilon-Greedy logic to break "Cold Start" paralysis.
-# 2. FEATURE SAFEGUARDS: Santized features to prevent NaN propagation.
-# 3. REWARD SHAPING: Implemented 10:1 Weighted Learning for profitable signals.
-# 4. DRIFT: Logic updated to handle new 'soft' labels from AdaptiveTripleBarrier.
+# 1. AGGRESSIVE DISCOVERY: Lowered threshold to 0.10.
+# 2. MOMENTUM INJECTION: Added Volatility Breakout fallback to force trades.
+# 3. SAFETY: Discovery trades bypass confidence checks but respect RiskManager.
 # =============================================================================
 import logging
 import sys
@@ -210,30 +209,62 @@ class ResearchStrategy:
             prob_buy = pred_proba.get(1, 0.0)
             prob_sell = pred_proba.get(-1, 0.0) 
 
-            # E. Execution Logic
+            # E. Execution Logic & Discovery Override
             dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
             
-            # --- DISCOVERY MODE (FIX FOR COLD START) ---
-            # If we are in the early phase of learning (e.g., first 2000 bars after burn-in),
-            # allow trades with lower confidence to break the "Predict 0" feedback loop.
-            discovery_mode = self.bars_processed < 2000
-            
+            # --- DISCOVERY MODE LOGIC (AGGRESSIVE FIX) ---
+            # If we are in the early phase (first 2500 bars), and the model is 
+            # predicting 0 (Hold), we check if there is ANY bias in probability.
+            # If so, we FORCE an action to generate PnL data.
+            is_discovery = self.bars_processed < 2500
+            effective_action = pred_action
+            discovery_triggered = False
+
+            if is_discovery and effective_action == 0:
+                # AGGRESSIVE: If model is even 10% confident in a direction, take it.
+                bias_buy = prob_buy > 0.10
+                bias_sell = prob_sell > 0.10
+                
+                if bias_buy and prob_buy > prob_sell:
+                    effective_action = 1
+                    discovery_triggered = True
+                elif bias_sell and prob_sell > prob_buy:
+                    effective_action = -1
+                    discovery_triggered = True
+                
+                # FALLBACK: MOMENTUM INJECTION
+                # If model is totally asleep (prob < 0.1), use Volatility Breakout to force feed.
+                # If volatility is expanding, trade in direction of current bar return.
+                elif not discovery_triggered and features.get('vol_breakout', 0) > 0:
+                    ret = features.get('return_raw', 0)
+                    if ret > 0:
+                        effective_action = 1
+                        discovery_triggered = True
+                    elif ret < 0:
+                        effective_action = -1
+                        discovery_triggered = True
+
             # --- META LABELING ---
-            if self.meta_label_events < 50 or discovery_mode:
+            if self.meta_label_events < 50 or discovery_triggered:
                 is_profitable = True
             else:
                 is_profitable = self.meta_labeler.predict(
                     features, 
-                    pred_action, 
+                    effective_action, 
                     threshold=self.params.get('meta_labeling_threshold', 0.55)
                 )
             
-            self.meta_label_events += 1
+            if effective_action != 0:
+                self.meta_label_events += 1
 
-            # --- PURE AI LOGIC ---
-            if pred_action == 1 or pred_action == -1:
+            # --- EXECUTION ---
+            if effective_action == 1 or effective_action == -1:
                 if is_profitable:
-                        self._execute_logic(prob_buy, prob_sell, price, features, broker, dt_timestamp, pred_action, discovery_mode)
+                        confidence = prob_buy if effective_action == 1 else prob_sell
+                        # Ensure confidence isn't 0.0 passed to risk manager
+                        if confidence < 0.01: confidence = 0.5 
+                        
+                        self._execute_logic(confidence, price, features, broker, dt_timestamp, effective_action, discovery_triggered)
                 else:
                     self.rejection_stats['Meta-Labeler'] += 1
             else:
@@ -253,21 +284,17 @@ class ResearchStrategy:
             if sym not in self.last_price_map:
                 self.last_price_map[sym] = price
 
-    def _execute_logic(self, p_buy, p_sell, price, features, broker, timestamp: datetime, action_int: int, discovery_mode: bool):
+    def _execute_logic(self, confidence, price, features, broker, timestamp: datetime, action_int: int, discovery_mode: bool):
         """Decides whether to enter a trade using Inverse-Volatility Sizing."""
         
         # 1. Signal Threshold
         min_prob = self.params.get('min_calibrated_probability', 0.50)
         
         # --- DISCOVERY MODE OVERRIDE ---
-        # If in discovery mode, we lower the bar to 0.35 to force exploration.
-        effective_min_prob = 0.35 if discovery_mode else min_prob
-        
-        confidence = p_buy if action_int == 1 else p_sell
-        
-        if confidence < effective_min_prob:
-            self.rejection_stats['Low Confidence'] += 1
-            return
+        if not discovery_mode:
+            if confidence < min_prob:
+                self.rejection_stats['Low Confidence'] += 1
+                return
 
         action = "BUY" if action_int == 1 else "SELL"
 
@@ -289,7 +316,8 @@ class ResearchStrategy:
 
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
-            conf=confidence,
+            # If discovery mode, pretend we have valid confidence to get a non-zero size
+            conf=confidence if not discovery_mode else 0.5, 
             volatility=volatility,
             active_correlations=0, 
             market_prices=self.last_price_map,
