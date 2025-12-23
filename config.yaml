@@ -1,12 +1,13 @@
 # =============================================================================
-# config.yaml – FTMO PROFIT MODE V36.0 (FORENSIC OPTIMIZED)
-# STATUS: SNIPER MODE V3 (RELAXED GATES + HIGH DRIFT)
+# config.yaml – FTMO PROFIT MODE V37.0 (AUDIT REMEDIATION)
+# STATUS: SNIPER MODE V4 (AGGRESSIVE DISCOVERY + RELAXED GATES)
 #
 # REMEDIATION LOG (2025-12-23):
-# 1. WEIGHTS: Set positive_class_weight to 1.5 to amplify signals over noise.
-# 2. FILTERS: Relaxed Entropy/VPIN (0.96) to prevent data starvation.
-# 3. RISK: Lowered Kelly Fraction (0.10) for survival; Target Vol 0.25.
-# 4. LOGIC: Added explicit Drift Threshold (0.75) for labeling.
+# 1. FILTERS: Relaxed Entropy/VPIN to 0.98 to fix data starvation (~90% rejection).
+# 2. DRIFT: Tightened Drift Threshold to 1.0 to reduce Class 0 (Noise) labels.
+# 3. WEIGHTS: Balanced weights (Pos 1.5 / Neg 1.5) to amplify all directional signals.
+# 4. GATES: Lowered Volatility Gate to 2.5x Spread to capture M5 moves.
+# 5. CONVICTION: Raised Min Probability to 0.55 to reduce low-confidence churn.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -105,8 +106,8 @@ features:
   
   d1_ema_period: 200
   entropy_window: 100
-  # RELAXED: 0.96 to allow more trade frequency in M5
-  entropy_threshold: 0.96
+  # RELAXED: 0.98 to fix starvation (allow chaotic but profitable volatility)
+  entropy_threshold: 0.98
   ofi_alpha: 0.1
   
   fractional_differentiation:
@@ -121,8 +122,8 @@ features:
 # --- MICROSTRUCTURE FILTERS ---
 microstructure:
   vpin_bucket_size: 1000
-  # RELAXED: 0.96 to prevent starvation
-  vpin_threshold: 0.96
+  # RELAXED: 0.98 to fix starvation
+  vpin_threshold: 0.98
   er_threshold_noise: 0.30
   er_threshold_trend: 0.60
   # Gate specific threshold
@@ -139,7 +140,7 @@ risk_management:
   
   # AUDIT FIX: Volatility Targeting
   sizing_method: "volatility_targeting"
-  target_annual_volatility: 0.25 # Increased for opportunity capture
+  target_annual_volatility: 0.25 
   # SAFETY: Reduced to 0.10 for survival
   kelly_fraction: 0.10
   
@@ -215,9 +216,9 @@ online_learning:
   delta: 0.00001
   
   # CRITICAL FIX: WEIGHTING
-  # 1.5x weight for Classes 1/-1 to encourage signals
+  # Balanced weighting (1.5x) to encourage both Buy/Sell signals over noise
   positive_class_weight: 1.5
-  negative_class_weight: 1.0
+  negative_class_weight: 1.5
   
   meta_labeling_threshold: 0.60
   
@@ -226,20 +227,20 @@ online_learning:
   lambda_value: 6
   
   learning_horizon_sec: 300
-  # RELAXED: 0.51+ allows learning while trading
-  min_calibrated_probability: 0.51
+  # TIGHTENED: 0.55 reduces churn/low-confidence trades
+  min_calibrated_probability: 0.55
   
   tbm:
     horizon_minutes: 30
     barrier_width: 2.0 # Standard deviation width
     min_profit_pips: 5.0
-    # AUDIT: Stricter labeling to reduce noise
-    drift_threshold: 0.75
+    # AUDIT: Tightened to 1.0 to require stronger moves for Class 0 separation
+    drift_threshold: 1.0
     
   # AUDIT FIX: Volatility Gate Settings
   volatility_gate:
     enabled: true
-    min_atr_spread_ratio: 3.0 # Relaxed from 4.0 to 3.0
+    min_atr_spread_ratio: 2.5 # Relaxed from 3.0 to 2.5 to capture M5 moves
 
 # --- FORENSIC AUDIT ---
 forensic_audit:

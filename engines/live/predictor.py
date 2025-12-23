@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages ARF models, Feature Engineering,
 # Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# AUDIT REMEDIATION (SNIPER MODE):
-# 1. WEIGHTING: Set positive_class_weight=1.5 to value signals over noise.
-# 2. ARCHITECTURE: Added 5-minute Auto-Save interval.
-# 3. ROBUSTNESS: Relaxed VPIN/Entropy filters (0.96) to match Research.
+# AUDIT REMEDIATION (SNIPER MODE V4):
+# 1. WEIGHTING: Balanced weights (1.5/1.5) to value all directional signals.
+# 2. FILTERS: Relaxed VPIN/Entropy filters to 0.98 to fix data starvation.
+# 3. CONVICTION: Raised min_calibrated_probability to 0.55.
 # 4. ALIGNMENT: Matches 'shared/financial/features.py' stationary pipeline.
 # =============================================================================
 import logging
@@ -75,7 +75,7 @@ class MultiAssetPredictor:
             horizon_ticks=tbm_conf['horizon_minutes'], # Converted to ticks implicitly by usage
             risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'],
             reward_mult=tbm_conf['barrier_width'], # Uses barrier width as TP mult
-            drift_threshold=tbm_conf.get('drift_threshold', 0.75) # AUDIT: Hardened labeling
+            drift_threshold=tbm_conf.get('drift_threshold', 1.0) # AUDIT: 1.0 Default
         ) for s in symbols}
 
         # 2. Models (River ARF)
@@ -186,11 +186,12 @@ class MultiAssetPredictor:
                 # We apply higher weights to trades that resulted in significant PnL.
                 # This teaches the model to prioritize "Big Moves" over noise.
                 
+                # AUDIT FIX: Balanced weighting (1.5/1.5) to treat both sides equally
                 w_pos = CONFIG['online_learning'].get('positive_class_weight', 1.5)
-                w_neg = CONFIG['online_learning'].get('negative_class_weight', 1.0)
+                w_neg = CONFIG['online_learning'].get('negative_class_weight', 1.5)
                 
                 # Base weight: Higher for Signals (1/-1), Lower for Noise (0)
-                base_weight = w_pos if outcome_label != 0 else w_neg
+                base_weight = w_pos if outcome_label != 0 else 1.0
                 
                 # Scale by Log Return Magnitude (Stationary scaling)
                 # log(1 + 1.0%) = 0.69 (Big Win). log(1 + 0.1%) = 0.09 (Small Win)
@@ -215,17 +216,18 @@ class MultiAssetPredictor:
         # 4. Inference
         current_pred_action = 0
         try:
-            # Forensic Filters (RELAXED to 0.96)
-            # We filter OUT extreme entropy/VPIN to avoid trading in chaos.
+            # Forensic Filters (RELAXED to 0.98)
+            # We filter OUT extreme entropy/VPIN to avoid trading in chaos,
+            # but allow higher noise (0.98) for M5 timeframe.
             entropy_val = features.get('entropy', 0.0)
-            entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.96)
+            entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.98)
             
             if entropy_val > entropy_thresh:
                 stats['High Entropy'] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"Max Entropy ({entropy_val:.2f})"})
 
             vpin_val = features.get('vpin', 0.0)
-            vpin_thresh = CONFIG['microstructure'].get('vpin_threshold', 0.96)
+            vpin_thresh = CONFIG['microstructure'].get('vpin_threshold', 0.98)
             
             if vpin_val > vpin_thresh:
                 stats['High VPIN'] += 1
@@ -256,7 +258,8 @@ class MultiAssetPredictor:
             )
 
             # Decision Logic
-            min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.51)
+            # AUDIT FIX: Raised floor to 0.55 to reduce churn
+            min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
             volatility = features.get('volatility', 0.001)
 
             # --- STANDARD AI LOGIC ---

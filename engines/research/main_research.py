@@ -5,12 +5,11 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (SNIPER MODE):
-# 1. SEARCH SPACE: Shifted params to High Patience (Grace 100+) & Low Delta.
-# 2. VISIBILITY: EmojiCallback prints 'Autopsy' for PRUNED trials (Gate Rejections).
-# 3. METRIC: Optimized for SQN + Profit Factor (Sustainable Alpha).
-# 4. DATA: Enforced 2M tick load for robust Volume Bar generation.
-# 5. SNIPER FLOOR: Hardened min_calibrated_probability to > 0.60.
+# AUDIT REMEDIATION (SNIPER MODE V4):
+# 1. OBJECTIVE: Added +1.0 Bonus for >200 trades to reward statistical significance.
+# 2. SEARCH SPACE: Lowered min_calibrated_probability floor to 0.55.
+# 3. FILTERS: Aligned Entropy/VPIN ranges with new relaxed Config (0.98).
+# 4. DRIFT: Added search range for drift_threshold (0.75-1.25).
 # =============================================================================
 import sys
 import os
@@ -197,17 +196,19 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 
                 # REMEDIATION (Step 1): RELAXED FILTER RANGES
                 # Prevent picking extremely low thresholds that filter 100% of data
-                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.90, 0.999), 
-                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.90, 0.999),
+                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.95, 0.999), 
+                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.95, 0.999),
                 
                 'tbm': {
                     # REMEDIATION (Step 2): Reduced range for M5/Volume bars
                     'barrier_width': trial.suggest_float('barrier_width', 1.0, 3.0),
-                    'horizon_minutes': trial.suggest_int('horizon_minutes', 15, 120)
+                    'horizon_minutes': trial.suggest_int('horizon_minutes', 15, 120),
+                    # AUDIT: Drift Threshold search (0.75 - 1.25)
+                    'drift_threshold': trial.suggest_float('drift_threshold', 0.75, 1.25)
                 },
-                # SNIPER MODE: Hardened Probability Floor (>0.60)
-                # We stop the bot from guessing on coin flips (0.51).
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.60, 0.75)
+                # SNIPER MODE: Hardened Probability Floor (>0.55)
+                # Lowered from 0.60 to 0.55 per Audit V37
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.55, 0.75)
             })
             
             # Instantiate Pipeline locally
@@ -242,13 +243,18 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sharpe", metrics['sharpe'])
             
             # --- CRITICAL FIX: PROFIT-BASED OBJECTIVE ---
-            # Score: SQN + (Profit Factor * 2) - Penalties
+            # Score: SQN + (Profit Factor * 2) - Penalties + Bonuses
             
             final_score = metrics['sqn'] + (metrics['profit_factor'] * 2.0)
             
             # Soft Penalty for Low Activity
             min_trades = CONFIG['wfo'].get('min_trades_optimization', 5)
             total_trades = metrics['total_trades']
+            
+            # AUDIT FIX: Volume Bonus (Reward Statistical Significance)
+            # If the model finds >200 trades, we boost the score to encourage this behavior.
+            if total_trades > 200:
+                final_score += 1.0
             
             if total_trades < min_trades:
                 trial.set_user_attr("pruned", True)
