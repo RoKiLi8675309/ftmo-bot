@@ -6,7 +6,7 @@
 # DESCRIPTION: Online Learning Kernel. Manages ARF models, Feature Engineering,
 # Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# AUDIT REMEDIATION (SNIPER MODE V4):
+# PHOENIX STRATEGY UPGRADE (2025-12-23):
 # 1. WEIGHTING: Balanced weights (1.5/1.5) to value all directional signals.
 # 2. FILTERS: Relaxed VPIN/Entropy filters to 0.98 to fix data starvation.
 # 3. CONVICTION: Raised min_calibrated_probability to 0.55.
@@ -146,11 +146,12 @@ class MultiAssetPredictor:
         
         self.bar_counters[symbol] += 1
 
-        # Extract Real Flow
-        buy_vol = getattr(bar, 'buy_vol', bar.volume / 2.0)
-        sell_vol = getattr(bar, 'sell_vol', bar.volume / 2.0)
+        # Extract Real Flow (BVC logic handled inside Feature Engineer if 0)
+        buy_vol = getattr(bar, 'buy_vol', 0.0)
+        sell_vol = getattr(bar, 'sell_vol', 0.0)
 
         # 1. Feature Engineering (Stationary Pipeline)
+        # Updates VPIN, Entropy, and Physics here
         features = fe.update(
             price=bar.close,
             timestamp=bar.timestamp,
@@ -182,11 +183,10 @@ class MultiAssetPredictor:
         
         if resolved_labels:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
-                # --- PROFIT WEIGHTED LEARNING (SNIPER MODE) ---
-                # We apply higher weights to trades that resulted in significant PnL.
-                # This teaches the model to prioritize "Big Moves" over noise.
+                # --- PROFIT WEIGHTED LEARNING (PHOENIX MODE) ---
+                # We apply balanced weights to trades that resulted in significant PnL.
                 
-                # AUDIT FIX: Balanced weighting (1.5/1.5) to treat both sides equally
+                # PHOENIX FIX: Balanced weighting (1.5/1.5) to treat both sides equally
                 w_pos = CONFIG['online_learning'].get('positive_class_weight', 1.5)
                 w_neg = CONFIG['online_learning'].get('negative_class_weight', 1.5)
                 
@@ -216,7 +216,7 @@ class MultiAssetPredictor:
         # 4. Inference
         current_pred_action = 0
         try:
-            # Forensic Filters (RELAXED to 0.98)
+            # Forensic Filters (RELAXED to 0.98 per Phoenix Strategy)
             # We filter OUT extreme entropy/VPIN to avoid trading in chaos,
             # but allow higher noise (0.98) for M5 timeframe.
             entropy_val = features.get('entropy', 0.0)
@@ -258,7 +258,7 @@ class MultiAssetPredictor:
             )
 
             # Decision Logic
-            # AUDIT FIX: Raised floor to 0.55 to reduce churn
+            # PHOENIX FIX: Raised floor to 0.55 to reduce churn
             min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
             volatility = features.get('volatility', 0.001)
 

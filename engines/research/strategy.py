@@ -5,7 +5,7 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
-# AUDIT REMEDIATION (SNIPER MODE V4):
+# PHOENIX STRATEGY UPGRADE (2025-12-23):
 # 1. DISCOVERY: Increased Discovery Size to 0.2 (20%) to bootstrap positives.
 # 2. GATES: Added Efficiency Ratio (ER) > 0.4 hard gate to filter chop.
 # 3. DRIFT: Updated default Drift Threshold to 1.0.
@@ -133,11 +133,11 @@ class ResearchStrategy:
         except Exception:
             timestamp = 0.0
 
-        # Flow Volumes
+        # Flow Volumes (from Aggregated Bars)
         buy_vol = snapshot.get_price(self.symbol, 'buy_vol')
         sell_vol = snapshot.get_price(self.symbol, 'sell_vol')
         
-        # Fallback to Tick Rule if flow missing
+        # Fallback to Tick Rule if flow missing (should be handled by aggregator, but safe guard)
         if buy_vol == 0 and sell_vol == 0:
             if self.last_price > 0:
                 if price > self.last_price:

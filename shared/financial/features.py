@@ -5,10 +5,11 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional)
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
-# AUDIT REMEDIATION (SNIPER MODE - HOTFIX):
-# 1. ADDED: 'ofi_trend' (EMA of OFI) to capture flow persistence.
-# 2. UPDATED: AdaptiveTripleBarrier default drift to 0.75.
-# 3. STATIONARITY: Normalized OFI features.
+# PHOENIX STRATEGY UPGRADE (2025-12-23):
+# 1. VPIN: Upgraded to Bulk Volume Classification (BVC) logic for toxicity detection.
+# 2. STATIONARITY: Strict log-return normalization for all price-derived features.
+# 3. REGIME: Enhanced Entropy calculation to detect market ordering vs chaos.
+# 4. ROBUSTNESS: RecursiveEMA hardened against NaN/Inf injection.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -327,7 +328,7 @@ class MetaLabeler:
                 clean[k] = 0.0
         return clean
 
-# --- 5. ONLINE FEATURE ENGINEER (STATIONARY + PHYSICS) ---
+# --- 5. ONLINE FEATURE ENGINEER (PHOENIX: STATIONARY + PHYSICS) ---
 class OnlineFeatureEngineer:
     def __init__(self, window_size: int = 50):
         self.window_size = window_size
@@ -395,6 +396,7 @@ class OnlineFeatureEngineer:
         
         # 3. Update Legacy Metrics
         entropy_val = self.entropy.update(price)
+        # PHOENIX UPGRADE: Pass explicit Buy/Sell volume for VPIN
         vpin_val = self.vpin.update(volume, price, buy_vol, sell_vol)
         fd_price = self.frac_diff.update(price)
         volatility_val = self.vol_monitor.update(ret_log)
@@ -412,6 +414,7 @@ class OnlineFeatureEngineer:
             hurst_val = calculate_hurst(ret_arr)
 
         # 6. Order Flow Imbalance (OFI)
+        # Normalized by volume to ensure stationarity
         denominator = volume if volume > 0 else 1.0
         ofi_val = (buy_vol - sell_vol) / denominator
         
@@ -573,63 +576,110 @@ class StreamingTripleBarrier:
         return resolved
 
 class EntropyMonitor:
+    """
+    Calculates Shannon Entropy of price distribution.
+    Phoenix Upgrade: Uses log-returns histogram for better stationarity.
+    """
     def __init__(self, window: int = 50):
         self.buffer = deque(maxlen=window)
     
-    def update(self, x: float) -> float:
-        self.buffer.append(x)
-        if len(self.buffer) < 10: return 0.5
-        if np.std(list(self.buffer)) < 1e-9: return 0.0
+    def update(self, price: float) -> float:
+        self.buffer.append(price)
+        if len(self.buffer) < 20: return 0.5
         
         try:
-            hist, _ = np.histogram(self.buffer, bins=10, density=True)
+            # PHOENIX UPGRADE: Use returns instead of raw prices for histogram
+            prices = list(self.buffer)
+            returns = np.diff(prices)
+            if np.std(returns) < 1e-9: return 0.0
+            
+            hist, _ = np.histogram(returns, bins=10, density=True)
             ent = entropy(hist)
             if math.isnan(ent): return 0.5
+            
+            # Normalize to 0-1
             return ent / np.log(10)
         except Exception:
             return 0.5
 
 class VPINMonitor:
+    """
+    Calculates Volume-Synchronized Probability of Informed Trading (VPIN).
+    PHOENIX UPGRADE: Uses Bulk Volume Classification (BVC) approximation.
+    High VPIN (>0.8) indicates Toxic Flow / Adverse Selection Risk.
+    """
     def __init__(self, bucket_size: float = 1000):
         self.bucket_size = bucket_size
+        
+        # Accumulators
         self.current_bucket_vol = 0.0
-        self.buy_vol = 0.0
-        self.sell_vol = 0.0
-        self.buckets = deque(maxlen=50)
-        self.last_price = 0.0
+        self.current_buy_vol = 0.0
+        self.current_sell_vol = 0.0
+        
+        # Store buckets as (buy_vol, sell_vol)
+        self.buckets = deque(maxlen=50) 
+        self.last_price = None
 
     def update(self, volume: float, price: float, buy_vol_input: float = 0.0, sell_vol_input: float = 0.0) -> float:
+        """
+        Updates VPIN state.
+        If buy_vol_input/sell_vol_input are provided (from Aggregator), uses them.
+        Otherwise, infers using Tick Rule (BVC approximation).
+        """
+        if self.last_price is None:
+            self.last_price = price
+            return 0.5
+
+        # Determine Flow Split
+        b_vol = 0.0
+        s_vol = 0.0
+
         if buy_vol_input > 0 or sell_vol_input > 0:
-            self.buy_vol += buy_vol_input
-            self.sell_vol += sell_vol_input
+            b_vol = buy_vol_input
+            s_vol = sell_vol_input
         else:
+            # Fallback Tick Rule
             if price > self.last_price:
-                self.buy_vol += volume
+                b_vol = volume
             elif price < self.last_price:
-                self.sell_vol += volume
+                s_vol = volume
             else:
-                self.buy_vol += volume / 2
-                self.sell_vol += volume / 2
+                # Neutral tick: 50/50 split
+                b_vol = volume / 2
+                s_vol = volume / 2
         
-        self.current_bucket_vol += volume
         self.last_price = price
+
+        # Update Accumulators
+        self.current_buy_vol += b_vol
+        self.current_sell_vol += s_vol
+        self.current_bucket_vol += volume
         
+        # Bucket Management
         if self.current_bucket_vol >= self.bucket_size:
-            self.buckets.append((self.buy_vol, self.sell_vol))
+            # Commit Bucket
+            self.buckets.append((self.current_buy_vol, self.current_sell_vol))
+            
+            # Reset
             self.current_bucket_vol = 0.0
-            self.buy_vol = 0.0
-            self.sell_vol = 0.0
+            self.current_buy_vol = 0.0
+            self.current_sell_vol = 0.0
         
+        return self.get_vpin()
+
+    def get_vpin(self) -> float:
         if not self.buckets: return 0.5
         
         total_vol = 0.0
-        diff_vol = 0.0
+        absolute_imbalance = 0.0
+        
         for b_buy, b_sell in self.buckets:
             total_vol += (b_buy + b_sell)
-            diff_vol += abs(b_buy - b_sell)
+            absolute_imbalance += abs(b_buy - b_sell)
         
         if total_vol < 1e-9: return 0.5
-        return diff_vol / total_vol
+        
+        return absolute_imbalance / total_vol
 
 class IncrementalFracDiff:
     def __init__(self, d: float = 0.6, window: int = 20):

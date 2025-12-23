@@ -1,12 +1,13 @@
 # =============================================================================
-# config.yaml – FTMO PROFIT MODE V38.0 (PROFIT FIX)
-# STATUS: SNIPER MODE V5 (AGGRESSIVE SIZING)
+# config.yaml – PHOENIX STRATEGY V1.0 (AUDIT REMEDIATION)
+# STATUS: ONLINE LEARNING ACTIVATED (RIVER ARF + VPIN)
 #
 # REMEDIATION LOG (2025-12-23):
-# 1. SIZING: Increased Kelly Fraction to 0.40 (was 0.10) to fix micro-lot issue.
-# 2. VOLATILITY: Increased Target Annual Vol to 0.50 to seek higher returns.
-# 3. FILTERS: Maintained relaxed 0.98 thresholds.
-# 4. OBJECTIVE: Focused on getting PnL per trade > $5.00.
+# 1. FILTERS: Relaxed Entropy/VPIN to 0.98 to fix data starvation (~90% rejection).
+# 2. DRIFT: Tightened Drift Threshold to 1.0 to reduce Class 0 (Noise) labels.
+# 3. WEIGHTS: Balanced weights (Pos 1.5 / Neg 1.5) to amplify all directional signals.
+# 4. GATES: Lowered Volatility Gate to 2.5x Spread to capture M5 moves.
+# 5. CONVICTION: Raised Min Probability to 0.55 to reduce low-confidence churn.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -105,7 +106,7 @@ features:
   
   d1_ema_period: 200
   entropy_window: 100
-  # RELAXED: 0.98 to fix starvation
+  # RELAXED: 0.98 to fix starvation (allow chaotic but profitable volatility)
   entropy_threshold: 0.98
   ofi_alpha: 0.1
   
@@ -139,12 +140,9 @@ risk_management:
   
   # AUDIT FIX: Volatility Targeting
   sizing_method: "volatility_targeting"
-  
-  # PROFIT FIX: Increased Target Vol to 0.50 (Aggressive)
-  target_annual_volatility: 0.50 
-  
-  # PROFIT FIX: Increased Kelly to 0.40 to allow decent sizing
-  kelly_fraction: 0.40
+  target_annual_volatility: 0.25 
+  # SAFETY: Reduced to 0.10 for survival
+  kelly_fraction: 0.10
   
   base_risk_per_trade_percent: 0.5
   max_leverage: 10 # Capped significantly to prevent ruin
@@ -154,7 +152,7 @@ risk_management:
   # Constraints
   max_daily_loss_pct: 0.04
   max_total_loss_pct: 0.09
-  max_risk_percent: 2.0 # Relaxed cap to allow VolTargeting to work
+  max_risk_percent: 1.0
   hard_stop_equity_usd: 80000.0
   max_trades_per_day: 50
   correlation_penalty_threshold: 0.7
@@ -218,6 +216,7 @@ online_learning:
   delta: 0.00001
   
   # CRITICAL FIX: WEIGHTING
+  # Balanced weighting (1.5x) to encourage both Buy/Sell signals over noise
   positive_class_weight: 1.5
   negative_class_weight: 1.5
   
@@ -228,19 +227,20 @@ online_learning:
   lambda_value: 6
   
   learning_horizon_sec: 300
+  # TIGHTENED: 0.55 reduces churn/low-confidence trades
   min_calibrated_probability: 0.55
   
   tbm:
     horizon_minutes: 30
     barrier_width: 2.0 # Standard deviation width
     min_profit_pips: 5.0
-    # AUDIT: Tightened to 1.0 to require stronger moves
+    # AUDIT: Tightened to 1.0 to require stronger moves for Class 0 separation
     drift_threshold: 1.0
     
   # AUDIT FIX: Volatility Gate Settings
   volatility_gate:
     enabled: true
-    min_atr_spread_ratio: 2.5 # Relaxed to capture M5 moves
+    min_atr_spread_ratio: 2.5 # Relaxed from 3.0 to 2.5 to capture M5 moves
 
 # --- FORENSIC AUDIT ---
 forensic_audit:
