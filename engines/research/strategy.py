@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
-# AUDIT REMEDIATION (PROFIT WEIGHTED LEARNING):
-# 1. ADDED: Realized Return capture from Labeler.
-# 2. ADDED: Log-weighted sample learning (Big Wins = Big Weights).
-# 3. FIXED: Epsilon-Greedy logic.
+# AUDIT REMEDIATION (FIXED):
+# 1. CRITICAL FIX: Assigned trade_intent.action BEFORE risk validation check.
+# 2. PROFIT WEIGHTED LEARNING: Log-weighted sample learning enabled.
+# 3. DISCOVERY MODE: Epsilon-Greedy logic preserved.
 # =============================================================================
 import logging
 import sys
@@ -352,8 +352,15 @@ class ResearchStrategy:
             atr=current_atr
         )
 
-        # 3. SAFETY: Check if Risk Manager Rejected the trade
-        if trade_intent.volume <= 0 or trade_intent.action == "HOLD":
+        # --- FIX START: Assign Action BEFORE Risk Check ---
+        # RiskManager returns a generic "HOLD" action by default because it doesn't know direction.
+        # We MUST overwrite it with our intended action (BUY/SELL) so we don't self-reject.
+        trade_intent.action = action 
+        # --- FIX END ---
+
+        # 3. SAFETY: Check if Risk Manager Rejected the trade (Volume <= 0)
+        # Note: We removed the check for 'action == HOLD' because we just manually set it above.
+        if trade_intent.volume <= 0:
             self.rejection_stats[f"Risk: {trade_intent.comment}"] += 1
             return
 

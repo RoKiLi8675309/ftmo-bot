@@ -6,7 +6,8 @@
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
 # AUDIT FIX (2025-12-23):
-# 1. VISIBILITY FIX: EmojiCallback now prints Autopsy even if trial is PRUNED.
+# 1. PARAMETER SAFETY: Adjusted Entropy/VPIN ranges to prevent self-sabotage.
+# 2. VISIBILITY FIX: EmojiCallback now prints Autopsy even if trial is PRUNED.
 #    This allows us to see *why* trades were rejected (e.g. Risk, VPIN).
 # =============================================================================
 import sys
@@ -190,9 +191,10 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'grace_period': trial.suggest_int('grace_period', 20, 100),
                 'delta': trial.suggest_float('delta', 0.0001, 0.01, log=True),
                 
-                # REMEDIATION (Step 1): Widened Range
-                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.60, 0.99),
-                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.60, 0.99),
+                # REMEDIATION (Step 1): SAFE Entropy/VPIN ranges
+                # Prevent picking extremely low thresholds that filter 100% of data
+                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.85, 0.999), 
+                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.85, 0.999),
                 
                 'tbm': {
                     # REMEDIATION (Step 2): Reduced range for M5/Volume bars
