@@ -292,6 +292,11 @@ class ResearchStrategy:
             atr=current_atr
         )
 
+        # 3. SAFETY: Check if Risk Manager Rejected the trade due to low volatility
+        if trade_intent.volume <= 0 or trade_intent.action == "HOLD":
+            self.rejection_stats[f"RiskManager: {trade_intent.comment}"] += 1
+            return
+
         qty = trade_intent.volume
         stop_dist = trade_intent.stop_loss
         tp_dist = trade_intent.take_profit

@@ -8,6 +8,7 @@
 # AUDIT FIX (2025-12-23):
 # 1. FIXED: Removed hardcoded STANDARD_LOT_UNITS inside calculation.
 # 2. FIXED: Injected contract_size dynamically from config/args.
+# 3. SAFETY: Added 'min_volatility_pips' to prevent trading dead pairs.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -131,9 +132,9 @@ class RiskManager:
     ) -> Tuple[Trade, float]:
         """
         Calculates position size using Inverse-Volatility Sizing (Audit Compliant).
-        Logic: Risk Amount is fixed (0.2%), Volume scales inversely with ATR.
+        Logic: Risk Amount is fixed, Volume scales inversely with ATR.
         
-        UPDATED (2025-12-23): Defaults to 0.2% risk to target 10% profit in 90 days.
+        SAFETY FIX: Adds a check for minimum ATR to prevent over-leveraging on dead pairs.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -181,10 +182,14 @@ class RiskManager:
             # REFINEMENT: Log fallback usage for debugging
             logger.debug(f"{symbol}: ATR Fallback Used (ATR={atr})")
 
-        # Safety Check: Invalid Stop Distance (Minimum 5 pips)
+        # --- DEAD PAIR PROTECTION (SAFETY FLOOR) ---
+        # If ATR is too small relative to spread (e.g. < 5 pips), we must NOT trade.
+        # Spreads + Commissions will eat the profit.
         pip_val, _ = RiskManager.get_pip_info(symbol)
-        if stop_dist < (pip_val * 5):
-            stop_dist = pip_val * 10 # Minimum 10 pips safety if volatility collapses or data is flat
+        min_pips_req = 5.0 # Absolute minimum movement required
+        
+        if stop_dist < (pip_val * min_pips_req):
+             return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, f"Low Volatility (<{min_pips_req} pips)"), 0.0
 
         sl_pips = stop_dist / pip_val
 
@@ -220,7 +225,7 @@ class RiskManager:
 
         # Constraints
         min_lot = risk_conf.get('min_lot_size', 0.01)
-        max_lot = risk_conf.get('max_lot_size', 50.0)
+        max_lot = risk_conf.get('max_lot_size', 50.0) # Used to be 50, config now clamps this
         lots = max(min_lot, min(lots, max_lot))
         lots = round(lots, 2)
         
