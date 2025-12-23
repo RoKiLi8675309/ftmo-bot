@@ -5,10 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
-# AUDIT REMEDIATION (FIXED):
-# 1. CRITICAL FIX: Assigned trade_intent.action BEFORE risk validation check.
-# 2. PROFIT WEIGHTED LEARNING: Log-weighted sample learning enabled.
-# 3. DISCOVERY MODE: Epsilon-Greedy logic preserved.
+# AUDIT REMEDIATION (PROFITABILITY FIX):
+# 1. DISCOVERY SAFETY: Raised bias threshold from 0.05 to 0.40 (Stop random noise).
+# 2. CHEAP LEARNING: Discovery trades now use 10% of normal risk (0.1 scalar).
+# 3. KELLY FIX: Honest confidence reporting to Risk Manager.
+# 4. BUG FIX: Variable name mismatch (discovery_mode -> discovery_triggered).
 # =============================================================================
 import logging
 import sys
@@ -160,37 +161,25 @@ class ResearchStrategy:
         self.bars_processed += 1
 
         # B. Delayed Training (Label Resolution via Adaptive Barrier)
-        # UPDATED: Unpack realized_ret for Weighted Learning
         resolved_labels = self.labeler.resolve_labels(high, low, current_close=price)
         
         if resolved_labels:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
                 # --- PROFIT WEIGHTED LEARNING ---
-                # Weight = Base Weight * Log(1 + |Return| * 100)
-                # Helps model focus on the Trades that made MONEY, not just small wiggles.
-                
                 w_pos = self.params.get('positive_class_weight', 10.0)
                 w_neg = self.params.get('negative_class_weight', 1.0)
                 
                 base_weight = w_pos if outcome_label != 0 else w_neg
                 
-                # Dynamic Scalar: Returns are typically 0.001 to 0.01. 
-                # Multiply by 100 to get percentage like 0.1 to 1.0.
-                # log(1 + 1.0) = 0.69. log(1 + 0.1) = 0.09.
-                # Big wins get ~7x more weight than small wins.
+                # Scale by Profit Magnitude
                 ret_scalar = math.log1p(abs(realized_ret) * 100.0)
-                
-                # Clamp scalar to avoid exploding gradients/weights (min 0.5 for stability)
                 ret_scalar = max(0.5, ret_scalar)
                 
                 final_weight = base_weight * ret_scalar
                 
                 self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
                 
-                # Update Meta Labeler (Gatekeeper)
                 if outcome_label != 0:
-                    # Meta Labeler learns: "Given these features + action, did we profit?"
-                    # We treat realized_ret > 0 as profit
                     self.meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
 
         # C. Add CURRENT Bar as new Trade Opportunity
@@ -229,10 +218,11 @@ class ResearchStrategy:
             # E. Execution Logic & Discovery Override
             dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
             
-            # --- DISCOVERY MODE LOGIC (AGGRESSIVE FIX) ---
-            # If we are in the early phase (first 2500 bars), and the model is
-            # predicting 0 (Hold), we check if there is ANY bias in probability.
-            # If so, we FORCE an action to generate PnL data.
+            # --- PROFITABLE DISCOVERY LOGIC ---
+            # Instead of purely random trades, we only force a trade if the model
+            # shows a HINT of bias (> 0.40). We verify 50/50 guesses.
+            # CRITICAL: We reduce risk size for discovery trades.
+            
             is_discovery = self.bars_processed < 2500
             effective_action = pred_action
             discovery_triggered = False
@@ -240,19 +230,17 @@ class ResearchStrategy:
             if is_discovery and effective_action == 0:
                 max_prob = max(prob_buy, prob_sell)
                 
-                # 1. Cold Start Epsilon-Greedy (20% Random Exploration)
-                # Fixes paralysis when model probabilities are exactly 0.0 (fresh model)
+                # 1. Cold Start: Epsilon Greedy (Rare: 10%)
                 if max_prob == 0.0:
-                    if random.random() < 0.2:  # 20% chance to force trade
+                    if random.random() < 0.1:  
                         effective_action = random.choice([1, -1])
                         discovery_triggered = True
                 
-                # 2. Weak Signal Amplification (Bias Check)
-                # Only runs if model has some opinion (max_prob > 0)
+                # 2. Bias Amplification (Must show some conviction)
+                # Raised threshold from 0.05 to 0.40 to stop trading noise
                 else:
-                    # AGGRESSIVE: If model is even 5% confident in a direction, take it.
-                    bias_buy = prob_buy > 0.05
-                    bias_sell = prob_sell > 0.05
+                    bias_buy = prob_buy > 0.40
+                    bias_sell = prob_sell > 0.40
                     
                     if bias_buy and prob_buy > prob_sell:
                         effective_action = 1
@@ -261,8 +249,7 @@ class ResearchStrategy:
                         effective_action = -1
                         discovery_triggered = True
                 
-                # 3. Fallback: Momentum Injection (Volatility Breakout)
-                # If neither epsilon nor bias triggered, but volatility is high, trade the trend.
+                # 3. Volatility Breakout Fallback
                 if not discovery_triggered and features.get('vol_breakout', 0) > 0:
                     ret = features.get('return_raw', 0)
                     if ret > 0:
@@ -288,9 +275,14 @@ class ResearchStrategy:
             # --- EXECUTION ---
             if effective_action == 1 or effective_action == -1:
                 if is_profitable:
+                        # For AI trades, use actual probability.
+                        # For Discovery trades, use a fixed conservative confidence for Kelly
                         confidence = prob_buy if effective_action == 1 else prob_sell
-                        # Ensure confidence isn't 0.0 passed to risk manager
-                        if confidence < 0.01: confidence = 0.5
+                        
+                        # --- FIX: USE discovery_triggered NOT discovery_mode ---
+                        if discovery_triggered:
+                            # Clamp confidence for Risk Manager to be safe
+                            confidence = 0.25 
                         
                         self._execute_logic(confidence, price, features, broker, dt_timestamp, effective_action, discovery_triggered)
                 else:
@@ -315,10 +307,9 @@ class ResearchStrategy:
     def _execute_logic(self, confidence, price, features, broker, timestamp: datetime, action_int: int, discovery_mode: bool):
         """Decides whether to enter a trade using Inverse-Volatility Sizing."""
         
-        # 1. Signal Threshold
+        # 1. Signal Threshold (Only applies to AI trades, not Discovery)
         min_prob = self.params.get('min_calibrated_probability', 0.50)
         
-        # --- DISCOVERY MODE OVERRIDE ---
         if not discovery_mode:
             if confidence < min_prob:
                 self.rejection_stats['Low Confidence'] += 1
@@ -344,27 +335,31 @@ class ResearchStrategy:
 
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
-            # If discovery mode, pretend we have valid confidence to get a non-zero size
-            conf=confidence if not discovery_mode else 0.5,
+            conf=confidence,
             volatility=volatility,
             active_correlations=0,
             market_prices=self.last_price_map,
             atr=current_atr
         )
 
-        # --- FIX START: Assign Action BEFORE Risk Check ---
-        # RiskManager returns a generic "HOLD" action by default because it doesn't know direction.
-        # We MUST overwrite it with our intended action (BUY/SELL) so we don't self-reject.
+        # --- CRITICAL FIX: Assign Action Explicitly ---
         trade_intent.action = action 
-        # --- FIX END ---
 
-        # 3. SAFETY: Check if Risk Manager Rejected the trade (Volume <= 0)
-        # Note: We removed the check for 'action == HOLD' because we just manually set it above.
+        # 3. SAFETY: Check if Risk Manager Rejected the trade
         if trade_intent.volume <= 0:
             self.rejection_stats[f"Risk: {trade_intent.comment}"] += 1
             return
 
         qty = trade_intent.volume
+        
+        # --- CHEAP LEARNING: Slash size for Discovery Trades ---
+        if discovery_mode:
+            qty = qty * 0.1  # Take 1/10th of the calculated risk
+            # Ensure we don't go below min lot size (usually 0.01)
+            qty = max(0.01, qty)
+            # Log it for clarity in comments
+            trade_intent.comment += "|DISC_SIZE"
+
         stop_dist = trade_intent.stop_loss
         tp_dist = trade_intent.take_profit
 

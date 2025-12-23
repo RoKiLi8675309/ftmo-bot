@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – FTMO PROFIT MODE V34.0 (AUDIT FIXED)
-# STATUS: PHASE 9 - PROFIT WEIGHTED LEARNING & RISK FIX
+# config.yaml – FTMO PROFIT MODE V34.1 (PROFIT FIX)
+# STATUS: PHASE 9 - CHEAP LEARNING ACTIVATED
 #
 # REMEDIATION LOG (2025-12-23):
-# 1. RISK: Fixed "Death by Spread" (min_stop_loss now dynamic).
-# 2. LEARNING: Enabled Profit-Weighted Samples.
-# 3. FEATURES: Added Lagged Returns & Candle Physics.
+# 1. RISK: Dynamic Stop Loss Clamping enabled.
+# 2. LEARNING: Profit-Weighted Samples + Cheap Discovery (0.1x Risk).
+# 3. FEATURES: Lagged Returns & Candle Physics.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -114,7 +114,7 @@ features:
 # --- MICROSTRUCTURE FILTERS ---
 microstructure:
   vpin_bucket_size: 1000
-  vpin_threshold: 0.85 # RELAXED: From 0.90 to 0.85
+  vpin_threshold: 0.90 # RELAXED: Allow more data flow
   er_threshold_noise: 0.30
   er_threshold_trend: 0.60
   hurst_threshold_mean_revert: 0.45
@@ -155,11 +155,11 @@ risk_management:
   # Execution Guardrails
   min_lot_size: 0.01
   max_lot_size: 10.0
-  min_stop_loss_pips: 5.0 # Deprecated in code by dynamic calc, kept for legacy config compat
+  min_stop_loss_pips: 5.0 
   max_loss_usd: 2000.0
   
   # Adaptive Stops (Optimized for M5)
-  stop_loss_atr_mult: 2.0 # WIDENED: Give trades room to breathe
+  stop_loss_atr_mult: 1.5 
   take_profit_atr_mult: 3.0 # High R:R
 
 # --- TRADING PORTFOLIO ---
