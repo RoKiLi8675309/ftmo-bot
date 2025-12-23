@@ -140,8 +140,8 @@ risk_management:
   contract_size: 100000 # Default Forex size. Override in logic for others.
   
   # Constraints
-  max_daily_loss_pct: 0.05
-  max_total_loss_pct: 0.10
+  max_daily_loss_pct: 0.04
+  max_total_loss_pct: 0.09
   max_risk_percent: 0.5 # Hard Cap
   hard_stop_equity_usd: 80000.0
   max_trades_per_day: 50
@@ -199,7 +199,7 @@ news_filter:
 
 # --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 100
+  n_trials: 10
   train_years: 2
   test_months: 6
   min_trades_optimization: 3 # LOWERED: From 5 to 3 to prevent over-pruning

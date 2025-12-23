@@ -8,9 +8,8 @@
 # FORENSIC REMEDIATION LOG (2025-12-23):
 # 1. PARALYSIS CURE: Relaxed VPIN/Entropy to 0.75 (Dynamic via params).
 # 2. REWARD SHAPING: Implemented 10:1 Weighted Learning for profitable signals.
-# 3. AUTOPSY: Enhanced rejection tracking with 'Analysis Paralysis' detection.
+# 3. SHORT SELLING FIX: Enabled support for Class -1 (Sell) in training and execution.
 # 4. DRIFT: Logic updated to handle new 'soft' labels from AdaptiveTripleBarrier.
-# 5. AUDIT FIX: Added visibility into Burn-In progress.
 # =============================================================================
 import logging
 import sys
@@ -165,23 +164,19 @@ class ResearchStrategy:
         if resolved_labels:
             for (stored_feats, outcome_label) in resolved_labels:
                 # --- CONTINUOUS REWARD SHAPING (SIMULATED VIA WEIGHTS) ---
-                # Instead of continuous labels (which break ARFClassifier), we use
-                # heavy sample weights for profitable trades (label=1).
-                
-                # Fetch weights from params (defaulting to Aggressive 10:1)
+                # Fetch weights from params
                 w_pos = self.params.get('positive_class_weight', 10.0)
                 w_neg = self.params.get('negative_class_weight', 1.0)
                 
                 # Apply Weighting:
-                # If outcome is 1 (Success/Drift), we weight it heavily to force the model
-                # to "remember" this rare profitable setup.
-                weight = w_pos if outcome_label == 1 else w_neg
+                # Weight heavily if outcome is meaningful (1 or -1). Noise (0) gets normal weight.
+                weight = w_pos if outcome_label != 0 else w_neg
                 
                 self.model.learn_one(stored_feats, outcome_label, sample_weight=weight)
                 
-                # Update Meta Labeler (Gatekeeper)
-                # We assume the primary model predicted 1 for the sake of meta-training
-                self.meta_labeler.update(stored_feats, primary_action=1, outcome_pnl=1.0 if outcome_label==1 else -1.0)
+                # Update Meta Labeler (Gatekeeper) - Assuming we only meta-label if there's a direction
+                if outcome_label != 0:
+                    self.meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=1.0)
 
         # C. Add CURRENT Bar as new Trade Opportunity
         current_atr = features.get('atr', 0.0)
@@ -192,7 +187,6 @@ class ResearchStrategy:
             # --- FILTER RELAXATION (Fix "Analysis Paralysis") ---
             # 1. Entropy Filter
             entropy_val = features.get('entropy', 0)
-            # Default to 0.75 (Relaxed) if not optimized
             entropy_thresh = self.params.get('entropy_threshold', 0.75) 
             
             if entropy_val > entropy_thresh:
@@ -201,7 +195,6 @@ class ResearchStrategy:
 
             # 2. VPIN Filter (Microstructure)
             vpin_val = features.get('vpin', 0)
-            # Default to 0.75 (Relaxed)
             vpin_thresh = self.params.get('vpin_threshold', 0.75)
             
             if vpin_val > vpin_thresh: 
@@ -224,7 +217,6 @@ class ResearchStrategy:
             dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
             
             # --- META LABELING (COLD START BYPASS) ---
-            # If we haven't seen 50 events yet, assume it's good to force data collection.
             if self.meta_label_events < 50:
                 is_profitable = True
             else:
@@ -237,7 +229,7 @@ class ResearchStrategy:
             self.meta_label_events += 1
 
             # --- PURE AI LOGIC ---
-            if pred_action == 1:
+            if pred_action == 1 or pred_action == -1:
                 if is_profitable:
                         self._execute_logic(prob_buy, prob_sell, price, features, broker, dt_timestamp, pred_action)
                 else:
@@ -312,7 +304,7 @@ class ResearchStrategy:
             sl_price = price - stop_dist
             tp_price = price + tp_dist
             side = 1
-        else:
+        else: # SELL
             sl_price = price + stop_dist
             tp_price = price - tp_dist
             side = -1

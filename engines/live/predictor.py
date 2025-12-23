@@ -6,14 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages ARF models, Feature Engineering,
 # Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# FORENSIC REMEDIATION LOG (2025-12-22):
-# 1. REMOVED AGGRESSIVE MODE: Deleted 'aggressive' parameter and logic.
+# FORENSIC REMEDIATION LOG (2025-12-23):
+# 1. SHORT SELLING ENABLED: Logic updated to execute on prediction class -1.
 # 2. WEIGHTED LEARNING: Implemented sample_weight (5.0) in model training.
-# 3. ADAPTIVE BARRIERS: Integrated AdaptiveTripleBarrier for ATR-based labeling.
-# 4. WARM-UP: Enforced 'burn_in_periods' gate.
-# 5. PARALYSIS FIX: Lowered confidence floor (0.50) and relaxed Entropy (0.85+).
-# 6. FILTER FIX: VPIN threshold now dynamic (0.85) instead of hardcoded (0.95).
-# 7. LOGGING: Added Rejection Stats to track "Analysis Paralysis" reasons.
+# 3. PARALYSIS FIX: Lowered confidence floor (0.50) and relaxed Entropy (0.85+).
+# 4. FILTER FIX: VPIN threshold now dynamic (0.85) instead of hardcoded (0.95).
 # =============================================================================
 import logging
 import pickle
@@ -115,7 +112,7 @@ class MultiAssetPredictor:
                     leaf_prediction='mc',
                     max_features='log2',
                     lambda_value=conf['lambda_value'],
-                    metric=metrics.Recall() # Optimization Target: RECALL (Prioritize finding trades)
+                    metric=metrics.F1() # Optimization Target: F1 (Balanced for -1, 0, 1)
                 )
             )
             
@@ -173,11 +170,11 @@ class MultiAssetPredictor:
         if resolved_labels:
             for (stored_feats, outcome_label) in resolved_labels:
                 # --- PHASE 2: WEIGHTED LEARNING ---
-                # Positive (1) = 5.0, Negative (0) = 1.0 (Balanced for Precision/Recall)
+                # Positive/Negative (Actionable) = 5.0, Noise (0) = 1.0
                 w_pos = CONFIG['online_learning'].get('positive_class_weight', 5.0)
                 w_neg = CONFIG['online_learning'].get('negative_class_weight', 1.0)
                 
-                weight = w_pos if outcome_label == 1 else w_neg
+                weight = w_pos if outcome_label != 0 else w_neg
                 
                 # Train Primary Model
                 model.learn_one(stored_feats, outcome_label, sample_weight=weight)
@@ -212,12 +209,16 @@ class MultiAssetPredictor:
             pred_class = model.predict_one(features)
             pred_proba = model.predict_proba_one(features)
             
-            confidence = pred_proba.get(1, 0.0)
-            
             try:
                 current_pred_action = int(pred_class)
             except:
                 current_pred_action = 0
+
+            # Get Confidence for Specific Action
+            prob_buy = pred_proba.get(1, 0.0)
+            prob_sell = pred_proba.get(-1, 0.0)
+            
+            confidence = prob_buy if current_pred_action == 1 else prob_sell
 
             # Meta-Labeling Check
             meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.55)
@@ -238,11 +239,22 @@ class MultiAssetPredictor:
                         return Signal(symbol, "BUY", confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr})
                     else:
                         stats['Meta Rejected'] += 1
-                        # logger.debug(f"🚫 {symbol} Meta-Labeler Rejected: Prob={confidence:.2f}")
                         return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
                 else:
                     stats['Low Confidence'] += 1
                     return Signal(symbol, "HOLD", confidence, {"reason": f"Low Confidence ({confidence:.2f} < {min_conf})"})
+            
+            elif current_pred_action == -1: # SELL LOGIC
+                if confidence > min_conf:
+                    if is_profitable:
+                        return Signal(symbol, "SELL", confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr})
+                    else:
+                        stats['Meta Rejected'] += 1
+                        return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
+                else:
+                    stats['Low Confidence'] += 1
+                    return Signal(symbol, "HOLD", confidence, {"reason": f"Low Confidence ({confidence:.2f} < {min_conf})"})
+            
             else:
                 stats['Model Predicted 0'] += 1
             

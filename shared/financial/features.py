@@ -7,8 +7,8 @@
 #
 # FORENSIC REMEDIATION LOG (2025-12-23):
 # 1. NEW FEATURES: Added Regime (Hurst), Cumulative OFI, and Volatility Breakout.
-# 2. ROBUSTNESS: Enhanced OnlineFeatureEngineer to track internal EMA/Windows for new feats.
-# 3. COMPATIBILITY: Maintained RecursiveEMA for O(1) streaming updates.
+# 2. ROBUSTNESS: Enhanced OnlineFeatureEngineer to track internal EMA/Windows.
+# 3. LABELING FIX: AdaptiveTripleBarrier now outputs -1 for Downside moves (Sell Signals).
 # =============================================================================
 from __future__ import annotations
 import math
@@ -143,17 +143,14 @@ class StreamingIndicators:
 
         return features
 
-# --- 2. ADAPTIVE TRIPLE BARRIER (PHASE 2 CORE + DRIFT LOGIC) ---
+# --- 2. ADAPTIVE TRIPLE BARRIER (SELL SIGNAL ENABLED) ---
 
 class AdaptiveTripleBarrier:
     """
     Volatility-Adaptive Labeling with Soft Drift Detection.
     Barriers expand/contract based on ATR.
     
-    OPTIMIZATION UPDATE (Section 3.3):
-    If the vertical barrier (timeout) is hit, we check for 'Drift'.
-    If price moved > drift_threshold * ATR in the favorable direction, we label it as 1.
-    This prevents 'Hold' bias in low-volatility regimes.
+    FIXED: Generates -1 labels for downside breaks to enable Shorting.
     """
     def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.2):
         self.buffer = deque()
@@ -164,20 +161,22 @@ class AdaptiveTripleBarrier:
 
     def add_trade_opportunity(self, features: Dict[str, float], entry_price: float, current_atr: float, timestamp: float):
         """
-        Registers a potential trade setup.
+        Registers a potential trade setup (Hypothetical entry at current bar).
         """
         if current_atr <= 0: return
 
         # Dynamic Barriers based on ATR
-        take_profit = entry_price + (self.reward_mult * current_atr)
-        stop_loss = entry_price - (self.risk_mult * current_atr)
+        # Upper Barrier (Profit for Buy, Stop for Sell)
+        upper_barrier = entry_price + (self.reward_mult * current_atr)
+        # Lower Barrier (Stop for Buy, Profit for Sell)
+        lower_barrier = entry_price - (self.risk_mult * current_atr)
 
         self.buffer.append({
             'features': features,
             'entry': entry_price,
-            'tp': take_profit,
-            'sl': stop_loss,
-            'atr': current_atr, # Stored for Drift Calculation
+            'tp': upper_barrier,   # Top Barrier
+            'sl': lower_barrier,   # Bottom Barrier
+            'atr': current_atr,    # Stored for Drift Calculation
             'start_time': timestamp,
             'age': 0
         })
@@ -186,8 +185,10 @@ class AdaptiveTripleBarrier:
         """
         Checks active trades against current price action.
         Returns list of (features, label).
-        Label 1 = Success (TP Hit OR Positive Drift)
-        Label 0 = Failure (SL Hit OR No Drift)
+        
+        Label  1 = UP Move (Buy Signal)
+        Label -1 = DOWN Move (Sell Signal) - FIXED
+        Label  0 = Noise/Hold
         """
         resolved = []
         active = deque()
@@ -202,24 +203,26 @@ class AdaptiveTripleBarrier:
             
             label = None
 
-            # 1. Did price hit TP? (Bullish assumption for label 1)
+            # 1. Did price hit Upper Barrier?
             if current_high >= trade['tp']:
-                label = 1 # HARD SUCCESS
+                label = 1 # BUY SIGNAL
 
-            # 2. Did price hit SL?
+            # 2. Did price hit Lower Barrier?
             elif current_low <= trade['sl']:
-                label = 0 # FAILURE
+                label = -1 # SELL SIGNAL (FIX: Changed from 0 to -1)
 
             # 3. Timeout? (Vertical Barrier)
             elif trade['age'] >= self.time_limit:
                 # --- DRIFT LOGIC (Soft Labeling) ---
                 # Calculate movement relative to entry
                 drift = current_close - trade['entry']
-                # Threshold to consider this a "Win" (e.g. 0.2 * ATR)
+                # Threshold to consider this a signal
                 drift_req = trade['atr'] * self.drift_threshold
                 
                 if drift > drift_req:
-                    label = 1 # SOFT SUCCESS (Captured Momentum)
+                    label = 1 # SOFT BUY (Upward Drift)
+                elif drift < -drift_req:
+                    label = -1 # SOFT SELL (Downward Drift)
                 else:
                     label = 0 # TIMEOUT (True Noise)
 
