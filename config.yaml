@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – FTMO GROWTH MODE V31.1 (AUDIT FIX)
-# STATUS: PHASE 6 - AGGRESSIVE SCALING & FEATURE ENRICHMENT
+# config.yaml – FTMO GROWTH MODE V32.0 (PROFITABILITY FIX)
+# STATUS: PHASE 7 - HIGH R:R & RELAXED FILTERING
 #
-# FORENSIC REMEDIATION LOG (2025-12-23):
-# 1. CRITICAL FIX: Increased num_candles_backtest to 100,000 to surpass burn-in.
-# 2. RISK ADJUSTMENT: base_risk_per_trade_percent raised to 0.2% to target 10% gain.
-# 3. FILTER RELAXATION: VPIN/Entropy lowered to 0.75 to cure "Analysis Paralysis".
-# 4. OPTIMIZATION: Min trades lowered to 3; Positive weight increased to 10.0.
+# REMEDIATION LOG:
+# 1. PARALYSIS FIX: Relaxed Entropy/VPIN to 0.90 to allow data flow.
+# 2. EXPECTANCY FIX: Increased barrier_width default to 3.0 (Targeting 1:3 R:R).
+# 3. PRECISION FIX: Raised min_calibrated_probability to 0.60.
+# 4. EXECUTION: Risk increased to 0.5% per trade to overcome commissions.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -77,9 +77,9 @@ data:
   volume_bar_threshold: 1000
   download_start_date: "2020-01-01"
   num_candles_producer: 50000
-  num_candles_train: 2000000 # Kept high for robust clusters
+  num_candles_train: 2000000 # High data density for robust trees
   num_candles_wfo: 10000
-  num_candles_backtest: 100000 # AUDIT FIX: Increased from 1000 to allow burn-in + trading
+  num_candles_backtest: 200000 # Increased for reliable backtests
 
 # --- FEATURE ENGINEERING ---
 features:
@@ -88,7 +88,7 @@ features:
   use_cache: true
   window_size: 50
   
-  # New Strategy Flags (2025-12-23)
+  # New Strategy Flags
   use_regime: true
   use_cum_ofi: true
   use_vol_breakout: true
@@ -103,7 +103,7 @@ features:
   # Context
   d1_ema_period: 200
   entropy_window: 100
-  entropy_threshold: 0.75 # RELAXED from 0.85 to encourage trading
+  entropy_threshold: 0.90 # RELAXED: From 0.75 to 0.90 to fix Analysis Paralysis
   ofi_alpha: 0.1
   
   fractional_differentiation:
@@ -119,8 +119,8 @@ features:
 # --- MICROSTRUCTURE FILTERS ---
 microstructure:
   vpin_bucket_size: 1000
-  vpin_threshold: 0.75 # RELAXED: Lowered from 0.85 to fix "Analysis Paralysis"
-  er_threshold_noise: 0.30 # LOWERED: Detect trends earlier
+  vpin_threshold: 0.90 # RELAXED: From 0.75 to 0.90
+  er_threshold_noise: 0.30
   er_threshold_trend: 0.60
   hurst_threshold_mean_revert: 0.45
   hurst_threshold_random_low: 0.45
@@ -134,15 +134,15 @@ risk_management:
   
   # Sizing Logic
   sizing_method: "inverse_volatility" 
-  base_risk_per_trade_percent: 0.3 # INCREASED: From 0.1% to 0.3% for Growth
+  base_risk_per_trade_percent: 0.5 # INCREASED: From 0.3% to 0.5% to make winners count
   max_leverage: 30
   commission_per_lot_rt: 5.0
-  contract_size: 100000 # Default Forex size. Override in logic for others.
+  contract_size: 100000
   
   # Constraints
   max_daily_loss_pct: 0.04
   max_total_loss_pct: 0.09
-  max_risk_percent: 0.5 # Hard Cap
+  max_risk_percent: 1.0 # Hard Cap
   hard_stop_equity_usd: 80000.0
   max_trades_per_day: 50
   correlation_penalty_threshold: 0.7
@@ -161,11 +161,11 @@ risk_management:
   min_lot_size: 0.01
   max_lot_size: 50.0
   min_stop_loss_pips: 5.0
-  max_loss_usd: 2000.0 # Adjusted for 0.2% of 100k roughly (with buffer)
+  max_loss_usd: 2000.0
   
   # Adaptive Stops
   stop_loss_atr_mult: 1.5 
-  take_profit_atr_mult: 2.0 # 1:2 Risk:Reward
+  take_profit_atr_mult: 3.0 # TARGET 1:2 or 1:3 R:R Ratio
 
 # --- TRADING PORTFOLIO ---
 trading:
@@ -189,20 +189,20 @@ news_filter:
   enabled: true
   primary_url: "http://nfs.faireconomy.media/ff_calendar_thisweek.xml"
   backup_url: "https://www.forexfactory.com/calendar"
-  buffer_minutes_before: 15
-  buffer_minutes_after: 15
+  buffer_minutes_before: 30 # INCREASED: Safer buffer
+  buffer_minutes_after: 30
   restricted_events: 
-    USD: ["FOMC", "NFP", "CPI", "GDP"]
-    EUR: ["ECB", "CPI"]
-    GBP: ["BOE", "CPI"]
-    JPY: ["BOJ"]
+    USD: ["FOMC", "NFP", "CPI", "GDP", "Rate"]
+    EUR: ["ECB", "CPI", "Rate"]
+    GBP: ["BOE", "CPI", "Rate"]
+    JPY: ["BOJ", "Rate"]
 
 # --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 10
+  n_trials: 100 # INCREASED: From 10 to 100 as requested
   train_years: 2
   test_months: 6
-  min_trades_optimization: 3 # LOWERED: From 5 to 3 to prevent over-pruning
+  min_trades_optimization: 10 # Force optimization to find active strategies
 
 # --- ONLINE LEARNING ---
 online_learning:
@@ -217,25 +217,25 @@ online_learning:
   delta: 0.001
   
   # Weighted Learning
-  positive_class_weight: 10.0 # INCREASED: From 5.0 to 10.0 to capture rare profitable signals
+  positive_class_weight: 10.0
   negative_class_weight: 1.0  
   
   # Meta Labeling
   meta_labeling_threshold: 0.55
   
   # Optimization
-  metric: "F1" # CHANGED: From Recall to F1 for balanced profitability
+  metric: "F1"
   max_features: 'log2'
   lambda_value: 6
   
   learning_horizon_sec: 300
-  min_calibrated_probability: 0.50
+  min_calibrated_probability: 0.60 # INCREASED: Higher conviction required
 
-  # TBM
+  # TBM (Adaptive Labeling)
   tbm:
-    horizon_minutes: 60 
-    barrier_width: 2.0
-    min_profit_pips: 2.0
+    horizon_minutes: 120 
+    barrier_width: 3.0 # Target 3 ATR moves (Big Wins)
+    min_profit_pips: 5.0
 
 # --- FORENSIC AUDIT ---
 forensic_audit:

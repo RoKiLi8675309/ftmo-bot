@@ -6,10 +6,10 @@
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
 # FORENSIC REMEDIATION LOG (2025-12-23):
-# 1. OBJECTIVE: Switched to 'SQN + 2*PF' to prioritize Profitability over Recall.
-# 2. SEARCH SPACE: Widened VPIN/Entropy ranges (0.6-0.95) to fix paralysis.
-# 3. METRIC: Changed River metric to 'F1' for balanced performance.
-# 4. PRUNING: Lowered min_trades to 3 with soft penalties to encourage exploration.
+# 1. OBJECTIVE: 'SQN + 2*PF' prioritized.
+# 2. SEARCH SPACE: Widened VPIN/Entropy (0.6-0.99) to cure paralysis.
+# 3. REWARD TARGET: Barrier Width optimized between 2.0 and 5.0 (High R:R).
+# 4. TRIALS: Supports high trial counts with memory management.
 # =============================================================================
 import sys
 import os
@@ -183,16 +183,17 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'grace_period': trial.suggest_int('grace_period', 20, 100),
                 'delta': trial.suggest_float('delta', 0.0001, 0.01, log=True),
                 
-                # REMEDIATION (Step 1): Widened Range 0.60 -> 0.95 to find "sweet spot"
-                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.60, 0.95),
-                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.60, 0.95),
+                # REMEDIATION (Step 1): Widened Range 0.60 -> 0.99 to find "sweet spot" & FIX PARALYSIS
+                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.60, 0.99),
+                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.60, 0.99),
                 
                 'tbm': {
-                    'barrier_width': trial.suggest_float('barrier_width', 1.5, 4.0),
+                    # REMEDIATION (Step 2): High Barrier Width = High Reward (Target 2.0R to 5.0R)
+                    'barrier_width': trial.suggest_float('barrier_width', 2.0, 5.0),
                     'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 240) 
                 },
-                # REMEDIATION: Lowered floor to 0.45 to catch all possible signals initially
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.45, 0.70)
+                # REMEDIATION (Step 3): Higher confidence floor to ensure precision
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.55, 0.75)
             })
             
             # Instantiate Pipeline locally
@@ -233,7 +234,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             final_score = metrics['sqn'] + (metrics['profit_factor'] * 2.0)
             
             # Soft Penalty for Low Activity
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 3) # Lowered to 3
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 10) # Target at least 10 trades per run
             total_trades = metrics['total_trades']
             
             if total_trades < min_trades:
@@ -478,7 +479,7 @@ class ResearchPipeline:
                 log.warning(f"Study init warning {symbol}: {e}")
 
         # 2. Distribute Workers
-        total_trials_per_symbol = CONFIG['wfo'].get('n_trials', 50)
+        total_trials_per_symbol = CONFIG['wfo'].get('n_trials', 100) # Ensure config aligns with request
         tasks = []
         workers_per_symbol = max(1, self.total_cores // len(self.symbols))
         trials_per_worker = math.ceil(total_trials_per_symbol / workers_per_symbol)
