@@ -7,9 +7,8 @@
 #
 # FORENSIC REMEDIATION LOG (2025-12-23):
 # 1. OBJECTIVE: 'SQN + 2*PF' prioritized.
-# 2. SEARCH SPACE: Widened VPIN/Entropy (0.6-0.99) to cure paralysis.
-# 3. REWARD TARGET: Barrier Width optimized between 2.0 and 5.0 (High R:R).
-# 4. TRIALS: Supports high trial counts with memory management.
+# 2. SEARCH SPACE: Relaxed barrier_width lower bound (1.5) to suit M5.
+# 3. SAFETY: Fixed pruning logic to allow learning from low-volume epochs.
 # =============================================================================
 import sys
 import os
@@ -188,12 +187,13 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'vpin_threshold': trial.suggest_float('vpin_threshold', 0.60, 0.99),
                 
                 'tbm': {
-                    # REMEDIATION (Step 2): High Barrier Width = High Reward (Target 2.0R to 5.0R)
-                    'barrier_width': trial.suggest_float('barrier_width', 2.0, 5.0),
+                    # REMEDIATION (Step 2): Relaxed lower bound to 1.5 for M5 feasibility
+                    # 1.5 * ATR is a standard "Base Hit" target. 5.0 is a "Home Run".
+                    'barrier_width': trial.suggest_float('barrier_width', 1.5, 5.0),
                     'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 240) 
                 },
-                # REMEDIATION (Step 3): Higher confidence floor to ensure precision
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.55, 0.75)
+                # REMEDIATION (Step 3): Lowered floor to 0.50 to allow volume recovery
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.50, 0.75)
             })
             
             # Instantiate Pipeline locally

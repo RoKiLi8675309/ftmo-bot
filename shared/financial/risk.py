@@ -8,7 +8,7 @@
 # AUDIT FIX (2025-12-23):
 # 1. FIXED: Removed hardcoded STANDARD_LOT_UNITS inside calculation.
 # 2. FIXED: Injected contract_size dynamically from config/args.
-# 3. SAFETY: Added 'min_volatility_pips' to prevent trading dead pairs.
+# 3. SAFETY: Lowered 'min_pips_req' to 2.0 to unblock M5 trading.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -183,10 +183,12 @@ class RiskManager:
             logger.debug(f"{symbol}: ATR Fallback Used (ATR={atr})")
 
         # --- DEAD PAIR PROTECTION (SAFETY FLOOR) ---
-        # If ATR is too small relative to spread (e.g. < 5 pips), we must NOT trade.
+        # If ATR is too small relative to spread (e.g. < 2 pips on M5), we must NOT trade.
         # Spreads + Commissions will eat the profit.
         pip_val, _ = RiskManager.get_pip_info(symbol)
-        min_pips_req = 5.0 # Absolute minimum movement required
+        
+        # FIX: Lowered from 5.0 to 2.0 to unblock M5 trading
+        min_pips_req = 2.0 
         
         if stop_dist < (pip_val * min_pips_req):
              return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, f"Low Volatility (<{min_pips_req} pips)"), 0.0

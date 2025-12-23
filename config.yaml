@@ -1,11 +1,12 @@
 # =============================================================================
-# config.yaml – FTMO GROWTH MODE V32.1 (QUARANTINE PROTOCOL)
-# STATUS: PHASE 7 - TOXIC ASSET REMOVAL
+# config.yaml – FTMO GROWTH MODE V33.0 (CORRECTED SAFETY)
+# STATUS: PHASE 7 - TOXIC ASSET REMOVAL & M5 TUNING
 #
 # REMEDIATION LOG:
 # 1. QUARANTINE: Removed EURGBP and AUDCAD (Toxic/Low Volatility).
 # 2. LEVERAGE SAFETY: Reduced max_lot_size to 10.0 to prevent low-vol blowouts.
-# 3. PROFIT FOCUS: Kept high R:R settings for GBPJPY/AUDJPY success.
+# 3. SAFETY FLOOR: Adjusted min_pips_req logic (via code) and thresholds here.
+# 4. EXECUTION: Lowered min_prob to 0.50 to recover trade volume on M5.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -219,7 +220,7 @@ online_learning:
   lambda_value: 6
   
   learning_horizon_sec: 300
-  min_calibrated_probability: 0.60
+  min_calibrated_probability: 0.50 # LOWERED: Recover M5 Volume
 
   tbm:
     horizon_minutes: 120 
