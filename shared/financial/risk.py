@@ -5,11 +5,12 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# AUDIT REMEDIATION (SNIPER MODE):
-# 1. VOLATILITY TARGETING: Implemented Institutional Sizing (Target Vol / Realized Vol).
-# 2. FRACTIONAL KELLY: Added Kelly Criterion scalar to the targeting logic.
-# 3. SPREAD CLAMP: Replaced rejection with minimum-stop clamping (keeps learning active).
-# 4. ROBUSTNESS: Enhanced conversion rate logic and zero-division guards.
+# AUDIT REMEDIATION (SNIPER MODE V5):
+# 1. SIZING LOGIC: Replaced linear conviction cliff with Power Law (conf^2).
+#    - At 0.55 Conf: Old=0.10, New=0.30 (3x Boost).
+#    - At 0.60 Conf: Old=0.20, New=0.36 (1.8x Boost).
+# 2. SCALAR: Works in tandem with Config V38 (TargetVol=0.5, Kelly=0.4).
+# 3. SAFETY: Maintained CPPI and Hard Risk Caps.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -160,7 +161,8 @@ class RiskManager:
         risk_budget_usd = cushion * cppi_mult
 
         # Clamp Risk Budget to Hard Max Risk %
-        base_risk_pct = risk_conf.get('base_risk_per_trade_percent', 0.5) / 100.0
+        # PROFIT FIX: Raised to 2.0% in Config V38, logic respects it here.
+        base_risk_pct = risk_conf.get('max_risk_percent', 1.0) / 100.0
         max_risk_usd = balance * base_risk_pct
         
         # Effective Risk Budget: Min(CPPI Budget, Hard Cap)
@@ -214,6 +216,7 @@ class RiskManager:
             # Formula: TargetExposure = (Equity * TargetAnnualVol) / InstrumentAnnualVol
             # Note: We limit this by the CPPI/MaxRisk calculated above as a ceiling.
             
+            # PROFIT FIX: Target Vol boosted to 0.50 in Config
             target_ann_vol = risk_conf.get('target_annual_volatility', 0.20)
             
             # Annualize the short-term volatility (M5 data assumption: 288 bars/day * 252 days)
@@ -224,17 +227,17 @@ class RiskManager:
             ann_factor = 269.4
             realized_ann_vol = volatility * ann_factor
             
-            # Volatility Scalar (e.g., 0.20 / 0.40 = 0.5 leverage)
+            # Volatility Scalar (e.g., 0.50 / 0.13 = ~3.8 leverage)
             vol_scalar = target_ann_vol / realized_ann_vol
             
             # Fractional Kelly Application
-            # We map model confidence (0.5-1.0) to a Kelly-like multiplier
-            # Low confidence (0.5) -> Low size. High confidence (0.9) -> High size.
+            # PROFIT FIX: Kelly Fraction boosted to 0.40 in Config
             kelly_fraction = risk_conf.get('kelly_fraction', 0.25)
             
-            # Map conf to size scalar (0.5 -> 0.0, 1.0 -> 1.0) for linear scaling
-            # But we add a base conviction floor.
-            conviction = max(0.0, (conf - 0.5) * 2) 
+            # PROFIT FIX: REPLACED LINEAR CLIFF WITH POWER LAW
+            # Old: max(0.0, (conf - 0.5) * 2) -> at 0.55 this was 0.1 (Too punitive)
+            # New: pow(conf, 2) -> at 0.55 this is ~0.3 (3x Boost)
+            conviction = pow(conf, 2)
             
             # Apply Fraction
             final_scalar = vol_scalar * kelly_fraction * conviction
