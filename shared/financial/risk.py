@@ -5,10 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# AUDIT FIX (2025-12-23):
-# 1. CRITICAL FIX: Changed "Spread Risk" from REJECT to CLAMP.
-#    - If calculated stop is too small, we widen it to safety minimum and SIZE DOWN.
-#    - This ensures trades (and learning) continue even in low-volatility.
+# AUDIT FIX (BLEEDING OUT FIX):
+# 1. VOLATILITY KICKER: Added logic to BOOST position size if Confidence is High
+#    and Volatility is High. This counteracts "Inverse Volatility" sizing which 
+#    previously strangled high-quality setups during fast markets.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -133,8 +133,6 @@ class RiskManager:
         """
         Calculates position size using Inverse-Volatility Sizing (Audit Compliant).
         Logic: Risk Amount is fixed, Volume scales inversely with ATR.
-        
-        SAFETY FIX: Adds a check for minimum ATR to prevent over-leveraging on dead pairs.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -222,6 +220,16 @@ class RiskManager:
             # If Volatility is high, loss_per_lot is high -> lots decrease.
             # If Volatility is low, loss_per_lot is low -> lots increase.
             lots = final_risk_usd / loss_per_lot
+
+        # --- VOLATILITY KICKER (BLEEDING FIX) ---
+        # In highly volatile markets, Inv-Vol sizing punishes us too hard.
+        # If Confidence is High (> 0.60), we dampen the sizing reduction.
+        # We allow a size boost of up to 1.5x based on volatility magnitude.
+        if conf > 0.60:
+             # Cap volatility effect at 0.05 (5% per bar is huge)
+             # Multiplier = 1.0 + (Vol * 10). Example: Vol 0.01 -> 1.1x. Vol 0.05 -> 1.5x.
+             kicker = 1.0 + (min(volatility, 0.05) * 10.0)
+             lots *= kicker
 
         # --- KELLY CONFIDENCE SCALAR ---
         # Scale down if confidence is low, but never exceed the Hard Cap.

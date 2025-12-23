@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
-# AUDIT REMEDIATION (PROFITABILITY FIX):
-# 1. DISCOVERY SAFETY: Raised bias threshold from 0.05 to 0.40 (Stop random noise).
-# 2. CHEAP LEARNING: Discovery trades now use 10% of normal risk (0.1 scalar).
-# 3. KELLY FIX: Honest confidence reporting to Risk Manager.
-# 4. BUG FIX: Variable name mismatch (discovery_mode -> discovery_triggered).
+# AUDIT REMEDIATION (BLEEDING OUT FIX):
+# 1. ENTROPY/VPIN: Defaults set to 1.0 (Accept All) to stop filtering volatility.
+# 2. TRAUMA WATCHDOG: Forces Discovery Mode if Win Rate < 40% (prevents death spiral).
+# 3. OUTCOME TRACKING: Added self.recent_outcomes to monitor performance.
 # =============================================================================
 import logging
 import sys
@@ -88,6 +87,9 @@ class ResearchStrategy:
         self.decision_log = deque(maxlen=1000)
         self.trade_events = []
         self.rejection_stats = defaultdict(int)  # Track why we didn't trade
+        
+        # --- TRAUMA WATCHDOG STATE ---
+        self.recent_outcomes = deque(maxlen=20) # Track last 20 trade outcomes for Trauma Check
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
@@ -181,6 +183,10 @@ class ResearchStrategy:
                 
                 if outcome_label != 0:
                     self.meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
+                    
+                # --- UPDATE TRAUMA WATCHDOG ---
+                # 1 = Win, 0 = Loss (for simple WR calc)
+                self.recent_outcomes.append(1 if realized_ret > 0 else 0)
 
         # C. Add CURRENT Bar as new Trade Opportunity
         current_atr = features.get('atr', 0.0)
@@ -188,16 +194,17 @@ class ResearchStrategy:
 
         # D. Inference
         try:
-            # --- FILTER RELAXATION ---
+            # --- FILTER RELAXATION (BLEEDING FIX) ---
+            # Default to 1.0 (Accept All) to prevent filtering active markets
             entropy_val = features.get('entropy', 0)
-            entropy_thresh = self.params.get('entropy_threshold', 0.85)
+            entropy_thresh = self.params.get('entropy_threshold', 1.0) 
             
             if entropy_val > entropy_thresh:
                 self.rejection_stats['High Entropy'] += 1
                 return
 
             vpin_val = features.get('vpin', 0)
-            vpin_thresh = self.params.get('vpin_threshold', 0.85)
+            vpin_thresh = self.params.get('vpin_threshold', 1.0)
             
             if vpin_val > vpin_thresh:
                 self.rejection_stats['High VPIN'] += 1
@@ -218,12 +225,20 @@ class ResearchStrategy:
             # E. Execution Logic & Discovery Override
             dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
             
+            # --- TRAUMA WATCHDOG CHECK ---
+            trauma_triggered = False
+            if len(self.recent_outcomes) >= 20:
+                current_wr = sum(self.recent_outcomes) / len(self.recent_outcomes)
+                if current_wr < 0.40:
+                    trauma_triggered = True
+                    # self.rejection_stats['Trauma Mode'] += 1 # Optional logging
+
             # --- PROFITABLE DISCOVERY LOGIC ---
-            # Instead of purely random trades, we only force a trade if the model
-            # shows a HINT of bias (> 0.40). We verify 50/50 guesses.
-            # CRITICAL: We reduce risk size for discovery trades.
+            # Discovery Mode is active if:
+            # 1. We are in early phases (< 2500 bars)
+            # 2. OR Trauma Watchdog is triggered (WR < 40%)
             
-            is_discovery = self.bars_processed < 2500
+            is_discovery = (self.bars_processed < 2500) or trauma_triggered
             effective_action = pred_action
             discovery_triggered = False
 
@@ -279,7 +294,6 @@ class ResearchStrategy:
                         # For Discovery trades, use a fixed conservative confidence for Kelly
                         confidence = prob_buy if effective_action == 1 else prob_sell
                         
-                        # --- FIX: USE discovery_triggered NOT discovery_mode ---
                         if discovery_triggered:
                             # Clamp confidence for Risk Manager to be safe
                             confidence = 0.25 

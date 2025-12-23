@@ -5,10 +5,11 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT FIX (2025-12-23):
-# 1. PARAMETER SAFETY: Adjusted Entropy/VPIN ranges to prevent self-sabotage.
-# 2. VISIBILITY FIX: EmojiCallback now prints Autopsy even if trial is PRUNED.
-#    This allows us to see *why* trades were rejected (e.g. Risk, VPIN).
+# AUDIT FIX (BLEEDING OUT FIX):
+# 1. OPTIMIZATION RANGES: Shifted target to High Volatility.
+#    - Entropy/VPIN: 0.90 - 1.0 (Accept Noise)
+#    - Barriers: 2.0 - 6.0 (Target larger moves)
+#    - Confidence: 0.50 - 0.85 (Ride the winners)
 # =============================================================================
 import sys
 import os
@@ -191,18 +192,18 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'grace_period': trial.suggest_int('grace_period', 20, 100),
                 'delta': trial.suggest_float('delta', 0.0001, 0.01, log=True),
                 
-                # REMEDIATION (Step 1): SAFE Entropy/VPIN ranges
-                # Prevent picking extremely low thresholds that filter 100% of data
-                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.85, 0.999), 
-                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.85, 0.999),
+                # REMEDIATION (BLEEDING FIX): Target High Volatility
+                # We relax the filters (0.90 - 1.0) to allow noise, as we want to trade IT
+                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.90, 1.0), 
+                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.90, 1.0),
                 
                 'tbm': {
-                    # REMEDIATION (Step 2): Reduced range for M5/Volume bars
-                    'barrier_width': trial.suggest_float('barrier_width', 0.5, 3.0),  # Changed from 1.5-5.0
-                    'horizon_minutes': trial.suggest_int('horizon_minutes', 10, 60)   # Changed from 30-240
+                    # REMEDIATION: Wider Barriers to capture larger moves
+                    'barrier_width': trial.suggest_float('barrier_width', 2.0, 6.0), 
+                    'horizon_minutes': trial.suggest_int('horizon_minutes', 15, 60)
                 },
-                # REMEDIATION (Step 3): Lowered floor to 0.20 to allow discovery
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.2, 0.75) # Changed from 0.35-0.75
+                # REMEDIATION: Higher Conviction Required (0.50 floor)
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.50, 0.85)
             })
             
             # Instantiate Pipeline locally
