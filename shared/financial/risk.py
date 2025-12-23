@@ -5,10 +5,11 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# AUDIT FIX (BLEEDING OUT FIX):
-# 1. VOLATILITY KICKER: Added logic to BOOST position size if Confidence is High
-#    and Volatility is High. This counteracts "Inverse Volatility" sizing which 
-#    previously strangled high-quality setups during fast markets.
+# AUDIT REMEDIATION (SNIPER MODE):
+# 1. VOLATILITY TARGETING: Implemented Institutional Sizing (Target Vol / Realized Vol).
+# 2. FRACTIONAL KELLY: Added Kelly Criterion scalar to the targeting logic.
+# 3. SPREAD CLAMP: Replaced rejection with minimum-stop clamping (keeps learning active).
+# 4. ROBUSTNESS: Enhanced conversion rate logic and zero-division guards.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -39,7 +40,7 @@ logger = logging.getLogger("RiskManager")
 class RiskManager:
     """
     Stateless utilities for Pip value calculations, Exchange Rates,
-    and Advanced Position Sizing (Kelly-Vol, CPPI).
+    and Advanced Position Sizing (Volatility Targeting, Kelly, CPPI).
     """
     # Default fallback, but logic now prefers config/override
     DEFAULT_CONTRACT_SIZE = 100_000 
@@ -131,8 +132,8 @@ class RiskManager:
         contract_size_override: Optional[float] = None # NEW: Allow overriding lot size
     ) -> Tuple[Trade, float]:
         """
-        Calculates position size using Inverse-Volatility Sizing (Audit Compliant).
-        Logic: Risk Amount is fixed, Volume scales inversely with ATR.
+        Calculates position size using the configured method (Volatility Targeting or Inverse-Volatility).
+        Handles risk clamping, dead pair protection, and fractional scaling.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -140,12 +141,13 @@ class RiskManager:
 
         # 1. Retrieve Config Parameters
         risk_conf = CONFIG.get('risk_management', {})
+        sizing_method = risk_conf.get('sizing_method', 'inverse_volatility')
 
         # Determine Contract Size
         # Priority: Override arg > Config > Default 100k
         c_size = contract_size_override if contract_size_override else risk_conf.get('contract_size', RiskManager.DEFAULT_CONTRACT_SIZE)
 
-        # --- CPPI SAFE EQUITY CUSHION (Legacy Safety) ---
+        # --- CPPI SAFE EQUITY CUSHION ---
         cppi_floor_pct = risk_conf.get('cppi_floor_pct', 0.08)
         
         # USE DETECTED ACCOUNT SIZE (if available), else default to Config
@@ -158,8 +160,7 @@ class RiskManager:
         risk_budget_usd = cushion * cppi_mult
 
         # Clamp Risk Budget to Hard Max Risk %
-        # UPDATED: Default to 0.2% (Growth Mode) if not in config
-        base_risk_pct = risk_conf.get('base_risk_per_trade_percent', 0.2) / 100.0
+        base_risk_pct = risk_conf.get('base_risk_per_trade_percent', 0.5) / 100.0
         max_risk_usd = balance * base_risk_pct
         
         # Effective Risk Budget: Min(CPPI Budget, Hard Cap)
@@ -167,44 +168,35 @@ class RiskManager:
         final_risk_usd = min(risk_budget_usd, max_risk_usd)
 
         # --- ADAPTIVE STOP LOSS (ATR Based) ---
-        # Phase 3 Requirement: Use ATR passed from StreamingIndicators
         atr_mult_sl = risk_conf.get('stop_loss_atr_mult', 1.5)
         atr_mult_tp = risk_conf.get('take_profit_atr_mult', 2.0)
 
-        # AUDIT FIX: ATR Fallback Logic to prevent zero-size trades
+        # ATR Fallback Logic
         if atr and atr > 0:
             stop_dist = atr * atr_mult_sl
         else:
             # Fallback 0.1% of price if ATR missing or zero
             stop_dist = price * 0.001 * atr_mult_sl
-            # REFINEMENT: Log fallback usage for debugging
             logger.debug(f"{symbol}: ATR Fallback Used (ATR={atr})")
 
-        # --- DEAD PAIR PROTECTION (SAFETY FLOOR) ---
-        # If ATR is too small relative to spread (e.g. < 2 pips on M5), we must NOT trade.
-        # Spreads + Commissions will eat the profit.
+        # --- DEAD PAIR PROTECTION (SPREAD CLAMP) ---
+        # If ATR is too small relative to spread, we must widen stop or risk instant stop-out.
         pip_val, _ = RiskManager.get_pip_info(symbol)
         
-        # FORENSIC FIX: Dynamic Spread Buffer
-        # Assume typical spread from config or hardcoded assumption if missing
+        # Forensic Fix: Dynamic Spread Buffer
         spread_assumed = CONFIG.get('forensic_audit', {}).get('spread_pips', {}).get(symbol, 1.5)
         
-        # Minimum Stop Loss must be at least 2.0x Spread + 1 Pip buffer
-        min_stop_req = (spread_assumed * 2.0 * pip_val)
+        # Minimum Stop Loss must be at least 3.0x Spread (Volatility Gate logic applied to risk)
+        min_stop_req = (spread_assumed * 3.0 * pip_val)
         
-        # CRITICAL FIX (2025-12-23): CLAMP instead of REJECT
-        # If the ATR stop is tighter than the spread allows, widen it to the minimum safe distance.
-        # The position sizing logic below will naturally reduce the lot size to keep risk constant.
+        # CLAMP: Widen stop to minimum if volatility is compressed
         if stop_dist < min_stop_req:
-             # logger.debug(f"⚠️ WIDENING STOP for {symbol}: {stop_dist/pip_val:.1f}p -> {min_stop_req/pip_val:.1f}p")
              stop_dist = min_stop_req
 
         sl_pips = stop_dist / pip_val
 
         # --- CROSS-PAIR PIP VALUE CALCULATION ---
-        # Value of 1 pip in Quote Currency for 1 Standard Lot (Contract Size)
         pip_value_quote = c_size * pip_val
-        
         conversion_rate = RiskManager.get_conversion_rate(symbol, price, market_prices)
         
         if conversion_rate <= 0:
@@ -213,43 +205,90 @@ class RiskManager:
         usd_per_pip_per_lot = pip_value_quote * conversion_rate
         loss_per_lot = sl_pips * usd_per_pip_per_lot
         
-        if loss_per_lot <= 0: 
-            lots = 0.0
-        else: 
-            # --- VOLATILITY SCALING ---
-            # If Volatility is high, loss_per_lot is high -> lots decrease.
-            # If Volatility is low, loss_per_lot is low -> lots increase.
-            lots = final_risk_usd / loss_per_lot
+        lots = 0.0
 
-        # --- VOLATILITY KICKER (BLEEDING FIX) ---
-        # In highly volatile markets, Inv-Vol sizing punishes us too hard.
-        # If Confidence is High (> 0.60), we dampen the sizing reduction.
-        # We allow a size boost of up to 1.5x based on volatility magnitude.
-        if conf > 0.60:
-             # Cap volatility effect at 0.05 (5% per bar is huge)
-             # Multiplier = 1.0 + (Vol * 10). Example: Vol 0.01 -> 1.1x. Vol 0.05 -> 1.5x.
-             kicker = 1.0 + (min(volatility, 0.05) * 10.0)
-             lots *= kicker
+        # --- SIZING METHOD SELECTION ---
+        
+        if sizing_method == 'volatility_targeting':
+            # --- METHOD 1: VOLATILITY TARGETING ---
+            # Formula: TargetExposure = (Equity * TargetAnnualVol) / InstrumentAnnualVol
+            # Note: We limit this by the CPPI/MaxRisk calculated above as a ceiling.
+            
+            target_ann_vol = risk_conf.get('target_annual_volatility', 0.20)
+            
+            # Annualize the short-term volatility (M5 data assumption: 288 bars/day * 252 days)
+            # Volatility feature is typically std dev of returns.
+            if volatility <= 1e-9: volatility = 0.001
+            
+            # M5 Annualization Factor ~ sqrt(72576) approx 269.4
+            ann_factor = 269.4
+            realized_ann_vol = volatility * ann_factor
+            
+            # Volatility Scalar (e.g., 0.20 / 0.40 = 0.5 leverage)
+            vol_scalar = target_ann_vol / realized_ann_vol
+            
+            # Fractional Kelly Application
+            # We map model confidence (0.5-1.0) to a Kelly-like multiplier
+            # Low confidence (0.5) -> Low size. High confidence (0.9) -> High size.
+            kelly_fraction = risk_conf.get('kelly_fraction', 0.25)
+            
+            # Map conf to size scalar (0.5 -> 0.0, 1.0 -> 1.0) for linear scaling
+            # But we add a base conviction floor.
+            conviction = max(0.0, (conf - 0.5) * 2) 
+            
+            # Apply Fraction
+            final_scalar = vol_scalar * kelly_fraction * conviction
+            
+            # Calculate Target Exposure in USD
+            target_exposure = balance * final_scalar
+            
+            # Convert Exposure to Lots: Exposure / (ContractSize * Price * Conversion)
+            # Note: Price * Conversion gives Price in USD approx
+            notional_value_per_lot = c_size * price * conversion_rate
+            
+            if notional_value_per_lot > 0:
+                lots = target_exposure / notional_value_per_lot
+                
+            # --- CEILING CHECK ---
+            # Ensure this lot size doesn't violate the dollar risk budget (Max Loss)
+            # If (Lots * LossPerLot) > FinalRiskUSD -> Clamp it
+            current_risk_dollars = lots * loss_per_lot
+            if current_risk_dollars > final_risk_usd:
+                lots = final_risk_usd / loss_per_lot if loss_per_lot > 0 else 0.0
 
-        # --- KELLY CONFIDENCE SCALAR ---
-        # Scale down if confidence is low, but never exceed the Hard Cap.
-        conf_scalar = conf # 0.6 -> 60% of max allowed risk
-        lots *= conf_scalar
+        else:
+            # --- METHOD 2: INVERSE VOLATILITY (LEGACY) ---
+            # Simple fixed dollar risk / stop loss distance
+            if loss_per_lot > 0: 
+                lots = final_risk_usd / loss_per_lot
+            
+            # Scalar based on confidence
+            lots *= conf
 
         # --- CORRELATION PENALTY ---
         if active_correlations > 0:
             penalty_factor = 1.0 / (1.0 + (0.5 * active_correlations))
             lots *= penalty_factor
 
-        # Constraints
+        # --- CONSTRAINTS & SANITIZATION ---
         min_lot = risk_conf.get('min_lot_size', 0.01)
-        max_lot = risk_conf.get('max_lot_size', 50.0) # Used to be 50, config now clamps this
+        max_lot = risk_conf.get('max_lot_size', 10.0) 
+        max_lev = risk_conf.get('max_leverage', 30.0)
+        
+        # Leverage Cap
+        # Max Exposure = Balance * MaxLeverage
+        # Lots <= MaxExposure / NotionalPerLot
+        notional = c_size * price * conversion_rate
+        if notional > 0:
+            max_lots_lev = (balance * max_lev) / notional
+            lots = min(lots, max_lots_lev)
+
         lots = max(min_lot, min(lots, max_lot))
         lots = round(lots, 2)
         
         actual_risk_usd = lots * loss_per_lot
 
-        # Sanitizer for comment formatting (Fixes TypeError if atr is None)
+        # Sanitizer for comment formatting
         atr_val = atr if atr is not None else 0.0
 
         # Construct Trade Object
@@ -260,7 +299,7 @@ class RiskManager:
             entry_price=price,
             stop_loss=stop_dist,
             take_profit=stop_dist * (atr_mult_tp / atr_mult_sl), 
-            comment=f"VolSizing|Risk:${final_risk_usd:.0f}|ATR:{atr_val:.5f}"
+            comment=f"{'VolTgt' if sizing_method == 'volatility_targeting' else 'InvVol'}|R:${actual_risk_usd:.0f}|ATR:{atr_val:.5f}"
         )
         
         return trade, actual_risk_usd

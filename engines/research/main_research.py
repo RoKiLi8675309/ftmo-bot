@@ -5,11 +5,11 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT FIX (BLEEDING OUT FIX):
-# 1. OPTIMIZATION RANGES: Shifted target to High Volatility.
-#    - Entropy/VPIN: 0.90 - 1.0 (Accept Noise)
-#    - Barriers: 2.0 - 6.0 (Target larger moves)
-#    - Confidence: 0.50 - 0.85 (Ride the winners)
+# AUDIT REMEDIATION (SNIPER MODE):
+# 1. SEARCH SPACE: Shifted params to High Patience (Grace 100+) & Low Delta.
+# 2. VISIBILITY: EmojiCallback prints 'Autopsy' for PRUNED trials (Gate Rejections).
+# 3. METRIC: Optimized for SQN + Profit Factor (Sustainable Alpha).
+# 4. DATA: Enforced 2M tick load for robust Volume Bar generation.
 # =============================================================================
 import sys
 import os
@@ -74,7 +74,7 @@ class EmojiCallback:
             icon = "💀"  # Blown Account
             status = "BLOWN"
         elif attrs.get('pruned', False):
-            icon = "✂️"  # Pruned (Low Trades)
+            icon = "✂️"  # Pruned (Low Trades / Gate Rejection)
             status = "PRUNE"
         elif trades == 0:
             icon = "💤"  # No Trades
@@ -120,7 +120,7 @@ class EmojiCallback:
         log.info(msg.strip())
         
         # 6. Conditional Autopsy (Debug Info for Failed/Weak/Pruned Trials)
-        # VISIBILITY FIX: Show autopsy if pruning happened so user knows WHY
+        # VISIBILITY FIX: Always show autopsy for Pruned/Blown trials so we see Vol Gate activity
         show_autopsy = False
         if 'autopsy' in attrs:
             if attrs.get('blown', False): show_autopsy = True
@@ -188,22 +188,24 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             # Define Search Space (Focused on Profitability & Exploration)
             params = CONFIG['online_learning'].copy()
             params.update({
-                'n_models': trial.suggest_int('n_models', 10, 45, step=5),
-                'grace_period': trial.suggest_int('grace_period', 20, 100),
-                'delta': trial.suggest_float('delta', 0.0001, 0.01, log=True),
+                'n_models': trial.suggest_int('n_models', 15, 45, step=5),
                 
-                # REMEDIATION (BLEEDING FIX): Target High Volatility
-                # We relax the filters (0.90 - 1.0) to allow noise, as we want to trade IT
-                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.90, 1.0), 
-                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.90, 1.0),
+                # AUDIT FIX: High Patience for Sniper Mode
+                'grace_period': trial.suggest_int('grace_period', 100, 500), # Wait longer before split
+                'delta': trial.suggest_float('delta', 1e-7, 1e-4, log=True), # Low sensitivity to drift
+                
+                # REMEDIATION (Step 1): SAFE Entropy/VPIN ranges
+                # Prevent picking extremely low thresholds that filter 100% of data
+                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.85, 0.999), 
+                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.85, 0.999),
                 
                 'tbm': {
-                    # REMEDIATION: Wider Barriers to capture larger moves
-                    'barrier_width': trial.suggest_float('barrier_width', 2.0, 6.0), 
-                    'horizon_minutes': trial.suggest_int('horizon_minutes', 15, 60)
+                    # REMEDIATION (Step 2): Reduced range for M5/Volume bars
+                    'barrier_width': trial.suggest_float('barrier_width', 1.0, 3.0),
+                    'horizon_minutes': trial.suggest_int('horizon_minutes', 15, 120)
                 },
-                # REMEDIATION: Higher Conviction Required (0.50 floor)
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.50, 0.85)
+                # REMEDIATION (Step 3): Lowered floor to 0.20 to allow discovery
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.3, 0.7)
             })
             
             # Instantiate Pipeline locally
@@ -238,13 +240,12 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sharpe", metrics['sharpe'])
             
             # --- CRITICAL FIX: PROFIT-BASED OBJECTIVE ---
-            # Old: Score based on Sortino * log(freq)
-            # New: SQN + (Profit Factor * 2) - Penalties
+            # Score: SQN + (Profit Factor * 2) - Penalties
             
             final_score = metrics['sqn'] + (metrics['profit_factor'] * 2.0)
             
             # Soft Penalty for Low Activity
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 10)
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 5)
             total_trades = metrics['total_trades']
             
             if total_trades < min_trades:
@@ -256,6 +257,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 final_score -= penalty
                 
                 if total_trades == 0:
+                    # Save autopsy to explain WHY we had 0 trades (Vol Gate?)
                     trial.set_user_attr("autopsy", strategy.generate_autopsy())
                     final_score = -5.0
 
@@ -381,8 +383,8 @@ class ResearchPipeline:
             forest.ARFClassifier(
                 n_models=params.get('n_models', 25),
                 seed=42,
-                grace_period=params.get('grace_period', 50),
-                delta=params.get('delta', 0.001),
+                grace_period=params.get('grace_period', 200),
+                delta=params.get('delta', 1e-5),
                 split_criterion='gini',
                 leaf_prediction='mc',
                 max_features='log2',

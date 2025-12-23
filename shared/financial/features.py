@@ -5,10 +5,11 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional)
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
-# AUDIT REMEDIATION (PROFIT FOCUS):
-# 1. ADDED: Lagged Returns (t-1 to t-5) for tree memory.
-# 2. ADDED: Candle Physics (Body/Wick ratios) for Price Action.
-# 3. FIXED: Robust sanitization for infinite values.
+# AUDIT REMEDIATION (SNIPER MODE):
+# 1. STATIONARITY: Added Log Returns (log_ret) & Volatility Ratios (vol_ratio).
+# 2. NORMALIZATION: MACD and Oscillators normalized by Price/ATR.
+# 3. PHYSICS: Candle Body/Wick ratios to detect exhaustion/impulse.
+# 4. ROBUSTNESS: Enhanced NaN/Inf sanitization for River stability.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -17,6 +18,9 @@ import sys
 import numpy as np
 from collections import deque
 from typing import Dict, Any, Optional, List, Tuple
+
+# Shared Config
+from shared.core.config import CONFIG
 
 # Numba for high-performance JIT compilation (Guarded)
 try:
@@ -56,7 +60,7 @@ class RecursiveEMA:
         self.value = None
 
     def update(self, x: float):
-        if x is None or math.isnan(x):
+        if x is None or math.isnan(x) or math.isinf(x):
             return  # Skip bad values
             
         if self.value is None:
@@ -326,7 +330,7 @@ class MetaLabeler:
                 clean[k] = 0.0
         return clean
 
-# --- 5. ONLINE FEATURE ENGINEER (INTEGRATED) ---
+# --- 5. ONLINE FEATURE ENGINEER (STATIONARY + PHYSICS) ---
 
 class OnlineFeatureEngineer:
     def __init__(self, window_size: int = 50):
@@ -345,11 +349,13 @@ class OnlineFeatureEngineer:
         self.vol_monitor = VolatilityMonitor(window=20)
         self.last_price = None
 
-        # --- NEW CONTEXT FEATURES (2025-12-23) ---
+        # --- AUDIT FIX: STATIONARITY & CONTEXT ---
         # 1. Cumulative OFI Window
         self.ofi_window = deque(maxlen=20)
         # 2. Volatility Trend EMA (for breakout detection)
         self.atr_ema = RecursiveEMA(alpha=0.05)
+        # 3. Long-term Volatility Baseline (for Vol Ratio)
+        self.vol_baseline = RecursiveEMA(alpha=0.001) 
 
     def update(self, price: float, timestamp: float, volume: float, 
                high: Optional[float] = None, low: Optional[float] = None,
@@ -363,49 +369,61 @@ class OnlineFeatureEngineer:
         if high is None: high = price
         if low is None: low = price
 
+        # Validate Inputs (Nan/Inf Protection)
+        if not math.isfinite(price) or price <= 0: return None
+        if not math.isfinite(volume): volume = 0.0
+
         self.prices.append(price)
         self.volumes.append(volume)
         
-        # Returns
-        ret = 0.0
+        # 1. Log Returns (Stationary)
+        # Replaces raw linear returns for ML stability
+        ret_log = 0.0
         if self.last_price and self.last_price > 0:
-            ret = math.log(price / self.last_price) if price > 0 else 0.0
-            self.returns.append(ret)
+            try:
+                ret_log = math.log(price / self.last_price)
+            except ValueError:
+                ret_log = 0.0
+            self.returns.append(ret_log)
         else:
             self.returns.append(0.0)
 
-        # 1. Update Recursive Indicators (Phase 2 Core)
+        # 2. Update Recursive Indicators (Phase 2 Core)
         tech_feats = self.indicators.update(price, high, low)
+        current_atr = tech_feats.get('atr', 0.001)
         
-        # 2. Update Legacy Metrics
+        # 3. Update Legacy Metrics
         entropy_val = self.entropy.update(price)
         vpin_val = self.vpin.update(volume, price, buy_vol, sell_vol)
         fd_price = self.frac_diff.update(price)
-        volatility_val = self.vol_monitor.update(ret)
+        volatility_val = self.vol_monitor.update(ret_log)
 
-        # 3. Hurst Exponent (Market Memory)
+        # 4. Volatility Ratio (Stationary)
+        # Current Short-term Vol vs Long-term Baseline
+        self.vol_baseline.update(volatility_val)
+        baseline_vol = self.vol_baseline.get()
+        vol_ratio = volatility_val / baseline_vol if baseline_vol > 1e-9 else 1.0
+
+        # 5. Hurst Exponent (Market Memory)
         hurst_val = 0.5
         if len(self.returns) >= 20:
             ret_arr = np.array(list(self.returns), dtype=np.float64)
             hurst_val = calculate_hurst(ret_arr)
 
-        # 4. Order Flow Imbalance (OFI)
+        # 6. Order Flow Imbalance (OFI)
         denominator = volume if volume > 0 else 1.0
         ofi_val = (buy_vol - sell_vol) / denominator
 
-        # --- NEW: Cumulative OFI (Trend of Order Flow) ---
+        # --- Context Features ---
         self.ofi_window.append(ofi_val)
         cum_ofi = sum(self.ofi_window) / len(self.ofi_window) if self.ofi_window else 0.0
 
-        # --- NEW: Regime Detection (Trend vs Mean Reversion) ---
-        # 1.0 = Trending, -1.0 = Mean Reverting, 0.0 = Random Walk
+        # Regime Detection (Trend vs Mean Reversion)
         regime_val = 1.0 if hurst_val > 0.55 else (-1.0 if hurst_val < 0.45 else 0.0)
 
-        # --- NEW: Volatility Breakout (Expansion) ---
-        current_atr = tech_feats['atr']
+        # Volatility Breakout (Expansion)
         self.atr_ema.update(current_atr)
         atr_trend = self.atr_ema.get()
-        # If current ATR is significantly higher than average, volatility is expanding
         vol_breakout = 1.0 if current_atr > (atr_trend * 1.05) else 0.0
 
         # Efficiency Ratio (ER)
@@ -417,24 +435,29 @@ class OnlineFeatureEngineer:
             net_change = abs(price_list[-1] - price_list[0])
             er_val = net_change / abs_change_sum if abs_change_sum > 0 else 0.0
 
-        # Z-Scores
-        price_z = 0.0
-        volume_z = 0.0
-        if len(self.prices) > 1:
-            price_mean = np.mean(self.prices)
-            price_std = np.std(self.prices)
-            price_z = (price - price_mean) / price_std if price_std > 1e-9 else 0.0
-            price_z = np.clip(price_z, -3, 3)
-            
-            volume_mean = np.mean(self.volumes)
-            volume_std = np.std(self.volumes)
-            volume_z = (volume - volume_mean) / volume_std if volume_std > 1e-9 else 0.0
-            volume_z = np.clip(volume_z, -3, 3)
+        # --- AUDIT FIX: CANDLE PHYSICS (Stationary) ---
+        # Normalize candle features by range or previous close
+        candle_range = max(high - low, 1e-9)
+        prev_close = self.prices[-2] if len(self.prices) > 1 else price
+        
+        # Body Ratio (Body / Range)
+        body_size = abs(price - prev_close)
+        body_ratio = body_size / candle_range
+        
+        # Wick Ratios
+        upper_wick = high - max(price, prev_close)
+        lower_wick = min(price, prev_close) - low
+        upper_wick_ratio = upper_wick / candle_range
+        lower_wick_ratio = lower_wick / candle_range
+
+        # Normalized Oscillators
+        # MACD is absolute price difference, normalize by price to make stationary
+        macd_norm = tech_feats['macd_line'] / price
+        rsi_norm = tech_feats['rsi'] / 100.0  # Scale 0-1
 
         self.last_price = price
 
-        # --- PROFIT FIX: FEATURE ENRICHMENT ---
-        # 1. Lagged Returns (Memory)
+        # --- LAG GENERATION (Memory) ---
         lagged_feats = {}
         r_list = list(self.returns)
         for i in range(1, 6): # Lag 1 to 5
@@ -443,43 +466,41 @@ class OnlineFeatureEngineer:
             else:
                 lagged_feats[f'ret_lag_{i}'] = 0.0
 
-        # 2. Candle Physics (Price Action)
-        body = abs(price - self.prices[-2]) if len(self.prices) > 1 else 0.0
-        upper_wick = high - max(price, self.prices[-2]) if len(self.prices) > 1 else 0.0
-        lower_wick = min(price, self.prices[-2]) - low if len(self.prices) > 1 else 0.0
-        
-        candle_range = high - low if high != low else 1e-9
-        
+        # Construct Final Feature Vector
         raw_features = {
-            # Recursive Technicals
-            'rsi': tech_feats['rsi'],
-            'macd_line': tech_feats['macd_line'],
-            'macd_hist': tech_feats['macd_hist'],
-            'atr': tech_feats['atr'],
+            # Stationary Technicals
+            'rsi_norm': rsi_norm,
+            'macd_norm': macd_norm,
+            'macd_hist_norm': tech_feats['macd_hist'] / price,
+            'atr_pct': current_atr / price,  # ATR as % of price
+            
+            # Stationary Volatility
+            'vol_ratio': vol_ratio,
+            'volatility_log': math.log(volatility_val + 1e-9),
+            'log_ret': ret_log,
             
             # Statistical / Microstructure
-            'frac_diff': fd_price,
-            'volatility': volatility_val,
+            'frac_diff': fd_price / price, # Normalize FracDiff price approx
             'entropy': entropy_val,
             'vpin': vpin_val,
             'hurst': hurst_val,
             'ofi': ofi_val,
             'efficiency_ratio': er_val,
             
-            # --- NEW ENRICHED FEATURES ---
+            # Context
             'cum_ofi': cum_ofi,
             'regime': regime_val,
             'vol_breakout': vol_breakout,
             
             # Candle Physics
-            'body_pct': body / candle_range,
-            'wick_ratio': (upper_wick + lower_wick) / candle_range,
-            # -----------------------------
-
-            # Normalized
-            'price_z': price_z,
-            'volume_z': volume_z,
-            'return_raw': ret,
+            'body_ratio': body_ratio,
+            'upper_wick_ratio': upper_wick_ratio,
+            'lower_wick_ratio': lower_wick_ratio,
+            
+            # Original inputs (Normalized Z-Scores)
+            # We calculate simple Z-scores on the fly for price/vol
+            # This is locally stationary
+            'volume_z': (volume - np.mean(self.volumes)) / (np.std(self.volumes) + 1e-9) if len(self.volumes) > 2 else 0.0,
             
             **lagged_feats,
             **time_feats
@@ -660,6 +681,7 @@ def enrich_with_d1_data(features: Dict[str, float], d1_data: Dict[str, float], c
     
     if prev_high == 0: return features
     
+    # Normalize distances by price to ensure stationarity
     features['dist_d1_high'] = (prev_high - current_price) / current_price
     features['dist_d1_low'] = (current_price - prev_low) / current_price
     

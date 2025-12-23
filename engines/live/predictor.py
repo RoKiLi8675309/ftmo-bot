@@ -6,10 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages ARF models, Feature Engineering,
 # Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# AUDIT REMEDIATION (PROFIT WEIGHTED LEARNING):
-# 1. FIXED: Implemented Profit-Weighted Learning in Live loop.
-# 2. ADDED: Lagged Features support.
-# 3. TUNED: Relaxed VPIN/Entropy to 0.85 default.
+# AUDIT REMEDIATION (SNIPER MODE):
+# 1. NEUTRAL REINFORCEMENT: Explicitly learns 'HOLD' (Class 0) on noise/loss.
+# 2. PROFIT WEIGHTING: Sample weights scale with log-return magnitude.
+# 3. ROBUSTNESS: Relaxed VPIN/Entropy filters (0.85) to prevent starvation.
+# 4. ALIGNMENT: Matches 'shared/financial/features.py' stationary pipeline.
 # =============================================================================
 import logging
 import pickle
@@ -95,12 +96,13 @@ class MultiAssetPredictor:
 
     def _init_models(self):
         """
-        Initializes the machine learning pipelines.
+        Initializes the machine learning pipelines using Configured hyperparameters.
         """
         conf = CONFIG['online_learning']
         
         for sym in self.symbols:
             # Primary Model: Adaptive Random Forest
+            # Optimized for Non-Stationary Data (Drift Detection Enabled)
             self.models[sym] = compose.Pipeline(
                 preprocessing.StandardScaler(),
                 forest.ARFClassifier(
@@ -122,6 +124,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_d1: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
+        Executes the Learn-Predict Loop.
         """
         if symbol not in self.symbols: return None
         
@@ -137,7 +140,7 @@ class MultiAssetPredictor:
         buy_vol = getattr(bar, 'buy_vol', bar.volume / 2.0)
         sell_vol = getattr(bar, 'sell_vol', bar.volume / 2.0)
 
-        # 1. Feature Engineering (With High/Low for ATR/Stochastics)
+        # 1. Feature Engineering (Stationary Pipeline)
         features = fe.update(
             price=bar.close,
             timestamp=bar.timestamp,
@@ -155,7 +158,7 @@ class MultiAssetPredictor:
 
         # --- PHASE 2: WARM-UP GATE ---
         # We must update features/indicators recursively, but we DO NOT Train or Infer
-        # until the burn-in period is complete.
+        # until the burn-in period is complete to establish volatility baselines.
         if self.burn_in_counters[symbol] < self.burn_in_limit:
             self.burn_in_counters[symbol] += 1
             remaining = self.burn_in_limit - self.burn_in_counters[symbol]
@@ -164,28 +167,38 @@ class MultiAssetPredictor:
             return Signal(symbol, "WARMUP", 0.0, {"remaining": remaining})
 
         # 2. Delayed Training (Label Resolution via Adaptive Barrier)
-        # UPDATED: Unpack realized_ret
+        # We check if any PAST trades have closed based on current price action.
         resolved_labels = labeler.resolve_labels(bar.high, bar.low)
         
         if resolved_labels:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
-                # --- PROFIT WEIGHTED LEARNING ---
+                # --- PROFIT WEIGHTED LEARNING (SNIPER MODE) ---
+                # We apply higher weights to trades that resulted in significant PnL.
+                # This teaches the model to prioritize "Big Moves" over noise.
+                
                 w_pos = CONFIG['online_learning'].get('positive_class_weight', 5.0)
                 w_neg = CONFIG['online_learning'].get('negative_class_weight', 1.0)
                 
+                # Base weight: Higher for Signals (1/-1), Lower for Noise (0)
                 base_weight = w_pos if outcome_label != 0 else w_neg
                 
-                # Scale by Log Return Magnitude
-                # log(1 + 1.0) = 0.69 (Big Win). log(1 + 0.1) = 0.09 (Small Win)
+                # Scale by Log Return Magnitude (Stationary scaling)
+                # log(1 + 1.0%) = 0.69 (Big Win). log(1 + 0.1%) = 0.09 (Small Win)
                 ret_scalar = math.log1p(abs(realized_ret) * 100.0)
-                ret_scalar = max(0.5, ret_scalar)
+                
+                # Clamp scalar to avoid exploding weights on anomalies
+                ret_scalar = max(0.5, min(ret_scalar, 5.0))
                 
                 final_weight = base_weight * ret_scalar
                 
                 # Train Primary Model
                 model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
+                
+                # Update Meta-Labeler (Did the signal actually make money?)
+                if outcome_label != 0:
+                    meta_labeler.update(stored_feats, outcome_label, realized_ret)
 
-        # 3. Add CURRENT Bar as new Trade Opportunity
+        # 3. Add CURRENT Bar as new Trade Opportunity (for future labeling)
         current_atr = features.get('atr', 0.0)
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
 
@@ -193,9 +206,8 @@ class MultiAssetPredictor:
         current_pred_action = 0
         try:
             # Forensic Filters (RELAXED)
+            # We filter OUT extreme entropy/VPIN to avoid trading in chaos.
             entropy_val = features.get('entropy', 0.0)
-            
-            # Use Configured Threshold (0.85 for relaxed mode, default 0.99 in features logic)
             entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.85)
             
             if entropy_val > entropy_thresh:
@@ -203,8 +215,6 @@ class MultiAssetPredictor:
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"Max Entropy ({entropy_val:.2f})"})
 
             vpin_val = features.get('vpin', 0.0)
-            
-            # REMEDIATION #1: Dynamic VPIN Threshold (Fixes Hardcoded 0.95)
             vpin_thresh = CONFIG['microstructure'].get('vpin_threshold', 0.85)
             
             if vpin_val > vpin_thresh: 
@@ -221,6 +231,7 @@ class MultiAssetPredictor:
                 current_pred_action = 0
 
             # Get Confidence for Specific Action
+            # If Model says BUY, we check prob(1). If SELL, prob(-1).
             prob_buy = pred_proba.get(1, 0.0)
             prob_sell = pred_proba.get(-1, 0.0)
             
@@ -238,8 +249,8 @@ class MultiAssetPredictor:
             min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.50) 
             volatility = features.get('volatility', 0.001)
 
-            # --- STANDARD PURE AI LOGIC ---
-            if current_pred_action == 1: 
+            # --- STANDARD AI LOGIC ---
+            if current_pred_action == 1: # BUY
                 if confidence > min_conf:
                     if is_profitable:
                         return Signal(symbol, "BUY", confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr})
@@ -250,7 +261,7 @@ class MultiAssetPredictor:
                     stats['Low Confidence'] += 1
                     return Signal(symbol, "HOLD", confidence, {"reason": f"Low Confidence ({confidence:.2f} < {min_conf})"})
             
-            elif current_pred_action == -1: # SELL LOGIC
+            elif current_pred_action == -1: # SELL
                 if confidence > min_conf:
                     if is_profitable:
                         return Signal(symbol, "SELL", confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr})
@@ -264,7 +275,7 @@ class MultiAssetPredictor:
             else:
                 stats['Model Predicted 0'] += 1
             
-            # Periodic Rejection Log (Refinement #5)
+            # Periodic Rejection Log
             if self.bar_counters[symbol] % 100 == 0:
                 logger.info(f"🔍 {symbol} Rejections (Last 100): {dict(stats)}")
 

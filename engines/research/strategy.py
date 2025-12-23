@@ -5,10 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
-# AUDIT REMEDIATION (BLEEDING OUT FIX):
-# 1. ENTROPY/VPIN: Defaults set to 1.0 (Accept All) to stop filtering volatility.
-# 2. TRAUMA WATCHDOG: Forces Discovery Mode if Win Rate < 40% (prevents death spiral).
-# 3. OUTCOME TRACKING: Added self.recent_outcomes to monitor performance.
+# AUDIT REMEDIATION (SNIPER MODE):
+# 1. VOLATILITY GATE: Hard block on trading if ATR < 3x Spread (Configurable).
+# 2. DISCOVERY SAFETY: Removed "Random" exploration. Only trades on Bias (>0.4) or Breakout.
+# 3. RISK ALIGNMENT: Passes 'atr' explicitly to RiskManager for Volatility Targeting.
+# 4. AUTOPSY: Enhanced reporting to track Gate rejections.
 # =============================================================================
 import logging
 import sys
@@ -59,7 +60,7 @@ class ResearchStrategy:
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
         self.labeler = AdaptiveTripleBarrier(
-            horizon_ticks=tbm_conf.get('horizon_minutes', 60),
+            horizon_ticks=tbm_conf.get('horizon_minutes', 30),
             risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'],
             reward_mult=tbm_conf.get('barrier_width', 2.0)
         )
@@ -87,9 +88,16 @@ class ResearchStrategy:
         self.decision_log = deque(maxlen=1000)
         self.trade_events = []
         self.rejection_stats = defaultdict(int)  # Track why we didn't trade
+
+        # --- AUDIT FIX: VOLATILITY GATE ---
+        # Load Gate settings from config (Sniper Mode)
+        self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
+        self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 3.0)
         
-        # --- TRAUMA WATCHDOG STATE ---
-        self.recent_outcomes = deque(maxlen=20) # Track last 20 trade outcomes for Trauma Check
+        # Load Spread Assumptions for Gating
+        self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
+        self.default_spread = self.spread_map.get('default', 1.5)
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
@@ -140,7 +148,8 @@ class ResearchStrategy:
         
         self.last_price = price
 
-        # A. Feature Engineering (Recursive Update)
+        # A. Feature Engineering (Stationary Pipeline)
+        # fe.update matches the new signature in shared/financial/features.py
         features = self.fe.update(
             price=price,
             timestamp=timestamp,
@@ -149,7 +158,7 @@ class ResearchStrategy:
             low=low,
             buy_vol=buy_vol,
             sell_vol=sell_vol,
-            time_feats={}
+            time_feats={} # Transformer logic can be added here if needed
         )
         self.last_features = features
 
@@ -168,43 +177,56 @@ class ResearchStrategy:
         if resolved_labels:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
                 # --- PROFIT WEIGHTED LEARNING ---
+                # We reward "Big Wins" and punish "Churn" (Neutral Reinforcement)
+                
                 w_pos = self.params.get('positive_class_weight', 10.0)
                 w_neg = self.params.get('negative_class_weight', 1.0)
                 
                 base_weight = w_pos if outcome_label != 0 else w_neg
                 
                 # Scale by Profit Magnitude
+                # log(1 + 1%) = 0.69. log(1 + 0.1%) = 0.09.
                 ret_scalar = math.log1p(abs(realized_ret) * 100.0)
-                ret_scalar = max(0.5, ret_scalar)
+                ret_scalar = max(0.5, ret_scalar) # Floor at 0.5 to keep learning from small moves
                 
                 final_weight = base_weight * ret_scalar
                 
                 self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
                 
+                # Meta Labeler Update
                 if outcome_label != 0:
                     self.meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
-                    
-                # --- UPDATE TRAUMA WATCHDOG ---
-                # 1 = Win, 0 = Loss (for simple WR calc)
-                self.recent_outcomes.append(1 if realized_ret > 0 else 0)
 
         # C. Add CURRENT Bar as new Trade Opportunity
         current_atr = features.get('atr', 0.0)
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
+        # --- AUDIT FIX: VOLATILITY GATE (SNIPER MODE) ---
+        # If ATR is too low relative to spread, we strictly REJECT the trade.
+        # This prevents the bot from bleeding spread costs in dead markets.
+        if self.use_vol_gate:
+            pip_size, _ = RiskManager.get_pip_info(self.symbol)
+            spread_pips = self.spread_map.get(self.symbol, self.default_spread)
+            spread_cost = spread_pips * pip_size
+            
+            # Gate Requirement: ATR must be > K * Spread
+            # e.g., if Spread is 1.5 pips, ATR must be > 4.5 pips.
+            if current_atr < (spread_cost * self.min_atr_spread_ratio):
+                self.rejection_stats['Vol Gate (Dead Market)'] += 1
+                return # --- HARD STOP ---
+
         # D. Inference
         try:
-            # --- FILTER RELAXATION (BLEEDING FIX) ---
-            # Default to 1.0 (Accept All) to prevent filtering active markets
+            # --- FILTER RELAXATION ---
             entropy_val = features.get('entropy', 0)
-            entropy_thresh = self.params.get('entropy_threshold', 1.0) 
+            entropy_thresh = self.params.get('entropy_threshold', 0.85)
             
             if entropy_val > entropy_thresh:
                 self.rejection_stats['High Entropy'] += 1
                 return
 
             vpin_val = features.get('vpin', 0)
-            vpin_thresh = self.params.get('vpin_threshold', 1.0)
+            vpin_thresh = self.params.get('vpin_threshold', 0.85)
             
             if vpin_val > vpin_thresh:
                 self.rejection_stats['High VPIN'] += 1
@@ -225,35 +247,22 @@ class ResearchStrategy:
             # E. Execution Logic & Discovery Override
             dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
             
-            # --- TRAUMA WATCHDOG CHECK ---
-            trauma_triggered = False
-            if len(self.recent_outcomes) >= 20:
-                current_wr = sum(self.recent_outcomes) / len(self.recent_outcomes)
-                if current_wr < 0.40:
-                    trauma_triggered = True
-                    # self.rejection_stats['Trauma Mode'] += 1 # Optional logging
-
             # --- PROFITABLE DISCOVERY LOGIC ---
-            # Discovery Mode is active if:
-            # 1. We are in early phases (< 2500 bars)
-            # 2. OR Trauma Watchdog is triggered (WR < 40%)
+            # We removed "Random Coin Flips". We only trade if:
+            # 1. AI is confident (> Threshold)
+            # 2. AI shows "Bias" (> 0.40) during discovery phase.
+            # 3. Volatility Breakout occurs.
             
-            is_discovery = (self.bars_processed < 2500) or trauma_triggered
+            is_discovery = self.bars_processed < 2500
             effective_action = pred_action
             discovery_triggered = False
 
             if is_discovery and effective_action == 0:
                 max_prob = max(prob_buy, prob_sell)
                 
-                # 1. Cold Start: Epsilon Greedy (Rare: 10%)
-                if max_prob == 0.0:
-                    if random.random() < 0.1:  
-                        effective_action = random.choice([1, -1])
-                        discovery_triggered = True
-                
-                # 2. Bias Amplification (Must show some conviction)
-                # Raised threshold from 0.05 to 0.40 to stop trading noise
-                else:
+                # 1. Bias Amplification (Must show some conviction)
+                # We do NOT trade if probabilities are 0.0 (Cold Start)
+                if max_prob > 0.0:
                     bias_buy = prob_buy > 0.40
                     bias_sell = prob_sell > 0.40
                     
@@ -264,9 +273,10 @@ class ResearchStrategy:
                         effective_action = -1
                         discovery_triggered = True
                 
-                # 3. Volatility Breakout Fallback
+                # 2. Volatility Breakout Fallback
+                # If AI is unsure, but volatility is expanding, follow the trend (Stationary Log Ret)
                 if not discovery_triggered and features.get('vol_breakout', 0) > 0:
-                    ret = features.get('return_raw', 0)
+                    ret = features.get('log_ret', 0)
                     if ret > 0:
                         effective_action = 1
                         discovery_triggered = True
@@ -291,7 +301,6 @@ class ResearchStrategy:
             if effective_action == 1 or effective_action == -1:
                 if is_profitable:
                         # For AI trades, use actual probability.
-                        # For Discovery trades, use a fixed conservative confidence for Kelly
                         confidence = prob_buy if effective_action == 1 else prob_sell
                         
                         if discovery_triggered:
@@ -319,7 +328,7 @@ class ResearchStrategy:
                 self.last_price_map[sym] = price
 
     def _execute_logic(self, confidence, price, features, broker, timestamp: datetime, action_int: int, discovery_mode: bool):
-        """Decides whether to enter a trade using Inverse-Volatility Sizing."""
+        """Decides whether to enter a trade using Volatility Targeting."""
         
         # 1. Signal Threshold (Only applies to AI trades, not Discovery)
         min_prob = self.params.get('min_calibrated_probability', 0.50)
@@ -353,10 +362,10 @@ class ResearchStrategy:
             volatility=volatility,
             active_correlations=0,
             market_prices=self.last_price_map,
-            atr=current_atr
+            atr=current_atr # Explicit ATR pass for Volatility Targeting
         )
 
-        # --- CRITICAL FIX: Assign Action Explicitly ---
+        # Assign Action Explicitly
         trade_intent.action = action 
 
         # 3. SAFETY: Check if Risk Manager Rejected the trade
@@ -369,9 +378,7 @@ class ResearchStrategy:
         # --- CHEAP LEARNING: Slash size for Discovery Trades ---
         if discovery_mode:
             qty = qty * 0.1  # Take 1/10th of the calculated risk
-            # Ensure we don't go below min lot size (usually 0.01)
             qty = max(0.01, qty)
-            # Log it for clarity in comments
             trade_intent.comment += "|DISC_SIZE"
 
         stop_dist = trade_intent.stop_loss

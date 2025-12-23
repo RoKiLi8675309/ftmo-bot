@@ -6,11 +6,11 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates bars, generates signals, checks risk, executes trades.
 # COMPLIANCE: FTMO Rules, Session Guards, News Filters.
 #
-# FORENSIC REMEDIATION LOG (2025-12-22):
-# 1. AUTO-DETECT: Retrieves real account size from Redis to scale CPPI logic.
-# 2. REMOVED AGGRESSIVE MODE: Deleted daily trade counters and forced trade logic.
-# 3. WARM-UP GATE: Enforces strict burn-in period.
-# 4. RISK: Passes 'atr' from signal metadata to RiskManager.
+# AUDIT REMEDIATION (SNIPER MODE):
+# 1. VOLATILITY GATE: Live enforcement of ATR > 3x Spread.
+# 2. AUTO-DETECT: Retrieves real account size from Redis to scale CPPI logic.
+# 3. WARM-UP GATE: Enforces strict burn-in period (ignores 'WARMUP' signals).
+# 4. RISK: Passes 'atr' from signal metadata to RiskManager for Volatility Targeting.
 # =============================================================================
 import logging
 import time
@@ -107,6 +107,12 @@ class LiveTradingEngine:
         # Live Price Cache for Risk Calculations
         self.latest_prices = {}
 
+        # --- AUDIT FIX: Volatility Gate Config ---
+        self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
+        self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 3.0)
+        self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
+
     def process_tick(self, tick_data: dict):
         """
         Handles a single raw tick from Redis.
@@ -163,14 +169,27 @@ class LiveTradingEngine:
 
         logger.info(f"{LogSymbols.SIGNAL} SIGNAL: {signal.action} {bar.symbol} (Conf: {signal.confidence:.2f})")
 
+        # --- AUDIT FIX: VOLATILITY GATE ---
+        # If the ATR is too low relative to the spread, we reject.
+        # This stops the bot from trading in dead markets where spread > profit potential.
+        current_atr = signal.meta_data.get('atr', 0.0)
+        
+        if self.use_vol_gate:
+            pip_size, _ = RiskManager.get_pip_info(bar.symbol)
+            spread_pips = self.spread_map.get(bar.symbol, 1.5) # Default 1.5 if unknown
+            spread_cost = spread_pips * pip_size
+            
+            if current_atr < (spread_cost * self.min_atr_spread_ratio):
+                logger.warning(f"{LogSymbols.LOCK} Vol Gate: {bar.symbol} Rejected. ATR {current_atr:.5f} < {self.min_atr_spread_ratio}x Spread.")
+                return
+
         # 4. Check Risk & Compliance Gates
         if not self._check_risk_gates(bar.symbol):
             return
 
-        # 5. Calculate Size (Kelly-Vol)
+        # 5. Calculate Size (Volatility Targeting)
         volatility = signal.meta_data.get('volatility', 0.001)
-        current_atr = signal.meta_data.get('atr', 0.001) 
-
+        
         # Count correlations
         active_corrs = self.portfolio_mgr.get_correlation_count(
             bar.symbol, 
@@ -202,7 +221,7 @@ class LiveTradingEngine:
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=signal.confidence,
-            volatility=volatility, # Used for Kelly
+            volatility=volatility, # Used for Kelly/VolTargeting
             active_correlations=active_corrs,
             market_prices=self.latest_prices,
             atr=current_atr, # Phase 2: Explicitly pass ATR for stop distances
