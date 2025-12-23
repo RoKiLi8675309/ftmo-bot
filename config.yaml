@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – FTMO PROFIT MODE V35.0 (AUDIT REMEDIATION)
-# STATUS: SNIPER MODE ACTIVATED
+# config.yaml – FTMO PROFIT MODE V35.1 (REMEDIATION PATCH)
+# STATUS: SNIPER MODE V2 (BALANCED WEIGHTS)
 #
 # REMEDIATION LOG (2025-12-23):
-# 1. LEARNING: High 'grace_period' (200) & low 'delta' (1e-5) to filter M5 noise.
-# 2. RISK: Volatility Targeting enabled (20% Annualized) with Kelly Cap.
-# 3. GATING: Volatility Gate enabled (ATR must be > 3x Spread).
-# 4. FEATURES: Log-returns and Volatility Ratios for stationarity.
+# 1. WEIGHTS: Reduced positive_class_weight (10.0 -> 2.0) to stop hallucinations.
+# 2. FILTERS: Relaxed Entropy/VPIN (0.85 -> 0.95) to stop data starvation.
+# 3. RISK: Lowered Kelly Fraction (0.25 -> 0.15) for survival.
+# 4. GATING: Maintained Volatility Gate but allowed valid high-entropy setups.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -105,7 +105,8 @@ features:
   
   d1_ema_period: 200
   entropy_window: 100
-  entropy_threshold: 0.85 # Relaxed from 0.99 based on audit
+  # RELAXED: 0.85 was too strict for M5, causing 90% rejection.
+  entropy_threshold: 0.96 
   ofi_alpha: 0.1
   
   fractional_differentiation:
@@ -120,7 +121,8 @@ features:
 # --- MICROSTRUCTURE FILTERS ---
 microstructure:
   vpin_bucket_size: 1000
-  vpin_threshold: 0.85 # Relaxed from 0.95 based on audit
+  # RELAXED: High VPIN is normal in M5 trends. Only filter extreme toxicity.
+  vpin_threshold: 0.96
   er_threshold_noise: 0.30
   er_threshold_trend: 0.60
   hurst_threshold_mean_revert: 0.45
@@ -136,7 +138,8 @@ risk_management:
   # AUDIT FIX: Volatility Targeting
   sizing_method: "volatility_targeting" 
   target_annual_volatility: 0.20 # Target 20% annual vol
-  kelly_fraction: 0.25 # Quarter Kelly for safety
+  # SAFETY: Reduced from 0.25. Survival first.
+  kelly_fraction: 0.15 
   
   base_risk_per_trade_percent: 0.5
   max_leverage: 10 # Capped significantly to prevent ruin
@@ -158,7 +161,7 @@ risk_management:
   max_loss_usd: 2000.0
   
   # Adaptive Stops (Optimized for M5)
-  stop_loss_atr_mult: 2.0  # Widened to prevent noise stops
+  stop_loss_atr_mult: 2.0  
   take_profit_atr_mult: 3.0 # High R:R
 
 # --- TRADING PORTFOLIO ---
@@ -206,21 +209,23 @@ online_learning:
   burn_in_periods: 1000
   
   # AUDIT FIX: High Patience Parameters to filter Noise
-  grace_period: 200 # Increased from 50. Model waits for strong evidence.
-  delta: 0.00001    # Desensitized from 0.001. Harder to trigger drift reset.
+  grace_period: 200
+  delta: 0.00001
   
-  # Base weights (Scalar applied dynamically based on Profit in code)
-  positive_class_weight: 10.0
+  # CRITICAL FIX: REBALANCED WEIGHTS
+  # 10.0 caused hallucinations. 2.0 encourages signals but respects noise.
+  positive_class_weight: 2.0
   negative_class_weight: 1.0
   
-  meta_labeling_threshold: 0.60 # Increased confidence requirement
+  meta_labeling_threshold: 0.60
   
   metric: "F1"
   max_features: 'log2'
   lambda_value: 6
   
   learning_horizon_sec: 300
-  min_calibrated_probability: 0.55
+  # RELAXED: Lowered to allow model to take trades while learning.
+  min_calibrated_probability: 0.51
   
   tbm:
     horizon_minutes: 30

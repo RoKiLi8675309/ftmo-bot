@@ -7,7 +7,7 @@
 #
 # AUDIT REMEDIATION (SNIPER MODE):
 # 1. VOLATILITY GATE: Hard block on trading if ATR < 3x Spread (Configurable).
-# 2. DISCOVERY SAFETY: Removed "Random" exploration. Only trades on Bias (>0.4) or Breakout.
+# 2. DISCOVERY SAFETY: Removed "Random" exploration. Only trades on Bias (>0.45) or Breakout.
 # 3. RISK ALIGNMENT: Passes 'atr' explicitly to RiskManager for Volatility Targeting.
 # 4. AUTOPSY: Enhanced reporting to track Gate rejections.
 # =============================================================================
@@ -179,7 +179,7 @@ class ResearchStrategy:
                 # --- PROFIT WEIGHTED LEARNING ---
                 # We reward "Big Wins" and punish "Churn" (Neutral Reinforcement)
                 
-                w_pos = self.params.get('positive_class_weight', 10.0)
+                w_pos = self.params.get('positive_class_weight', 2.0)
                 w_neg = self.params.get('negative_class_weight', 1.0)
                 
                 base_weight = w_pos if outcome_label != 0 else w_neg
@@ -204,6 +204,7 @@ class ResearchStrategy:
         # --- AUDIT FIX: VOLATILITY GATE (SNIPER MODE) ---
         # If ATR is too low relative to spread, we strictly REJECT the trade.
         # This prevents the bot from bleeding spread costs in dead markets.
+        gate_passed = True
         if self.use_vol_gate:
             pip_size, _ = RiskManager.get_pip_info(self.symbol)
             spread_pips = self.spread_map.get(self.symbol, self.default_spread)
@@ -212,21 +213,20 @@ class ResearchStrategy:
             # Gate Requirement: ATR must be > K * Spread
             # e.g., if Spread is 1.5 pips, ATR must be > 4.5 pips.
             if current_atr < (spread_cost * self.min_atr_spread_ratio):
-                self.rejection_stats['Vol Gate (Dead Market)'] += 1
-                return # --- HARD STOP ---
+                gate_passed = False
 
         # D. Inference
         try:
             # --- FILTER RELAXATION ---
             entropy_val = features.get('entropy', 0)
-            entropy_thresh = self.params.get('entropy_threshold', 0.85)
+            entropy_thresh = self.params.get('entropy_threshold', 0.95)
             
             if entropy_val > entropy_thresh:
                 self.rejection_stats['High Entropy'] += 1
                 return
 
             vpin_val = features.get('vpin', 0)
-            vpin_thresh = self.params.get('vpin_threshold', 0.85)
+            vpin_thresh = self.params.get('vpin_threshold', 0.95)
             
             if vpin_val > vpin_thresh:
                 self.rejection_stats['High VPIN'] += 1
@@ -250,7 +250,7 @@ class ResearchStrategy:
             # --- PROFITABLE DISCOVERY LOGIC ---
             # We removed "Random Coin Flips". We only trade if:
             # 1. AI is confident (> Threshold)
-            # 2. AI shows "Bias" (> 0.40) during discovery phase.
+            # 2. AI shows "Bias" (> 0.45) during discovery phase AND Volatility allows it.
             # 3. Volatility Breakout occurs.
             
             is_discovery = self.bars_processed < 2500
@@ -258,13 +258,18 @@ class ResearchStrategy:
             discovery_triggered = False
 
             if is_discovery and effective_action == 0:
+                # Discovery MUST respect the Volatility Gate
+                if not gate_passed:
+                    self.rejection_stats['Vol Gate (Dead Market)'] += 1
+                    return
+
                 max_prob = max(prob_buy, prob_sell)
                 
-                # 1. Bias Amplification (Must show some conviction)
-                # We do NOT trade if probabilities are 0.0 (Cold Start)
+                # 1. Bias Amplification (Must show conviction)
+                # TIGHTENED: 0.45 bias required (0.4 was too loose)
                 if max_prob > 0.0:
-                    bias_buy = prob_buy > 0.40
-                    bias_sell = prob_sell > 0.40
+                    bias_buy = prob_buy > 0.45
+                    bias_sell = prob_sell > 0.45
                     
                     if bias_buy and prob_buy > prob_sell:
                         effective_action = 1
@@ -274,7 +279,6 @@ class ResearchStrategy:
                         discovery_triggered = True
                 
                 # 2. Volatility Breakout Fallback
-                # If AI is unsure, but volatility is expanding, follow the trend (Stationary Log Ret)
                 if not discovery_triggered and features.get('vol_breakout', 0) > 0:
                     ret = features.get('log_ret', 0)
                     if ret > 0:
@@ -283,6 +287,11 @@ class ResearchStrategy:
                     elif ret < 0:
                         effective_action = -1
                         discovery_triggered = True
+            
+            # Check gate for Regular Trades (Non-Discovery)
+            if not is_discovery and not gate_passed:
+                self.rejection_stats['Vol Gate (Dead Market)'] += 1
+                return
 
             # --- META LABELING ---
             if self.meta_label_events < 50 or discovery_triggered:
