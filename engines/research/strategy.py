@@ -5,12 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
-# FORENSIC REMEDIATION LOG (2025-12-22):
-# 1. COLD START BYPASS: Meta-Labeler is bypassed for first 50 events to force data.
-# 2. CONFIDENCE FLOOR: Updated logic to respect lower 0.50 floor.
-# 3. FILTERS: Relaxed Entropy/VPIN check to use dynamic threshold (0.85).
-# 4. AUTOPSY: Added detailed rejection tracking to debug "Analysis Paralysis".
-# 5. REFINEMENT: Added Confidence Distribution Histogram to Autopsy.
+# FORENSIC REMEDIATION LOG (2025-12-23):
+# 1. PARALYSIS CURE: Relaxed VPIN/Entropy to 0.75 (Dynamic via params).
+# 2. REWARD SHAPING: Implemented 10:1 Weighted Learning for profitable signals.
+# 3. AUTOPSY: Enhanced rejection tracking with 'Analysis Paralysis' detection.
+# 4. DRIFT: Logic updated to handle new 'soft' labels from AdaptiveTripleBarrier.
 # =============================================================================
 import logging
 import sys
@@ -136,6 +135,7 @@ class ResearchStrategy:
         self.last_price = price
 
         # A. Feature Engineering (Recursive Update)
+        # Includes new Regime/OFI features automatically via updated `features.py`
         features = self.fe.update(
             price=price,
             timestamp=timestamp,
@@ -154,22 +154,28 @@ class ResearchStrategy:
             return 
 
         # B. Delayed Training (Label Resolution via Adaptive Barrier)
-        resolved_labels = self.labeler.resolve_labels(high, low)
+        resolved_labels = self.labeler.resolve_labels(high, low, current_close=price)
         
         if resolved_labels:
             for (stored_feats, outcome_label) in resolved_labels:
-                # Weighted Learning (5:1 adjusted)
-                w_pos = self.params.get('positive_class_weight', 5.0)
+                # --- CONTINUOUS REWARD SHAPING (SIMULATED VIA WEIGHTS) ---
+                # Instead of continuous labels (which break ARFClassifier), we use
+                # heavy sample weights for profitable trades (label=1).
+                
+                # Fetch weights from params (defaulting to Aggressive 10:1)
+                w_pos = self.params.get('positive_class_weight', 10.0)
                 w_neg = self.params.get('negative_class_weight', 1.0)
                 
+                # Apply Weighting:
+                # If outcome is 1 (Success/Drift), we weight it heavily to force the model
+                # to "remember" this rare profitable setup.
                 weight = w_pos if outcome_label == 1 else w_neg
                 
                 self.model.learn_one(stored_feats, outcome_label, sample_weight=weight)
                 
-                # --- UPDATE META LABELER ---
-                # We assume the primary model *would* have predicted 1 if we took the trade.
-                # Only update meta-labeler if we actually had a setup (simplified simulation).
-                pass 
+                # Update Meta Labeler (Gatekeeper)
+                # We assume the primary model predicted 1 for the sake of meta-training
+                self.meta_labeler.update(stored_feats, primary_action=1, outcome_pnl=1.0 if outcome_label==1 else -1.0)
 
         # C. Add CURRENT Bar as new Trade Opportunity
         current_atr = features.get('atr', 0.0)
@@ -177,20 +183,20 @@ class ResearchStrategy:
 
         # D. Inference
         try:
-            # Forensic Filters (RELAXED via params)
+            # --- FILTER RELAXATION (Fix "Analysis Paralysis") ---
+            # 1. Entropy Filter
             entropy_val = features.get('entropy', 0)
-            # Default to 0.85 (Relaxed) 
-            entropy_thresh = self.params.get('entropy_threshold', 0.85) 
+            # Default to 0.75 (Relaxed) if not optimized
+            entropy_thresh = self.params.get('entropy_threshold', 0.75) 
             
             if entropy_val > entropy_thresh:
                 self.rejection_stats['High Entropy'] += 1
                 return
 
+            # 2. VPIN Filter (Microstructure)
             vpin_val = features.get('vpin', 0)
-            
-            # REMEDIATION: Dynamic VPIN Threshold (Fixes Hardcoded 0.85/0.95 inconsistency)
-            # Pulls from params (if optimizing) or falls back to global config
-            vpin_thresh = self.params.get('vpin_threshold', CONFIG['microstructure'].get('vpin_threshold', 0.85))
+            # Default to 0.75 (Relaxed)
+            vpin_thresh = self.params.get('vpin_threshold', 0.75)
             
             if vpin_val > vpin_thresh: 
                 self.rejection_stats['High VPIN'] += 1
@@ -212,7 +218,7 @@ class ResearchStrategy:
             dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
             
             # --- META LABELING (COLD START BYPASS) ---
-            # If we haven't seen 50 events yet, assume it's good to force learning.
+            # If we haven't seen 50 events yet, assume it's good to force data collection.
             if self.meta_label_events < 50:
                 is_profitable = True
             else:
@@ -375,5 +381,5 @@ class ResearchStrategy:
         for i, t in enumerate(display_trades):
             ts_str = str(t['time'])
             report += f"   Trade: {t['action']} @ {ts_str} | Conf:{t['conf']:.2f}\n"
-           
+            
         return report

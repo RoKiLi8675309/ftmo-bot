@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional)
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
-# FORENSIC REMEDIATION LOG (2025-12-22):
-# 1. TEMPORAL INTEGRITY: Implemented RecursiveEMA for stateful, O(1) indicators.
-# 2. INDICATORS: Added StreamingIndicators class (RSI, MACD, ATR).
-# 3. LABELING: AdaptiveTripleBarrier updated with DRIFT LOGIC (Soft Labeling).
-# 4. MATH: Fixed indentation and type safety in recursive calculations.
+# FORENSIC REMEDIATION LOG (2025-12-23):
+# 1. NEW FEATURES: Added Regime (Hurst), Cumulative OFI, and Volatility Breakout.
+# 2. ROBUSTNESS: Enhanced OnlineFeatureEngineer to track internal EMA/Windows for new feats.
+# 3. COMPATIBILITY: Maintained RecursiveEMA for O(1) streaming updates.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -331,6 +330,12 @@ class OnlineFeatureEngineer:
         self.vol_monitor = VolatilityMonitor(window=20)
         self.last_price = None
 
+        # --- NEW CONTEXT FEATURES (2025-12-23) ---
+        # 1. Cumulative OFI Window
+        self.ofi_window = deque(maxlen=20)
+        # 2. Volatility Trend EMA (for breakout detection)
+        self.atr_ema = RecursiveEMA(alpha=0.05)
+
     def update(self, price: float, timestamp: float, volume: float, 
                high: Optional[float] = None, low: Optional[float] = None,
                buy_vol: float = 0.0, sell_vol: float = 0.0, 
@@ -363,14 +368,32 @@ class OnlineFeatureEngineer:
         fd_price = self.frac_diff.update(price)
         volatility_val = self.vol_monitor.update(ret)
 
+        # 3. Hurst Exponent (Market Memory)
         hurst_val = 0.5
         if len(self.returns) >= 20:
             ret_arr = np.array(list(self.returns), dtype=np.float64)
             hurst_val = calculate_hurst(ret_arr)
 
+        # 4. Order Flow Imbalance (OFI)
         denominator = volume if volume > 0 else 1.0
         ofi_val = (buy_vol - sell_vol) / denominator
 
+        # --- NEW: Cumulative OFI (Trend of Order Flow) ---
+        self.ofi_window.append(ofi_val)
+        cum_ofi = sum(self.ofi_window) / len(self.ofi_window) if self.ofi_window else 0.0
+
+        # --- NEW: Regime Detection (Trend vs Mean Reversion) ---
+        # 1.0 = Trending, -1.0 = Mean Reverting, 0.0 = Random Walk
+        regime_val = 1.0 if hurst_val > 0.55 else (-1.0 if hurst_val < 0.45 else 0.0)
+
+        # --- NEW: Volatility Breakout (Expansion) ---
+        current_atr = tech_feats['atr']
+        self.atr_ema.update(current_atr)
+        atr_trend = self.atr_ema.get()
+        # If current ATR is significantly higher than average, volatility is expanding
+        vol_breakout = 1.0 if current_atr > (atr_trend * 1.05) else 0.0
+
+        # Efficiency Ratio (ER)
         er_val = 0.5
         if len(self.prices) >= 10:
             price_list = list(self.prices)
@@ -411,6 +434,12 @@ class OnlineFeatureEngineer:
             'ofi': ofi_val,
             'efficiency_ratio': er_val,
             
+            # --- NEW ENRICHED FEATURES ---
+            'cum_ofi': cum_ofi,
+            'regime': regime_val,
+            'vol_breakout': vol_breakout,
+            # -----------------------------
+
             # Normalized
             'price_z': price_z,
             'volume_z': volume_z,

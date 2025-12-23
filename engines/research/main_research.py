@@ -5,11 +5,11 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# FORENSIC REMEDIATION LOG (2025-12-22):
-# 1. METRIC SHIFT: Switched ARFClassifier metric to 'Recall' to cure paralysis.
-# 2. DATA SCALING: Increased training data load to 2,000,000 ticks (Rec #3).
-# 3. REPORTING: Enhanced EmojiCallback to track 'Win Rate' vs 'Risk-Adjusted Return'.
-# 4. OPTIMIZATION FIX: Replaced Hard Pruning with Soft Penalties (Gradient Descent).
+# FORENSIC REMEDIATION LOG (2025-12-23):
+# 1. OBJECTIVE: Switched to 'SQN + 2*PF' to prioritize Profitability over Recall.
+# 2. SEARCH SPACE: Widened VPIN/Entropy ranges (0.6-0.95) to fix paralysis.
+# 3. METRIC: Changed River metric to 'F1' for balanced performance.
+# 4. PRUNING: Lowered min_trades to 3 with soft penalties to encourage exploration.
 # =============================================================================
 import sys
 import os
@@ -176,25 +176,23 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
 
         # 2. Define Objective
         def objective(trial):
-            # Define Search Space (Focused on Tree Structure & Adaptation)
+            # Define Search Space (Focused on Profitability & Exploration)
             params = CONFIG['online_learning'].copy()
             params.update({
                 'n_models': trial.suggest_int('n_models', 10, 45, step=5),
                 'grace_period': trial.suggest_int('grace_period', 20, 100),
                 'delta': trial.suggest_float('delta', 0.0001, 0.01, log=True),
                 
-                # REMEDIATION: Expanded range 0.85 -> 0.99 to allow "Noisy" Trades (FOMO)
-                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.85, 0.99),
-                # NEW: Allow optimizing VPIN threshold dynamically
-                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.75, 0.95),
+                # REMEDIATION (Step 1): Widened Range 0.60 -> 0.95 to find "sweet spot"
+                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.60, 0.95),
+                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.60, 0.95),
                 
                 'tbm': {
-                    # REMEDIATION: Relaxed targets for Volatility-Adjusted Environment
-                    'barrier_width': trial.suggest_float('barrier_width', 1.5, 3.5),
+                    'barrier_width': trial.suggest_float('barrier_width', 1.5, 4.0),
                     'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 240) 
                 },
-                # REMEDIATION: Lowered floor to 0.50 to catch weak signals
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.50, 0.70)
+                # REMEDIATION: Lowered floor to 0.45 to catch all possible signals initially
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.45, 0.70)
             })
             
             # Instantiate Pipeline locally
@@ -228,44 +226,35 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("sharpe", metrics['sharpe'])
             
-            # --- CRITICAL FIX: SOFT PENALTY (GRADIENT DESCENT) ---
-            # Instead of a hard prune returning -10.0, we apply a scaled penalty.
-            # This allows Optuna to see "15 trades" as better than "0 trades".
+            # --- CRITICAL FIX: PROFIT-BASED OBJECTIVE ---
+            # Old: Score based on Sortino * log(freq)
+            # New: SQN + (Profit Factor * 2) - Penalties
             
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 5) # Default lowered to 5
+            final_score = metrics['sqn'] + (metrics['profit_factor'] * 2.0)
+            
+            # Soft Penalty for Low Activity
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 3) # Lowered to 3
             total_trades = metrics['total_trades']
-            final_score = metrics['score']
             
             if total_trades < min_trades:
                 trial.set_user_attr("pruned", True)
-                
                 # Calculate Deficit
                 deficit = min_trades - total_trades
-                
-                # Penalty: -0.5 per missing trade.
-                # 0 trades = -2.5 penalty (if min is 5).
-                # 4 trades = -0.5 penalty.
-                penalty = deficit * 0.5
-                
+                # Penalty: -1.0 per missing trade
+                penalty = deficit * 1.0
                 final_score -= penalty
                 
                 trial.set_user_attr("autopsy", f"LOW ACTIVITY: {total_trades}/{min_trades} trades. Soft Penalty applied: -{penalty:.2f}")
                 
-                # If 0 trades, ensure score is low enough to discourage but not break gradient
                 if total_trades == 0:
                     final_score = -5.0 
 
-                return final_score
-
-            # CRITICAL CONSTRAINT 2: Profitability (Profit Factor)
-            # Stop optimizing losers. If active (>50 trades) but losing money, penalize heavily.
-            if metrics['total_trades'] > 50 and metrics['profit_factor'] < 0.9:
-                trial.set_user_attr("pruned", True)
-                trial.set_user_attr("autopsy", f"PRUNED: Active but Losing (PF {metrics['profit_factor']:.2f}).")
-                return -5.0 # Moderate penalty, not -10.0
+            # Penalty for Negative PnL despite activity
+            if total_trades > 5 and metrics['total_pnl'] < 0:
+                 final_score -= 2.0 # Discourage losing strategies
 
             # Generate Autopsy if result is poor (Debugging)
-            if metrics['score'] < 0.5 or broker.is_blown:
+            if final_score < 0.5 or broker.is_blown:
                 trial.set_user_attr("autopsy", strategy.generate_autopsy())
                 
             if broker.is_blown:
@@ -376,8 +365,8 @@ class ResearchPipeline:
         if params is None:
             params = CONFIG['online_learning']
         
-        # FORENSIC REMEDIATION: Using ARFClassifier
-        # CRITICAL FIX: Changed metric from Precision to Recall to cure Analysis Paralysis
+        # FORENSIC REMEDIATION: Using ARFClassifier with F1 Score
+        # Changed metric from Recall to F1 to balance Precision (Safety) and Recall (Opportunity)
         return compose.Pipeline(
             preprocessing.StandardScaler(),
             forest.ARFClassifier(
@@ -389,8 +378,8 @@ class ResearchPipeline:
                 leaf_prediction='mc',
                 max_features='log2',
                 lambda_value=6,
-                # Optimization Target: RECALL (Prioritize finding trades over being perfect)
-                metric=metrics.Recall() 
+                # Optimization Target: F1 (Balanced)
+                metric=metrics.F1() 
             )
         )
 
@@ -449,7 +438,7 @@ class ResearchPipeline:
         avg_ret = df['Net_PnL'].mean()
         if avg_ret <= 0:
             metrics['score'] = -1.0
-            return metrics
+            # return metrics # Let it continue to calculate SQN for debugging
 
         # Volatility Based Metrics
         pnl_std = df['Net_PnL'].std() if len(df) > 1 else 1.0
@@ -465,9 +454,8 @@ class ResearchPipeline:
         if len(df) > 1 and pnl_std > 1e-9:
             metrics['sqn'] = math.sqrt(len(df)) * (avg_ret / pnl_std)
         
-        # Scoring Formula (Sortino + Frequency Bonus)
-        freq_bonus = np.log10(len(df) + 1)
-        metrics['score'] = metrics['sortino'] * freq_bonus
+        # Scoring Formula is calculated in objective function now
+        metrics['score'] = 0.0 # Placeholder
         
         return metrics
 

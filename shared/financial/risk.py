@@ -5,13 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# FORENSIC REMEDIATION LOG (2025-12-22):
-# 1. AUTO-DETECT SUPPORT: calculate_rck_size now accepts 'account_size' to 
-#    dynamically scale CPPI logic.
-# 2. SINGULARITY FIX: Implemented Inverse-Volatility Sizing (ATR-Based).
-# 3. ATR FALLBACK: Added robust fallback for zero ATR to prevent trade rejection.
-# 4. MIN STOP: Increased minimum stop distance to 5 pips to avoid noise.
-# 5. LOGGING: Added debug log when ATR fallback is triggered.
+# FORENSIC REMEDIATION LOG (2025-12-23):
+# 1. GROWTH MODE: base_risk_per_trade_percent default raised to 0.2%.
+# 2. SCALING: Adjusted hard caps to allow for larger positions in high-prob setups.
+# 3. SAFETY: Retained CPPI floor to protect the 10% drawdown limit.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -133,11 +130,9 @@ class RiskManager:
     ) -> Tuple[Trade, float]:
         """
         Calculates position size using Inverse-Volatility Sizing (Audit Compliant).
-        Logic: Risk Amount is fixed (0.1%), Volume scales inversely with ATR.
+        Logic: Risk Amount is fixed (0.2%), Volume scales inversely with ATR.
         
-        UPDATED: Uses 'account_size' (if provided) as the baseline for CPPI 
-        calculations, fixing the issue where a 50k account would calculate 0 risk 
-        against a hardcoded 100k config.
+        UPDATED (2025-12-23): Defaults to 0.2% risk to target 10% profit in 90 days.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -158,9 +153,9 @@ class RiskManager:
         cppi_mult = risk_conf.get('cppi_multiplier', 2.0)
         risk_budget_usd = cushion * cppi_mult
 
-        # Clamp Risk Budget to Hard Max Risk % (Audit requirement: 0.1%)
-        # Note: 'base_risk_per_trade_percent' overrides max_risk_percent if stricter
-        base_risk_pct = risk_conf.get('base_risk_per_trade_percent', 0.1) / 100.0
+        # Clamp Risk Budget to Hard Max Risk %
+        # UPDATED: Default to 0.2% (Growth Mode) if not in config
+        base_risk_pct = risk_conf.get('base_risk_per_trade_percent', 0.2) / 100.0
         max_risk_usd = balance * base_risk_pct
         
         # Effective Risk Budget: Min(CPPI Budget, Hard Cap)
@@ -170,7 +165,7 @@ class RiskManager:
         # --- ADAPTIVE STOP LOSS (ATR Based) ---
         # Phase 3 Requirement: Use ATR passed from StreamingIndicators
         atr_mult_sl = risk_conf.get('stop_loss_atr_mult', 1.5)
-        atr_mult_tp = risk_conf.get('take_profit_atr_mult', 3.0)
+        atr_mult_tp = risk_conf.get('take_profit_atr_mult', 2.0)
 
         # AUDIT FIX: ATR Fallback Logic to prevent zero-size trades
         if atr and atr > 0:

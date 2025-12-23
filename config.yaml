@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – FTMO COMPLIANCE MODE V30.1 (CONSERVATIVE BASELINE)
-# STATUS: PHASE 5 - RISK CONTROL & CONSISTENCY
+# config.yaml – FTMO GROWTH MODE V31.0 (PROFIT FOCUS)
+# STATUS: PHASE 6 - AGGRESSIVE SCALING & FEATURE ENRICHMENT
 #
-# FORENSIC REMEDIATION LOG (2025-12-22):
-# 1. RISK REDUCTION: base_risk_per_trade_percent set to 0.1% (Compliance).
-# 2. VPIN ALIGNMENT: Explicitly set thresholds to 0.85 for consistency.
-# 3. SAFETY CAP: max_risk_percent lowered to 0.5% (Hard Ceiling).
-# 4. OPTIMIZATION FIX: Lowered min_trades to 5 to cure "Optimization Blindness".
+# FORENSIC REMEDIATION LOG (2025-12-23):
+# 1. RISK ADJUSTMENT: base_risk_per_trade_percent raised to 0.2% to target 10% gain.
+# 2. FILTER RELAXATION: VPIN/Entropy lowered to 0.75 to cure "Analysis Paralysis".
+# 3. FEATURE FLAGS: Added Regime, Cumulative OFI, and Volatility Breakout flags.
+# 4. OPTIMIZATION: Min trades lowered to 3; Positive weight increased to 10.0.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -88,6 +88,11 @@ features:
   use_cache: true
   window_size: 50
   
+  # New Strategy Flags (2025-12-23)
+  use_regime: true
+  use_cum_ofi: true
+  use_vol_breakout: true
+
   # Recursive Indicators
   rsi_period: 14
   macd_fast: 12
@@ -98,7 +103,7 @@ features:
   # Context
   d1_ema_period: 200
   entropy_window: 100
-  entropy_threshold: 0.85 # RELAXED
+  entropy_threshold: 0.75 # RELAXED from 0.85 to encourage trading
   ofi_alpha: 0.1
   
   fractional_differentiation:
@@ -114,8 +119,8 @@ features:
 # --- MICROSTRUCTURE FILTERS ---
 microstructure:
   vpin_bucket_size: 1000
-  vpin_threshold: 0.85 # RELAXED: Consistent with logic
-  er_threshold_noise: 0.40
+  vpin_threshold: 0.75 # RELAXED: Lowered from 0.85 to fix "Analysis Paralysis"
+  er_threshold_noise: 0.30 # LOWERED: Detect trends earlier
   er_threshold_trend: 0.60
   hurst_threshold_mean_revert: 0.45
   hurst_threshold_random_low: 0.45
@@ -129,7 +134,7 @@ risk_management:
   
   # Sizing Logic
   sizing_method: "inverse_volatility" 
-  base_risk_per_trade_percent: 0.1 # CORRECTED: 0.1% Conservative Risk
+  base_risk_per_trade_percent: 0.2 # INCREASED: From 0.1% to 0.2% for Growth
   max_leverage: 30
   commission_per_lot_rt: 5.0
   contract_size: 100000
@@ -137,7 +142,7 @@ risk_management:
   # Constraints
   max_daily_loss_pct: 0.05
   max_total_loss_pct: 0.10
-  max_risk_percent: 0.5 # Hard Cap lowered for safety
+  max_risk_percent: 0.5 # Hard Cap
   hard_stop_equity_usd: 80000.0
   max_trades_per_day: 50
   correlation_penalty_threshold: 0.7
@@ -156,7 +161,7 @@ risk_management:
   min_lot_size: 0.01
   max_lot_size: 50.0
   min_stop_loss_pips: 5.0
-  max_loss_usd: 1000.0 # Lowered to match 0.1% of 100k roughly
+  max_loss_usd: 2000.0 # Adjusted for 0.2% of 100k roughly (with buffer)
   
   # Adaptive Stops
   stop_loss_atr_mult: 1.5 
@@ -197,7 +202,7 @@ wfo:
   n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 5 # LOWERED: Fixes Optimization Blindness
+  min_trades_optimization: 3 # LOWERED: From 5 to 3 to prevent over-pruning
 
 # --- ONLINE LEARNING ---
 online_learning:
@@ -212,14 +217,14 @@ online_learning:
   delta: 0.001
   
   # Weighted Learning
-  positive_class_weight: 5.0
+  positive_class_weight: 10.0 # INCREASED: From 5.0 to 10.0 to capture rare profitable signals
   negative_class_weight: 1.0  
   
   # Meta Labeling
   meta_labeling_threshold: 0.55
   
   # Optimization
-  metric: "Recall"
+  metric: "F1" # CHANGED: From Recall to F1 for balanced profitability
   max_features: 'log2'
   lambda_value: 6
   
