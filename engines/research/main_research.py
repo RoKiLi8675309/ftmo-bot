@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (SNIPER MODE V4):
-# 1. OBJECTIVE: Added +1.0 Bonus for >200 trades to reward statistical significance.
-# 2. SEARCH SPACE: Lowered min_calibrated_probability floor to 0.55.
-# 3. FILTERS: Aligned Entropy/VPIN ranges with new relaxed Config (0.98).
-# 4. DRIFT: Added search range for drift_threshold (0.75-1.25).
+# AUDIT REMEDIATION (CHALLENGE MODE V1.2):
+# 1. OBJECTIVE: Switched to PnL-Dominant Scoring. (Raw $$$ > Sharpe).
+# 2. SEARCH SPACE: Widened Barrier Width (2.0 - 6.0) for Home Runs.
+# 3. FILTERS: Aligned with new Aggressive Config.
 # =============================================================================
 import sys
 import os
@@ -69,6 +68,7 @@ class EmojiCallback:
         # 1. Determine Status Icon & Rank
         sqn = attrs.get('sqn', 0.0)
         trades = attrs.get('trades', 0)
+        pnl = attrs.get('pnl', 0.0)
         
         if attrs.get('blown', False):
             icon = "💀"  # Blown Account
@@ -79,13 +79,13 @@ class EmojiCallback:
         elif trades == 0:
             icon = "💤"  # No Trades
             status = "IDLE "
-        elif val is not None and val >= 3.0 and sqn > 2.0:
-            icon = "💎"  # Diamond Hand / Excellent
-            status = "ELITE"
-        elif val is not None and val >= 1.0:
-            icon = "🚀"  # Good
+        elif pnl >= 5000.0: # Aggressive Target
+            icon = "🚀"  # To the Moon
+            status = "ALPHA"
+        elif pnl >= 1000.0:
+            icon = "💎"  # Solid
             status = "PROFIT"
-        elif val is not None and val > 0.0:
+        elif pnl > 0.0:
             icon = "🛡️"  # Weak Profit
             status = "WEAK "
         else:
@@ -93,7 +93,6 @@ class EmojiCallback:
             status = "LOSS "
 
         # 2. Extract Metrics (Safe Defaults)
-        pnl = attrs.get('pnl', 0.0)
         dd = attrs.get('max_dd_pct', 0.0) * 100
         wr = attrs.get('win_rate', 0.0) * 100
         pf = attrs.get('profit_factor', 0.0)
@@ -188,7 +187,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             # Define Search Space (Focused on Profitability & Exploration)
             params = CONFIG['online_learning'].copy()
             params.update({
-                'n_models': trial.suggest_int('n_models', 15, 45, step=5),
+                'n_models': trial.suggest_int('n_models', 20, 50, step=5),
                 
                 # AUDIT FIX: High Patience for Sniper Mode
                 'grace_period': trial.suggest_int('grace_period', 100, 500), # Wait longer before split
@@ -200,15 +199,14 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'vpin_threshold': trial.suggest_float('vpin_threshold', 0.95, 0.999),
                 
                 'tbm': {
-                    # REMEDIATION (Step 2): Reduced range for M5/Volume bars
-                    'barrier_width': trial.suggest_float('barrier_width', 1.0, 3.0),
+                    # CHALLENGE MODE: Wide Barriers for Home Runs
+                    'barrier_width': trial.suggest_float('barrier_width', 2.0, 6.0),
                     'horizon_minutes': trial.suggest_int('horizon_minutes', 15, 120),
                     # AUDIT: Drift Threshold search (0.75 - 1.25)
                     'drift_threshold': trial.suggest_float('drift_threshold', 0.75, 1.25)
                 },
-                # SNIPER MODE: Hardened Probability Floor (>0.55)
-                # Lowered from 0.60 to 0.55 per Audit V37
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.55, 0.75)
+                # CHALLENGE MODE: Allow lower probability floor (0.50) because Sizing is aggressive
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.50, 0.75)
             })
             
             # Instantiate Pipeline locally
@@ -242,10 +240,14 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("sharpe", metrics['sharpe'])
             
-            # --- CRITICAL FIX: PROFIT-BASED OBJECTIVE ---
-            # Score: SQN + (Profit Factor * 2) - Penalties + Bonuses
+            # --- CRITICAL FIX: AGGRESSIVE PNL OBJECTIVE ---
+            # Score = (Net Profit / $100) + SQN.
+            # Example: $5000 profit = 50 pts. SQN 2.0 = 2 pts. Total 52.
+            # Example: $50 profit = 0.5 pts. SQN 5.0 = 5 pts. Total 5.5.
+            # Winner: The $5000 strategy, even with lower SQN.
             
-            final_score = metrics['sqn'] + (metrics['profit_factor'] * 2.0)
+            pnl_score = metrics['total_pnl'] / 100.0
+            final_score = pnl_score + metrics['sqn']
             
             # Soft Penalty for Low Activity
             min_trades = CONFIG['wfo'].get('min_trades_optimization', 5)
@@ -254,7 +256,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             # AUDIT FIX: Volume Bonus (Reward Statistical Significance)
             # If the model finds >200 trades, we boost the score to encourage this behavior.
             if total_trades > 200:
-                final_score += 1.0
+                final_score += 5.0 # Massive boost for high activity
             
             if total_trades < min_trades:
                 trial.set_user_attr("pruned", True)
@@ -267,11 +269,11 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 if total_trades == 0:
                     # Save autopsy to explain WHY we had 0 trades (Vol Gate?)
                     trial.set_user_attr("autopsy", strategy.generate_autopsy())
-                    final_score = -5.0
+                    final_score = -50.0
 
             # Penalty for Negative PnL despite activity
             if total_trades > 5 and metrics['total_pnl'] < 0:
-                 final_score -= 2.0  # Discourage losing strategies
+                 final_score -= 10.0  # Strongly discourage losing strategies
 
             # Generate Autopsy if result is poor (Debugging)
             if final_score < 0.5 or broker.is_blown:
@@ -279,7 +281,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 
             if broker.is_blown:
                 trial.set_user_attr("blown", True)
-                return -50.0  # Max Penalty
+                return -100.0  # Max Penalty
             
             return final_score
 

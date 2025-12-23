@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-23):
-# 1. DISCOVERY: Increased Discovery Size to 0.2 (20%) to bootstrap positives.
-# 2. GATES: Added Efficiency Ratio (ER) > 0.4 hard gate to filter chop.
-# 3. DRIFT: Updated default Drift Threshold to 1.0.
-# 4. LOGIC: Enforced Bias > 0.55 for Discovery Trades.
+# AUDIT REMEDIATION (CHALLENGE MODE V1.2):
+# 1. DISCOVERY: FULL SIZE (100%) execution enabled. No more "testing" size.
+# 2. GATES: Efficiency Ratio (ER) gate logic remains, but uses relaxed Config value.
+# 3. LOGIC: Enforced Bias > 0.55 for Discovery Trades (High Conviction).
 # =============================================================================
 import logging
 import sys
@@ -100,7 +99,8 @@ class ResearchStrategy:
         self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.5)
         
         # AUDIT FIX: ER Gate Threshold
-        self.min_er_threshold = CONFIG['microstructure'].get('gate_er_threshold', 0.40)
+        # CHALLENGE MODE: This will now pick up the 0.20 from the updated Config
+        self.min_er_threshold = CONFIG['microstructure'].get('gate_er_threshold', 0.20)
         
         # Load Spread Assumptions for Gating
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
@@ -341,7 +341,7 @@ class ResearchStrategy:
                         
                         if discovery_triggered:
                             # Clamp confidence for Risk Manager to be safe
-                            confidence = 0.25
+                            confidence = 0.55 # Assume Conviction for Sizing
                         
                         self._execute_logic(confidence, price, features, broker, dt_timestamp, effective_action, discovery_triggered)
                 else:
@@ -414,10 +414,11 @@ class ResearchStrategy:
         
         # --- CHEAP LEARNING: Discovery Trades ---
         if discovery_mode:
-            # AUDIT FIX: Increased Discovery Size to 0.2 (20%)
-            qty = qty * 0.2 
+            # CHALLENGE MODE: FULL SIZE (100%)
+            # We trust the gates. If it passes, we trade it fully.
+            qty = qty * 1.0 
             qty = max(0.01, qty)
-            trade_intent.comment += "|DISC_SIZE"
+            trade_intent.comment += "|FULL_DISC"
 
         stop_dist = trade_intent.stop_loss
         tp_dist = trade_intent.take_profit

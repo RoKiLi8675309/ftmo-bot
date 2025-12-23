@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PHOENIX STRATEGY V1.1 (SNIPER MODE V5)
-# STATUS: AGGRESSIVE SCALING + RELAXED GATES
+# config.yaml – PHOENIX STRATEGY V1.2 (FTMO CHALLENGE MODE)
+# STATUS: HIGH RISK / HIGH REWARD
 #
-# REMEDIATION LOG (2025-12-23 - V5 UPDATE):
-# 1. GATES: Lowered gate_er_threshold to 0.25 to reduce "Chop" rejections by ~50%.
-# 2. SIZING: Increased kelly_fraction to 0.25 to target meaningful profit.
-# 3. CONVICTION: Maintained 0.55 probability floor for safety.
+# REMEDIATION LOG (2025-12-23 - CHALLENGE UPDATE):
+# 1. RISK: Bumped Target Vol to 0.60 and Kelly to 0.80 for meaningful lot sizes.
+# 2. GATES: Relaxed ER Threshold to 0.20 to stop filtering 90% of moves.
+# 3. DISCOVERY: Full size execution enabled.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -124,8 +124,8 @@ microstructure:
   vpin_threshold: 0.98
   er_threshold_noise: 0.30
   er_threshold_trend: 0.60
-  # AGGRESSIVE FIX: Lowered ER Gate to 0.25 to reduce rejection rate
-  gate_er_threshold: 0.25
+  # AGGRESSIVE FIX: Relaxed Gate to 0.20 (Stop blocking good trades!)
+  gate_er_threshold: 0.20
   hurst_threshold_mean_revert: 0.45
   hurst_threshold_random_low: 0.45
   hurst_threshold_random_high: 0.55
@@ -136,30 +136,29 @@ risk_management:
   account_currency: "USD"
   risk_timezone: "Europe/Prague"
   
-  # Volatility Targeting
+  # Volatility Targeting (AGGRESSIVE MODE)
   sizing_method: "volatility_targeting"
-  target_annual_volatility: 0.25 
-  # AGGRESSIVE FIX: Increased to 0.25 to boost position size
-  kelly_fraction: 0.25
+  target_annual_volatility: 0.60 # Was 0.25 (Too safe) -> 0.60 (Growth)
+  kelly_fraction: 0.80 # Was 0.25 (Too small) -> 0.80 (Aggressive)
   
-  base_risk_per_trade_percent: 0.5
-  max_leverage: 10 # Capped significantly to prevent ruin
+  base_risk_per_trade_percent: 1.0
+  max_leverage: 30 # Increased to allow larger positions
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
   # Constraints
   max_daily_loss_pct: 0.04
   max_total_loss_pct: 0.09
-  max_risk_percent: 1.0
+  max_risk_percent: 2.5 # Raised hard cap per trade to 2.5%
   hard_stop_equity_usd: 80000.0
-  max_trades_per_day: 50
-  correlation_penalty_threshold: 0.7
+  max_trades_per_day: 100
+  correlation_penalty_threshold: 0.8
   
   # Execution Guardrails
   min_lot_size: 0.01
-  max_lot_size: 10.0
+  max_lot_size: 50.0
   min_stop_loss_pips: 5.0
-  max_loss_usd: 2000.0
+  max_loss_usd: 5000.0
   
   # Adaptive Stops (Optimized for M5)
   stop_loss_atr_mult: 2.0
@@ -205,19 +204,19 @@ wfo:
 # --- ONLINE LEARNING ---
 online_learning:
   model_type: "ARFClassifier"
-  n_models: 35
+  n_models: 40
   
   burn_in_periods: 1000
   
   # High Patience Parameters
-  grace_period: 200
+  grace_period: 250
   delta: 0.00001
   
-  # Balanced Weighting (1.5x)
-  positive_class_weight: 1.5
-  negative_class_weight: 1.5
+  # Balanced Weighting (Boosted for Signal)
+  positive_class_weight: 2.0
+  negative_class_weight: 2.0
   
-  meta_labeling_threshold: 0.60
+  meta_labeling_threshold: 0.55
   
   metric: "F1"
   max_features: 'log2'
@@ -229,7 +228,7 @@ online_learning:
   
   tbm:
     horizon_minutes: 30
-    barrier_width: 2.0 # Standard deviation width
+    barrier_width: 2.5 # Standard deviation width
     min_profit_pips: 5.0
     # Drift Threshold
     drift_threshold: 1.0

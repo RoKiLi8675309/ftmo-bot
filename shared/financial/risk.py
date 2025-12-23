@@ -5,11 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# AUDIT REMEDIATION (SNIPER MODE V5):
-# 1. SIZING LOGIC: Replaced linear conviction cliff with Power Law (conf^2).
-#    - At 0.55 Conf: Old=0.10, New=0.30 (3x Boost).
-#    - At 0.60 Conf: Old=0.20, New=0.36 (1.8x Boost).
-# 2. SCALAR: Works in tandem with Config V38 (TargetVol=0.5, Kelly=0.4).
+# AUDIT REMEDIATION (CHALLENGE MODE V1.2):
+# 1. SIZING LOGIC: REMOVED Power Law (conf^2). Now uses Linear Scaling.
+#    - At 0.60 Conf: Old=0.36, New=0.60 (Almost Double Size).
+# 2. SCALAR: Works in tandem with Config V1.2 (TargetVol=0.6, Kelly=0.8).
 # 3. SAFETY: Maintained CPPI and Hard Risk Caps.
 # =============================================================================
 from __future__ import annotations
@@ -161,7 +160,7 @@ class RiskManager:
         risk_budget_usd = cushion * cppi_mult
 
         # Clamp Risk Budget to Hard Max Risk %
-        # PROFIT FIX: Raised to 2.0% in Config V38, logic respects it here.
+        # PROFIT FIX: Raised to 2.5% in Config V1.2, logic respects it here.
         base_risk_pct = risk_conf.get('max_risk_percent', 1.0) / 100.0
         max_risk_usd = balance * base_risk_pct
         
@@ -216,7 +215,7 @@ class RiskManager:
             # Formula: TargetExposure = (Equity * TargetAnnualVol) / InstrumentAnnualVol
             # Note: We limit this by the CPPI/MaxRisk calculated above as a ceiling.
             
-            # PROFIT FIX: Target Vol boosted to 0.50 in Config
+            # PROFIT FIX: Target Vol boosted to 0.60 in Config
             target_ann_vol = risk_conf.get('target_annual_volatility', 0.20)
             
             # Annualize the short-term volatility (M5 data assumption: 288 bars/day * 252 days)
@@ -231,13 +230,14 @@ class RiskManager:
             vol_scalar = target_ann_vol / realized_ann_vol
             
             # Fractional Kelly Application
-            # PROFIT FIX: Kelly Fraction boosted to 0.40 in Config
+            # PROFIT FIX: Kelly Fraction boosted to 0.80 in Config
             kelly_fraction = risk_conf.get('kelly_fraction', 0.25)
             
-            # PROFIT FIX: REPLACED LINEAR CLIFF WITH POWER LAW
-            # Old: max(0.0, (conf - 0.5) * 2) -> at 0.55 this was 0.1 (Too punitive)
-            # New: pow(conf, 2) -> at 0.55 this is ~0.3 (3x Boost)
-            conviction = pow(conf, 2)
+            # AGGRESSIVE FIX: LINEAR SCALING (No Penalty)
+            # If AI is 60% sure, we bet 60% of the calculated size.
+            # Old: pow(conf, 2) -> 0.6^2 = 0.36 (Too small)
+            # New: conf -> 0.60 (Full aggression)
+            conviction = conf
             
             # Apply Fraction
             final_scalar = vol_scalar * kelly_fraction * conviction
