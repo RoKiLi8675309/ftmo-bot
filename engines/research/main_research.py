@@ -5,11 +5,9 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# FORENSIC REMEDIATION LOG (2025-12-23):
-# 1. OBJECTIVE: 'SQN + 2*PF' prioritized.
-# 2. SEARCH SPACE: Reduced barrier/horizon ranges for M5/Volume bars (0.5-3.0 width, 10-60m horizon).
-# 3. SAFETY: Fixed pruning logic to allow learning from low-volume epochs.
-# 4. FIX: Expanded probability search space to 0.20 - 0.75 to enable cold-start learning.
+# AUDIT FIX (2025-12-23):
+# 1. VISIBILITY FIX: EmojiCallback now prints Autopsy even if trial is PRUNED.
+#    This allows us to see *why* trades were rejected (e.g. Risk, VPIN).
 # =============================================================================
 import sys
 import os
@@ -119,8 +117,15 @@ class EmojiCallback:
         # 5. Log to File (for persistence)
         log.info(msg.strip())
         
-        # 6. Conditional Autopsy (Debug Info for Failed/Weak Trials)
-        if 'autopsy' in attrs and (attrs.get('blown', False) or (val is not None and val < 0.5 and not attrs.get('pruned', False))):
+        # 6. Conditional Autopsy (Debug Info for Failed/Weak/Pruned Trials)
+        # VISIBILITY FIX: Show autopsy if pruning happened so user knows WHY
+        show_autopsy = False
+        if 'autopsy' in attrs:
+            if attrs.get('blown', False): show_autopsy = True
+            elif attrs.get('pruned', False): show_autopsy = True
+            elif val is not None and val < 0.5: show_autopsy = True
+            
+        if show_autopsy:
             autopsy_msg = f"\n🔎 AUTOPSY (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
             print(autopsy_msg, flush=True)
             log.info(autopsy_msg)

@@ -6,10 +6,9 @@
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
 # AUDIT FIX (2025-12-23):
-# 1. FIXED: Removed hardcoded STANDARD_LOT_UNITS inside calculation.
-# 2. FIXED: Injected contract_size dynamically from config/args.
-# 3. SAFETY: Lowered 'min_pips_req' to 2.0 to unblock M5 trading.
-# 4. CRITICAL FIX: Fixed "Death by Spread" bug by making min pips dynamic.
+# 1. CRITICAL FIX: Changed "Spread Risk" from REJECT to CLAMP.
+#    - If calculated stop is too small, we widen it to safety minimum and SIZE DOWN.
+#    - This ensures trades (and learning) continue even in low-volatility.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -195,8 +194,12 @@ class RiskManager:
         # Minimum Stop Loss must be at least 2.0x Spread + 1 Pip buffer
         min_stop_req = (spread_assumed * 2.0 * pip_val)
         
+        # CRITICAL FIX (2025-12-23): CLAMP instead of REJECT
+        # If the ATR stop is tighter than the spread allows, widen it to the minimum safe distance.
+        # The position sizing logic below will naturally reduce the lot size to keep risk constant.
         if stop_dist < min_stop_req:
-             return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, f"Spread Risk: Stop {stop_dist/pip_val:.1f}p < {min_stop_req/pip_val:.1f}p"), 0.0
+             # logger.debug(f"⚠️ WIDENING STOP for {symbol}: {stop_dist/pip_val:.1f}p -> {min_stop_req/pip_val:.1f}p")
+             stop_dist = min_stop_req
 
         sl_pips = stop_dist / pip_val
 
