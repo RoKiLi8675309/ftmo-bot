@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – FTMO PROFIT MODE V35.2 (SNIPER HARDENING)
-# STATUS: SNIPER MODE V2 (NEUTRAL WEIGHTS)
+# config.yaml – FTMO PROFIT MODE V36.0 (FORENSIC OPTIMIZED)
+# STATUS: SNIPER MODE V3 (RELAXED GATES + HIGH DRIFT)
 #
 # REMEDIATION LOG (2025-12-23):
-# 1. WEIGHTS: Set positive_class_weight to 1.0. Profit magnitude now drives learning.
+# 1. WEIGHTS: Set positive_class_weight to 1.5 to amplify signals over noise.
 # 2. FILTERS: Relaxed Entropy/VPIN (0.96) to prevent data starvation.
-# 3. RISK: Lowered Kelly Fraction (0.15) for survival.
-# 4. GATING: Maintained Volatility Gate but allowed valid high-entropy setups.
+# 3. RISK: Lowered Kelly Fraction (0.10) for survival; Target Vol 0.25.
+# 4. LOGIC: Added explicit Drift Threshold (0.75) for labeling.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -105,8 +105,8 @@ features:
   
   d1_ema_period: 200
   entropy_window: 100
-  # RELAXED: 0.85 was too strict for M5, causing 90% rejection.
-  entropy_threshold: 0.96 
+  # RELAXED: 0.96 to allow more trade frequency in M5
+  entropy_threshold: 0.96
   ofi_alpha: 0.1
   
   fractional_differentiation:
@@ -121,10 +121,12 @@ features:
 # --- MICROSTRUCTURE FILTERS ---
 microstructure:
   vpin_bucket_size: 1000
-  # RELAXED: High VPIN is normal in M5 trends. Only filter extreme toxicity.
+  # RELAXED: 0.96 to prevent starvation
   vpin_threshold: 0.96
   er_threshold_noise: 0.30
   er_threshold_trend: 0.60
+  # Gate specific threshold
+  gate_er_threshold: 0.40
   hurst_threshold_mean_revert: 0.45
   hurst_threshold_random_low: 0.45
   hurst_threshold_random_high: 0.55
@@ -136,10 +138,10 @@ risk_management:
   risk_timezone: "Europe/Prague"
   
   # AUDIT FIX: Volatility Targeting
-  sizing_method: "volatility_targeting" 
-  target_annual_volatility: 0.20 # Target 20% annual vol
-  # SAFETY: Reduced from 0.25. Survival first.
-  kelly_fraction: 0.15 
+  sizing_method: "volatility_targeting"
+  target_annual_volatility: 0.25 # Increased for opportunity capture
+  # SAFETY: Reduced to 0.10 for survival
+  kelly_fraction: 0.10
   
   base_risk_per_trade_percent: 0.5
   max_leverage: 10 # Capped significantly to prevent ruin
@@ -157,11 +159,11 @@ risk_management:
   # Execution Guardrails
   min_lot_size: 0.01
   max_lot_size: 10.0
-  min_stop_loss_pips: 5.0 
+  min_stop_loss_pips: 5.0
   max_loss_usd: 2000.0
   
   # Adaptive Stops (Optimized for M5)
-  stop_loss_atr_mult: 2.0  
+  stop_loss_atr_mult: 2.0
   take_profit_atr_mult: 3.0 # High R:R
 
 # --- TRADING PORTFOLIO ---
@@ -208,13 +210,13 @@ online_learning:
   
   burn_in_periods: 1000
   
-  # AUDIT FIX: High Patience Parameters to filter Noise
+  # AUDIT FIX: High Patience Parameters
   grace_period: 200
   delta: 0.00001
   
-  # CRITICAL FIX: NEUTRAL WEIGHTS
-  # 1.0 ensures we let profit magnitude determine importance, not arbitrary multipliers.
-  positive_class_weight: 1.0
+  # CRITICAL FIX: WEIGHTING
+  # 1.5x weight for Classes 1/-1 to encourage signals
+  positive_class_weight: 1.5
   negative_class_weight: 1.0
   
   meta_labeling_threshold: 0.60
@@ -224,18 +226,20 @@ online_learning:
   lambda_value: 6
   
   learning_horizon_sec: 300
-  # RELAXED: Lowered to allow model to take trades while learning.
+  # RELAXED: 0.51+ allows learning while trading
   min_calibrated_probability: 0.51
   
   tbm:
     horizon_minutes: 30
     barrier_width: 2.0 # Standard deviation width
     min_profit_pips: 5.0
-
+    # AUDIT: Stricter labeling to reduce noise
+    drift_threshold: 0.75
+    
   # AUDIT FIX: Volatility Gate Settings
   volatility_gate:
     enabled: true
-    min_atr_spread_ratio: 3.0 # ATR must be > 3x Spread to trade
+    min_atr_spread_ratio: 3.0 # Relaxed from 4.0 to 3.0
 
 # --- FORENSIC AUDIT ---
 forensic_audit:

@@ -6,9 +6,8 @@
 # DESCRIPTION: Manages Redis connections, Streams, and Retry policies.
 # CRITICAL: Python 3.9 Compatible. Handles Network partitions gracefully.
 # AUDIT REMEDIATION (2025-12-20):
-#   - Added add_event helper to enforce MAXLEN on Redis Streams (Memory Protection).
+# - Enforced strict MAXLEN=5000 on all streams to prevent OOM.
 # =============================================================================
-
 import logging
 import time
 from typing import Optional, Any, Dict
@@ -27,10 +26,10 @@ class RedisStreamManager:
     Manages the lifecycle of a Redis Stream Consumer Group.
     Ensures connectivity, group creation, and reliable message acknowledgement.
     """
-    def __init__(self, 
-                 host: str = 'localhost', 
-                 port: int = 6379, 
-                 db: int = 0, 
+    def __init__(self,
+                 host: str = 'localhost',
+                 port: int = 6379,
+                 db: int = 0,
                  stream_key: str = 'price_data_stream',
                  group_name: str = 'trading_bot_group',
                  dlq_key: str = 'market_ticks_dlq',
@@ -57,7 +56,7 @@ class RedisStreamManager:
         
         # Retry up to 10 times on specific network errors
         retry_logic = Retry(
-            backoff=backoff_strategy, 
+            backoff=backoff_strategy,
             retries=10
         )
         
@@ -73,8 +72,8 @@ class RedisStreamManager:
             connection_pool=self.pool,
             retry=retry_logic,
             retry_on_error=[
-                ConnectionError, 
-                TimeoutError, 
+                ConnectionError,
+                TimeoutError,
                 ConnectionResetError, # Using Python's built-in exception
                 BusyLoadingError
             ],
@@ -101,10 +100,10 @@ class RedisStreamManager:
         except Exception as e:
             self.logger.error(f"Unexpected error ensuring group: {e}")
 
-    def add_event(self, stream_key: str, data: Dict[str, Any], maxlen: int = 10000) -> str:
+    def add_event(self, stream_key: str, data: Dict[str, Any], maxlen: int = 5000) -> str:
         """
         AUDIT FIX: Helper to safely add events to a stream with strict memory capping.
-        Prevents Redis OOM crashes by enforcing maxlen.
+        Prevents Redis OOM crashes by enforcing maxlen (Default 5000).
         """
         try:
             return self.r.xadd(stream_key, data, maxlen=maxlen, approximate=True)
@@ -112,17 +111,18 @@ class RedisStreamManager:
             self.logger.error(f"Failed to add event to stream {stream_key}: {e}")
             return ""
 
-    def trim_stream(self, maxlen: int = 10000) -> None:
+    def trim_stream(self, maxlen: int = 5000) -> None:
         """
         Trims the stream to a fixed size to prevent memory leaks.
+        Default hardened to 5000.
         """
         try:
-            self.r.xtrim(self.stream_key, maxlen=maxlen)
+            self.r.xtrim(self.stream_key, maxlen=maxlen, approximate=True)
         except Exception as e:
             self.logger.error(f"Failed to trim stream: {e}")
 
-def get_redis_connection(host: str = 'localhost', 
-                         port: int = 6379, 
+def get_redis_connection(host: str = 'localhost',
+                         port: int = 6379,
                          db: int = 0,
                          password: Optional[str] = None,
                          decode_responses: bool = True) -> redis.Redis:
@@ -131,11 +131,12 @@ def get_redis_connection(host: str = 'localhost',
     Used by Shared Utilities, Config, and Dashboard.
     """
     backoff_strategy = ExponentialBackoff(cap=10.0, base=1.0)
+    
     retry_logic = Retry(
-        backoff=backoff_strategy, 
+        backoff=backoff_strategy,
         retries=10
     )
-
+    
     return redis.Redis(
         host=host,
         port=port,
@@ -144,8 +145,8 @@ def get_redis_connection(host: str = 'localhost',
         decode_responses=decode_responses,
         retry=retry_logic,
         retry_on_error=[
-            ConnectionError, 
-            TimeoutError, 
+            ConnectionError,
+            TimeoutError,
             ConnectionResetError, # Using Python's built-in exception
             BusyLoadingError
         ],

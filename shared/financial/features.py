@@ -6,8 +6,9 @@
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
 # AUDIT REMEDIATION (SNIPER MODE - HOTFIX):
-# 1. RESTORED: 'atr' and 'volatility' keys. Critical for Strategy Gates & Risk Manager.
-# 2. RETAINED: Stationary features (atr_pct, log_ret) for the ML Model.
+# 1. ADDED: 'ofi_trend' (EMA of OFI) to capture flow persistence.
+# 2. UPDATED: AdaptiveTripleBarrier default drift to 0.75.
+# 3. STATIONARITY: Normalized OFI features.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -46,7 +47,6 @@ except ImportError:
 logger = logging.getLogger("Features")
 
 # --- 0. HELPER MATH KERNELS (ROBUST) ---
-
 class RecursiveEMA:
     """
     Dependency-free Exponential Moving Average.
@@ -59,7 +59,7 @@ class RecursiveEMA:
 
     def update(self, x: float):
         if x is None or math.isnan(x) or math.isinf(x):
-            return  # Skip bad values
+            return # Skip bad values
             
         if self.value is None:
             self.value = x
@@ -70,7 +70,6 @@ class RecursiveEMA:
         return self.value if self.value is not None else 0.0
 
 # --- 1. STREAMING INDICATORS (PHASE 2 CORE) ---
-
 class StreamingIndicators:
     """
     Recursive implementation of technical indicators.
@@ -81,13 +80,13 @@ class StreamingIndicators:
         self.ema_fast = RecursiveEMA(alpha=2 / (macd_fast + 1))
         self.ema_slow = RecursiveEMA(alpha=2 / (macd_slow + 1))
         self.macd_signal = RecursiveEMA(alpha=2 / (macd_sig + 1))
-
+        
         # RSI Components
         self.rsi_period = rsi_period
         self.rsi_avg_gain = RecursiveEMA(alpha=1 / rsi_period)
         self.rsi_avg_loss = RecursiveEMA(alpha=1 / rsi_period)
         self.prev_price = None
-
+        
         # ATR Components (Volatility)
         self.atr_mean = RecursiveEMA(alpha=1 / atr_period)
         self.prev_close = None
@@ -97,17 +96,17 @@ class StreamingIndicators:
         Updates recursive state and returns current indicator values.
         """
         features = {}
-
+        
         # 1. MACD Calculation
         self.ema_fast.update(price)
         self.ema_slow.update(price)
         self.macd_line = self.ema_fast.get() - self.ema_slow.get()
         self.macd_signal.update(self.macd_line)
         histogram = self.macd_line - self.macd_signal.get()
-
+        
         features['macd_line'] = self.macd_line
         features['macd_hist'] = histogram
-
+        
         # 2. RSI Calculation
         if self.prev_price is not None:
             change = price - self.prev_price
@@ -129,7 +128,7 @@ class StreamingIndicators:
             features['rsi'] = rsi
         else:
             features['rsi'] = 50.0
-
+            
         # 3. ATR Calculation (True Range)
         if self.prev_close is not None:
             tr1 = high - low
@@ -141,24 +140,22 @@ class StreamingIndicators:
         else:
             # First tick fallback
             features['atr'] = high - low if (high > 0 and low > 0 and high != low) else 0.001
-
+            
         # Update State
         self.prev_price = price
         self.prev_close = price
-
         return features
 
 # --- 2. ADAPTIVE TRIPLE BARRIER (SELL SIGNAL ENABLED) ---
-
 class AdaptiveTripleBarrier:
     """
     Volatility-Adaptive Labeling with Soft Drift Detection.
     Barriers expand/contract based on ATR.
     
     FIXED: Generates -1 labels for downside breaks to enable Shorting.
-    AUDIT FIX: Drift Threshold Hardened to 0.50 to purge soft-label noise (Poison Data Fix).
+    AUDIT FIX: Drift Threshold Hardened to 0.75 to purge soft-label noise.
     """
-    def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.50):
+    def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.75):
         self.buffer = deque()
         self.time_limit = horizon_ticks
         self.risk_mult = risk_mult
@@ -171,19 +168,20 @@ class AdaptiveTripleBarrier:
         """
         # Ensure ATR is valid to prevent zero-width barriers
         if current_atr <= 0: current_atr = entry_price * 0.0001
-
+        
         # Dynamic Barriers based on ATR
         # Upper Barrier (Profit for Buy, Stop for Sell)
         upper_barrier = entry_price + (self.reward_mult * current_atr)
+        
         # Lower Barrier (Stop for Buy, Profit for Sell)
         lower_barrier = entry_price - (self.risk_mult * current_atr)
-
+        
         self.buffer.append({
             'features': features,
             'entry': entry_price,
-            'tp': upper_barrier,    # Top Barrier
-            'sl': lower_barrier,    # Bottom Barrier
-            'atr': current_atr,     # Stored for Drift Calculation
+            'tp': upper_barrier, # Top Barrier
+            'sl': lower_barrier, # Bottom Barrier
+            'atr': current_atr,  # Stored for Drift Calculation
             'start_time': timestamp,
             'age': 0
         })
@@ -193,9 +191,9 @@ class AdaptiveTripleBarrier:
         Checks active trades against current price action.
         Returns list of (features, label, realized_return).
         
-        Label 1  = UP Move (Buy Signal)
+        Label 1 = UP Move (Buy Signal)
         Label -1 = DOWN Move (Sell Signal)
-        Label 0  = Noise/Hold
+        Label 0 = Noise/Hold
         """
         resolved = []
         active = deque()
@@ -213,12 +211,12 @@ class AdaptiveTripleBarrier:
 
             # 1. Did price hit Upper Barrier?
             if current_high >= trade['tp']:
-                label = 1   # BUY SIGNAL
+                label = 1 # BUY SIGNAL
                 realized_ret = (trade['tp'] - trade['entry']) / trade['entry']
             
             # 2. Did price hit Lower Barrier?
             elif current_low <= trade['sl']:
-                label = -1  # SELL SIGNAL
+                label = -1 # SELL SIGNAL
                 realized_ret = (trade['entry'] - trade['sl']) / trade['entry'] # Positive return for short
             
             # 3. Timeout? (Vertical Barrier)
@@ -228,16 +226,17 @@ class AdaptiveTripleBarrier:
                 drift = current_close - trade['entry']
                 
                 # Threshold to consider this a signal
+                # AUDIT FIX: drift_threshold defaults to 0.75 now
                 drift_req = trade['atr'] * self.drift_threshold
                 
                 if drift > drift_req:
-                    label = 1   # SOFT BUY (Upward Drift)
+                    label = 1 # SOFT BUY (Upward Drift)
                     realized_ret = (current_close - trade['entry']) / trade['entry']
                 elif drift < -drift_req:
-                    label = -1  # SOFT SELL (Downward Drift)
+                    label = -1 # SOFT SELL (Downward Drift)
                     realized_ret = (trade['entry'] - current_close) / trade['entry']
                 else:
-                    label = 0   # TIMEOUT (True Noise)
+                    label = 0 # TIMEOUT (True Noise)
                     realized_ret = 0.0
 
             if label is not None:
@@ -249,13 +248,13 @@ class AdaptiveTripleBarrier:
         return resolved
 
 # --- 3. PROBABILITY CALIBRATOR ---
-
 class ProbabilityCalibrator:
     def __init__(self, window: int = 1000):
         self.window = window
         self.y_true = deque(maxlen=window)
         self.y_prob = deque(maxlen=window)
         self.calibrator = None
+        
         if ML_AVAILABLE:
             self.calibrator = IsotonicRegression(out_of_bounds='clip')
 
@@ -266,6 +265,7 @@ class ProbabilityCalibrator:
     def calibrate(self, raw_prob: float) -> float:
         if not ML_AVAILABLE or len(self.y_true) < 100:
             return raw_prob
+        
         try:
             self.calibrator.fit(list(self.y_prob), list(self.y_true))
             return float(self.calibrator.predict([raw_prob])[0])
@@ -273,7 +273,6 @@ class ProbabilityCalibrator:
             return raw_prob
 
 # --- 4. META LABELER ---
-
 class MetaLabeler:
     """
     Secondary model that learns whether a primary signal resulted in profit.
@@ -289,7 +288,7 @@ class MetaLabeler:
     def update(self, features: Dict[str, float], primary_action: int, outcome_pnl: float):
         if not ML_AVAILABLE or primary_action == 0:
             return
-
+            
         y_meta = 1 if outcome_pnl > 0 else 0
         
         try:
@@ -329,7 +328,6 @@ class MetaLabeler:
         return clean
 
 # --- 5. ONLINE FEATURE ENGINEER (STATIONARY + PHYSICS) ---
-
 class OnlineFeatureEngineer:
     def __init__(self, window_size: int = 50):
         self.window_size = window_size
@@ -346,23 +344,28 @@ class OnlineFeatureEngineer:
         self.frac_diff = IncrementalFracDiff(d=0.3, window=window_size)
         self.vol_monitor = VolatilityMonitor(window=20)
         self.last_price = None
-
+        
         # --- AUDIT FIX: STATIONARITY & CONTEXT ---
         # 1. Cumulative OFI Window
         self.ofi_window = deque(maxlen=20)
+        
         # 2. Volatility Trend EMA (for breakout detection)
         self.atr_ema = RecursiveEMA(alpha=0.05)
+        
         # 3. Long-term Volatility Baseline (for Vol Ratio)
-        self.vol_baseline = RecursiveEMA(alpha=0.001) 
+        self.vol_baseline = RecursiveEMA(alpha=0.001)
+        
+        # 4. OFI Trend (New Feature: Flow Momentum)
+        self.ofi_ema = RecursiveEMA(alpha=CONFIG['features'].get('ofi_alpha', 0.1))
 
-    def update(self, price: float, timestamp: float, volume: float, 
+    def update(self, price: float, timestamp: float, volume: float,
                high: Optional[float] = None, low: Optional[float] = None,
                buy_vol: float = 0.0, sell_vol: float = 0.0,
                time_feats: Dict[str, float] = None) -> Dict[str, float]:
         
         if time_feats is None:
             time_feats = {'sin_hour': 0.0, 'cos_hour': 0.0}
-
+            
         # Fallback if high/low not provided
         if high is None: high = price
         if low is None: low = price
@@ -411,14 +414,18 @@ class OnlineFeatureEngineer:
         # 6. Order Flow Imbalance (OFI)
         denominator = volume if volume > 0 else 1.0
         ofi_val = (buy_vol - sell_vol) / denominator
-
+        
         # --- Context Features ---
         self.ofi_window.append(ofi_val)
         cum_ofi = sum(self.ofi_window) / len(self.ofi_window) if self.ofi_window else 0.0
+        
+        # OFI Trend (Momentum)
+        self.ofi_ema.update(ofi_val)
+        ofi_trend = self.ofi_ema.get()
 
         # Regime Detection (Trend vs Mean Reversion)
         regime_val = 1.0 if hurst_val > 0.55 else (-1.0 if hurst_val < 0.45 else 0.0)
-
+        
         # Volatility Breakout (Expansion)
         self.atr_ema.update(current_atr)
         atr_trend = self.atr_ema.get()
@@ -451,7 +458,7 @@ class OnlineFeatureEngineer:
         # Normalized Oscillators
         # MACD is absolute price difference, normalize by price to make stationary
         macd_norm = tech_feats['macd_line'] / price
-        rsi_norm = tech_feats['rsi'] / 100.0  # Scale 0-1
+        rsi_norm = tech_feats['rsi'] / 100.0 # Scale 0-1
 
         self.last_price = price
 
@@ -467,15 +474,15 @@ class OnlineFeatureEngineer:
         # Construct Final Feature Vector
         raw_features = {
             # --- CRITICAL FIX: RESTORE RAW ATR/VOL FOR GATE & RISK ---
-            'atr': current_atr, 
+            'atr': current_atr,
             'volatility': volatility_val,
             # ---------------------------------------------------------
-
+            
             # Stationary Technicals
             'rsi_norm': rsi_norm,
             'macd_norm': macd_norm,
             'macd_hist_norm': tech_feats['macd_hist'] / price,
-            'atr_pct': current_atr / price,  # ATR as % of price
+            'atr_pct': current_atr / price, # ATR as % of price
             
             # Stationary Volatility
             'vol_ratio': vol_ratio,
@@ -492,6 +499,7 @@ class OnlineFeatureEngineer:
             
             # Context
             'cum_ofi': cum_ofi,
+            'ofi_trend': ofi_trend, # New
             'regime': regime_val,
             'vol_breakout': vol_breakout,
             
@@ -508,7 +516,7 @@ class OnlineFeatureEngineer:
             **lagged_feats,
             **time_feats
         }
-
+        
         return self._sanitize_features(raw_features)
 
     def _sanitize_features(self, features: Dict[str, float]) -> Dict[str, float]:
@@ -521,7 +529,6 @@ class OnlineFeatureEngineer:
         return clean
 
 # --- 6. LEGACY MONITORS (RETAINED) ---
-
 class StreamingTripleBarrier:
     """
     Legacy barrier logic. Retained for backward compatibility if needed.
@@ -536,7 +543,7 @@ class StreamingTripleBarrier:
         self.history.append(price)
         resolved = []
         to_remove = []
-
+        
         for origin_ts, params in self.pending_events.items():
             if price >= params['top']:
                 resolved.append((1, origin_ts))
@@ -550,11 +557,12 @@ class StreamingTripleBarrier:
         
         for ts in to_remove:
             del self.pending_events[ts]
-
+            
         if len(self.history) >= 20:
             vol = np.std(list(self.history))
             if vol < 1e-9: vol = price * 0.001
             width = vol * self.vol_multiplier
+            
             self.pending_events[timestamp] = {
                 'entry': price,
                 'top': price + width,
@@ -605,7 +613,7 @@ class VPINMonitor:
         
         self.current_bucket_vol += volume
         self.last_price = price
-
+        
         if self.current_bucket_vol >= self.bucket_size:
             self.buckets.append((self.buy_vol, self.sell_vol))
             self.current_bucket_vol = 0.0

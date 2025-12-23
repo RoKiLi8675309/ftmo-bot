@@ -7,9 +7,9 @@
 # Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
 # AUDIT REMEDIATION (SNIPER MODE):
-# 1. NEUTRAL REINFORCEMENT: Explicitly learns 'HOLD' (Class 0) on noise/loss.
-# 2. PROFIT WEIGHTING: Sample weights scale with log-return magnitude.
-# 3. ROBUSTNESS: Relaxed VPIN/Entropy filters (0.85) to prevent starvation.
+# 1. WEIGHTING: Set positive_class_weight=1.5 to value signals over noise.
+# 2. ARCHITECTURE: Added 5-minute Auto-Save interval.
+# 3. ROBUSTNESS: Relaxed VPIN/Entropy filters (0.96) to match Research.
 # 4. ALIGNMENT: Matches 'shared/financial/features.py' stationary pipeline.
 # =============================================================================
 import logging
@@ -35,7 +35,7 @@ from shared import (
     CONFIG,
     LogSymbols,
     OnlineFeatureEngineer,
-    AdaptiveTripleBarrier, 
+    AdaptiveTripleBarrier,
     ProbabilityCalibrator,
     enrich_with_d1_data,
     VolumeBar
@@ -52,7 +52,7 @@ class Signal:
     """
     def __init__(self, symbol: str, action: str, confidence: float, meta_data: Dict[str, Any]):
         self.symbol = symbol
-        self.action = action  # "BUY", "SELL", "HOLD", "WARMUP"
+        self.action = action # "BUY", "SELL", "HOLD", "WARMUP"
         self.confidence = confidence
         self.meta_data = meta_data
 
@@ -74,21 +74,26 @@ class MultiAssetPredictor:
         self.labelers = {s: AdaptiveTripleBarrier(
             horizon_ticks=tbm_conf['horizon_minutes'], # Converted to ticks implicitly by usage
             risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'],
-            reward_mult=tbm_conf['barrier_width'] # Uses barrier width as TP mult
+            reward_mult=tbm_conf['barrier_width'], # Uses barrier width as TP mult
+            drift_threshold=tbm_conf.get('drift_threshold', 0.75) # AUDIT: Hardened labeling
         ) for s in symbols}
 
         # 2. Models (River ARF)
         self.models = {}
         self.meta_labelers = {} # Secondary Filter
         self.calibrators = {}
-
+        
         # 3. Warm-up State (Phase 2 Requirement)
         self.burn_in_counters = {s: 0 for s in symbols}
         self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 1000)
-
+        
         # 4. Forensic Stats (Refinement #5)
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
         self.bar_counters = {s: 0 for s in symbols}
+        
+        # 5. Architecture: Auto-Save Timer
+        self.last_save_time = time.time()
+        self.save_interval = 300 # 5 Minutes
 
         # Initialize Models
         self._init_models()
@@ -128,6 +133,11 @@ class MultiAssetPredictor:
         """
         if symbol not in self.symbols: return None
         
+        # --- AUTO SAVE CHECK ---
+        if time.time() - self.last_save_time > self.save_interval:
+            self.save_state()
+            self.last_save_time = time.time()
+
         fe = self.feature_engineers[symbol]
         labeler = self.labelers[symbol]
         model = self.models[symbol]
@@ -152,7 +162,7 @@ class MultiAssetPredictor:
         )
         
         if features is None: return None
-
+        
         if context_d1:
             features = enrich_with_d1_data(features, context_d1, bar.close)
 
@@ -176,7 +186,7 @@ class MultiAssetPredictor:
                 # We apply higher weights to trades that resulted in significant PnL.
                 # This teaches the model to prioritize "Big Moves" over noise.
                 
-                w_pos = CONFIG['online_learning'].get('positive_class_weight', 5.0)
+                w_pos = CONFIG['online_learning'].get('positive_class_weight', 1.5)
                 w_neg = CONFIG['online_learning'].get('negative_class_weight', 1.0)
                 
                 # Base weight: Higher for Signals (1/-1), Lower for Noise (0)
@@ -205,19 +215,19 @@ class MultiAssetPredictor:
         # 4. Inference
         current_pred_action = 0
         try:
-            # Forensic Filters (RELAXED)
+            # Forensic Filters (RELAXED to 0.96)
             # We filter OUT extreme entropy/VPIN to avoid trading in chaos.
             entropy_val = features.get('entropy', 0.0)
-            entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.85)
+            entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.96)
             
             if entropy_val > entropy_thresh:
                 stats['High Entropy'] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"Max Entropy ({entropy_val:.2f})"})
 
             vpin_val = features.get('vpin', 0.0)
-            vpin_thresh = CONFIG['microstructure'].get('vpin_threshold', 0.85)
+            vpin_thresh = CONFIG['microstructure'].get('vpin_threshold', 0.96)
             
-            if vpin_val > vpin_thresh: 
+            if vpin_val > vpin_thresh:
                 stats['High VPIN'] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"Toxic VPIN ({vpin_val:.2f})"})
 
@@ -229,7 +239,7 @@ class MultiAssetPredictor:
                 current_pred_action = int(pred_class)
             except:
                 current_pred_action = 0
-
+                
             # Get Confidence for Specific Action
             # If Model says BUY, we check prob(1). If SELL, prob(-1).
             prob_buy = pred_proba.get(1, 0.0)
@@ -238,15 +248,15 @@ class MultiAssetPredictor:
             confidence = prob_buy if current_pred_action == 1 else prob_sell
 
             # Meta-Labeling Check
-            meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.55)
+            meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.60)
             is_profitable = meta_labeler.predict(
-                features, 
-                current_pred_action, 
+                features,
+                current_pred_action,
                 threshold=meta_threshold
             )
 
             # Decision Logic
-            min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.50) 
+            min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.51)
             volatility = features.get('volatility', 0.001)
 
             # --- STANDARD AI LOGIC ---
@@ -291,11 +301,14 @@ class MultiAssetPredictor:
             for sym in self.symbols:
                 with open(self.models_dir / f"river_pipeline_{sym}.pkl", "wb") as f:
                     pickle.dump(self.models[sym], f)
+                
                 with open(self.models_dir / f"meta_model_{sym}.pkl", "wb") as f:
                     pickle.dump(self.meta_labelers[sym], f)
+                
                 with open(self.models_dir / f"calibrators_{sym}.pkl", "wb") as f:
                     pickle.dump(self.calibrators[sym], f)
-            logger.info(f"{LogSymbols.DATABASE} Models Auto-Saved.")
+                    
+            logger.info(f"{LogSymbols.DATABASE} Models Auto-Saved (5-min Checkpoint).")
         except Exception as e:
             logger.error(f"{LogSymbols.ERROR} Failed to save models: {e}")
 

@@ -6,9 +6,9 @@
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
 # AUDIT REMEDIATION (SNIPER MODE):
-# 1. VOLATILITY GATE: Hardened block on trading. ATR must be > 4.0x Spread.
-# 2. DISCOVERY SAFETY: Removed "Random" exploration. Only trades on Bias (>0.45) or Breakout.
-# 3. RISK ALIGNMENT: Passes 'atr' explicitly to RiskManager for Volatility Targeting.
+# 1. VOLATILITY GATE: Relaxed to 3.0x Spread (was 4.0x) to allow more trades.
+# 2. DISCOVERY: Strict Bias (>0.55) or Breakout with Direction (ret > 0.001%).
+# 3. FILTERS: Relaxed Entropy/VPIN to 0.96 to stop data starvation.
 # 4. AUTOPSY: Enhanced reporting to track Gate rejections.
 # =============================================================================
 import logging
@@ -24,7 +24,7 @@ from datetime import datetime
 from shared import (
     CONFIG,
     OnlineFeatureEngineer,
-    AdaptiveTripleBarrier, 
+    AdaptiveTripleBarrier,
     ProbabilityCalibrator,
     RiskManager,
     enrich_with_d1_data,
@@ -56,23 +56,24 @@ class ResearchStrategy:
         self.fe = OnlineFeatureEngineer(
             window_size=params.get('window_size', 50)
         )
-
+        
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
         self.labeler = AdaptiveTripleBarrier(
             horizon_ticks=tbm_conf.get('horizon_minutes', 30),
             risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'],
-            reward_mult=tbm_conf.get('barrier_width', 2.0)
+            reward_mult=tbm_conf.get('barrier_width', 2.0),
+            drift_threshold=tbm_conf.get('drift_threshold', 0.75) # AUDIT: 0.75 Default
         )
-
+        
         # 3. Meta Labeler (The Gatekeeper)
         self.meta_labeler = MetaLabeler()
-        self.meta_label_events = 0  # Count events to bypass cold start
-
+        self.meta_label_events = 0 # Count events to bypass cold start
+        
         # 4. Probability Calibrators
         self.calibrator_buy = ProbabilityCalibrator(window=2000)
         self.calibrator_sell = ProbabilityCalibrator(window=2000)
-
+        
         # 5. Warm-up State
         self.burn_in_limit = params.get('burn_in_periods', 1000)
         self.burn_in_counter = 0
@@ -87,16 +88,16 @@ class ResearchStrategy:
         # --- FORENSIC RECORDER ---
         self.decision_log = deque(maxlen=1000)
         self.trade_events = []
-        self.rejection_stats = defaultdict(int)  # Track why we didn't trade
-
+        self.rejection_stats = defaultdict(int) # Track why we didn't trade
+        
         # --- AUDIT FIX: VOLATILITY GATE ---
         # Load Gate settings from config (Sniper Mode)
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
         
-        # SNIPER HARDENING: Default increased from 3.0 to 4.0
+        # SNIPER HARDENING: Relaxed from 4.0 to 3.0 per Audit
         # If the market is dead (low ATR relative to spread), we stay out.
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 4.0)
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 3.0)
         
         # Load Spread Assumptions for Gating
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
@@ -163,6 +164,7 @@ class ResearchStrategy:
             sell_vol=sell_vol,
             time_feats={} # Transformer logic can be added here if needed
         )
+        
         self.last_features = features
 
         # --- WARM-UP GATE ---
@@ -182,8 +184,8 @@ class ResearchStrategy:
                 # --- PROFIT WEIGHTED LEARNING ---
                 # We reward "Big Wins" and punish "Churn" (Neutral Reinforcement)
                 
-                # Default to 1.0 (Neutral) if not specified, driven by profit magnitude
-                w_pos = self.params.get('positive_class_weight', 1.0)
+                # Default to 1.5 (Neutral) if not specified, driven by profit magnitude
+                w_pos = self.params.get('positive_class_weight', 1.5)
                 w_neg = self.params.get('negative_class_weight', 1.0)
                 
                 base_weight = w_pos if outcome_label != 0 else w_neg
@@ -215,22 +217,23 @@ class ResearchStrategy:
             spread_cost = spread_pips * pip_size
             
             # Gate Requirement: ATR must be > K * Spread
-            # e.g., if Spread is 1.5 pips, ATR must be > 6.0 pips (at 4.0x ratio).
+            # e.g., if Spread is 1.5 pips, ATR must be > 4.5 pips (at 3.0x ratio).
             if current_atr < (spread_cost * self.min_atr_spread_ratio):
                 gate_passed = False
 
         # D. Inference
         try:
             # --- FILTER RELAXATION ---
+            # Relaxed to 0.96 per Audit to reduce data starvation
             entropy_val = features.get('entropy', 0)
-            entropy_thresh = self.params.get('entropy_threshold', 0.95)
+            entropy_thresh = self.params.get('entropy_threshold', 0.96)
             
             if entropy_val > entropy_thresh:
                 self.rejection_stats['High Entropy'] += 1
                 return
 
             vpin_val = features.get('vpin', 0)
-            vpin_thresh = self.params.get('vpin_threshold', 0.95)
+            vpin_thresh = self.params.get('vpin_threshold', 0.96)
             
             if vpin_val > vpin_thresh:
                 self.rejection_stats['High VPIN'] += 1
@@ -254,7 +257,7 @@ class ResearchStrategy:
             # --- PROFITABLE DISCOVERY LOGIC ---
             # We removed "Random Coin Flips". We only trade if:
             # 1. AI is confident (> Threshold)
-            # 2. AI shows "Bias" (> 0.45) during discovery phase AND Volatility allows it.
+            # 2. AI shows "Bias" (> 0.55) during discovery phase AND Volatility allows it.
             # 3. Volatility Breakout occurs.
             
             is_discovery = self.bars_processed < 2500
@@ -270,10 +273,10 @@ class ResearchStrategy:
                 max_prob = max(prob_buy, prob_sell)
                 
                 # 1. Bias Amplification (Must show conviction)
-                # TIGHTENED: 0.45 bias required (0.4 was too loose)
+                # TIGHTENED: 0.55 bias required (0.4 was too loose)
                 if max_prob > 0.0:
-                    bias_buy = prob_buy > 0.45
-                    bias_sell = prob_sell > 0.45
+                    bias_buy = prob_buy > 0.55
+                    bias_sell = prob_sell > 0.55
                     
                     if bias_buy and prob_buy > prob_sell:
                         effective_action = 1
@@ -285,10 +288,11 @@ class ResearchStrategy:
                 # 2. Volatility Breakout Fallback
                 if not discovery_triggered and features.get('vol_breakout', 0) > 0:
                     ret = features.get('log_ret', 0)
-                    if ret > 0:
+                    # Filter tiny breakouts (noise)
+                    if ret > 0.00001: 
                         effective_action = 1
                         discovery_triggered = True
-                    elif ret < 0:
+                    elif ret < -0.00001:
                         effective_action = -1
                         discovery_triggered = True
             
@@ -304,7 +308,7 @@ class ResearchStrategy:
                 is_profitable = self.meta_labeler.predict(
                     features,
                     effective_action,
-                    threshold=self.params.get('meta_labeling_threshold', 0.55)
+                    threshold=self.params.get('meta_labeling_threshold', 0.60)
                 )
             
             if effective_action != 0:
@@ -318,7 +322,7 @@ class ResearchStrategy:
                         
                         if discovery_triggered:
                             # Clamp confidence for Risk Manager to be safe
-                            confidence = 0.25 
+                            confidence = 0.25
                         
                         self._execute_logic(confidence, price, features, broker, dt_timestamp, effective_action, discovery_triggered)
                 else:
@@ -344,7 +348,7 @@ class ResearchStrategy:
         """Decides whether to enter a trade using Volatility Targeting."""
         
         # 1. Signal Threshold (Only applies to AI trades, not Discovery)
-        min_prob = self.params.get('min_calibrated_probability', 0.50)
+        min_prob = self.params.get('min_calibrated_probability', 0.51)
         
         if not discovery_mode:
             if confidence < min_prob:
@@ -379,7 +383,7 @@ class ResearchStrategy:
         )
 
         # Assign Action Explicitly
-        trade_intent.action = action 
+        trade_intent.action = action
 
         # 3. SAFETY: Check if Risk Manager Rejected the trade
         if trade_intent.volume <= 0:
@@ -390,7 +394,7 @@ class ResearchStrategy:
         
         # --- CHEAP LEARNING: Slash size for Discovery Trades ---
         if discovery_mode:
-            qty = qty * 0.1  # Take 1/10th of the calculated risk
+            qty = qty * 0.1 # Take 1/10th of the calculated risk
             qty = max(0.01, qty)
             trade_intent.comment += "|DISC_SIZE"
 
