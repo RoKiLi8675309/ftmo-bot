@@ -5,10 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
-# AUDIT REMEDIATION (CHALLENGE MODE V1.2):
-# 1. DISCOVERY: FULL SIZE (100%) execution enabled. No more "testing" size.
-# 2. GATES: Efficiency Ratio (ER) gate logic remains, but uses relaxed Config value.
-# 3. LOGIC: Enforced Bias > 0.55 for Discovery Trades (High Conviction).
+# AUDIT REMEDIATION (2025-12-23 - SAFE MODE RECOVERY):
+# 1. DISCOVERY: DISABLED "Full Size" override. Now respects RiskManager $C^2$ scaling.
+#    - Discovery Conf fixed at 0.55 -> Results in 0.30x sizing (Safety Buffer).
+# 2. GATES: Strict ER Threshold (0.40) enforcement for ALL trades to filter chop.
+# 3. LOGIC: Re-enabled Volatility Gate rejection logging.
 # =============================================================================
 import logging
 import sys
@@ -31,7 +32,6 @@ from shared import (
     LogSymbols,
     Trade
 )
-
 # New Feature Import
 from shared.financial.features import MetaLabeler
 
@@ -99,8 +99,8 @@ class ResearchStrategy:
         self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.5)
         
         # AUDIT FIX: ER Gate Threshold
-        # CHALLENGE MODE: This will now pick up the 0.20 from the updated Config
-        self.min_er_threshold = CONFIG['microstructure'].get('gate_er_threshold', 0.20)
+        # SAFE MODE: This picks up 0.40 from Config V1.3
+        self.min_er_threshold = CONFIG['microstructure'].get('gate_er_threshold', 0.40)
         
         # Load Spread Assumptions for Gating
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
@@ -169,7 +169,7 @@ class ResearchStrategy:
         )
         
         self.last_features = features
-
+        
         # --- WARM-UP GATE ---
         if self.burn_in_counter < self.burn_in_limit:
             self.burn_in_counter += 1
@@ -187,9 +187,9 @@ class ResearchStrategy:
                 # --- PROFIT WEIGHTED LEARNING ---
                 # We reward "Big Wins" and punish "Churn" (Neutral Reinforcement)
                 
-                # Default to 1.5 (Aggressive) if not specified
-                w_pos = self.params.get('positive_class_weight', 1.5)
-                w_neg = self.params.get('negative_class_weight', 1.5)
+                # Default to 2.0 (Balanced) if not specified
+                w_pos = self.params.get('positive_class_weight', 2.0)
+                w_neg = self.params.get('negative_class_weight', 2.0)
                 
                 base_weight = w_pos if outcome_label != 0 else w_neg
                 
@@ -225,23 +225,23 @@ class ResearchStrategy:
                 # Don't return yet, log it later if we attempt to trade
         
         # 2. Efficiency Ratio Gate (Chop Protection)
-        # We check ER only if we are considering a trade, but good to flag "Low ER" state
+        # SAFE MODE: Strict enforcement (0.40)
         current_er = features.get('efficiency_ratio', 0.5)
         er_passed = current_er > self.min_er_threshold
 
         # D. Inference
         try:
-            # --- FILTER RELAXATION ---
-            # Relaxed to 0.98 per Audit V37
+            # --- FILTER ENFORCEMENT ---
+            # Strict filters (0.95) to match Config V1.3
             entropy_val = features.get('entropy', 0)
-            entropy_thresh = self.params.get('entropy_threshold', 0.98)
+            entropy_thresh = self.params.get('entropy_threshold', 0.95)
             
             if entropy_val > entropy_thresh:
                 self.rejection_stats['High Entropy'] += 1
                 return
 
             vpin_val = features.get('vpin', 0)
-            vpin_thresh = self.params.get('vpin_threshold', 0.98)
+            vpin_thresh = self.params.get('vpin_threshold', 0.95)
             
             if vpin_val > vpin_thresh:
                 self.rejection_stats['High VPIN'] += 1
@@ -262,11 +262,9 @@ class ResearchStrategy:
             # E. Execution Logic & Discovery Override
             dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
             
-            # --- PROFITABLE DISCOVERY LOGIC ---
-            # We removed "Random Coin Flips". We only trade if:
-            # 1. AI is confident (> Threshold)
-            # 2. AI shows "Bias" (> 0.55) during discovery phase AND Volatility allows it.
-            # 3. Volatility Breakout occurs.
+            # --- SAFE DISCOVERY LOGIC ---
+            # We allow trading in the early phase (Discovery), but strictly governed by Risk Manager.
+            # No massive bets.
             
             is_discovery = self.bars_processed < 2500
             effective_action = pred_action
@@ -278,14 +276,14 @@ class ResearchStrategy:
                     self.rejection_stats['Vol Gate (Dead Market)'] += 1
                     return
                 
-                # AUDIT FIX: ER Check for Discovery
+                # SAFE MODE: Strict ER Check for Discovery
                 if not er_passed:
                     self.rejection_stats['Low Efficiency (Chop)'] += 1
                     return
 
                 max_prob = max(prob_buy, prob_sell)
                 
-                # 1. Bias Amplification (Must show conviction)
+                # 1. Bias Check (Must show conviction)
                 # TIGHTENED: 0.55 bias required (Audit Requirement)
                 if max_prob > 0.0:
                     bias_buy = prob_buy > 0.55
@@ -302,7 +300,7 @@ class ResearchStrategy:
                 if not discovery_triggered and features.get('vol_breakout', 0) > 0:
                     ret = features.get('log_ret', 0)
                     # Filter tiny breakouts (noise)
-                    if ret > 0.00001: 
+                    if ret > 0.00001:
                         effective_action = 1
                         discovery_triggered = True
                     elif ret < -0.00001:
@@ -314,8 +312,9 @@ class ResearchStrategy:
                 if not gate_passed:
                     self.rejection_stats['Vol Gate (Dead Market)'] += 1
                     return
-                # Optional: Enforce ER gate for normal trades too, or trust the model
-                # Ideally the model learns chop, but a hard gate helps low-data regimes.
+                
+                # SAFE MODE: Enforce ER gate for normal trades too
+                # This prevents the model from trading "chops" even if it thinks it sees a signal.
                 if not er_passed:
                     self.rejection_stats['Low Efficiency (Chop)'] += 1
                     return
@@ -340,8 +339,10 @@ class ResearchStrategy:
                         confidence = prob_buy if effective_action == 1 else prob_sell
                         
                         if discovery_triggered:
-                            # Clamp confidence for Risk Manager to be safe
-                            confidence = 0.55 # Assume Conviction for Sizing
+                            # SAFE MODE: Clamp confidence for Risk Manager.
+                            # 0.55 ^ 2 = 0.30 sizing factor.
+                            # This prevents "Betting the farm" on discovery trades.
+                            confidence = 0.55 
                         
                         self._execute_logic(confidence, price, features, broker, dt_timestamp, effective_action, discovery_triggered)
                 else:
@@ -412,14 +413,12 @@ class ResearchStrategy:
 
         qty = trade_intent.volume
         
-        # --- CHEAP LEARNING: Discovery Trades ---
-        if discovery_mode:
-            # CHALLENGE MODE: FULL SIZE (100%)
-            # We trust the gates. If it passes, we trade it fully.
-            qty = qty * 1.0 
-            qty = max(0.01, qty)
-            trade_intent.comment += "|FULL_DISC"
-
+        # --- SAFE DISCOVERY LOGIC ---
+        # No explicit quantity override. We trust RiskManager.
+        # If discovery_mode=True, confidence is 0.55.
+        # RiskManager (Safe Mode) calculates: scalar * 0.55^2 = scalar * 0.3025.
+        # This results in a 30% conviction bet, which is safe for exploration.
+        
         stop_dist = trade_intent.stop_loss
         tp_dist = trade_intent.take_profit
 
@@ -446,6 +445,7 @@ class ResearchStrategy:
             take_profit=tp_price,
             comment=f"{trade_intent.comment}|Prob:{confidence:.2f}|{'DISC' if discovery_mode else 'AI'}"
         )
+        
         broker.submit_order(order)
         
         # Record detailed trade event

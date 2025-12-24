@@ -6,11 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages ARF models, Feature Engineering,
 # Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-23):
-# 1. WEIGHTING: Balanced weights (1.5/1.5) to value all directional signals.
-# 2. FILTERS: Relaxed VPIN/Entropy filters to 0.98 to fix data starvation.
-# 3. CONVICTION: Raised min_calibrated_probability to 0.55.
-# 4. ALIGNMENT: Matches 'shared/financial/features.py' stationary pipeline.
+# AUDIT REMEDIATION (2025-12-23 - SAFE MODE SYNC):
+# 1. DISCOVERY: Syncs with ResearchStrategy. Force Conf=0.55 for discovery trades.
+# 2. GATES: Enforces ER > 0.40 and Volatility Gates inside the decision loop.
+# 3. FILTERS: Tightened Entropy/VPIN to 0.95.
 # =============================================================================
 import logging
 import pickle
@@ -38,9 +37,9 @@ from shared import (
     AdaptiveTripleBarrier,
     ProbabilityCalibrator,
     enrich_with_d1_data,
-    VolumeBar
+    VolumeBar,
+    RiskManager
 )
-
 # New Feature Import
 from shared.financial.features import MetaLabeler
 
@@ -52,7 +51,7 @@ class Signal:
     """
     def __init__(self, symbol: str, action: str, confidence: float, meta_data: Dict[str, Any]):
         self.symbol = symbol
-        self.action = action # "BUY", "SELL", "HOLD", "WARMUP"
+        self.action = action  # "BUY", "SELL", "HOLD", "WARMUP"
         self.confidence = confidence
         self.meta_data = meta_data
 
@@ -87,13 +86,21 @@ class MultiAssetPredictor:
         self.burn_in_counters = {s: 0 for s in symbols}
         self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 1000)
         
-        # 4. Forensic Stats (Refinement #5)
+        # 4. Forensic Stats
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
         self.bar_counters = {s: 0 for s in symbols}
         
         # 5. Architecture: Auto-Save Timer
         self.last_save_time = time.time()
         self.save_interval = 300 # 5 Minutes
+
+        # --- AUDIT FIX: Gating Params ---
+        self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
+        self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.5)
+        # SAFE MODE: ER Threshold 0.40
+        self.min_er_threshold = CONFIG['microstructure'].get('gate_er_threshold', 0.40)
+        self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
 
         # Initialize Models
         self._init_models()
@@ -107,7 +114,6 @@ class MultiAssetPredictor:
         
         for sym in self.symbols:
             # Primary Model: Adaptive Random Forest
-            # Optimized for Non-Stationary Data (Drift Detection Enabled)
             self.models[sym] = compose.Pipeline(
                 preprocessing.StandardScaler(),
                 forest.ARFClassifier(
@@ -151,7 +157,6 @@ class MultiAssetPredictor:
         sell_vol = getattr(bar, 'sell_vol', 0.0)
 
         # 1. Feature Engineering (Stationary Pipeline)
-        # Updates VPIN, Entropy, and Physics here
         features = fe.update(
             price=bar.close,
             timestamp=bar.timestamp,
@@ -168,8 +173,6 @@ class MultiAssetPredictor:
             features = enrich_with_d1_data(features, context_d1, bar.close)
 
         # --- PHASE 2: WARM-UP GATE ---
-        # We must update features/indicators recursively, but we DO NOT Train or Infer
-        # until the burn-in period is complete to establish volatility baselines.
         if self.burn_in_counters[symbol] < self.burn_in_limit:
             self.burn_in_counters[symbol] += 1
             remaining = self.burn_in_limit - self.burn_in_counters[symbol]
@@ -178,26 +181,19 @@ class MultiAssetPredictor:
             return Signal(symbol, "WARMUP", 0.0, {"remaining": remaining})
 
         # 2. Delayed Training (Label Resolution via Adaptive Barrier)
-        # We check if any PAST trades have closed based on current price action.
         resolved_labels = labeler.resolve_labels(bar.high, bar.low)
         
         if resolved_labels:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
-                # --- PROFIT WEIGHTED LEARNING (PHOENIX MODE) ---
-                # We apply balanced weights to trades that resulted in significant PnL.
+                # --- PROFIT WEIGHTED LEARNING ---
+                # Safe Mode: Balanced weights (2.0/2.0)
+                w_pos = CONFIG['online_learning'].get('positive_class_weight', 2.0)
+                w_neg = CONFIG['online_learning'].get('negative_class_weight', 2.0)
                 
-                # PHOENIX FIX: Balanced weighting (1.5/1.5) to treat both sides equally
-                w_pos = CONFIG['online_learning'].get('positive_class_weight', 1.5)
-                w_neg = CONFIG['online_learning'].get('negative_class_weight', 1.5)
+                base_weight = w_pos if outcome_label != 0 else w_neg
                 
-                # Base weight: Higher for Signals (1/-1), Lower for Noise (0)
-                base_weight = w_pos if outcome_label != 0 else 1.0
-                
-                # Scale by Log Return Magnitude (Stationary scaling)
-                # log(1 + 1.0%) = 0.69 (Big Win). log(1 + 0.1%) = 0.09 (Small Win)
+                # Scale by Log Return Magnitude
                 ret_scalar = math.log1p(abs(realized_ret) * 100.0)
-                
-                # Clamp scalar to avoid exploding weights on anomalies
                 ret_scalar = max(0.5, min(ret_scalar, 5.0))
                 
                 final_weight = base_weight * ret_scalar
@@ -205,29 +201,42 @@ class MultiAssetPredictor:
                 # Train Primary Model
                 model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
                 
-                # Update Meta-Labeler (Did the signal actually make money?)
+                # Update Meta-Labeler
                 if outcome_label != 0:
-                    meta_labeler.update(stored_feats, outcome_label, realized_ret)
+                    meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
 
-        # 3. Add CURRENT Bar as new Trade Opportunity (for future labeling)
+        # 3. Add CURRENT Bar as new Trade Opportunity
         current_atr = features.get('atr', 0.0)
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
+
+        # --- AUDIT FIX: GATES CALCULATION ---
+        gate_passed = True
+        
+        # Volatility Gate Logic
+        if self.use_vol_gate:
+            pip_size, _ = RiskManager.get_pip_info(symbol)
+            spread_pips = self.spread_map.get(symbol, 1.5)
+            spread_cost = spread_pips * pip_size
+            if current_atr < (spread_cost * self.min_atr_spread_ratio):
+                gate_passed = False
+        
+        # Efficiency Ratio Logic (Safe Mode)
+        current_er = features.get('efficiency_ratio', 0.5)
+        er_passed = current_er > self.min_er_threshold
 
         # 4. Inference
         current_pred_action = 0
         try:
-            # Forensic Filters (RELAXED to 0.98 per Phoenix Strategy)
-            # We filter OUT extreme entropy/VPIN to avoid trading in chaos,
-            # but allow higher noise (0.98) for M5 timeframe.
+            # --- FILTER ENFORCEMENT (Strict 0.95) ---
             entropy_val = features.get('entropy', 0.0)
-            entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.98)
+            entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.95)
             
             if entropy_val > entropy_thresh:
                 stats['High Entropy'] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"Max Entropy ({entropy_val:.2f})"})
 
             vpin_val = features.get('vpin', 0.0)
-            vpin_thresh = CONFIG['microstructure'].get('vpin_threshold', 0.98)
+            vpin_thresh = CONFIG['microstructure'].get('vpin_threshold', 0.95)
             
             if vpin_val > vpin_thresh:
                 stats['High VPIN'] += 1
@@ -242,48 +251,97 @@ class MultiAssetPredictor:
             except:
                 current_pred_action = 0
                 
-            # Get Confidence for Specific Action
-            # If Model says BUY, we check prob(1). If SELL, prob(-1).
             prob_buy = pred_proba.get(1, 0.0)
             prob_sell = pred_proba.get(-1, 0.0)
             
-            confidence = prob_buy if current_pred_action == 1 else prob_sell
+            # 5. SAFE DISCOVERY LOGIC & EXECUTION
+            is_discovery = self.bar_counters[symbol] < 2500
+            effective_action = current_pred_action
+            discovery_triggered = False
 
-            # Meta-Labeling Check
+            if is_discovery and effective_action == 0:
+                # Gates must pass even for Discovery
+                if not gate_passed:
+                    stats['Vol Gate (Discovery)'] += 1
+                    return Signal(symbol, "HOLD", 0.0, {"reason": "Vol Gate"})
+                
+                if not er_passed:
+                    stats['ER Gate (Discovery)'] += 1
+                    return Signal(symbol, "HOLD", 0.0, {"reason": "ER Gate"})
+
+                max_prob = max(prob_buy, prob_sell)
+                
+                # Bias Check (> 0.55 required)
+                if max_prob > 0.0:
+                    bias_buy = prob_buy > 0.55
+                    bias_sell = prob_sell > 0.55
+                    
+                    if bias_buy and prob_buy > prob_sell:
+                        effective_action = 1
+                        discovery_triggered = True
+                    elif bias_sell and prob_sell > prob_buy:
+                        effective_action = -1
+                        discovery_triggered = True
+                
+                # Breakout Fallback
+                if not discovery_triggered and features.get('vol_breakout', 0) > 0:
+                    ret = features.get('log_ret', 0)
+                    if ret > 0.00001:
+                        effective_action = 1
+                        discovery_triggered = True
+                    elif ret < -0.00001:
+                        effective_action = -1
+                        discovery_triggered = True
+
+            # Standard Trade Checks (Non-Discovery)
+            if not is_discovery:
+                if not gate_passed:
+                    stats['Vol Gate (Live)'] += 1
+                    return Signal(symbol, "HOLD", 0.0, {"reason": "Vol Gate"})
+                if not er_passed:
+                    stats['ER Gate (Live)'] += 1
+                    return Signal(symbol, "HOLD", 0.0, {"reason": "ER Gate"})
+
+            # Calculate Final Confidence
+            confidence = prob_buy if effective_action == 1 else prob_sell
+            
+            if discovery_triggered:
+                # SAFE MODE FORCE: 0.55 Confidence -> 0.30 Sizing
+                confidence = 0.55
+
+            # Meta Labeling Check
             meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.60)
             is_profitable = meta_labeler.predict(
                 features,
-                current_pred_action,
+                effective_action,
                 threshold=meta_threshold
             )
 
-            # Decision Logic
-            # PHOENIX FIX: Raised floor to 0.55 to reduce churn
+            # --- DECISION ---
             min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
             volatility = features.get('volatility', 0.001)
 
-            # --- STANDARD AI LOGIC ---
-            if current_pred_action == 1: # BUY
+            if effective_action == 1: # BUY
                 if confidence > min_conf:
-                    if is_profitable:
+                    if is_profitable or discovery_triggered:
                         return Signal(symbol, "BUY", confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr})
                     else:
                         stats['Meta Rejected'] += 1
                         return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
                 else:
                     stats['Low Confidence'] += 1
-                    return Signal(symbol, "HOLD", confidence, {"reason": f"Low Confidence ({confidence:.2f} < {min_conf})"})
+                    return Signal(symbol, "HOLD", confidence, {"reason": f"Low Conf ({confidence:.2f})"})
             
-            elif current_pred_action == -1: # SELL
+            elif effective_action == -1: # SELL
                 if confidence > min_conf:
-                    if is_profitable:
+                    if is_profitable or discovery_triggered:
                         return Signal(symbol, "SELL", confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr})
                     else:
                         stats['Meta Rejected'] += 1
                         return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
                 else:
                     stats['Low Confidence'] += 1
-                    return Signal(symbol, "HOLD", confidence, {"reason": f"Low Confidence ({confidence:.2f} < {min_conf})"})
+                    return Signal(symbol, "HOLD", confidence, {"reason": f"Low Conf ({confidence:.2f})"})
             
             else:
                 stats['Model Predicted 0'] += 1
@@ -291,7 +349,7 @@ class MultiAssetPredictor:
             # Periodic Rejection Log
             if self.bar_counters[symbol] % 100 == 0:
                 logger.info(f"🔍 {symbol} Rejections (Last 100): {dict(stats)}")
-
+                
             return Signal(symbol, "HOLD", confidence, {})
 
         except Exception as e:
@@ -334,6 +392,6 @@ class MultiAssetPredictor:
                     with open(meta_path, "rb") as f:
                         self.meta_labelers[sym] = pickle.load(f)
                 except Exception: pass
-
+                
         if loaded_count > 0:
             logger.info(f"{LogSymbols.SUCCESS} Loaded {loaded_count} existing models.")

@@ -1,11 +1,12 @@
 # =============================================================================
-# config.yaml – PHOENIX STRATEGY V1.2 (FTMO CHALLENGE MODE)
-# STATUS: HIGH RISK / HIGH REWARD
+# config.yaml – PHOENIX STRATEGY V1.3 (SAFE MODE RECOVERY)
+# STATUS: CONSERVATIVE / RECOVERY
 #
-# REMEDIATION LOG (2025-12-23 - CHALLENGE UPDATE):
-# 1. RISK: Bumped Target Vol to 0.60 and Kelly to 0.80 for meaningful lot sizes.
-# 2. GATES: Relaxed ER Threshold to 0.20 to stop filtering 90% of moves.
-# 3. DISCOVERY: Full size execution enabled.
+# AUDIT REMEDIATION (2025-12-23 - POST-MORTEM FIXES):
+# 1. RISK: Reverted Target Vol to 0.25 and Kelly to 0.25 to prevent Death Spiral.
+# 2. GATES: Tightened ER Threshold to 0.40 to filter chop/noise.
+# 3. LABELING: Capped Barrier Width at 3.0 SDs to align with M5 ATR reality.
+# 4. DISCOVERY: Re-enabled risk controls on discovery trades.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -104,8 +105,8 @@ features:
   
   d1_ema_period: 200
   entropy_window: 100
-  # RELAXED: 0.98 to fix starvation
-  entropy_threshold: 0.98
+  # AUDIT FIX: Restored strict entropy filter to avoid random walk regimes
+  entropy_threshold: 0.95
   ofi_alpha: 0.1
   
   fractional_differentiation:
@@ -120,12 +121,12 @@ features:
 # --- MICROSTRUCTURE FILTERS ---
 microstructure:
   vpin_bucket_size: 1000
-  # RELAXED: 0.98 to fix starvation
-  vpin_threshold: 0.98
+  # AUDIT FIX: Restored strict VPIN filter to avoid toxic flow
+  vpin_threshold: 0.95
   er_threshold_noise: 0.30
   er_threshold_trend: 0.60
-  # AGGRESSIVE FIX: Relaxed Gate to 0.20 (Stop blocking good trades!)
-  gate_er_threshold: 0.20
+  # AUDIT FIX: Tightened Gate to 0.40 (Trend Required) per Remediation Plan
+  gate_er_threshold: 0.40
   hurst_threshold_mean_revert: 0.45
   hurst_threshold_random_low: 0.45
   hurst_threshold_random_high: 0.55
@@ -136,33 +137,33 @@ risk_management:
   account_currency: "USD"
   risk_timezone: "Europe/Prague"
   
-  # Volatility Targeting (AGGRESSIVE MODE)
+  # Volatility Targeting (SAFE MODE)
   sizing_method: "volatility_targeting"
-  target_annual_volatility: 0.60 # Was 0.25 (Too safe) -> 0.60 (Growth)
-  kelly_fraction: 0.80 # Was 0.25 (Too small) -> 0.80 (Aggressive)
+  target_annual_volatility: 0.25 # REMEDIATION: Lowered from 0.60 to 0.25
+  kelly_fraction: 0.25 # REMEDIATION: Lowered from 0.80 to 0.25 (Fractional Kelly)
   
   base_risk_per_trade_percent: 1.0
-  max_leverage: 30 # Increased to allow larger positions
+  max_leverage: 30
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
   # Constraints
   max_daily_loss_pct: 0.04
   max_total_loss_pct: 0.09
-  max_risk_percent: 2.5 # Raised hard cap per trade to 2.5%
+  max_risk_percent: 1.5 # REMEDIATION: Lowered hard cap per trade to 1.5%
   hard_stop_equity_usd: 80000.0
-  max_trades_per_day: 100
+  max_trades_per_day: 50 # REMEDIATION: Capped to prevent over-trading
   correlation_penalty_threshold: 0.8
   
   # Execution Guardrails
   min_lot_size: 0.01
-  max_lot_size: 50.0
+  max_lot_size: 20.0 # Capped max exposure
   min_stop_loss_pips: 5.0
-  max_loss_usd: 5000.0
+  max_loss_usd: 2500.0
   
   # Adaptive Stops (Optimized for M5)
   stop_loss_atr_mult: 2.0
-  take_profit_atr_mult: 3.0 # High R:R
+  take_profit_atr_mult: 3.0
 
 # --- TRADING PORTFOLIO ---
 trading:
@@ -212,11 +213,12 @@ online_learning:
   grace_period: 250
   delta: 0.00001
   
-  # Balanced Weighting (Boosted for Signal)
+  # Balanced Weighting
   positive_class_weight: 2.0
   negative_class_weight: 2.0
   
-  meta_labeling_threshold: 0.55
+  # REMEDIATION: Raised threshold to 0.60 as per Edge Recovery plan
+  meta_labeling_threshold: 0.60
   
   metric: "F1"
   max_features: 'log2'
@@ -228,7 +230,8 @@ online_learning:
   
   tbm:
     horizon_minutes: 30
-    barrier_width: 2.5 # Standard deviation width
+    # REMEDIATION: Capped barrier width to 2.5 SDs (Realistic for M5)
+    barrier_width: 2.5 
     min_profit_pips: 5.0
     # Drift Threshold
     drift_threshold: 1.0
@@ -236,7 +239,7 @@ online_learning:
   # Volatility Gate Settings
   volatility_gate:
     enabled: true
-    min_atr_spread_ratio: 2.5 # Relaxed from 3.0 to 2.5 to capture M5 moves
+    min_atr_spread_ratio: 2.5
 
 # --- FORENSIC AUDIT ---
 forensic_audit:

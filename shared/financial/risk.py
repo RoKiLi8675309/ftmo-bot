@@ -5,11 +5,12 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# AUDIT REMEDIATION (CHALLENGE MODE V1.2):
-# 1. SIZING LOGIC: REMOVED Power Law (conf^2). Now uses Linear Scaling.
-#    - At 0.60 Conf: Old=0.36, New=0.60 (Almost Double Size).
-# 2. SCALAR: Works in tandem with Config V1.2 (TargetVol=0.6, Kelly=0.8).
-# 3. SAFETY: Maintained CPPI and Hard Risk Caps.
+# AUDIT REMEDIATION (2025-12-23 - SAFE MODE RECOVERY):
+# 1. SIZING LOGIC: Restored Power Law (conf^2) scaling.
+#    - At 0.55 Conf: Linear=0.55, Power=0.30 (Safety Buffer).
+#    - At 0.90 Conf: Linear=0.90, Power=0.81 (Conviction rewarded).
+# 2. SCALAR: Works with Config V1.3 (TargetVol=0.25, Kelly=0.25).
+# 3. SAFETY: CPPI floor maintained.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -43,7 +44,7 @@ class RiskManager:
     and Advanced Position Sizing (Volatility Targeting, Kelly, CPPI).
     """
     # Default fallback, but logic now prefers config/override
-    DEFAULT_CONTRACT_SIZE = 100_000 
+    DEFAULT_CONTRACT_SIZE = 100_000
 
     @staticmethod
     def get_pip_info(symbol: str) -> Tuple[float, int]:
@@ -55,7 +56,7 @@ class RiskManager:
             return 0.1, 2
         # Indices heuristic
         if any(x in s for x in ["US30", "GER30", "NAS100", "SPX500"]):
-            return 1.0, 1 # Usually 1 point steps
+            return 1.0, 1  # Usually 1 point steps
         return 0.0001, 5
 
     @staticmethod
@@ -160,7 +161,7 @@ class RiskManager:
         risk_budget_usd = cushion * cppi_mult
 
         # Clamp Risk Budget to Hard Max Risk %
-        # PROFIT FIX: Raised to 2.5% in Config V1.2, logic respects it here.
+        # SAFEMODE FIX: Lowered hard cap back to 1.5% in Config, logic respects it here.
         base_risk_pct = risk_conf.get('max_risk_percent', 1.0) / 100.0
         max_risk_usd = balance * base_risk_pct
         
@@ -207,7 +208,7 @@ class RiskManager:
         loss_per_lot = sl_pips * usd_per_pip_per_lot
         
         lots = 0.0
-
+        
         # --- SIZING METHOD SELECTION ---
         
         if sizing_method == 'volatility_targeting':
@@ -215,7 +216,7 @@ class RiskManager:
             # Formula: TargetExposure = (Equity * TargetAnnualVol) / InstrumentAnnualVol
             # Note: We limit this by the CPPI/MaxRisk calculated above as a ceiling.
             
-            # PROFIT FIX: Target Vol boosted to 0.60 in Config
+            # SAFE FIX: Target Vol reverted to 0.25 in Config
             target_ann_vol = risk_conf.get('target_annual_volatility', 0.20)
             
             # Annualize the short-term volatility (M5 data assumption: 288 bars/day * 252 days)
@@ -226,18 +227,17 @@ class RiskManager:
             ann_factor = 269.4
             realized_ann_vol = volatility * ann_factor
             
-            # Volatility Scalar (e.g., 0.50 / 0.13 = ~3.8 leverage)
+            # Volatility Scalar (e.g., 0.25 / 0.13 = ~1.9 leverage)
             vol_scalar = target_ann_vol / realized_ann_vol
             
             # Fractional Kelly Application
-            # PROFIT FIX: Kelly Fraction boosted to 0.80 in Config
+            # SAFE FIX: Kelly Fraction reverted to 0.25 in Config
             kelly_fraction = risk_conf.get('kelly_fraction', 0.25)
             
-            # AGGRESSIVE FIX: LINEAR SCALING (No Penalty)
-            # If AI is 60% sure, we bet 60% of the calculated size.
-            # Old: pow(conf, 2) -> 0.6^2 = 0.36 (Too small)
-            # New: conf -> 0.60 (Full aggression)
-            conviction = conf
+            # REMEDIATION FIX: POWER LAW SCALING (Penalty Applied)
+            # If AI is 55% sure, we bet 0.55^2 = 0.30 (30%) of the calculated size.
+            # This strongly penalizes low-confidence signals, preventing noise trading.
+            conviction = conf * conf
             
             # Apply Fraction
             final_scalar = vol_scalar * kelly_fraction * conviction
@@ -262,7 +262,7 @@ class RiskManager:
         else:
             # --- METHOD 2: INVERSE VOLATILITY (LEGACY) ---
             # Simple fixed dollar risk / stop loss distance
-            if loss_per_lot > 0: 
+            if loss_per_lot > 0:
                 lots = final_risk_usd / loss_per_lot
             
             # Scalar based on confidence
@@ -275,7 +275,7 @@ class RiskManager:
 
         # --- CONSTRAINTS & SANITIZATION ---
         min_lot = risk_conf.get('min_lot_size', 0.01)
-        max_lot = risk_conf.get('max_lot_size', 10.0) 
+        max_lot = risk_conf.get('max_lot_size', 10.0)
         max_lev = risk_conf.get('max_leverage', 30.0)
         
         # Leverage Cap
@@ -296,12 +296,12 @@ class RiskManager:
 
         # Construct Trade Object
         trade = Trade(
-            symbol=symbol, 
-            action="HOLD", 
+            symbol=symbol,
+            action="HOLD",
             volume=lots,
             entry_price=price,
             stop_loss=stop_dist,
-            take_profit=stop_dist * (atr_mult_tp / atr_mult_sl), 
+            take_profit=stop_dist * (atr_mult_tp / atr_mult_sl),
             comment=f"{'VolTgt' if sizing_method == 'volatility_targeting' else 'InvVol'}|R:${actual_risk_usd:.0f}|ATR:{atr_val:.5f}"
         )
         
@@ -316,7 +316,7 @@ class HierarchicalRiskParity:
         cols = returns_df.columns.tolist()
         if not SCIPY_AVAILABLE:
             return {c: 1.0/len(cols) for c in cols}
-
+        
         try:
             # 1. Compute Correlation Matrix
             corr = returns_df.corr().fillna(0)
@@ -350,7 +350,6 @@ class HierarchicalRiskParity:
         link = link.astype(int)
         sort_ix = pd.Series([link[-1, 0], link[-1, 1]])
         num_items = link[-1, 3]
-
         while sort_ix.max() >= num_items:
             sort_ix.index = range(0, sort_ix.shape[0] * 2, 2)
             df0 = sort_ix[sort_ix >= num_items]
@@ -383,6 +382,7 @@ class PortfolioRiskManager:
         if not SCIPY_AVAILABLE: return
         min_len = min(len(v) for v in self.returns_buffer.values())
         if min_len < 20: return
+        
         data = {s: self.returns_buffer[s][-min_len:] for s in self.symbols}
         df = pd.DataFrame(data)
         self.correlation_matrix = df.corr()
