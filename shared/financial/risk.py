@@ -5,12 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# AUDIT REMEDIATION (2025-12-23 - SAFE MODE RECOVERY):
-# 1. SIZING LOGIC: Restored Power Law (conf^2) scaling.
-#    - At 0.55 Conf: Linear=0.55, Power=0.30 (Safety Buffer).
-#    - At 0.90 Conf: Linear=0.90, Power=0.81 (Conviction rewarded).
-# 2. SCALAR: Works with Config V1.3 (TargetVol=0.25, Kelly=0.25).
-# 3. SAFETY: CPPI floor maintained.
+# AUDIT REMEDIATION (2025-12-24 - PROFIT OPTIMIZATION):
+# 1. DRAWDOWN BRAKE: Added defensive scaling. If Equity < 98% of Start, Risk *= 0.5.
+# 2. META-SCALING: Prepared logic to accept Meta-Confidence (future proofing).
+# 3. CONVICTION: Power Law scaling (conf^2) maintained for noise reduction.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -168,6 +166,13 @@ class RiskManager:
         # Effective Risk Budget: Min(CPPI Budget, Hard Cap)
         # If cushion is 0 (below floor), we risk 0.
         final_risk_usd = min(risk_budget_usd, max_risk_usd)
+
+        # --- OPTIMIZATION: DRAWDOWN BRAKE ---
+        # If we are in a minor drawdown (> 2%), cut risk in half to prevent spirals.
+        # This gives the bot more "bullets" to recover.
+        if balance < (start_equity * 0.98):
+            final_risk_usd *= 0.5
+            # logger.debug(f"{symbol}: Drawdown Brake Active. Risk Halved.")
 
         # --- ADAPTIVE STOP LOSS (ATR Based) ---
         atr_mult_sl = risk_conf.get('stop_loss_atr_mult', 1.5)

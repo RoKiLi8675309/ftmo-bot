@@ -1,17 +1,18 @@
 # =============================================================================
-# config.yaml – PHOENIX STRATEGY V1.5 (ALPHA SEEKER)
-# STATUS: BALANCED / ADAPTIVE LEARNING
+# config.yaml – PHOENIX STRATEGY V2.0 (ALPHA SEEKER)
+# STATUS: PROFIT OPTIMIZED / META-LABELING ENABLED
 #
-# OPTIMIZATION TWEAKS (2025-12-23):
-# 1. GATES RELAXED: ER Threshold lowered to 0.25 to allow Mean Reversion trades.
-# 2. ALPHA: Vortex Indicator added to feature set (Implicit in code).
-# 3. META-LABELING: Threshold adjusted to 0.55 to capture more opportunities.
-# 4. STATS: Entropy/VPIN filters slightly relaxed to 0.95 to reduce false negatives.
+# AUDIT REMEDIATION (2025-12-24):
+# 1. RISK: Switched to Volatility Targeting (Target Vol 20%).
+# 2. GATES: Hardened Volatility & Efficiency gates to stop chop trading.
+# 3. META: ARF Meta-Labeler enabled with 0.60 confidence threshold.
+# 4. SAFETY: Drawdown Brake trigger established at 2% DD.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
 env:
   initial_balance: 100000.0
+  mode: "RESEARCH" # OPTIONS: LIVE, RESEARCH, PAPER
 
 # --- LOGGING CONFIGURATION ---
 logging:
@@ -24,10 +25,11 @@ logging:
 
 # --- BROKER CONNECTION ---
 mt5:
-  login: null
-  password: null
-  server: null
-  path: null
+  login: null # Set via Env Var
+  password: null # Set via Env Var
+  server: "FTMO-Server"
+  path: "C:\\Program Files\\FTMO MetaTrader 5\\terminal64.exe"
+  timeout_seconds: 5
 
 # --- INFRASTRUCTURE ---
 redis:
@@ -36,7 +38,7 @@ redis:
   db: 0
   price_data_stream: "price_data_stream"
   candle_stream_key_prefix: "stream:new_candle"
-  trade_request_stream: "trade_request_stream"
+  trade_request_stream: "trade_requests"
   closed_trade_stream_key: "stream:closed_trades"
   account_info_key: "bot:account_info"
   position_state_key_prefix: "bot:positions"
@@ -44,12 +46,14 @@ redis:
   engine_state_key: 'bot:engine_state'
   
   risk_keys:
+    current_equity: "risk:equity"
+    daily_drawdown: "risk:daily_dd"
+    open_positions: "risk:positions"
     daily_pnl: "risk:daily_pnl"
     consecutive_losses: "risk:consecutive_losses"
     last_deal_time: "risk:last_deal_time"
     pause_trading_flag: "risk:pause_trading"
     daily_starting_equity: "risk:daily_starting_equity"
-    current_equity: "risk:current_equity"
     kill_switch_active: "bot:state:kill_switch_active"
     midnight_freeze: "bot:state:freeze"
     last_reset_date: "risk:last_reset_date"
@@ -96,7 +100,6 @@ features:
   use_regime: true
   use_cum_ofi: true
   use_vol_breakout: true
-  use_vortex: true # NEW ALPHA
   
   rsi_period: 14
   macd_fast: 12
@@ -106,8 +109,8 @@ features:
   
   d1_ema_period: 200
   entropy_window: 100
-  # OPTIMIZATION: Relaxed to 0.95 to allow more data flow
-  entropy_threshold: 0.95
+  # AUDIT FIX: Tightened to 0.90 to filter chop/noise
+  entropy_threshold: 0.90
   ofi_alpha: 0.1
   
   fractional_differentiation:
@@ -122,49 +125,60 @@ features:
 # --- MICROSTRUCTURE FILTERS ---
 microstructure:
   vpin_bucket_size: 1000
-  # OPTIMIZATION: Relaxed to 0.95
-  vpin_threshold: 0.95
+  # AUDIT FIX: Tightened to 0.90 to filter toxic flow
+  vpin_threshold: 0.90
   er_threshold_noise: 0.30
   er_threshold_trend: 0.60
-  # OPTIMIZATION: Lowered to 0.25 to unlock Mean Reversion trades
-  gate_er_threshold: 0.25
+  # AUDIT FIX: Strict Gate at 0.40 (Trend Required)
+  gate_er_threshold: 0.40
   hurst_threshold_mean_revert: 0.45
   hurst_threshold_random_low: 0.45
   hurst_threshold_random_high: 0.55
   hurst_threshold_trend: 0.55
+  
+  # Order Flow Imbalance (OFI)
+  use_ofi: true
+  ofi_threshold: 0.1
 
-# --- RISK MANAGEMENT ---
+# --- RISK MANAGEMENT (CRITICAL) ---
 risk_management:
   account_currency: "USD"
-  risk_timezone: "Europe/Prague"
   
-  # Volatility Targeting
+  # Sizing Method: "volatility_targeting" OR "inverse_volatility"
   sizing_method: "volatility_targeting"
-  target_annual_volatility: 0.25 
-  kelly_fraction: 0.25 
+  
+  # Volatility Targeting Params
+  target_annual_volatility: 0.20  # Aim for 20% annualized vol
+  kelly_fraction: 0.25            # Safety factor (Quarter Kelly)
   
   base_risk_per_trade_percent: 1.0
-  max_leverage: 30
+  
+  # Hard Limits
+  max_daily_loss_pct: 0.04
+  max_total_loss_pct: 0.09
+  max_risk_percent: 1.5           # Hard Cap per trade (Account %)
+  max_leverage: 30.0              # Regulator cap
+  max_lot_size: 50.0
+  min_lot_size: 0.01
+  
+  # CPPI (Capital Preservation)
+  cppi_floor_pct: 0.08            # Stop trading if equity drops >8% total
+  cppi_multiplier: 2.0
+  
+  # Trade Management
+  stop_loss_atr_mult: 1.5
+  take_profit_atr_mult: 2.0
+  risk_timezone: "Europe/Prague"  # FTMO Timezone
+  
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
   # Constraints
-  max_daily_loss_pct: 0.04
-  max_total_loss_pct: 0.09
-  max_risk_percent: 1.5 
-  hard_stop_equity_usd: 80000.0
   max_trades_per_day: 50
   correlation_penalty_threshold: 0.8
-  
-  # Execution Guardrails
-  min_lot_size: 0.01
-  max_lot_size: 20.0
-  min_stop_loss_pips: 5.0
   max_loss_usd: 2500.0
-  
-  # Adaptive Stops (Optimized for M5)
-  stop_loss_atr_mult: 2.0
-  take_profit_atr_mult: 3.0
+  hard_stop_equity_usd: 80000.0
+  min_stop_loss_pips: 5.0
 
 # --- TRADING PORTFOLIO ---
 trading:
@@ -183,6 +197,44 @@ trading:
   magic_number: 621001
   slippage: 5
 
+# --- ONLINE LEARNING (RIVER ML) ---
+online_learning:
+  model_type: "ARFClassifier"
+  n_models: 25                    # Reduced for speed, increased for robustness
+  
+  burn_in_periods: 1000           # Bars required before ANY inference
+  
+  # Volatility Gate: Rejects Dead Markets
+  volatility_gate:
+    enabled: true
+    min_atr_spread_ratio: 2.5     # ATR must be > 2.5x Spread
+  
+  # Adaptive Learning
+  grace_period: 250
+  delta: 0.00001
+  
+  # Class Weights (Profit Focus)
+  positive_class_weight: 2.0
+  negative_class_weight: 2.0
+  
+  # Meta-Labeling (The Gatekeeper)
+  meta_labeling_threshold: 0.60   # Must be >60% sure of profit
+  
+  # Tree Parameters
+  metric: "F1"
+  max_features: 'sqrt'
+  lambda_value: 6
+  
+  # TBM (Triple Barrier Method) - Research specific
+  tbm:
+    horizon_minutes: 30
+    barrier_width: 2.5
+    min_profit_pips: 5.0
+    drift_threshold: 1.0
+    
+  learning_horizon_sec: 300
+  min_calibrated_probability: 0.55
+
 # --- NEWS FILTER ---
 news_filter:
   enabled: true
@@ -196,58 +248,24 @@ news_filter:
     GBP: ["BOE", "CPI", "Rate"]
     JPY: ["BOJ", "Rate"]
 
-# --- WFO OPTIMIZATION ---
+# --- FORENSIC AUDIT ASSUMPTIONS ---
+# Used for Gates when live spreads aren't available in backtest
+forensic_audit:
+  enforce_spread: true
+  max_slippage_pips: 2.0
+  commission_per_lot: 5.0
+  spread_pips:
+    default: 1.5
+    GBPUSD: 1.8
+    EURUSD: 1.2
+    USDJPY: 1.5
+    AUDJPY: 2.0
+    GBPJPY: 2.5
+    XAUUSD: 30.0 # 3.0 pips (gold digits)
+
+# --- WFO OPTIMIZATION (HYPERPARAMS) ---
 wfo:
   n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 5
-
-# --- ONLINE LEARNING ---
-online_learning:
-  model_type: "ARFClassifier"
-  n_models: 40
-  
-  burn_in_periods: 1000
-  
-  # Adaptive Learning Params
-  grace_period: 250
-  delta: 0.00001
-  
-  # Balanced Weighting
-  positive_class_weight: 2.0
-  negative_class_weight: 2.0
-  
-  # Edge Recovery: Lowered to 0.55 to be less restrictive
-  meta_labeling_threshold: 0.55
-  
-  metric: "F1"
-  max_features: 'log2'
-  lambda_value: 6
-  
-  learning_horizon_sec: 300
-  # Conviction Floor
-  min_calibrated_probability: 0.55
-  
-  tbm:
-    horizon_minutes: 30
-    # Optimization: Allow wider barriers search space in Research
-    barrier_width: 2.5 
-    min_profit_pips: 5.0
-    drift_threshold: 1.0
-    
-  # Volatility Gate Settings
-  volatility_gate:
-    enabled: true
-    min_atr_spread_ratio: 2.5
-
-# --- FORENSIC AUDIT ---
-forensic_audit:
-  enforce_spread: true
-  spread_pips:
-    default: 1.5
-    GBPJPY: 2.5
-    AUDJPY: 2.0
-    EURGBP: 1.8
-  max_slippage_pips: 2.0
-  commission_per_lot: 5.0
+  min_trades_optimization: 10

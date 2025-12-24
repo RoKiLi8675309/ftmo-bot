@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# PHOENIX STRATEGY V1.5 (ALPHA SEEKER - 2025-12-23):
-# 1. OPTIMIZATION GOAL: Maximize PnL (Alpha Hunting).
-# 2. META-LABELING: Added 'meta_threshold' to search space (0.50 - 0.70).
-# 3. GATES: Added 'gate_er' to search space (0.20 - 0.40) to find optimal chop filter.
-# 4. REPORTING: Enhanced HTML reports to visualize Alpha vs. Chop.
+# AUDIT REMEDIATION (2025-12-23 - SNIPER MODE):
+# 1. SEARCH SPACE: Capped Barrier Width at 3.0 SD (Realistic M5 Targets).
+# 2. FILTERS: Forced stricter search range (0.85-0.95) to ensure noise filtering.
+# 3. SCORING: PnL + SQN (Profit Dominant) maintained.
 # =============================================================================
 import sys
 import os
@@ -25,7 +24,7 @@ import optuna
 import numpy as np
 import pandas as pd
 import psutil
-import yaml
+import yaml # Required for Auto-Deployment
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pathlib import Path
@@ -34,203 +33,644 @@ from typing import Dict, Any, List, Tuple, Optional
 from joblib import Parallel, delayed
 from river import compose, preprocessing, forest, metrics
 
-# Ensure project root is in sys.path
+# Ensure project root is in sys.path to resolve 'shared' and 'engines' modules
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "../../"))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-# Shared Imports
-from shared import CONFIG, LogSymbols, VolumeBarAggregator
-from engines.research.backtester import BacktestBroker, MarketSnapshot
-from engines.research.strategy import ResearchStrategy
+# Import after path fix
+try:
+    from engines.research.backtester import BacktestBroker, MarketSnapshot
+    from engines.research.strategy import ResearchStrategy
+    from shared import CONFIG, setup_logging, load_real_data, LogSymbols, batch_generate_volume_bars
+except ImportError as e:
+    print(f"CRITICAL: Failed to import dependencies. Ensure you are running from the project root or 'shared' is accessible.\nError: {e}")
+    sys.exit(1)
 
-# Configure Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)-8s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+setup_logging("Research")
 log = logging.getLogger("Research")
+
+# --- 1. TELEMETRY & REPORTING UTILS ---
+
+class EmojiCallback:
+    """
+    Injects FTMO-style Emojis and RICH TELEMETRY into Optuna Trial reporting.
+    Uses sys.stdout.write to ensure output visibility in parallel workers.
+    """
+    def __call__(self, study, trial):
+        val = trial.value
+        attrs = trial.user_attrs
+        
+        # Extract Symbol from Study Name (Convention: "study_SYMBOL")
+        symbol = study.study_name.replace("study_", "")
+        
+        # 1. Determine Status Icon & Rank
+        sqn = attrs.get('sqn', 0.0)
+        trades = attrs.get('trades', 0)
+        pnl = attrs.get('pnl', 0.0)
+        
+        if attrs.get('blown', False):
+            icon = "💀" # Blown Account
+            status = "BLOWN"
+        elif attrs.get('pruned', False):
+            icon = "✂️" # Pruned (Low Trades / Gate Rejection)
+            status = "PRUNE"
+        elif trades == 0:
+            icon = "💤" # No Trades
+            status = "IDLE "
+        elif pnl >= 5000.0: # Aggressive Target
+            icon = "🚀" # To the Moon
+            status = "ALPHA"
+        elif pnl >= 1000.0:
+            icon = "💎" # Solid
+            status = "PROFIT"
+        elif pnl > 0.0:
+            icon = "🛡️" # Weak Profit
+            status = "WEAK "
+        else:
+            icon = "🔻" # Loss
+            status = "LOSS "
+
+        # 2. Extract Metrics (Safe Defaults)
+        dd = attrs.get('max_dd_pct', 0.0) * 100
+        wr = attrs.get('win_rate', 0.0) * 100
+        pf = attrs.get('profit_factor', 0.0)
+        sharpe = attrs.get('sharpe', 0.0)
+        
+        # 3. Format Output (Column Aligned)
+        # Structure: [ICON] STATUS | SYMBOL | ID | SCORE | PnL | WR | DD | PF | SQN | TRADES
+        msg = (
+            f"{icon} {status:<6} | {symbol:<6} | Trial {trial.number:<3} | "
+            f"🏆 Score: {val:>6.2f} | "
+            f"💰 PnL: ${pnl:>9,.2f} | "
+            f"🎯 WR: {wr:>5.1f}% | "
+            f"📉 DD: {dd:>5.2f}% | "
+            f"⚖️ PF: {pf:>4.2f} | "
+            f"🧠 SQN: {sqn:>4.2f} | "
+            f"⚡ Sharpe: {sharpe:>4.2f} | "
+            f"#️⃣ {trades:<4}"
+        )
+        
+        # 4. FORCE PRINT to Console (Bypass Logger Buffering)
+        print(msg, flush=True)
+        
+        # 5. Log to File (for persistence)
+        log.info(msg.strip())
+        
+        # 6. Conditional Autopsy (Debug Info for Failed/Weak/Pruned Trials)
+        # VISIBILITY FIX: Always show autopsy for Pruned/Blown trials so we see Vol Gate activity
+        show_autopsy = False
+        if 'autopsy' in attrs:
+            if attrs.get('blown', False): show_autopsy = True
+            elif attrs.get('pruned', False): show_autopsy = True
+            elif val is not None and val < 0.5: show_autopsy = True
+            
+        if show_autopsy:
+            autopsy_msg = f"\n🔎 AUTOPSY (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
+            print(autopsy_msg, flush=True)
+            log.info(autopsy_msg)
+
+def process_data_into_bars(symbol: str, n_ticks: int = 2000000) -> pd.DataFrame:
+    """
+    Helper to Load Ticks -> Aggregate to Volume Bars -> Return Clean DataFrame.
+    Strictly enforcing Volume Bars eliminates "Time-Based noise".
+    UPDATED: Default n_ticks increased to 2M per recommendation.
+    """
+    # 1. Load Massive Amount of Ticks (To get sufficient Bars)
+    raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2) # Double days for safety
+    
+    if raw_ticks.empty:
+        return pd.DataFrame()
+
+    # 2. Aggregate into Volume Bars (CRITICAL STEP)
+    threshold = CONFIG['data'].get('volume_bar_threshold', 1000)
+    bars_list = batch_generate_volume_bars(raw_ticks, volume_threshold=threshold)
+    
+    if not bars_list:
+        log.warning(f"⚠️ {symbol}: Not enough volume to generate bars from {len(raw_ticks)} ticks.")
+        return pd.DataFrame()
+
+    # 3. Convert to DataFrame
+    df_bars = pd.DataFrame(bars_list)
+    
+    # 4. Set Index to Datetime for Snapshot compatibility
+    # Ensure 'timestamp' from aggregator (which is float) is converted to datetime
+    df_bars['time'] = pd.to_datetime(df_bars['timestamp'], unit='s', utc=True)
+    df_bars.set_index('time', inplace=True, drop=False)
+    
+    return df_bars
+
+# --- 2. WORKER FUNCTIONS (ISOLATED PROCESSES) ---
+
+def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url: str) -> None:
+    """
+    ISOLATED WORKER FUNCTION: Runs in a separate process.
+    Executes Optuna Optimization for a single symbol.
+    """
+    # RESTORED: Optuna INFO Logging for Analysis
+    optuna.logging.set_verbosity(optuna.logging.INFO)
+    
+    try:
+        # 1. Load & Aggregate Data (Using updated 2M limit)
+        df = process_data_into_bars(symbol, n_ticks=2000000)
+        
+        if df.empty:
+            log.error(f"❌ CRITICAL: No BAR data generated for {symbol}. Aborting worker.")
+            return
+        
+        # Force print to show progress
+        print(f"📥 {symbol}: Generated {len(df)} Volume Bars for training.", flush=True)
+
+        # 2. Define Objective
+        def objective(trial):
+            # Define Search Space (Focused on Profitability & Exploration)
+            params = CONFIG['online_learning'].copy()
+            params.update({
+                'n_models': trial.suggest_int('n_models', 20, 50, step=5),
+                
+                # AUDIT FIX: High Patience for Sniper Mode
+                'grace_period': trial.suggest_int('grace_period', 100, 500), # Wait longer before split
+                'delta': trial.suggest_float('delta', 1e-7, 1e-4, log=True), # Low sensitivity to drift
+                
+                # REMEDIATION (Step 2 - SNIPER MODE): STRICT FILTER RANGES
+                # We do not allow thresholds > 0.95. If the trade requires 0.99 to be safe, it's unsafe.
+                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.85, 0.95),
+                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.85, 0.95),
+                
+                'tbm': {
+                    # SNIPER MODE: Cap Barrier Width at 3.0 SD (Realistic M5 moves)
+                    # Anything > 3.0 is a "fake positive" waiting to happen.
+                    'barrier_width': trial.suggest_float('barrier_width', 1.5, 3.0),
+                    'horizon_minutes': trial.suggest_int('horizon_minutes', 15, 120),
+                    # Stricter Drift Threshold (0.5 - 1.0)
+                    'drift_threshold': trial.suggest_float('drift_threshold', 0.5, 1.0)
+                },
+                # High Conviction Requirement (0.55 - 0.75)
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.55, 0.75)
+            })
+            
+            # Instantiate Pipeline locally
+            pipeline_inst = ResearchPipeline()
+            broker = BacktestBroker(starting_cash=CONFIG['env']['initial_balance'])
+            model = pipeline_inst.get_fresh_model(params)
+            strategy = ResearchStrategy(model, symbol, params)
+            
+            # Run Simulation
+            for index, row in df.iterrows():
+                snapshot = MarketSnapshot(timestamp=index, data=row)
+                if snapshot.get_price(symbol, 'close') == 0: continue
+                
+                # Check broker pending orders (stops/limits)
+                broker.process_pending(snapshot)
+                
+                # Strategy makes decisions
+                strategy.on_data(snapshot, broker)
+                
+                if broker.is_blown: break
+            
+            # --- RICH METRICS EXTRACTION ---
+            metrics = pipeline_inst.calculate_performance_metrics(broker.trade_log, broker.starting_cash)
+            
+            # Pass metrics to Callback (Crucial for Emojis)
+            trial.set_user_attr("pnl", metrics['total_pnl'])
+            trial.set_user_attr("max_dd_pct", metrics['max_dd_pct'])
+            trial.set_user_attr("win_rate", metrics['win_rate'])
+            trial.set_user_attr("trades", metrics['total_trades'])
+            trial.set_user_attr("profit_factor", metrics['profit_factor'])
+            trial.set_user_attr("sqn", metrics['sqn'])
+            trial.set_user_attr("sharpe", metrics['sharpe'])
+            
+            # --- SCORING: PnL DOMINANT ---
+            # Score = (Net Profit / $100) + SQN.
+            
+            pnl_score = metrics['total_pnl'] / 100.0
+            final_score = pnl_score + metrics['sqn']
+            
+            # Penalty for Low Activity
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 5)
+            total_trades = metrics['total_trades']
+            
+            # Volume Bonus (Reward Statistical Significance)
+            if total_trades > 200:
+                final_score += 5.0 
+            
+            if total_trades < min_trades:
+                trial.set_user_attr("pruned", True)
+                deficit = min_trades - total_trades
+                penalty = deficit * 1.0
+                final_score -= penalty
+                
+                if total_trades == 0:
+                    trial.set_user_attr("autopsy", strategy.generate_autopsy())
+                    final_score = -50.0
+
+            # Penalty for Negative PnL despite activity
+            if total_trades > 5 and metrics['total_pnl'] < 0:
+                 final_score -= 10.0 # Strongly discourage losing strategies
+
+            # Generate Autopsy if result is poor (Debugging)
+            if final_score < 0.5 or broker.is_blown:
+                trial.set_user_attr("autopsy", strategy.generate_autopsy())
+                
+            if broker.is_blown:
+                trial.set_user_attr("blown", True)
+                return -100.0 # Max Penalty
+            
+            return final_score
+
+        # 3. Connect to Shared Study
+        study_name = f"study_{symbol}"
+        for _ in range(3):
+            try:
+                study = optuna.load_study(study_name=study_name, storage=db_url)
+                break
+            except Exception:
+                time.sleep(1)
+        
+        # 4. Execute Optimization
+        study.optimize(objective, n_trials=n_trials, callbacks=[EmojiCallback()])
+        
+        # Cleanup memory for this worker
+        del df
+        gc.collect()
+
+    except Exception as e:
+        log.error(f"CRITICAL WORKER ERROR ({symbol}): {e}")
+        import traceback
+        traceback.print_exc()
+
+def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_dir: Path) -> None:
+    """
+    Trains the Final Production Model using the Best Params found.
+    """
+    try:
+        # 1. Load & Aggregate Data (Using updated 2M limit)
+        df = process_data_into_bars(symbol, n_ticks=2000000)
+        if df.empty: return
+
+        # 2. Get Best Params
+        study_name = f"study_{symbol}"
+        study = optuna.load_study(study_name=study_name, storage=db_url)
+        
+        if len(study.trials) == 0:
+            log.warning(f"No trials found for {symbol}. Skipping finalization.")
+            return
+
+        best_params = study.best_params
+        
+        # 3. Save Best Params
+        params_path = models_dir / f"best_params_{symbol}.json"
+        with open(params_path, "w") as f:
+            json.dump(best_params, f, indent=4)
+
+        # 4. Final Training Run
+        final_params = CONFIG['online_learning'].copy()
+        final_params.update(best_params)
+        
+        pipeline_inst = ResearchPipeline()
+        model = pipeline_inst.get_fresh_model(final_params)
+        broker = BacktestBroker(starting_cash=CONFIG['env']['initial_balance'])
+        strategy = ResearchStrategy(model, symbol, final_params)
+
+        for index, row in df.iterrows():
+            snapshot = MarketSnapshot(timestamp=index, data=row)
+            if snapshot.get_price(symbol, 'close') == 0: continue
+            
+            broker.process_pending(snapshot)
+            strategy.on_data(snapshot, broker)
+
+        # 5. Save Artifacts
+        with open(models_dir / f"river_pipeline_{symbol}.pkl", "wb") as f:
+            pickle.dump(strategy.model, f)
+        
+        # Save MetaLabeler and Calibrators
+        with open(models_dir / f"meta_model_{symbol}.pkl", "wb") as f:
+            pickle.dump(strategy.meta_labeler, f)
+            
+        cal_state = {'buy': strategy.calibrator_buy, 'sell': strategy.calibrator_sell}
+        with open(models_dir / f"calibrators_{symbol}.pkl", "wb") as f:
+            pickle.dump(cal_state, f)
+            
+        log.info(f"✅ FINALIZED {symbol} | Best Score: {study.best_value:.4f}")
+        gc.collect()
+        
+    except Exception as e:
+        log.error(f"CRITICAL FINALIZE ERROR ({symbol}): {e}")
+
+# --- 3. MAIN PIPELINE CLASS ---
 
 class ResearchPipeline:
     def __init__(self):
-        self.data_dir = Path(project_root) / "data" / "processed"
-        self.models_dir = Path(project_root) / "models" / "production"
-        self.reports_dir = Path(project_root) / "reports"
-        self.reports_dir.mkdir(parents=True, exist_ok=True)
-        self.models_dir.mkdir(parents=True, exist_ok=True)
-        
         self.symbols = CONFIG['trading']['symbols']
-        self.num_workers = max(1, psutil.cpu_count(logical=False) - 2)
-
-    def load_data(self, symbol: str) -> pd.DataFrame:
-        """Loads parquet data for a specific symbol."""
-        p = self.data_dir / f"{symbol}_volume_bars.parquet"
-        if not p.exists():
-            log.warning(f"Data not found for {symbol}: {p}")
-            return pd.DataFrame()
-        return pd.read_parquet(p)
-
-    def optimize_symbol(self, symbol: str, df: pd.DataFrame, n_trials: int = 50):
-        """
-        Runs Optuna optimization for a single symbol to find Alpha.
-        """
-        if df.empty: return
+        self.models_dir = Path("models")
+        self.models_dir.mkdir(exist_ok=True)
+        self.reports_dir = Path("reports")
+        self.reports_dir.mkdir(exist_ok=True)
         
-        log.info(f"{LogSymbols.optimize} Optimizing {symbol} (Target: MAX PROFIT)...")
+        # Increased Tick counts to ensure Bar generation works
+        self.train_candles = CONFIG['data'].get('num_candles_train', 2000000)
+        self.backtest_candles = CONFIG['data'].get('num_candles_backtest', 500000)
         
-        def objective(trial):
-            # 1. Hyperparameter Search Space (The "Levers")
-            
-            # Model Params
-            n_models = trial.suggest_int("n_models", 10, 50, step=10)
-            grace_period = trial.suggest_int("grace_period", 100, 500, step=50)
-            
-            # Alpha / Gate Params
-            # Relaxed ER to find Mean Reversion trades
-            gate_er = trial.suggest_float("gate_er", 0.15, 0.40) 
-            # Tune the Meta-Labeler aggression
-            meta_threshold = trial.suggest_float("meta_threshold", 0.51, 0.65)
-            
-            # Dynamic Stop Loss (ATR Multiplier)
-            sl_mult = trial.suggest_float("sl_mult", 1.5, 3.5)
-            tp_mult = trial.suggest_float("tp_mult", 1.5, 4.0)
+        self.db_url = CONFIG['wfo']['db_url']
+        self.total_cores = max(1, psutil.cpu_count(logical=True) - 2)
+        
+        log.info(f"HARDWARE DETECTED: {psutil.cpu_count(logical=True)} Cores. Using {self.total_cores} workers.")
 
-            # 2. Inject Params into Config (Runtime Patching)
-            CONFIG['online_learning']['n_models'] = n_models
-            CONFIG['online_learning']['grace_period'] = grace_period
-            CONFIG['microstructure']['gate_er_threshold'] = gate_er
-            CONFIG['online_learning']['meta_labeling_threshold'] = meta_threshold
-            CONFIG['risk_management']['stop_loss_atr_mult'] = sl_mult
-            CONFIG['risk_management']['take_profit_atr_mult'] = tp_mult
-
-            # 3. Initialize Strategy & Model
-            model = compose.Pipeline(
-                preprocessing.StandardScaler(),
-                forest.ARFClassifier(
-                    n_models=n_models,
-                    seed=42,
-                    leaf_prediction="mc",
-                    drift_detector=None, # Disable internal drift for speed, use TBM
-                    warning_detector=None
-                )
+    def get_fresh_model(self, params: Dict[str, Any] = None) -> Any:
+        if params is None:
+            params = CONFIG['online_learning']
+        
+        # FORENSIC REMEDIATION: Using ARFClassifier with F1 Score
+        return compose.Pipeline(
+            preprocessing.StandardScaler(),
+            forest.ARFClassifier(
+                n_models=params.get('n_models', 25),
+                seed=42,
+                grace_period=params.get('grace_period', 200),
+                delta=params.get('delta', 1e-5),
+                split_criterion='gini',
+                leaf_prediction='mc',
+                max_features='log2',
+                lambda_value=6,
+                metric=metrics.F1()
             )
-            
-            strategy = ResearchStrategy(model=model, symbol=symbol)
-            broker = BacktestBroker(initial_balance=10000.0) # Small balance for normalization
-            
-            # 4. Simulation Loop (Vectorized-ish iteration)
-            # We iterate properly to simulate online learning
-            for row in df.itertuples(index=False):
-                # Convert namedtuple to Series-like dict for snapshot
-                data_dict = row._asdict()
-                snapshot = MarketSnapshot(
-                    timestamp=pd.Timestamp(row.timestamp, unit='s'),
-                    data=pd.Series(data_dict)
-                )
-                
-                strategy.process_tick(snapshot, broker)
-                
-            # 5. Scoring (The "Judge")
-            stats = broker.get_stats()
-            
-            # Profit Factor
-            pf = stats.get('profit_factor', 0.0)
-            # Net Profit
-            pnl = stats.get('total_pnl', 0.0)
-            # Drawdown
-            dd = stats.get('max_drawdown_pct', 1.0)
-            # Trade Count
-            trades = stats.get('total_trades', 0)
-            
-            # Penalty for inactivity
-            if trades < 10: 
-                return -1000.0
-            
-            # Penalty for blowing up
-            if dd > 0.10: # >10% DD is instant fail
-                return -5000.0
+        )
 
-            # Objective: Pure Profit, scaled by stability (PF)
-            # If PF < 1 (Losing strategy), score is negative PnL (punish losses)
-            # If PF > 1, score is PnL * PF (Compound reward for efficiency)
-            score = pnl * pf if pf > 1.0 else pnl
-            
-            # Log progress
-            outcome = "PROFIT" if pnl > 0 else "LOSS"
-            log.info(f"Trial {trial.number}: {outcome} | PnL: ${pnl:.2f} | PF: {pf:.2f} | Trades: {trades} | ER: {gate_er:.2f}")
-            
-            return score
+    def calculate_performance_metrics(self, trade_log: List[Dict], initial_capital=100000.0) -> Dict[str, float]:
+        """
+        Calculates extended metrics for robust debugging and scoring.
+        """
+        metrics = {
+            'score': -10.0,
+            'total_pnl': 0.0,
+            'max_dd_pct': 0.0,
+            'win_rate': 0.0,
+            'total_trades': 0,
+            'profit_factor': 0.0,
+            'sharpe': 0.0,
+            'sortino': 0.0,
+            'sqn': 0.0,
+            'avg_win': 0.0,
+            'avg_loss': 0.0
+        }
+        
+        if not trade_log:
+            return metrics
 
-        # Run Optimization
-        study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=n_trials, n_jobs=1) # Serial to prevent Race Conditions on Config
+        df = pd.DataFrame(trade_log)
         
-        log.info(f"✅ Best Params for {symbol}: {study.best_params}")
-        log.info(f"🏆 Best Score: {study.best_value}")
+        # Basic Stats
+        total_pnl = df['Net_PnL'].sum()
+        metrics['total_pnl'] = total_pnl
+        metrics['total_trades'] = len(df)
         
-        return study.best_params
+        winners = df[df['Net_PnL'] > 0]
+        losers = df[df['Net_PnL'] <= 0]
+        metrics['win_rate'] = len(winners) / len(df) if len(df) > 0 else 0.0
+        
+        metrics['avg_win'] = winners['Net_PnL'].mean() if not winners.empty else 0.0
+        metrics['avg_loss'] = losers['Net_PnL'].mean() if not losers.empty else 0.0
+
+        # Profit Factor
+        gross_profit = winners['Net_PnL'].sum()
+        gross_loss = abs(losers['Net_PnL'].sum())
+        metrics['profit_factor'] = gross_profit / gross_loss if gross_loss > 0 else 0.0
+
+        # Drawdown
+        df['equity'] = initial_capital + df['Net_PnL'].cumsum()
+        df['peak'] = df['equity'].cummax()
+        df['drawdown'] = df['equity'] - df['peak']
+        max_dd_val = df['drawdown'].min()
+        metrics['max_dd_pct'] = abs(max_dd_val / initial_capital)
+
+        # Fail Conditions
+        if metrics['max_dd_pct'] > 0.10: # 10% Hard Limit
+            metrics['score'] = -100.0
+            return metrics
+        
+        avg_ret = df['Net_PnL'].mean()
+        if avg_ret <= 0:
+            metrics['score'] = -1.0
+            # return metrics # Let it continue to calculate SQN for debugging
+
+        # Volatility Based Metrics
+        pnl_std = df['Net_PnL'].std() if len(df) > 1 else 1.0
+        downside_std = losers['Net_PnL'].std() if len(losers) > 1 else 1.0
+        
+        # Sharpe (Annualized approx assuming these are sequential trades in sample)
+        metrics['sharpe'] = avg_ret / (pnl_std + 1e-9)
+        
+        # Sortino
+        metrics['sortino'] = avg_ret / (downside_std + 1e-9)
+        
+        # SQN (System Quality Number)
+        if len(df) > 1 and pnl_std > 1e-9:
+            metrics['sqn'] = math.sqrt(len(df)) * (avg_ret / pnl_std)
+        
+        # Scoring Formula is calculated in objective function now
+        metrics['score'] = 0.0 # Placeholder
+        
+        return metrics
 
     def run_training(self, fresh_start: bool = False):
-        """
-        Main execution flow.
-        """
-        if fresh_start:
-            log.warning("PURGING previous models and studies...")
-            # Logic to delete pickle files would go here
-            pass
-
-        log.info(f"{LogSymbols.ONLINE} Starting Alpha Hunt on {len(self.symbols)} symbols.")
+        log.info(f"{LogSymbols.TIME} STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
         
-        for sym in self.symbols:
-            df = self.load_data(sym)
-            if len(df) < 1000:
-                log.error(f"Insufficient data for {sym}")
-                continue
-                
-            # Split Train/Test (Last 20% for validation)
-            split_idx = int(len(df) * 0.8)
-            train_df = df.iloc[:split_idx]
+        # 1. Init DB Studies
+        for symbol in self.symbols:
+            study_name = f"study_{symbol}"
+            if fresh_start:
+                print(f"🗑️ ATTEMPTING PURGE: {study_name}...")
+                try:
+                    optuna.delete_study(study_name=study_name, storage=self.db_url)
+                    print(f"✅ PURGED: {study_name}")
+                except Exception:
+                    pass
             
-            best_params = self.optimize_symbol(sym, train_df, n_trials=30)
-            
-            # Save Params
-            with open(self.models_dir / f"{sym}_best_params.json", "w") as f:
-                json.dump(best_params, f, indent=4)
+            try:
+                optuna.create_study(study_name=study_name, storage=self.db_url, direction="maximize", load_if_exists=True)
+            except Exception as e:
+                log.warning(f"Study init warning {symbol}: {e}")
+
+        # 2. Distribute Workers
+        total_trials_per_symbol = CONFIG['wfo'].get('n_trials', 100) # Ensure config aligns with request
+        tasks = []
+        workers_per_symbol = max(1, self.total_cores // len(self.symbols))
+        trials_per_worker = math.ceil(total_trials_per_symbol / workers_per_symbol)
+        
+        log.info(f"DISTRIBUTION: {workers_per_symbol} workers/symbol | {trials_per_worker} trials/worker")
+        for symbol in self.symbols:
+            for _ in range(workers_per_symbol):
+                tasks.append((symbol, trials_per_worker, self.train_candles, self.db_url))
+        
+        start_time = time.time()
+        
+        Parallel(n_jobs=self.total_cores, backend="loky")(
+            delayed(_worker_optimize_task)(*t) for t in tasks
+        )
+        
+        # 3. Finalize
+        duration = time.time() - start_time
+        log.info(f"{LogSymbols.SUCCESS} Swarm Optimization Complete in {duration:.2f}s")
+        log.info(f"{LogSymbols.DATABASE} Finalizing Models & Artifacts...")
+        
+        Parallel(n_jobs=len(self.symbols), backend="loky")(
+            delayed(_worker_finalize_task)(
+                sym,
+                self.train_candles,
+                self.db_url,
+                self.models_dir
+            ) for sym in self.symbols
+        )
+        log.info(f"{LogSymbols.SUCCESS} Training Pipeline Completed.")
 
     def run_backtest(self):
-        """
-        Runs a final validation backtest using the best parameters found.
-        """
-        log.info("Running Final Validation Backtest...")
-        # Implementation would load best_params.json and run a single pass
-        pass
+        log.info(f"{LogSymbols.TIME} Starting BACKTEST verification...")
+        
+        results = Parallel(n_jobs=len(self.symbols), backend="loky")(
+            delayed(self._run_backtest_symbol)(sym) for sym in self.symbols
+        )
+        
+        all_trades = []
+        for trades in results:
+            all_trades.extend(trades)
+            
+        self._generate_report(all_trades)
 
-if __name__ == "__main__":
+    def _run_backtest_symbol(self, symbol: str) -> List[Dict]:
+        try:
+            df = process_data_into_bars(symbol, n_ticks=self.backtest_candles)
+            if df.empty: return []
+
+            model_path = self.models_dir / f"river_pipeline_{symbol}.pkl"
+            params_path = self.models_dir / f"best_params_{symbol}.json"
+            meta_path = self.models_dir / f"meta_model_{symbol}.pkl"
+            cal_path = self.models_dir / f"calibrators_{symbol}.pkl"
+
+            if not model_path.exists():
+                log.error(f"Model missing for {symbol}")
+                return []
+
+            with open(model_path, "rb") as f: model = pickle.load(f)
+            
+            params = CONFIG['online_learning'].copy()
+            if params_path.exists():
+                with open(params_path, "r") as f: params.update(json.load(f))
+            
+            strategy = ResearchStrategy(model, symbol, params)
+            strategy.debug_mode = True
+            
+            if meta_path.exists():
+                with open(meta_path, "rb") as f: strategy.meta_labeler = pickle.load(f)
+            if cal_path.exists():
+                with open(cal_path, "rb") as f:
+                    cals = pickle.load(f)
+                    strategy.calibrator_buy = cals['buy']
+                    strategy.calibrator_sell = cals['sell']
+            
+            broker = BacktestBroker(starting_cash=CONFIG['env']['initial_balance'])
+            
+            for index, row in df.iterrows():
+                snapshot = MarketSnapshot(timestamp=index, data=row)
+                if snapshot.get_price(symbol, 'close') > 0:
+                    broker.process_pending(snapshot)
+                    strategy.on_data(snapshot, broker)
+            
+            return broker.trade_log
+
+        except Exception as e:
+            print(f"Backtest error {symbol}: {e}")
+            return []
+
+    def _generate_report(self, trade_log: List[Dict]):
+        if not trade_log:
+            log.info("No trades executed during backtest.")
+            return
+
+        df = pd.DataFrame(trade_log)
+        initial_capital = 100000.0 # Assumed start
+        
+        # Metrics
+        total_pnl = df['Net_PnL'].sum()
+        win_rate = len(df[df['Net_PnL']>0]) / len(df)
+        
+        log.info(f"--- BACKTEST RESULTS ---")
+        log.info(f"Total PnL: ${total_pnl:,.2f}")
+        log.info(f"Win Rate: {win_rate:.1%}")
+        log.info(f"Trades: {len(df)}")
+        
+        # Save CSV
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = self.reports_dir / f"backtest_trades_{timestamp_str}.csv"
+        df.to_csv(csv_path)
+        log.info(f"{LogSymbols.DATABASE} Saved Trades to {csv_path}")
+
+        # --- PLOTLY VISUALIZATION ---
+        try:
+            df['Entry_Time'] = pd.to_datetime(df['Entry_Time'])
+            df = df.sort_values('Entry_Time')
+            df['Equity'] = initial_capital + df['Net_PnL'].cumsum()
+            df['Peak'] = df['Equity'].cummax()
+            df['Drawdown'] = (df['Equity'] - df['Peak']) / df['Peak']
+            
+            self._plot_equity_curve(df, timestamp_str)
+        except Exception as e:
+            log.warning(f"Could not generate plot: {e}")
+
+    def _plot_equity_curve(self, df_equity: pd.DataFrame, timestamp_str: str):
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                            vertical_spacing=0.05, row_heights=[0.7, 0.3],
+                            subplot_titles=("Equity Curve", "Drawdown"))
+
+        # Equity Line
+        fig.add_trace(
+            go.Scatter(x=df_equity['Entry_Time'], y=df_equity['Equity'], mode='lines', name='Equity', line=dict(color='#00ff00')),
+            row=1, col=1
+        )
+        
+        # Drawdown Area
+        fig.add_trace(
+            go.Scatter(x=df_equity['Entry_Time'], y=df_equity['Drawdown'], mode='lines', name='Drawdown', fill='tozeroy', line=dict(color='#ff0000')),
+            row=2, col=1
+        )
+
+        fig.update_layout(
+            title="Backtest Performance (Aggregate)",
+            xaxis_title="Time",
+            template="plotly_dark",
+            height=800
+        )
+        
+        output_file = self.reports_dir / f"backtest_report_{timestamp_str}.html"
+        fig.write_html(output_file)
+        log.info(f"{LogSymbols.SUCCESS} HTML Report saved to: {output_file}")
+
+def main():
+    optuna.logging.set_verbosity(optuna.logging.INFO)
+    
     parser = argparse.ArgumentParser()
-    # RESTORED ARGUMENTS FOR COMPATIBILITY WITH run_pipeline.sh
-    parser.add_argument('--fresh-start', action='store_true', help="Purge existing state")
-    parser.add_argument('--train', action='store_true', help="Run Optimization Loop")
-    parser.add_argument('--backtest', action='store_true', help="Run Verification Backtest")
-    parser.add_argument('--wfo', action='store_true', help="Run Walk-Forward Optimization")
+    parser.add_argument('--train', action='store_true')
+    parser.add_argument('--backtest', action='store_true')
+    parser.add_argument('--fresh-start', action='store_true')
+    parser.add_argument('--wfo', action='store_true')
     
     args = parser.parse_args()
     
     pipeline = ResearchPipeline()
     
+    if args.wfo:
+        log.info("WFO Mode not fully implemented in this forensic context. Use --train.")
+    elif args.train:
+        pipeline.run_training(fresh_start=args.fresh_start)
+    elif args.backtest:
+        pipeline.run_backtest()
+    else:
+        pipeline.run_training(fresh_start=args.fresh_start)
+        pipeline.run_backtest()
+
+if __name__ == "__main__":
     try:
-        # Route execution based on flags
-        if args.wfo:
-            log.info("WFO mode selected (Placeholder for Alpha Hunt logic)")
-            pipeline.run_training(fresh_start=args.fresh_start)
-        elif args.backtest:
-            pipeline.run_backtest()
-        elif args.train:
-            pipeline.run_training(fresh_start=args.fresh_start)
-        else:
-            # Default behavior if no flag passed (e.g. direct run)
-            pipeline.run_training(fresh_start=args.fresh_start)
-            
-    except KeyboardInterrupt:
-        log.info("Aborted by user.")
+        main()
+    except Exception as e:
+        log.critical(f"FATAL crash: {e}")
+        input("Press Enter to exit...")
