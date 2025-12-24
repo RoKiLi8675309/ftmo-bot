@@ -209,11 +209,28 @@ class ResearchPipeline:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--fresh-start', action='store_true')
+    # RESTORED ARGUMENTS FOR COMPATIBILITY WITH run_pipeline.sh
+    parser.add_argument('--fresh-start', action='store_true', help="Purge existing state")
+    parser.add_argument('--train', action='store_true', help="Run Optimization Loop")
+    parser.add_argument('--backtest', action='store_true', help="Run Verification Backtest")
+    parser.add_argument('--wfo', action='store_true', help="Run Walk-Forward Optimization")
+    
     args = parser.parse_args()
     
     pipeline = ResearchPipeline()
+    
     try:
-        pipeline.run_training(fresh_start=args.fresh_start)
+        # Route execution based on flags
+        if args.wfo:
+            log.info("WFO mode selected (Placeholder for Alpha Hunt logic)")
+            pipeline.run_training(fresh_start=args.fresh_start)
+        elif args.backtest:
+            pipeline.run_backtest()
+        elif args.train:
+            pipeline.run_training(fresh_start=args.fresh_start)
+        else:
+            # Default behavior if no flag passed (e.g. direct run)
+            pipeline.run_training(fresh_start=args.fresh_start)
+            
     except KeyboardInterrupt:
         log.info("Aborted by user.")
