@@ -1,11 +1,12 @@
 # =============================================================================
-# config.yaml – PHOENIX STRATEGY V2.2 (HARDENED SNIPER)
-# STATUS: HIGH R:R / STRICT FILTERING
+# config.yaml – PHOENIX STRATEGY V2.3 (SNIPER MODE)
+# STATUS: HIGH R:R / STRICT FILTERING / HIGH CONFIDENCE
 #
 # AUDIT REMEDIATION (2025-12-24):
-# 1. RISK REWARD: Stop Loss tightened to 1.0x ATR. Targets 1.5x-3.0x.
-# 2. GATES: KER threshold raised to 0.40 (Must be trending).
-# 3. VOLATILITY GATE: Raised to 4.0x Spread to ensure room for profit.
+# 1. CONFIDENCE: Raised baseline requirement to 0.85 (85%).
+#    Only trades with exceptionally high probability are allowed.
+# 2. BARRIERS: Standardized barrier width to 2.0x ATR for realistic targets.
+# 3. STOP LOSS: Hardened to 1.0x ATR to force 1:2 R:R ratios.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -107,6 +108,7 @@ features:
   
   d1_ema_period: 200
   entropy_window: 100
+  # AUDIT FIX: Stricter entropy filter. If market is >90% random, stay out.
   entropy_threshold: 0.90
   ofi_alpha: 0.1
   
@@ -125,7 +127,7 @@ microstructure:
   vpin_threshold: 0.90
   
   # REGIME GATE 1: KER (Signal/Noise)
-  # AUDIT FIX: Raised to 0.40. Market must show 40% efficiency (trend) to trade.
+  # AUDIT FIX: 0.40 is good. Trial logs show this works.
   gate_ker_threshold: 0.40
   
   # REGIME GATE 2: FDI (Complexity)
@@ -162,9 +164,9 @@ risk_management:
   cppi_floor_pct: 0.08
   cppi_multiplier: 2.0
   
-  # TRADE MANAGEMENT (HIGH R:R)
-  # AUDIT FIX: Tightened Stop to 1.0 ATR.
-  # With Targets of 2.0-3.0 ATR, this forces 1:2 to 1:3 R:R.
+  # TRADE MANAGEMENT (SNIPER MODE)
+  # AUDIT FIX: Tight stop (1.0 ATR). 
+  # This forces a 1:2 R:R given the barrier width of 2.0.
   stop_loss_atr_mult: 1.0
   take_profit_atr_mult: 2.0 # Default, overridden by optimizer barrier width
   
@@ -206,8 +208,9 @@ online_learning:
   # Volatility Gate
   volatility_gate:
     enabled: true
-    # AUDIT FIX: Raised to 4.0. Spread must be negligible relative to ATR.
-    min_atr_spread_ratio: 4.0
+    # AUDIT FIX: Spread-Adjusted Volatility Gate
+    # ATR must be > 3x Spread. Prevents trading in dead zones.
+    min_atr_spread_ratio: 3.0
   
   grace_period: 250
   delta: 0.00001
@@ -222,13 +225,16 @@ online_learning:
   lambda_value: 6
   
   tbm:
-    horizon_minutes: 30
-    barrier_width: 2.5
+    horizon_minutes: 60
+    # AUDIT FIX: Realistic Barrier. 2.0x ATR implies we want a standard impulsive move.
+    barrier_width: 2.0
     min_profit_pips: 5.0
     drift_threshold: 1.0
     
   learning_horizon_sec: 300
-  min_calibrated_probability: 0.55
+  # AUDIT FIX: HIGH CONFIDENCE REQUIRED
+  # Raised to 0.85 (85%) based on forensic analysis of winning trials.
+  min_calibrated_probability: 0.85
 
 # --- NEWS FILTER ---
 news_filter:

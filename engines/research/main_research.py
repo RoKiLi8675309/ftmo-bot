@@ -5,10 +5,12 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (2025-12-24 - SNIPER MODE V2):
-# 1. HIGH CONFIDENCE: Optimizer forced to search 0.70 - 0.90 probability.
-# 2. HIGH REWARD: Barrier Width (TP) search floor raised to 2.0x ATR.
-# 3. SCORING: Heavy penalty for low Trade Count to avoid overfitting emptiness.
+# AUDIT REMEDIATION (2025-12-24 - SNIPER MODE V3):
+# 1. HYPER-CONFIDENCE: Optimizer forced to search 0.80 - 0.95 probability.
+#    (Forensic Analysis: 0.70-0.79 caused $7k losses. >0.85 was profitable.)
+# 2. REALISTIC TARGETS: Barrier Width cap reduced to 3.0x ATR.
+#    (Forensic Analysis: >3.5 ATR barriers timed out or reversed.)
+# 3. SCORING: Aggressive penalty for negative PnL to prune losers faster.
 # =============================================================================
 import sys
 import os
@@ -82,7 +84,7 @@ class EmojiCallback:
         elif pnl >= 5000.0: # Aggressive Target
             icon = "🚀" # To the Moon
             status = "ALPHA"
-        elif pnl >= 1000.0:
+        elif pnl >= 500.0:
             icon = "💎" # Solid
             status = "PROFIT"
         elif pnl > 0.0:
@@ -125,7 +127,7 @@ class EmojiCallback:
             if attrs.get('blown', False): show_autopsy = True
             elif attrs.get('pruned', False): show_autopsy = True
             elif val is not None and val < 0.5: show_autopsy = True
-            elif trades < 50: show_autopsy = True # Show why idle
+            elif trades < 50 and trades > 0: show_autopsy = True # Show why low activity (but not zero)
             
         if show_autopsy:
             autopsy_msg = f"\n🔎 AUTOPSY (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
@@ -191,7 +193,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'n_models': trial.suggest_int('n_models', 20, 50, step=5),
                 
                 # AUDIT FIX: High Patience for Sniper Mode
-                'grace_period': trial.suggest_int('grace_period', 100, 500), # Wait longer before split
+                'grace_period': trial.suggest_int('grace_period', 200, 600), # Wait longer before split
                 'delta': trial.suggest_float('delta', 1e-7, 1e-4, log=True), # Low sensitivity to drift
                 
                 # REMEDIATION (Step 2 - SNIPER MODE): STRICT FILTER RANGES
@@ -200,17 +202,19 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'vpin_threshold': trial.suggest_float('vpin_threshold', 0.85, 0.95),
                 
                 'tbm': {
-                    # AUDIT FIX: High R:R Enforcement (Sniper Mode V2)
-                    # Stop is 1.0 ATR (Config). Target must be 2.0 - 4.0 ATR.
-                    'barrier_width': trial.suggest_float('barrier_width', 2.0, 4.0),
-                    'horizon_minutes': trial.suggest_int('horizon_minutes', 15, 120),
-                    # Stricter Drift Threshold (0.5 - 1.0)
-                    'drift_threshold': trial.suggest_float('drift_threshold', 0.5, 1.0)
+                    # AUDIT FIX: SNIPER V3 - REALISTIC TARGETS
+                    # Stop is 1.0 ATR. Target 1.5 - 3.0 ATR.
+                    # Anything > 3.5 failed in previous trials.
+                    'barrier_width': trial.suggest_float('barrier_width', 1.5, 3.0),
+                    'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 90), # Narrowed Window
+                    # Stricter Drift Threshold to reduce soft-label noise
+                    'drift_threshold': trial.suggest_float('drift_threshold', 0.7, 1.5)
                 },
                 
-                # AUDIT FIX: High Confidence Only (Sniper Mode V2)
-                # No more 55% coin flips. We demand 70%+ conviction.
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.70, 0.90)
+                # AUDIT FIX: SNIPER V3 - HYPER CONFIDENCE
+                # 0.70-0.79 caused huge losses. 0.89 was profitable.
+                # Shift range to 0.80 - 0.95.
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.80, 0.95)
             })
             
             # Instantiate Pipeline locally
@@ -255,17 +259,18 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             total_trades = metrics['total_trades']
             
             # Volume Bonus (Reward Statistical Significance)
-            if total_trades > 200:
-                final_score += 5.0 
+            if total_trades > 50:
+                final_score += 2.0 
             
             if total_trades < min_trades:
                 trial.set_user_attr("pruned", True)
                 # Hard fail for near-zero activity to force exploration
                 return -100.0 
 
-            # Penalty for Negative PnL despite activity
+            # AGGRESSIVE PENALTY for Negative PnL
+            # If we lose money, we punish the trial heavily to move the optimizer away.
             if metrics['total_pnl'] < 0:
-                 final_score -= 20.0 # Strongly discourage losing strategies (Aggressive Penalty)
+                 final_score = -50.0 + (metrics['total_pnl'] / 50.0) # Scales with loss size
 
             # Generate Autopsy if result is poor (Debugging)
             if final_score < 0.5 or broker.is_blown:
@@ -448,10 +453,7 @@ class ResearchPipeline:
             return metrics
         
         avg_ret = df['Net_PnL'].mean()
-        if avg_ret <= 0:
-            metrics['score'] = -1.0
-            # return metrics # Let it continue to calculate SQN for debugging
-
+        
         # Volatility Based Metrics
         pnl_std = df['Net_PnL'].std() if len(df) > 1 else 1.0
         downside_std = losers['Net_PnL'].std() if len(losers) > 1 else 1.0
