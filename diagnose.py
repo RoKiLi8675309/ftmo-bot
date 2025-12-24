@@ -47,15 +47,15 @@ class TestFeatureEngineering(unittest.TestCase):
         # Case A: Constant Data (Extremely Low Entropy / Ordered)
         # We use a flat line. All data falls into 1 bin -> Entropy = 0.
         current_ts = 1000.0
-       
+        
         # Populate internal buffer with IDENTICAL values
         # Use np.full to guarantee identical values
         constant_prices = np.full(100, 100.0)
-       
+        
         for p in constant_prices:
             self.fe.prices.append(p)
             self.fe.entropy.buffer.append(p)
-       
+        
         # Trigger update with SAME price
         features = self.fe.update(price=100.0, timestamp=current_ts, volume=100)
         entropy_ordered = features.get('entropy', 0.5)
@@ -67,7 +67,7 @@ class TestFeatureEngineering(unittest.TestCase):
         np.random.seed(42)
         # Generate noise that spans a range to fill multiple bins
         noise_prices = 100.0 + np.random.normal(0, 5.0, 150)
-       
+        
         for p in noise_prices:
             self.fe.prices.append(p)
             self.fe.entropy.buffer.append(p)
@@ -93,14 +93,14 @@ class TestLabeling(unittest.TestCase):
         # The TBM requires >= 20 points of history.
         for _ in range(30):
             self.tbm.history.append(100.0)
-       
+        
         # Volatility of constant price is 0.
         # TBM Fallback Logic: vol = price * 0.001 = 0.1
         # Barrier Width = 0.1 * 2.0 = 0.2
         # Top Barrier = 100.2
-       
+        
         start_ts = 1000.0
-       
+        
         # Entry Tick (Trigger Event Creation)
         self.tbm.update(price=100.0, timestamp=start_ts)
 
@@ -111,10 +111,10 @@ class TestLabeling(unittest.TestCase):
         # 3. Tick above TP (100.3 > 100.2) -> Buy Signal (1)
         # This should resolve the event created at 100.0
         resolved = self.tbm.update(price=100.3, timestamp=start_ts + 2)
-       
+        
         # In streaming, we assert >= 1 because price jumps can resolve overlaps
         self.assertGreaterEqual(len(resolved), 1)
-       
+        
         # Verify Label correctness (Label 1 = Winner)
         # resolved is list of tuples: (label, timestamp)
         labels = [r[0] for r in resolved]
@@ -124,19 +124,19 @@ class TestVolumeAggregation(unittest.TestCase):
     def test_volume_threshold_carry_over(self):
         # Threshold 100
         agg = VolumeBarAggregator(symbol="TEST", threshold=100)
-       
+        
         # 1. Add small tick
         bar = agg.process_tick(price=1.0, volume=50, timestamp=1000)
         self.assertIsNone(bar)
-       
+        
         # 2. Add triggering tick (50 + 60 = 110)
         # This should trigger a bar close.
         bar = agg.process_tick(price=1.0, volume=60, timestamp=1001)
         self.assertIsNotNone(bar)
-       
+        
         # The bar should be EXACTLY the threshold (100)
         self.assertEqual(bar.volume, 100.0)
-       
+        
         # 3. Verify Carry Over
         # The internal accumulator should now be 10.0 (110 - 100)
         self.assertEqual(agg.current_volume, 10.0)
@@ -155,7 +155,7 @@ class TestRiskCalculations(unittest.TestCase):
             win_rate=0.55,
             risk_reward_ratio=1.0
         )
-       
+        
         # MOCK DATA: Provide the auxiliary price needed for conversion
         mock_prices = {
             "USDCAD": 1.3500  # 1 USD = 1.35 CAD, so 1 CAD ~ 0.74 USD
@@ -169,7 +169,7 @@ class TestRiskCalculations(unittest.TestCase):
             active_correlations=0,
             market_prices=mock_prices
         )
-       
+        
         self.assertGreater(trade.volume, 0.0, "Trade volume should be > 0 with valid conversion rate")
         self.assertGreater(risk_usd, 0.0, "Risk USD should be calculated")
 
@@ -177,7 +177,7 @@ class TestRiskCalculations(unittest.TestCase):
         # US30 check
         digits = PrecisionGuard.get_digits("US30")
         self.assertTrue(digits in [1, 2], "Indices should have 1 or 2 digits")
-       
+        
         # BTC check
         digits = PrecisionGuard.get_digits("BTCUSD")
         self.assertEqual(digits, 2, "Crypto heuristic should work")

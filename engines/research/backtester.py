@@ -1,3 +1,4 @@
+# =============================================================================
 # FILENAME: engines/research/backtester.py
 # ENVIRONMENT: Linux/WSL2 (Python 3.11)
 # PATH: engines/research/backtester.py
@@ -39,15 +40,15 @@ class MarketSnapshot:
         Handles both Single-Index (Train) and Multi-Index (Prod) DataFrame formats.
         """
         val = 0.0
-       
+        
         # 1. Try Direct Access (Single Symbol / Training Mode)
         if price_type in self.data:
             val = self.data[price_type]
-           
+            
         # 2. Try Prefixed Access (Multi Symbol / Production Mode)
         elif f"{symbol}_{price_type}" in self.data:
             val = self.data[f"{symbol}_{price_type}"]
-           
+            
         # 3. Fallback Logic: Tick Data Compatibility
         if (pd.isna(val) or val == 0.0) and price_type in ['close', 'open', 'high', 'low']:
             if 'price' in self.data:
@@ -58,9 +59,9 @@ class MarketSnapshot:
         # 4. Final Validation
         if pd.isna(val) or val is None:
             return 0.0
-           
+            
         return float(val)
-   
+    
     def get_high(self, symbol: str) -> float:
         h = self.get_price(symbol, 'high')
         return h if h > 0 else self.get_price(symbol, 'close')
@@ -124,10 +125,10 @@ class BacktestBroker:
         self.starting_cash = starting_cash
         self.cash = starting_cash
         self.equity = starting_cash
-       
+        
         self.positions: Dict[str, BacktestPosition] = {}
         self.pending_orders: deque[BacktestOrder] = deque()
-       
+        
         # Performance Tracking
         self.equity_curve: List[Tuple[datetime, float]] = []
         self.trade_log: List[Dict[str, Any]] = []
@@ -263,24 +264,24 @@ class BacktestBroker:
         Closes position and deducts COMMISSIONS + SWAP (simplified).
         """
         closed_qty = min(pos.quantity, qty_to_close)
-       
+        
         # PnL in Quote
         diff = exit_price - pos.entry_price
         if pos.side == -1: diff = -diff
         pnl_quote = diff * closed_qty * 100000
-       
+        
         # Convert to USD using robust simulation conversion
         rate = self._get_simulation_conversion_rate(pos.symbol, exit_price)
         pnl_usd = pnl_quote * rate
-       
+        
         # GROK REMEDIATION: Commission Deduction (Round Turn)
         # $5 per lot -> $5 * lots
         comm_cost = self.commission_per_lot * closed_qty
         
         net_pnl = pnl_usd - comm_cost
-       
+        
         self.cash += net_pnl
-       
+        
         # DEBUG: Log Exit Costs
         # logger.debug(f"💸 EXIT {pos.symbol}: Gross=${pnl_usd:.2f} | Comm=${comm_cost:.2f} | Net=${net_pnl:.2f} | {reason}")
 
@@ -298,7 +299,7 @@ class BacktestBroker:
             'Status': 'CLOSED',
             'Comment': reason
         })
-       
+        
         remaining = pos.quantity - closed_qty
         if remaining > 0.0001:
             pos.quantity = remaining
@@ -354,7 +355,7 @@ class BacktestBroker:
         for symbol, pos in self.positions.items():
             price = snapshot.get_price(symbol, 'close')
             if price == 0: continue
-           
+            
             diff = price - pos.entry_price
             if pos.side == -1: diff = -diff
             
@@ -364,7 +365,7 @@ class BacktestBroker:
             raw_pnl = diff * pos.quantity * 100000
             rate = self._get_simulation_conversion_rate(symbol, price)
             floating_pnl += (raw_pnl * rate) - comm_drag
-           
+            
         self.equity = self.cash + floating_pnl
         self.equity_curve.append((snapshot.timestamp, self.equity))
 

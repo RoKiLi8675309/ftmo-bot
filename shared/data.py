@@ -239,7 +239,7 @@ def load_real_data(
     """
     Loads historical data from Postgres using SQLAlchemy for stability.
     Raises ValueError if data is empty to prevent silent failures in Research.
-     
+      
     FIX: Enforces Data Mapping (Tick 'price' -> OHLC) and Sets Datetime Index.
     """
     if db_config is None:
@@ -346,7 +346,7 @@ def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 
     """
     Offline batch processor for converting Tick DF to Volume Bar List.
     FIX: Now correctly calculates Buy/Sell Volume using Lee-Ready Tick Rule.
-     
+      
     NOTE: If volume_threshold is default (1000), it attempts to auto-calculate 
     using AdaptiveVolumeNormalizer if possible, otherwise respects input.
     """

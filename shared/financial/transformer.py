@@ -20,7 +20,7 @@ class TimeFeatureTransformer:
     """
     Transforms linear timestamps into cyclical features to help ML models
     learn seasonality (e.g., Session overlaps, Friday closes).
-    
+     
     Concepts:
     - Hour of Day (0-23) -> Sine/Cosine pair
     - Day of Week (0-6) -> Sine/Cosine pair
@@ -88,7 +88,7 @@ class ClusterContextBuilder:
     """
     Analyzes asset groups to inject 'Regime Context' into the feature set.
     Example: If all USD pairs are moving up, we are in a 'USD Strong' regime.
-    
+     
     UPDATED (2025-12-23): Now tracks Inter-Symbol Correlations to detect
     market-wide stress or idiosyncratic moves.
     """
@@ -133,7 +133,7 @@ class ClusterContextBuilder:
         """
         Calculates the strength of specific currency moves based on the portfolio.
         Returns a dict of scores, e.g., {'USD': 0.8, 'EUR': -0.2}
-        
+         
         returns_map: Dict[symbol, log_return]
         """
         scores = {}

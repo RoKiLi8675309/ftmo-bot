@@ -81,7 +81,7 @@ class TradeDispatcher:
             # 4. Transmit to Redis
             # AUDIT FIX: Enforce maxlen to prevent stream from growing indefinitely
             self.stream_mgr.r.xadd(self.stream_key, payload, maxlen=10000, approximate=True)
-           
+            
             logger.info(
                 f"{LogSymbols.UPLOAD} DISPATCH SENT: {trade.action} {trade.symbol} "
                 f"| Vol: {trade.volume:.2f} | Risk: ${estimated_risk_usd:.2f} | ID: {short_id}"

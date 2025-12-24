@@ -1,32 +1,43 @@
-# Core Math & Data
+--- CORE MATH (STRICT PINS) ---
+
+Hardened against River/Numpy 2.0 conflicts
+
 numpy<2.0
 pandas>=2.0.0
 scipy>=1.10.0
-statsmodels
-numba>=0.57.0
-
-# Machine Learning (River is Key)
 scikit-learn<1.3.0
-river>=0.21.0
-joblib
-optuna>=3.0.0
+statsmodels
+pandas-ta
 
-# Infrastructure & Connectivity
+--- ONLINE LEARNING CORE ---
+
+river>=0.21.0
+
+--- OPTIMIZATION & INFRASTRUCTURE ---
+
+optuna>=3.0.0
 redis>=4.5.0
+pyarrow
 psycopg2-binary
 sqlalchemy
+quantstats
+joblib
 pyyaml
 python-dotenv
-psutil
-requests
-cloudscraper
-lxml
-beautifulsoup4
-
-# Visualization
+tqdm
+schedule
 streamlit
 plotly
-pandas_ta
 
-# Windows Only (Conditional in setup usually, but listed for ref)
-MetaTrader5; sys_platform == 'win32'
+--- HARDWARE OPTIMIZATION ---
+
+psutil
+numba>=0.57.0
+mpmath
+
+--- FTMO NEWS COMPLIANCE ---
+
+lxml
+beautifulsoup4
+cloudscraper
+requests

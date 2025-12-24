@@ -62,7 +62,7 @@ def get_system_health():
         redis_alive = r.ping()
         # Producer updates 'producer:heartbeat' timestamp
         last_beat = r.get(CONFIG.get('producer', {}).get('heartbeat_key', 'producer:heartbeat'))
-       
+        
         producer_status = "OFFLINE"
         if last_beat:
             delta = time.time() - float(last_beat)
@@ -70,7 +70,7 @@ def get_system_health():
                 producer_status = "ONLINE"
             else:
                 producer_status = f"STALE ({int(delta)}s)"
-       
+        
         return redis_alive, producer_status
     except Exception:
         return False, "ERROR"
@@ -81,7 +81,7 @@ def get_risk_metrics():
         start_eq = float(r.get(CONFIG['redis']['risk_keys']['daily_starting_equity']) or 0.0)
         curr_eq = float(r.get(CONFIG['redis']['risk_keys']['current_equity']) or 0.0)
         hwm = float(r.get("risk:high_water_mark") or 0.0)
-       
+        
         if start_eq > 0:
             daily_dd_pct = (start_eq - curr_eq) / start_eq
             daily_dd_val = start_eq - curr_eq
@@ -104,22 +104,22 @@ def toggle_kill_switch():
 # 1. SIDEBAR
 with st.sidebar:
     st.title("🦅 Control Panel")
-   
+    
     redis_ok, producer_stat = get_system_health()
-   
+    
     st.markdown("### System Status")
     col_s1, col_s2 = st.columns(2)
     col_s1.metric("Redis", "OK" if redis_ok else "ERR")
     col_s2.metric("Producer", producer_stat)
-   
-    st.divider()
-   
-    st.markdown("### Emergency Controls")
     
+    st.divider()
+    
+    st.markdown("### Emergency Controls")
+     
     # LOGIC SWITCH (Redis)
     kill_switch_key = CONFIG['redis']['risk_keys']['kill_switch_active']
     is_killed = r.exists(kill_switch_key)
-   
+    
     if is_killed:
         st.error("🛑 KILL SWITCH ACTIVE (Logic)")
         if st.button("RESUME TRADING"):
@@ -130,13 +130,13 @@ with st.sidebar:
         if st.button("ACTIVATE KILL SWITCH (Logic)", type="primary"):
             toggle_kill_switch()
             st.rerun()
-    
+     
     st.markdown("---")
-    
+     
     # HARD KILL SWITCH (File) - AUDIT FIX
     KILL_SWITCH_FILE = "kill_switch.lock"
     file_killed = os.path.exists(KILL_SWITCH_FILE)
-    
+     
     if file_killed:
         st.error("💀 HARD KILL ACTIVE (File)")
         st.caption("Windows Producer should be dead.")
@@ -158,7 +158,7 @@ with st.sidebar:
                 st.rerun()
             except Exception as e:
                 st.error(f"Failed to create file: {e}")
-           
+            
     st.divider()
     refresh_rate = st.slider("Refresh Rate (s)", 1, 60, 2)
 
@@ -198,7 +198,7 @@ tab_market, tab_trades, tab_logs = st.tabs(["📊 Live Market", "⚖️ Trade Lo
 
 with tab_market:
     st.subheader("Latest Tick Data (Redis Stream)")
-   
+    
     # Fetch last few ticks from stream
     stream_key = CONFIG['redis']['price_data_stream']
     try:
@@ -215,13 +215,13 @@ with tab_market:
                 "Volume": payload.get('volume'),
                 "Flags": payload.get('flags')
             })
-           
+            
         if parsed_data:
             df_ticks = pd.DataFrame(parsed_data)
             st.dataframe(df_ticks, use_container_width=True)
         else:
             st.info("No tick data arriving. Check Windows Producer.")
-           
+            
     except Exception as e:
         st.error(f"Error reading stream: {e}")
 
@@ -233,7 +233,7 @@ with tab_trades:
         trade_list = []
         for msg_id, payload in raw_trades:
             trade_list.append(payload)
-       
+        
         if trade_list:
             df_trades = pd.DataFrame(trade_list)
             st.dataframe(df_trades, use_container_width=True)
