@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional)
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-23):
-# 1. VPIN: Upgraded to Bulk Volume Classification (BVC) logic for toxicity detection.
-# 2. STATIONARITY: Strict log-return normalization for all price-derived features.
-# 3. REGIME: Enhanced Entropy calculation to detect market ordering vs chaos.
-# 4. ROBUSTNESS: RecursiveEMA hardened against NaN/Inf injection.
+# PHOENIX STRATEGY V1.5 (ALPHA SEEKER - 2025-12-23):
+# 1. ALPHA ADDITION: Vortex Indicator (Trend Capture).
+# 2. MEAN REVERSION: Rolling VWAP Distance (Overextension Signal).
+# 3. ROBUSTNESS: Hardened math kernels against zero-division.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -147,14 +146,91 @@ class StreamingIndicators:
         self.prev_close = price
         return features
 
-# --- 2. ADAPTIVE TRIPLE BARRIER (SELL SIGNAL ENABLED) ---
+# --- 2. VORTEX INDICATOR (ALPHA SIGNAL) ---
+class VortexMonitor:
+    """
+    Vortex Indicator (VI) for Trend Initiation Detection.
+    VI+ > VI- implies Bullish Trend.
+    VI- > VI+ implies Bearish Trend.
+    Returns: vi_diff (VI+ - VI-) normalized.
+    """
+    def __init__(self, period: int = 14):
+        self.period = period
+        self.tr_buffer = deque(maxlen=period)
+        self.vm_plus_buffer = deque(maxlen=period)
+        self.vm_minus_buffer = deque(maxlen=period)
+        self.prev_high = None
+        self.prev_low = None
+        self.prev_close = None
+
+    def update(self, high: float, low: float, close: float) -> float:
+        if self.prev_close is None:
+            self.prev_high = high
+            self.prev_low = low
+            self.prev_close = close
+            return 0.0
+
+        # 1. True Range
+        tr1 = abs(high - low)
+        tr2 = abs(high - self.prev_close)
+        tr3 = abs(low - self.prev_close)
+        tr = max(tr1, tr2, tr3)
+
+        # 2. Vortex Movements
+        vm_plus = abs(high - self.prev_low)
+        vm_minus = abs(low - self.prev_high)
+
+        # 3. Update Buffers
+        self.tr_buffer.append(tr)
+        self.vm_plus_buffer.append(vm_plus)
+        self.vm_minus_buffer.append(vm_minus)
+
+        # 4. State Update
+        self.prev_high = high
+        self.prev_low = low
+        self.prev_close = close
+
+        # 5. Calculation
+        if len(self.tr_buffer) < self.period:
+            return 0.0
+
+        sum_tr = sum(self.tr_buffer)
+        if sum_tr == 0: return 0.0
+
+        vi_plus = sum(self.vm_plus_buffer) / sum_tr
+        vi_minus = sum(self.vm_minus_buffer) / sum_tr
+
+        # Return stationary difference (oscillates around 0)
+        return vi_plus - vi_minus
+
+# --- 3. ROLLING VWAP (MEAN REVERSION) ---
+class VWAPMonitor:
+    """
+    Rolling VWAP for continuous timeframe analysis.
+    Captures overextension (Price vs Value).
+    """
+    def __init__(self, window: int = 50):
+        self.window = window
+        self.pv_buffer = deque(maxlen=window)
+        self.v_buffer = deque(maxlen=window)
+
+    def update(self, price: float, volume: float) -> float:
+        pv = price * volume
+        self.pv_buffer.append(pv)
+        self.v_buffer.append(volume)
+
+        sum_vol = sum(self.v_buffer)
+        if sum_vol == 0: return price
+
+        return sum(self.pv_buffer) / sum_vol
+
+# --- 4. ADAPTIVE TRIPLE BARRIER ---
 class AdaptiveTripleBarrier:
     """
     Volatility-Adaptive Labeling with Soft Drift Detection.
     Barriers expand/contract based on ATR.
     
-    FIXED: Generates -1 labels for downside breaks to enable Shorting.
-    AUDIT FIX: Drift Threshold Hardened to 0.75 to purge soft-label noise.
+    AUDIT FIX: Drift Threshold defaults to 0.75.
     """
     def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.75):
         self.buffer = deque()
@@ -164,42 +240,27 @@ class AdaptiveTripleBarrier:
         self.drift_threshold = drift_threshold
 
     def add_trade_opportunity(self, features: Dict[str, float], entry_price: float, current_atr: float, timestamp: float):
-        """
-        Registers a potential trade setup (Hypothetical entry at current bar).
-        """
-        # Ensure ATR is valid to prevent zero-width barriers
+        """Registers a potential trade setup."""
         if current_atr <= 0: current_atr = entry_price * 0.0001
         
-        # Dynamic Barriers based on ATR
-        # Upper Barrier (Profit for Buy, Stop for Sell)
         upper_barrier = entry_price + (self.reward_mult * current_atr)
-        
-        # Lower Barrier (Stop for Buy, Profit for Sell)
         lower_barrier = entry_price - (self.risk_mult * current_atr)
         
         self.buffer.append({
             'features': features,
             'entry': entry_price,
-            'tp': upper_barrier, # Top Barrier
-            'sl': lower_barrier, # Bottom Barrier
-            'atr': current_atr,  # Stored for Drift Calculation
+            'tp': upper_barrier,
+            'sl': lower_barrier,
+            'atr': current_atr,
             'start_time': timestamp,
             'age': 0
         })
 
     def resolve_labels(self, current_high: float, current_low: float, current_close: float = None) -> List[Tuple[Dict[str, float], int, float]]:
-        """
-        Checks active trades against current price action.
-        Returns list of (features, label, realized_return).
-        
-        Label 1 = UP Move (Buy Signal)
-        Label -1 = DOWN Move (Sell Signal)
-        Label 0 = Noise/Hold
-        """
+        """Checks active trades against current price action."""
         resolved = []
         active = deque()
         
-        # Fallback if close not provided (use mid of high/low)
         if current_close is None:
             current_close = (current_high + current_low) / 2.0
 
@@ -210,34 +271,24 @@ class AdaptiveTripleBarrier:
             label = None
             realized_ret = 0.0
 
-            # 1. Did price hit Upper Barrier?
             if current_high >= trade['tp']:
-                label = 1 # BUY SIGNAL
+                label = 1 # BUY
                 realized_ret = (trade['tp'] - trade['entry']) / trade['entry']
-            
-            # 2. Did price hit Lower Barrier?
             elif current_low <= trade['sl']:
-                label = -1 # SELL SIGNAL
-                realized_ret = (trade['entry'] - trade['sl']) / trade['entry'] # Positive return for short
-            
-            # 3. Timeout? (Vertical Barrier)
+                label = -1 # SELL
+                realized_ret = (trade['entry'] - trade['sl']) / trade['entry']
             elif trade['age'] >= self.time_limit:
-                # --- DRIFT LOGIC (Soft Labeling) ---
-                # Calculate movement relative to entry
                 drift = current_close - trade['entry']
-                
-                # Threshold to consider this a signal
-                # AUDIT FIX: drift_threshold defaults to 0.75 now
                 drift_req = trade['atr'] * self.drift_threshold
                 
                 if drift > drift_req:
-                    label = 1 # SOFT BUY (Upward Drift)
+                    label = 1 # SOFT BUY
                     realized_ret = (current_close - trade['entry']) / trade['entry']
                 elif drift < -drift_req:
-                    label = -1 # SOFT SELL (Downward Drift)
+                    label = -1 # SOFT SELL
                     realized_ret = (trade['entry'] - current_close) / trade['entry']
                 else:
-                    label = 0 # TIMEOUT (True Noise)
+                    label = 0 # NOISE
                     realized_ret = 0.0
 
             if label is not None:
@@ -248,14 +299,13 @@ class AdaptiveTripleBarrier:
         self.buffer = active
         return resolved
 
-# --- 3. PROBABILITY CALIBRATOR ---
+# --- 5. PROBABILITY CALIBRATOR ---
 class ProbabilityCalibrator:
     def __init__(self, window: int = 1000):
         self.window = window
         self.y_true = deque(maxlen=window)
         self.y_prob = deque(maxlen=window)
         self.calibrator = None
-        
         if ML_AVAILABLE:
             self.calibrator = IsotonicRegression(out_of_bounds='clip')
 
@@ -266,69 +316,49 @@ class ProbabilityCalibrator:
     def calibrate(self, raw_prob: float) -> float:
         if not ML_AVAILABLE or len(self.y_true) < 100:
             return raw_prob
-        
         try:
             self.calibrator.fit(list(self.y_prob), list(self.y_true))
             return float(self.calibrator.predict([raw_prob])[0])
         except Exception:
             return raw_prob
 
-# --- 4. META LABELER ---
+# --- 6. META LABELER ---
 class MetaLabeler:
-    """
-    Secondary model that learns whether a primary signal resulted in profit.
-    Acts as a 'Gatekeeper' to filter False Positives.
-    """
+    """Secondary model to filter False Positives."""
     def __init__(self):
         self.model = None
         self.buffer = deque(maxlen=1000)
-        
         if ML_AVAILABLE:
             self.model = linear_model.LogisticRegression()
 
     def update(self, features: Dict[str, float], primary_action: int, outcome_pnl: float):
-        if not ML_AVAILABLE or primary_action == 0:
-            return
-            
+        if not ML_AVAILABLE or primary_action == 0: return
         y_meta = 1 if outcome_pnl > 0 else 0
-        
         try:
-            augmented_features = features.copy()
-            augmented_features['primary_action'] = float(primary_action)
-            
-            clean_features = self._sanitize(augmented_features)
-            self.model.learn_one(clean_features, y_meta)
-            self.buffer.append((clean_features, y_meta))
+            augmented = features.copy()
+            augmented['primary_action'] = float(primary_action)
+            self.model.learn_one(self._sanitize(augmented), y_meta)
+            self.buffer.append((augmented, y_meta))
         except Exception as e:
             logger.error(f"MetaLabeler Update Error: {e}")
 
     def predict(self, features: Dict[str, float], primary_action: int, threshold: float = 0.55) -> bool:
-        if not ML_AVAILABLE or primary_action == 0:
-            return False
-            
+        if not ML_AVAILABLE or primary_action == 0: return False
         try:
-            augmented_features = features.copy()
-            augmented_features['primary_action'] = float(primary_action)
-            clean_features = self._sanitize(augmented_features)
-            
-            probs = self.model.predict_proba_one(clean_features)
-            prob_profit = probs.get(1, 0.0)
-            
-            return prob_profit > threshold
-        except Exception as e:
-            logger.error(f"MetaLabeler Predict Error: {e}")
+            augmented = features.copy()
+            augmented['primary_action'] = float(primary_action)
+            probs = self.model.predict_proba_one(self._sanitize(augmented))
+            return probs.get(1, 0.0) > threshold
+        except Exception:
             return False
 
     def _sanitize(self, features: Dict[str, float]) -> Dict[str, float]:
         clean = {}
         for k, v in features.items():
-            if math.isfinite(v):
-                clean[k] = float(v)
-            else:
-                clean[k] = 0.0
+            clean[k] = float(v) if math.isfinite(v) else 0.0
         return clean
 
-# --- 5. ONLINE FEATURE ENGINEER (PHOENIX: STATIONARY + PHYSICS) ---
+# --- 7. ONLINE FEATURE ENGINEER (PHOENIX: STATIONARY + PHYSICS) ---
 class OnlineFeatureEngineer:
     def __init__(self, window_size: int = 50):
         self.window_size = window_size
@@ -336,187 +366,152 @@ class OnlineFeatureEngineer:
         self.volumes = deque(maxlen=window_size)
         self.returns = deque(maxlen=window_size)
         
-        # Phase 2: Integrated Streaming Indicators (Uses RecursiveEMA)
+        # Phase 2: Indicators
         self.indicators = StreamingIndicators()
         
-        # Legacy components (Retained for continuity)
+        # New Alpha Monitors (v1.5)
+        self.vortex = VortexMonitor(period=14)
+        self.vwap_mon = VWAPMonitor(window=window_size)
+        
+        # Legacy components
         self.entropy = EntropyMonitor(window=window_size)
         self.vpin = VPINMonitor(bucket_size=1000)
         self.frac_diff = IncrementalFracDiff(d=0.3, window=window_size)
         self.vol_monitor = VolatilityMonitor(window=20)
         self.last_price = None
         
-        # --- AUDIT FIX: STATIONARITY & CONTEXT ---
-        # 1. Cumulative OFI Window
+        # Context
         self.ofi_window = deque(maxlen=20)
-        
-        # 2. Volatility Trend EMA (for breakout detection)
         self.atr_ema = RecursiveEMA(alpha=0.05)
-        
-        # 3. Long-term Volatility Baseline (for Vol Ratio)
         self.vol_baseline = RecursiveEMA(alpha=0.001)
-        
-        # 4. OFI Trend (New Feature: Flow Momentum)
         self.ofi_ema = RecursiveEMA(alpha=CONFIG['features'].get('ofi_alpha', 0.1))
 
     def update(self, price: float, timestamp: float, volume: float,
                high: Optional[float] = None, low: Optional[float] = None,
                buy_vol: float = 0.0, sell_vol: float = 0.0,
-               time_feats: Dict[str, float] = None) -> Dict[str, float]:
+               time_feats: Dict[str, float] = None, **kwargs) -> Dict[str, float]:
         
-        if time_feats is None:
-            time_feats = {'sin_hour': 0.0, 'cos_hour': 0.0}
-            
-        # Fallback if high/low not provided
+        if time_feats is None: time_feats = {'sin_hour': 0.0, 'cos_hour': 0.0}
         if high is None: high = price
         if low is None: low = price
 
-        # Validate Inputs (Nan/Inf Protection)
         if not math.isfinite(price) or price <= 0: return None
         if not math.isfinite(volume): volume = 0.0
 
         self.prices.append(price)
         self.volumes.append(volume)
         
-        # 1. Log Returns (Stationary)
-        # Replaces raw linear returns for ML stability
+        # 1. Log Returns
         ret_log = 0.0
         if self.last_price and self.last_price > 0:
-            try:
-                ret_log = math.log(price / self.last_price)
-            except ValueError:
-                ret_log = 0.0
+            try: ret_log = math.log(price / self.last_price)
+            except: ret_log = 0.0
             self.returns.append(ret_log)
         else:
             self.returns.append(0.0)
 
-        # 2. Update Recursive Indicators (Phase 2 Core)
+        # 2. Update Indicators
         tech_feats = self.indicators.update(price, high, low)
         current_atr = tech_feats.get('atr', 0.001)
         
-        # 3. Update Legacy Metrics
+        # 3. Alpha Signals (Vortex & VWAP)
+        vortex_val = self.vortex.update(high, low, price)
+        
+        # Use provided VWAP if available (from VolumeBar), else estimate
+        if 'vwap' in kwargs and kwargs['vwap'] is not None and kwargs['vwap'] > 0:
+            vwap_val = kwargs['vwap']
+        else:
+            vwap_val = self.vwap_mon.update(price, volume)
+            
+        vwap_dist = (price - vwap_val) / (current_atr + 1e-9) # Normalized by ATR for stationarity
+
+        # 4. Update Metrics
         entropy_val = self.entropy.update(price)
-        # PHOENIX UPGRADE: Pass explicit Buy/Sell volume for VPIN
         vpin_val = self.vpin.update(volume, price, buy_vol, sell_vol)
         fd_price = self.frac_diff.update(price)
         volatility_val = self.vol_monitor.update(ret_log)
 
-        # 4. Volatility Ratio (Stationary)
-        # Current Short-term Vol vs Long-term Baseline
+        # 5. Volatility Context
         self.vol_baseline.update(volatility_val)
         baseline_vol = self.vol_baseline.get()
         vol_ratio = volatility_val / baseline_vol if baseline_vol > 1e-9 else 1.0
 
-        # 5. Hurst Exponent (Market Memory)
+        # 6. Hurst
         hurst_val = 0.5
         if len(self.returns) >= 20:
-            ret_arr = np.array(list(self.returns), dtype=np.float64)
-            hurst_val = calculate_hurst(ret_arr)
+            hurst_val = calculate_hurst(np.array(list(self.returns), dtype=np.float64))
 
-        # 6. Order Flow Imbalance (OFI)
-        # Normalized by volume to ensure stationarity
+        # 7. OFI
         denominator = volume if volume > 0 else 1.0
         ofi_val = (buy_vol - sell_vol) / denominator
-        
-        # --- Context Features ---
         self.ofi_window.append(ofi_val)
         cum_ofi = sum(self.ofi_window) / len(self.ofi_window) if self.ofi_window else 0.0
-        
-        # OFI Trend (Momentum)
         self.ofi_ema.update(ofi_val)
         ofi_trend = self.ofi_ema.get()
 
-        # Regime Detection (Trend vs Mean Reversion)
+        # 8. Regimes & Breakouts
         regime_val = 1.0 if hurst_val > 0.55 else (-1.0 if hurst_val < 0.45 else 0.0)
-        
-        # Volatility Breakout (Expansion)
         self.atr_ema.update(current_atr)
         atr_trend = self.atr_ema.get()
         vol_breakout = 1.0 if current_atr > (atr_trend * 1.05) else 0.0
 
-        # Efficiency Ratio (ER)
+        # 9. Efficiency Ratio
         er_val = 0.5
         if len(self.prices) >= 10:
-            price_list = list(self.prices)
-            changes = np.diff(price_list)
-            abs_change_sum = np.sum(np.abs(changes))
-            net_change = abs(price_list[-1] - price_list[0])
-            er_val = net_change / abs_change_sum if abs_change_sum > 0 else 0.0
+            pl = list(self.prices)
+            net_change = abs(pl[-1] - pl[0])
+            sum_change = np.sum(np.abs(np.diff(pl)))
+            er_val = net_change / sum_change if sum_change > 0 else 0.0
 
-        # --- AUDIT FIX: CANDLE PHYSICS (Stationary) ---
-        # Normalize candle features by range or previous close
-        candle_range = max(high - low, 1e-9)
-        prev_close = self.prices[-2] if len(self.prices) > 1 else price
-        
-        # Body Ratio (Body / Range)
-        body_size = abs(price - prev_close)
-        body_ratio = body_size / candle_range
-        
-        # Wick Ratios
-        upper_wick = high - max(price, prev_close)
-        lower_wick = min(price, prev_close) - low
-        upper_wick_ratio = upper_wick / candle_range
-        lower_wick_ratio = lower_wick / candle_range
+        # 10. Candle Physics
+        rng = max(high - low, 1e-9)
+        prev = self.prices[-2] if len(self.prices) > 1 else price
+        body_ratio = abs(price - prev) / rng
+        upper_wick = (high - max(price, prev)) / rng
+        lower_wick = (min(price, prev) - low) / rng
 
-        # Normalized Oscillators
-        # MACD is absolute price difference, normalize by price to make stationary
+        # Normalized Technicals
         macd_norm = tech_feats['macd_line'] / price
-        rsi_norm = tech_feats['rsi'] / 100.0 # Scale 0-1
+        rsi_norm = tech_feats['rsi'] / 100.0
 
         self.last_price = price
 
-        # --- LAG GENERATION (Memory) ---
-        lagged_feats = {}
-        r_list = list(self.returns)
-        for i in range(1, 6): # Lag 1 to 5
-            if len(r_list) > i:
-                lagged_feats[f'ret_lag_{i}'] = r_list[-(i+1)]
-            else:
-                lagged_feats[f'ret_lag_{i}'] = 0.0
+        # Lags
+        lagged = {}
+        rl = list(self.returns)
+        for i in range(1, 6):
+            lagged[f'ret_lag_{i}'] = rl[-(i+1)] if len(rl) > i else 0.0
 
-        # Construct Final Feature Vector
         raw_features = {
-            # --- CRITICAL FIX: RESTORE RAW ATR/VOL FOR GATE & RISK ---
             'atr': current_atr,
             'volatility': volatility_val,
-            # ---------------------------------------------------------
             
-            # Stationary Technicals
+            # New Alpha
+            'vortex_diff': vortex_val,
+            'vwap_dist_atr': vwap_dist, # Price distance from VWAP in units of ATR
+            
             'rsi_norm': rsi_norm,
             'macd_norm': macd_norm,
             'macd_hist_norm': tech_feats['macd_hist'] / price,
-            'atr_pct': current_atr / price, # ATR as % of price
-            
-            # Stationary Volatility
+            'atr_pct': current_atr / price,
             'vol_ratio': vol_ratio,
             'volatility_log': math.log(volatility_val + 1e-9),
             'log_ret': ret_log,
-            
-            # Statistical / Microstructure
-            'frac_diff': fd_price / price, # Normalize FracDiff price approx
+            'frac_diff': fd_price / price,
             'entropy': entropy_val,
             'vpin': vpin_val,
             'hurst': hurst_val,
             'ofi': ofi_val,
             'efficiency_ratio': er_val,
-            
-            # Context
             'cum_ofi': cum_ofi,
-            'ofi_trend': ofi_trend, # New
+            'ofi_trend': ofi_trend,
             'regime': regime_val,
             'vol_breakout': vol_breakout,
-            
-            # Candle Physics
             'body_ratio': body_ratio,
-            'upper_wick_ratio': upper_wick_ratio,
-            'lower_wick_ratio': lower_wick_ratio,
-            
-            # Original inputs (Normalized Z-Scores)
-            # We calculate simple Z-scores on the fly for price/vol
-            # This is locally stationary
+            'upper_wick_ratio': upper_wick,
+            'lower_wick_ratio': lower_wick,
             'volume_z': (volume - np.mean(self.volumes)) / (np.std(self.volumes) + 1e-9) if len(self.volumes) > 2 else 0.0,
-            
-            **lagged_feats,
+            **lagged,
             **time_feats
         }
         
@@ -525,17 +520,11 @@ class OnlineFeatureEngineer:
     def _sanitize_features(self, features: Dict[str, float]) -> Dict[str, float]:
         clean = {}
         for k, v in features.items():
-            if math.isfinite(v):
-                clean[k] = float(v)
-            else:
-                clean[k] = 0.0
+            clean[k] = float(v) if math.isfinite(v) else 0.0
         return clean
 
-# --- 6. LEGACY MONITORS (RETAINED) ---
+# --- 8. LEGACY MONITORS ---
 class StreamingTripleBarrier:
-    """
-    Legacy barrier logic. Retained for backward compatibility if needed.
-    """
     def __init__(self, vol_multiplier: float = 2.0, barrier_len: int = 50, horizon_ticks: int = 100):
         self.vol_multiplier = vol_multiplier
         self.horizon_ticks = horizon_ticks
@@ -572,113 +561,68 @@ class StreamingTripleBarrier:
                 'bot': price - width,
                 'expiry': timestamp + (self.horizon_ticks * 60)
             }
-        
         return resolved
 
 class EntropyMonitor:
-    """
-    Calculates Shannon Entropy of price distribution.
-    Phoenix Upgrade: Uses log-returns histogram for better stationarity.
-    """
     def __init__(self, window: int = 50):
         self.buffer = deque(maxlen=window)
-    
     def update(self, price: float) -> float:
         self.buffer.append(price)
         if len(self.buffer) < 20: return 0.5
-        
         try:
-            # PHOENIX UPGRADE: Use returns instead of raw prices for histogram
             prices = list(self.buffer)
             returns = np.diff(prices)
             if np.std(returns) < 1e-9: return 0.0
-            
             hist, _ = np.histogram(returns, bins=10, density=True)
             ent = entropy(hist)
             if math.isnan(ent): return 0.5
-            
-            # Normalize to 0-1
             return ent / np.log(10)
         except Exception:
             return 0.5
 
 class VPINMonitor:
-    """
-    Calculates Volume-Synchronized Probability of Informed Trading (VPIN).
-    PHOENIX UPGRADE: Uses Bulk Volume Classification (BVC) approximation.
-    High VPIN (>0.8) indicates Toxic Flow / Adverse Selection Risk.
-    """
     def __init__(self, bucket_size: float = 1000):
         self.bucket_size = bucket_size
-        
-        # Accumulators
         self.current_bucket_vol = 0.0
         self.current_buy_vol = 0.0
         self.current_sell_vol = 0.0
-        
-        # Store buckets as (buy_vol, sell_vol)
         self.buckets = deque(maxlen=50) 
         self.last_price = None
 
     def update(self, volume: float, price: float, buy_vol_input: float = 0.0, sell_vol_input: float = 0.0) -> float:
-        """
-        Updates VPIN state.
-        If buy_vol_input/sell_vol_input are provided (from Aggregator), uses them.
-        Otherwise, infers using Tick Rule (BVC approximation).
-        """
         if self.last_price is None:
             self.last_price = price
             return 0.5
-
-        # Determine Flow Split
         b_vol = 0.0
         s_vol = 0.0
-
         if buy_vol_input > 0 or sell_vol_input > 0:
             b_vol = buy_vol_input
             s_vol = sell_vol_input
         else:
-            # Fallback Tick Rule
-            if price > self.last_price:
-                b_vol = volume
-            elif price < self.last_price:
-                s_vol = volume
+            if price > self.last_price: b_vol = volume
+            elif price < self.last_price: s_vol = volume
             else:
-                # Neutral tick: 50/50 split
                 b_vol = volume / 2
                 s_vol = volume / 2
-        
         self.last_price = price
-
-        # Update Accumulators
         self.current_buy_vol += b_vol
         self.current_sell_vol += s_vol
         self.current_bucket_vol += volume
-        
-        # Bucket Management
         if self.current_bucket_vol >= self.bucket_size:
-            # Commit Bucket
             self.buckets.append((self.current_buy_vol, self.current_sell_vol))
-            
-            # Reset
             self.current_bucket_vol = 0.0
             self.current_buy_vol = 0.0
             self.current_sell_vol = 0.0
-        
         return self.get_vpin()
 
     def get_vpin(self) -> float:
         if not self.buckets: return 0.5
-        
         total_vol = 0.0
         absolute_imbalance = 0.0
-        
         for b_buy, b_sell in self.buckets:
             total_vol += (b_buy + b_sell)
             absolute_imbalance += abs(b_buy - b_sell)
-        
         if total_vol < 1e-9: return 0.5
-        
         return absolute_imbalance / total_vol
 
 class IncrementalFracDiff:
@@ -687,14 +631,12 @@ class IncrementalFracDiff:
         self.window = window
         self.weights = self._get_weights_floored(d, window)
         self.memory = deque(maxlen=window)
-
     def _get_weights_floored(self, d, size):
         w = [1.0]
         for k in range(1, size):
             w_k = -w[-1] * (d - k + 1) / k
             w.append(w_k)
         return np.array(w[::-1])
-
     def update(self, price: float) -> float:
         self.memory.append(price)
         if len(self.memory) < self.window: return 0.0
@@ -704,7 +646,6 @@ class IncrementalFracDiff:
 class VolatilityMonitor:
     def __init__(self, window: int = 20):
         self.returns = deque(maxlen=window)
-    
     def update(self, ret: float) -> float:
         self.returns.append(ret)
         if len(self.returns) < 5: return 0.001
@@ -716,18 +657,14 @@ def calculate_hurst(ts):
     n = len(ts)
     if n < 20: return 0.5
     if np.std(ts) < 1e-9: return 0.5
-    
     lags = np.arange(2, 20)
     tau = np.zeros(len(lags))
     for i in range(len(lags)):
         lag = lags[i]
         diff = ts[lag:] - ts[:-lag]
         std_diff = np.std(diff)
-        if std_diff < 1e-9:
-            tau[i] = 1e-9
-        else:
-            tau[i] = std_diff
-    
+        if std_diff < 1e-9: tau[i] = 1e-9
+        else: tau[i] = std_diff
     x = np.log(lags.astype(np.float64))
     y = np.log(tau)
     A = np.column_stack((x, np.ones(len(x))))
@@ -736,14 +673,9 @@ def calculate_hurst(ts):
 
 def enrich_with_d1_data(features: Dict[str, float], d1_data: Dict[str, float], current_price: float) -> Dict[str, float]:
     if not d1_data: return features
-    
     prev_high = d1_data.get('high', 0)
     prev_low = d1_data.get('low', 0)
-    
     if prev_high == 0: return features
-    
-    # Normalize distances by price to ensure stationarity
     features['dist_d1_high'] = (prev_high - current_price) / current_price
     features['dist_d1_low'] = (current_price - prev_low) / current_price
-    
     return features

@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – PHOENIX STRATEGY V1.4 (SNIPER MODE)
-# STATUS: DEFENSIVE / HIGH PRECISION
+# config.yaml – PHOENIX STRATEGY V1.5 (ALPHA SEEKER)
+# STATUS: BALANCED / ADAPTIVE LEARNING
 #
-# AUDIT REMEDIATION (2025-12-23 - SNIPER FIX):
-# 1. FILTERS: Tightened Entropy/VPIN to 0.90 (Top 10% filtering).
-# 2. OPTIMIZATION: Capped Barrier Width at 2.5 SD to stop "Fake Positive" training.
-# 3. GATES: Enforced ER > 0.40 to ban chop trading.
-# 4. EXPECTANCY: Aiming for PF > 1.2 by cutting trade frequency by 50%.
+# OPTIMIZATION TWEAKS (2025-12-23):
+# 1. GATES RELAXED: ER Threshold lowered to 0.25 to allow Mean Reversion trades.
+# 2. ALPHA: Vortex Indicator added to feature set (Implicit in code).
+# 3. META-LABELING: Threshold adjusted to 0.55 to capture more opportunities.
+# 4. STATS: Entropy/VPIN filters slightly relaxed to 0.95 to reduce false negatives.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -96,6 +96,7 @@ features:
   use_regime: true
   use_cum_ofi: true
   use_vol_breakout: true
+  use_vortex: true # NEW ALPHA
   
   rsi_period: 14
   macd_fast: 12
@@ -105,8 +106,8 @@ features:
   
   d1_ema_period: 200
   entropy_window: 100
-  # AUDIT FIX: Tightened to 0.90 to filter chop/noise
-  entropy_threshold: 0.90
+  # OPTIMIZATION: Relaxed to 0.95 to allow more data flow
+  entropy_threshold: 0.95
   ofi_alpha: 0.1
   
   fractional_differentiation:
@@ -121,12 +122,12 @@ features:
 # --- MICROSTRUCTURE FILTERS ---
 microstructure:
   vpin_bucket_size: 1000
-  # AUDIT FIX: Tightened to 0.90 to filter toxic flow
-  vpin_threshold: 0.90
+  # OPTIMIZATION: Relaxed to 0.95
+  vpin_threshold: 0.95
   er_threshold_noise: 0.30
   er_threshold_trend: 0.60
-  # AUDIT FIX: Strict Gate at 0.40 (Trend Required)
-  gate_er_threshold: 0.40
+  # OPTIMIZATION: Lowered to 0.25 to unlock Mean Reversion trades
+  gate_er_threshold: 0.25
   hurst_threshold_mean_revert: 0.45
   hurst_threshold_random_low: 0.45
   hurst_threshold_random_high: 0.55
@@ -137,10 +138,10 @@ risk_management:
   account_currency: "USD"
   risk_timezone: "Europe/Prague"
   
-  # Volatility Targeting (SAFE/SNIPER MODE)
+  # Volatility Targeting
   sizing_method: "volatility_targeting"
-  target_annual_volatility: 0.25 # Kept low for safety
-  kelly_fraction: 0.25 # Fractional Kelly
+  target_annual_volatility: 0.25 
+  kelly_fraction: 0.25 
   
   base_risk_per_trade_percent: 1.0
   max_leverage: 30
@@ -209,7 +210,7 @@ online_learning:
   
   burn_in_periods: 1000
   
-  # High Patience Parameters
+  # Adaptive Learning Params
   grace_period: 250
   delta: 0.00001
   
@@ -217,8 +218,8 @@ online_learning:
   positive_class_weight: 2.0
   negative_class_weight: 2.0
   
-  # Edge Recovery: High threshold
-  meta_labeling_threshold: 0.60
+  # Edge Recovery: Lowered to 0.55 to be less restrictive
+  meta_labeling_threshold: 0.55
   
   metric: "F1"
   max_features: 'log2'
@@ -230,10 +231,9 @@ online_learning:
   
   tbm:
     horizon_minutes: 30
-    # REMEDIATION: Capped barrier width to 2.5 SDs
+    # Optimization: Allow wider barriers search space in Research
     barrier_width: 2.5 
     min_profit_pips: 5.0
-    # Drift Threshold
     drift_threshold: 1.0
     
   # Volatility Gate Settings
