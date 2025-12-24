@@ -7,7 +7,7 @@
 #
 # PHOENIX STRATEGY UPGRADE (2025-12-24 - REGIME AWARENESS):
 # 1. REGIME: Added KaufmanEfficiencyRatio (KER) and FractalDimensionIndex (FDI).
-# 2. HMM: Added RegimeDetector using GaussianHMM.
+# 2. HMM: Added RegimeDetector using GaussianHMM with Warm Start Fix.
 # 3. STATIONARITY: Log-return normalization for all price inputs.
 # 4. ROBUSTNESS: RecursiveEMA hardened against NaN/Inf.
 # =============================================================================
@@ -172,7 +172,8 @@ class RegimeDetector:
                     n_components=n_states, 
                     covariance_type="diag", 
                     n_iter=100,
-                    random_state=42
+                    random_state=42,
+                    init_params="stmc" # Initialize start, trans, means, covars
                 )
             except Exception as e:
                 logger.error(f"HMM Init Failed: {e}")
@@ -191,10 +192,14 @@ class RegimeDetector:
             # Reshape for HMM: (n_samples, n_features)
             data = np.array(self.returns).reshape(-1, 1)
             
-            # Re-fit periodically or on every bar (can be expensive, check perf)
-            # For online efficiency, we might want to fit less often, 
-            # but strict requirements say "Online HMM updates".
+            # Re-fit periodically or on every bar
             self.model.fit(data)
+            
+            # FIX: Disable re-initialization after first fit.
+            # This suppresses the "attribute overwritten" warning and enables Warm Start,
+            # allowing the EM algorithm to converge faster on the rolling window.
+            if self.model.init_params != "":
+                self.model.init_params = ""
             
             # Predict state of the most recent return
             current_state = int(self.model.predict(data[-1].reshape(1, -1))[0])
@@ -285,8 +290,6 @@ class AdaptiveTripleBarrier:
     """
     Volatility-Adaptive Labeling with Soft Drift Detection.
     Barriers expand/contract based on ATR and Volatility Regime.
-    
-    UPDATED (Step 3): Implements adaptive logic based on Volatility.
     """
     def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.75):
         self.buffer = deque()
@@ -308,7 +311,6 @@ class AdaptiveTripleBarrier:
         
         # Adaptive Scaling: If vol is high, widen barriers to avoid noise stop-outs.
         # Logic: Multiplier * (1 + Volatility)
-        # Assuming volatility is decimal (e.g., 0.001). We might need a scalar if vol is small.
         # Using a scalar 100 to make the impact noticeable: 1 + (0.001 * 100) = 1.1x width
         adaptive_scalar = 1.0 + (volatility * 100.0)
         
@@ -534,7 +536,7 @@ class OnlineFeatureEngineer:
                high: Optional[float] = None, low: Optional[float] = None,
                buy_vol: float = 0.0, sell_vol: float = 0.0,
                time_feats: Dict[str, float] = None,
-               sentiment: float = 0.0) -> Dict[str, float]: # Added sentiment arg
+               sentiment: float = 0.0) -> Dict[str, float]:
         
         if time_feats is None:
             time_feats = {'sin_hour': 0.0, 'cos_hour': 0.0}
