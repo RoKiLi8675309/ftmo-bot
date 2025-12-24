@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
-# AUDIT REMEDIATION (2025-12-23 - SAFE MODE RECOVERY):
-# 1. DISCOVERY: DISABLED "Full Size" override. Now respects RiskManager $C^2$ scaling.
-#    - Discovery Conf fixed at 0.55 -> Results in 0.30x sizing (Safety Buffer).
-# 2. GATES: Strict ER Threshold (0.40) enforcement for ALL trades to filter chop.
-# 3. LOGIC: Re-enabled Volatility Gate rejection logging.
+# AUDIT REMEDIATION (2025-12-23 - SNIPER MODE):
+# 1. ARCHITECTURE: "Gate-First" logic. Volatility & ER Gates run BEFORE Inference.
+# 2. STRICT CHOP BAN: If ER < 0.40, execution halts immediately.
+# 3. DISCOVERY: Strictly bound by the same gates. No "exploring" in noise.
 # =============================================================================
 import logging
 import sys
@@ -62,7 +61,6 @@ class ResearchStrategy:
             horizon_ticks=tbm_conf.get('horizon_minutes', 30),
             risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'],
             reward_mult=tbm_conf.get('barrier_width', 2.0),
-            # AUDIT: Tightened default to 1.0 per remediation plan
             drift_threshold=tbm_conf.get('drift_threshold', 1.0)
         )
         
@@ -90,16 +88,13 @@ class ResearchStrategy:
         self.trade_events = []
         self.rejection_stats = defaultdict(int) # Track why we didn't trade
         
-        # --- AUDIT FIX: VOLATILITY GATE ---
-        # Load Gate settings from config (Sniper Mode)
+        # --- AUDIT FIX: VOLATILITY GATE (SNIPER MODE) ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        
-        # SNIPER HARDENING: Relaxed to 2.5x per Config V37
         self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.5)
         
-        # AUDIT FIX: ER Gate Threshold
-        # SAFE MODE: This picks up 0.40 from Config V1.3
+        # --- AUDIT FIX: EFFICIENCY GATE (SNIPER MODE) ---
+        # Strictly enforce 0.40 threshold from Config
         self.min_er_threshold = CONFIG['microstructure'].get('gate_er_threshold', 0.40)
         
         # Load Spread Assumptions for Gating
@@ -137,7 +132,7 @@ class ResearchStrategy:
         buy_vol = snapshot.get_price(self.symbol, 'buy_vol')
         sell_vol = snapshot.get_price(self.symbol, 'sell_vol')
         
-        # Fallback to Tick Rule if flow missing (should be handled by aggregator, but safe guard)
+        # Fallback to Tick Rule if flow missing
         if buy_vol == 0 and sell_vol == 0:
             if self.last_price > 0:
                 if price > self.last_price:
@@ -155,8 +150,7 @@ class ResearchStrategy:
         
         self.last_price = price
 
-        # A. Feature Engineering (Stationary Pipeline)
-        # fe.update matches the new signature in shared/financial/features.py
+        # A. Feature Engineering
         features = self.fe.update(
             price=price,
             timestamp=timestamp,
@@ -165,7 +159,7 @@ class ResearchStrategy:
             low=low,
             buy_vol=buy_vol,
             sell_vol=sell_vol,
-            time_feats={} # Transformer logic can be added here if needed
+            time_feats={}
         )
         
         self.last_features = features
@@ -185,24 +179,19 @@ class ResearchStrategy:
         if resolved_labels:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
                 # --- PROFIT WEIGHTED LEARNING ---
-                # We reward "Big Wins" and punish "Churn" (Neutral Reinforcement)
-                
-                # Default to 2.0 (Balanced) if not specified
                 w_pos = self.params.get('positive_class_weight', 2.0)
                 w_neg = self.params.get('negative_class_weight', 2.0)
                 
                 base_weight = w_pos if outcome_label != 0 else w_neg
                 
                 # Scale by Profit Magnitude
-                # log(1 + 1%) = 0.69. log(1 + 0.1%) = 0.09.
                 ret_scalar = math.log1p(abs(realized_ret) * 100.0)
-                ret_scalar = max(0.5, ret_scalar) # Floor at 0.5 to keep learning from small moves
+                ret_scalar = max(0.5, ret_scalar)
                 
                 final_weight = base_weight * ret_scalar
                 
                 self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
                 
-                # Meta Labeler Update
                 if outcome_label != 0:
                     self.meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
 
@@ -210,9 +199,10 @@ class ResearchStrategy:
         current_atr = features.get('atr', 0.0)
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
-        # --- AUDIT FIX: VOLATILITY & EFFICIENCY GATES ---
-        gate_passed = True
-        
+        # --- AUDIT FIX: "GATE-FIRST" ARCHITECTURE ---
+        # We reject bad market conditions BEFORE invoking the ML model.
+        # This saves compute and prevents the model from hallucinating in noise.
+
         # 1. Volatility Gate (Dead Market Protection)
         if self.use_vol_gate:
             pip_size, _ = RiskManager.get_pip_info(self.symbol)
@@ -221,27 +211,27 @@ class ResearchStrategy:
             
             # Gate Requirement: ATR must be > K * Spread
             if current_atr < (spread_cost * self.min_atr_spread_ratio):
-                gate_passed = False
-                # Don't return yet, log it later if we attempt to trade
+                self.rejection_stats['Vol Gate (Dead Market)'] += 1
+                return # STRICT EXIT
         
         # 2. Efficiency Ratio Gate (Chop Protection)
-        # SAFE MODE: Strict enforcement (0.40)
         current_er = features.get('efficiency_ratio', 0.5)
-        er_passed = current_er > self.min_er_threshold
+        if current_er < self.min_er_threshold:
+            self.rejection_stats['Low Efficiency (Chop)'] += 1
+            return # STRICT EXIT
 
-        # D. Inference
+        # D. Inference (Only runs if Gates Pass)
         try:
             # --- FILTER ENFORCEMENT ---
-            # Strict filters (0.95) to match Config V1.3
             entropy_val = features.get('entropy', 0)
-            entropy_thresh = self.params.get('entropy_threshold', 0.95)
+            entropy_thresh = self.params.get('entropy_threshold', 0.90)
             
             if entropy_val > entropy_thresh:
                 self.rejection_stats['High Entropy'] += 1
                 return
 
             vpin_val = features.get('vpin', 0)
-            vpin_thresh = self.params.get('vpin_threshold', 0.95)
+            vpin_thresh = self.params.get('vpin_threshold', 0.90)
             
             if vpin_val > vpin_thresh:
                 self.rejection_stats['High VPIN'] += 1
@@ -263,28 +253,14 @@ class ResearchStrategy:
             dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
             
             # --- SAFE DISCOVERY LOGIC ---
-            # We allow trading in the early phase (Discovery), but strictly governed by Risk Manager.
-            # No massive bets.
-            
             is_discovery = self.bars_processed < 2500
             effective_action = pred_action
             discovery_triggered = False
 
             if is_discovery and effective_action == 0:
-                # Discovery MUST respect the Volatility Gate AND Efficiency Gate
-                if not gate_passed:
-                    self.rejection_stats['Vol Gate (Dead Market)'] += 1
-                    return
-                
-                # SAFE MODE: Strict ER Check for Discovery
-                if not er_passed:
-                    self.rejection_stats['Low Efficiency (Chop)'] += 1
-                    return
-
                 max_prob = max(prob_buy, prob_sell)
                 
                 # 1. Bias Check (Must show conviction)
-                # TIGHTENED: 0.55 bias required (Audit Requirement)
                 if max_prob > 0.0:
                     bias_buy = prob_buy > 0.55
                     bias_sell = prob_sell > 0.55
@@ -307,18 +283,6 @@ class ResearchStrategy:
                         effective_action = -1
                         discovery_triggered = True
             
-            # Check gate for Regular Trades (Non-Discovery)
-            if not is_discovery:
-                if not gate_passed:
-                    self.rejection_stats['Vol Gate (Dead Market)'] += 1
-                    return
-                
-                # SAFE MODE: Enforce ER gate for normal trades too
-                # This prevents the model from trading "chops" even if it thinks it sees a signal.
-                if not er_passed:
-                    self.rejection_stats['Low Efficiency (Chop)'] += 1
-                    return
-
             # --- META LABELING ---
             if self.meta_label_events < 50 or discovery_triggered:
                 is_profitable = True
@@ -340,8 +304,6 @@ class ResearchStrategy:
                         
                         if discovery_triggered:
                             # SAFE MODE: Clamp confidence for Risk Manager.
-                            # 0.55 ^ 2 = 0.30 sizing factor.
-                            # This prevents "Betting the farm" on discovery trades.
                             confidence = 0.55 
                         
                         self._execute_logic(confidence, price, features, broker, dt_timestamp, effective_action, discovery_triggered)
@@ -368,7 +330,6 @@ class ResearchStrategy:
         """Decides whether to enter a trade using Volatility Targeting."""
         
         # 1. Signal Threshold (Only applies to AI trades, not Discovery)
-        # AUDIT FIX: 0.55 Min Conviction
         min_prob = self.params.get('min_calibrated_probability', 0.55)
         
         if not discovery_mode:
@@ -403,7 +364,6 @@ class ResearchStrategy:
             atr=current_atr # Explicit ATR pass for Volatility Targeting
         )
 
-        # Assign Action Explicitly
         trade_intent.action = action
 
         # 3. SAFETY: Check if Risk Manager Rejected the trade
@@ -412,13 +372,6 @@ class ResearchStrategy:
             return
 
         qty = trade_intent.volume
-        
-        # --- SAFE DISCOVERY LOGIC ---
-        # No explicit quantity override. We trust RiskManager.
-        # If discovery_mode=True, confidence is 0.55.
-        # RiskManager (Safe Mode) calculates: scalar * 0.55^2 = scalar * 0.3025.
-        # This results in a 30% conviction bet, which is safe for exploration.
-        
         stop_dist = trade_intent.stop_loss
         tp_dist = trade_intent.take_profit
 

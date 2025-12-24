@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (CHALLENGE MODE V1.2):
-# 1. OBJECTIVE: Switched to PnL-Dominant Scoring. (Raw $$$ > Sharpe).
-# 2. SEARCH SPACE: Widened Barrier Width (2.0 - 6.0) for Home Runs.
-# 3. FILTERS: Aligned with new Aggressive Config.
+# AUDIT REMEDIATION (2025-12-23 - SNIPER MODE):
+# 1. SEARCH SPACE: Capped Barrier Width at 3.0 SD (Realistic M5 Targets).
+# 2. FILTERS: Forced stricter search range (0.85-0.95) to ensure noise filtering.
+# 3. SCORING: PnL + SQN (Profit Dominant) maintained.
 # =============================================================================
 import sys
 import os
@@ -24,7 +24,7 @@ import optuna
 import numpy as np
 import pandas as pd
 import psutil
-import yaml  # Required for Auto-Deployment
+import yaml # Required for Auto-Deployment
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pathlib import Path
@@ -71,25 +71,25 @@ class EmojiCallback:
         pnl = attrs.get('pnl', 0.0)
         
         if attrs.get('blown', False):
-            icon = "💀"  # Blown Account
+            icon = "💀" # Blown Account
             status = "BLOWN"
         elif attrs.get('pruned', False):
-            icon = "✂️"  # Pruned (Low Trades / Gate Rejection)
+            icon = "✂️" # Pruned (Low Trades / Gate Rejection)
             status = "PRUNE"
         elif trades == 0:
-            icon = "💤"  # No Trades
+            icon = "💤" # No Trades
             status = "IDLE "
         elif pnl >= 5000.0: # Aggressive Target
-            icon = "🚀"  # To the Moon
+            icon = "🚀" # To the Moon
             status = "ALPHA"
         elif pnl >= 1000.0:
-            icon = "💎"  # Solid
+            icon = "💎" # Solid
             status = "PROFIT"
         elif pnl > 0.0:
-            icon = "🛡️"  # Weak Profit
+            icon = "🛡️" # Weak Profit
             status = "WEAK "
         else:
-            icon = "🔻"  # Loss
+            icon = "🔻" # Loss
             status = "LOSS "
 
         # 2. Extract Metrics (Safe Defaults)
@@ -138,7 +138,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 2000000) -> pd.DataFrame:
     UPDATED: Default n_ticks increased to 2M per recommendation.
     """
     # 1. Load Massive Amount of Ticks (To get sufficient Bars)
-    raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2)  # Double days for safety
+    raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2) # Double days for safety
     
     if raw_ticks.empty:
         return pd.DataFrame()
@@ -193,20 +193,21 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'grace_period': trial.suggest_int('grace_period', 100, 500), # Wait longer before split
                 'delta': trial.suggest_float('delta', 1e-7, 1e-4, log=True), # Low sensitivity to drift
                 
-                # REMEDIATION (Step 1): RELAXED FILTER RANGES
-                # Prevent picking extremely low thresholds that filter 100% of data
-                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.95, 0.999), 
-                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.95, 0.999),
+                # REMEDIATION (Step 2 - SNIPER MODE): STRICT FILTER RANGES
+                # We do not allow thresholds > 0.95. If the trade requires 0.99 to be safe, it's unsafe.
+                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.85, 0.95),
+                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.85, 0.95),
                 
                 'tbm': {
-                    # CHALLENGE MODE: Wide Barriers for Home Runs
-                    'barrier_width': trial.suggest_float('barrier_width', 2.0, 6.0),
+                    # SNIPER MODE: Cap Barrier Width at 3.0 SD (Realistic M5 moves)
+                    # Anything > 3.0 is a "fake positive" waiting to happen.
+                    'barrier_width': trial.suggest_float('barrier_width', 1.5, 3.0),
                     'horizon_minutes': trial.suggest_int('horizon_minutes', 15, 120),
-                    # AUDIT: Drift Threshold search (0.75 - 1.25)
-                    'drift_threshold': trial.suggest_float('drift_threshold', 0.75, 1.25)
+                    # Stricter Drift Threshold (0.5 - 1.0)
+                    'drift_threshold': trial.suggest_float('drift_threshold', 0.5, 1.0)
                 },
-                # CHALLENGE MODE: Allow lower probability floor (0.50) because Sizing is aggressive
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.50, 0.75)
+                # High Conviction Requirement (0.55 - 0.75)
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.55, 0.75)
             })
             
             # Instantiate Pipeline locally
@@ -240,40 +241,33 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("sharpe", metrics['sharpe'])
             
-            # --- CRITICAL FIX: AGGRESSIVE PNL OBJECTIVE ---
+            # --- SCORING: PnL DOMINANT ---
             # Score = (Net Profit / $100) + SQN.
-            # Example: $5000 profit = 50 pts. SQN 2.0 = 2 pts. Total 52.
-            # Example: $50 profit = 0.5 pts. SQN 5.0 = 5 pts. Total 5.5.
-            # Winner: The $5000 strategy, even with lower SQN.
             
             pnl_score = metrics['total_pnl'] / 100.0
             final_score = pnl_score + metrics['sqn']
             
-            # Soft Penalty for Low Activity
+            # Penalty for Low Activity
             min_trades = CONFIG['wfo'].get('min_trades_optimization', 5)
             total_trades = metrics['total_trades']
             
-            # AUDIT FIX: Volume Bonus (Reward Statistical Significance)
-            # If the model finds >200 trades, we boost the score to encourage this behavior.
+            # Volume Bonus (Reward Statistical Significance)
             if total_trades > 200:
-                final_score += 5.0 # Massive boost for high activity
+                final_score += 5.0 
             
             if total_trades < min_trades:
                 trial.set_user_attr("pruned", True)
-                # Calculate Deficit
                 deficit = min_trades - total_trades
-                # Penalty: -1.0 per missing trade
                 penalty = deficit * 1.0
                 final_score -= penalty
                 
                 if total_trades == 0:
-                    # Save autopsy to explain WHY we had 0 trades (Vol Gate?)
                     trial.set_user_attr("autopsy", strategy.generate_autopsy())
                     final_score = -50.0
 
             # Penalty for Negative PnL despite activity
             if total_trades > 5 and metrics['total_pnl'] < 0:
-                 final_score -= 10.0  # Strongly discourage losing strategies
+                 final_score -= 10.0 # Strongly discourage losing strategies
 
             # Generate Autopsy if result is poor (Debugging)
             if final_score < 0.5 or broker.is_blown:
@@ -281,7 +275,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 
             if broker.is_blown:
                 trial.set_user_attr("blown", True)
-                return -100.0  # Max Penalty
+                return -100.0 # Max Penalty
             
             return final_score
 
@@ -451,14 +445,14 @@ class ResearchPipeline:
         metrics['max_dd_pct'] = abs(max_dd_val / initial_capital)
 
         # Fail Conditions
-        if metrics['max_dd_pct'] > 0.10:  # 10% Hard Limit
+        if metrics['max_dd_pct'] > 0.10: # 10% Hard Limit
             metrics['score'] = -100.0
             return metrics
         
         avg_ret = df['Net_PnL'].mean()
         if avg_ret <= 0:
             metrics['score'] = -1.0
-            # return metrics  # Let it continue to calculate SQN for debugging
+            # return metrics # Let it continue to calculate SQN for debugging
 
         # Volatility Based Metrics
         pnl_std = df['Net_PnL'].std() if len(df) > 1 else 1.0
@@ -505,7 +499,6 @@ class ResearchPipeline:
         trials_per_worker = math.ceil(total_trials_per_symbol / workers_per_symbol)
         
         log.info(f"DISTRIBUTION: {workers_per_symbol} workers/symbol | {trials_per_worker} trials/worker")
-
         for symbol in self.symbols:
             for _ in range(workers_per_symbol):
                 tasks.append((symbol, trials_per_worker, self.train_candles, self.db_url))
@@ -523,9 +516,9 @@ class ResearchPipeline:
         
         Parallel(n_jobs=len(self.symbols), backend="loky")(
             delayed(_worker_finalize_task)(
-                sym, 
-                self.train_candles, 
-                self.db_url, 
+                sym,
+                self.train_candles,
+                self.db_url,
                 self.models_dir
             ) for sym in self.symbols
         )
@@ -570,7 +563,7 @@ class ResearchPipeline:
             if meta_path.exists():
                 with open(meta_path, "rb") as f: strategy.meta_labeler = pickle.load(f)
             if cal_path.exists():
-                with open(cal_path, "rb") as f: 
+                with open(cal_path, "rb") as f:
                     cals = pickle.load(f)
                     strategy.calibrator_buy = cals['buy']
                     strategy.calibrator_sell = cals['sell']
@@ -584,6 +577,7 @@ class ResearchPipeline:
                     strategy.on_data(snapshot, broker)
             
             return broker.trade_log
+
         except Exception as e:
             print(f"Backtest error {symbol}: {e}")
             return []
@@ -594,7 +588,7 @@ class ResearchPipeline:
             return
 
         df = pd.DataFrame(trade_log)
-        initial_capital = 100000.0  # Assumed start
+        initial_capital = 100000.0 # Assumed start
         
         # Metrics
         total_pnl = df['Net_PnL'].sum()
@@ -624,7 +618,7 @@ class ResearchPipeline:
             log.warning(f"Could not generate plot: {e}")
 
     def _plot_equity_curve(self, df_equity: pd.DataFrame, timestamp_str: str):
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                             vertical_spacing=0.05, row_heights=[0.7, 0.3],
                             subplot_titles=("Equity Curve", "Drawdown"))
 

@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages ARF models, Feature Engineering,
 # Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# AUDIT REMEDIATION (2025-12-23 - SAFE MODE SYNC):
-# 1. DISCOVERY: Syncs with ResearchStrategy. Force Conf=0.55 for discovery trades.
-# 2. GATES: Enforces ER > 0.40 and Volatility Gates inside the decision loop.
-# 3. FILTERS: Tightened Entropy/VPIN to 0.95.
+# AUDIT REMEDIATION (2025-12-23 - SNIPER MODE):
+# 1. ARCHITECTURE: "Gate-First" Logic. Gates run BEFORE Inference.
+# 2. GATES: Strict rejection of Chop (ER < 0.40) and Dead Markets.
+# 3. DISCOVERY: Bound by strict gates. No exploration in noise.
 # =============================================================================
 import logging
 import pickle
@@ -94,7 +94,7 @@ class MultiAssetPredictor:
         self.last_save_time = time.time()
         self.save_interval = 300 # 5 Minutes
 
-        # --- AUDIT FIX: Gating Params ---
+        # --- AUDIT FIX: Gating Params (Sniper Mode) ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
         self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.5)
@@ -209,34 +209,39 @@ class MultiAssetPredictor:
         current_atr = features.get('atr', 0.0)
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
 
-        # --- AUDIT FIX: GATES CALCULATION ---
-        gate_passed = True
+        # --- AUDIT FIX: "GATE-FIRST" ARCHITECTURE (SNIPER MODE) ---
+        # We reject bad market conditions BEFORE invoking the ML model.
         
-        # Volatility Gate Logic
+        # 1. Volatility Gate (Dead Market Protection)
         if self.use_vol_gate:
             pip_size, _ = RiskManager.get_pip_info(symbol)
             spread_pips = self.spread_map.get(symbol, 1.5)
             spread_cost = spread_pips * pip_size
+            
+            # Gate Requirement: ATR must be > K * Spread
             if current_atr < (spread_cost * self.min_atr_spread_ratio):
-                gate_passed = False
+                stats['Vol Gate (Dead Market)'] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": "Vol Gate"})
         
-        # Efficiency Ratio Logic (Safe Mode)
+        # 2. Efficiency Ratio Gate (Chop Protection)
         current_er = features.get('efficiency_ratio', 0.5)
-        er_passed = current_er > self.min_er_threshold
+        if current_er < self.min_er_threshold:
+            stats['Low Efficiency (Chop)'] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "ER Gate"})
 
-        # 4. Inference
+        # 4. Inference (Only runs if Gates Pass)
         current_pred_action = 0
         try:
-            # --- FILTER ENFORCEMENT (Strict 0.95) ---
+            # --- FILTER ENFORCEMENT (Strict 0.90) ---
             entropy_val = features.get('entropy', 0.0)
-            entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.95)
+            entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.90)
             
             if entropy_val > entropy_thresh:
                 stats['High Entropy'] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"Max Entropy ({entropy_val:.2f})"})
 
             vpin_val = features.get('vpin', 0.0)
-            vpin_thresh = CONFIG['microstructure'].get('vpin_threshold', 0.95)
+            vpin_thresh = CONFIG['microstructure'].get('vpin_threshold', 0.90)
             
             if vpin_val > vpin_thresh:
                 stats['High VPIN'] += 1
@@ -260,15 +265,6 @@ class MultiAssetPredictor:
             discovery_triggered = False
 
             if is_discovery and effective_action == 0:
-                # Gates must pass even for Discovery
-                if not gate_passed:
-                    stats['Vol Gate (Discovery)'] += 1
-                    return Signal(symbol, "HOLD", 0.0, {"reason": "Vol Gate"})
-                
-                if not er_passed:
-                    stats['ER Gate (Discovery)'] += 1
-                    return Signal(symbol, "HOLD", 0.0, {"reason": "ER Gate"})
-
                 max_prob = max(prob_buy, prob_sell)
                 
                 # Bias Check (> 0.55 required)
@@ -292,15 +288,6 @@ class MultiAssetPredictor:
                     elif ret < -0.00001:
                         effective_action = -1
                         discovery_triggered = True
-
-            # Standard Trade Checks (Non-Discovery)
-            if not is_discovery:
-                if not gate_passed:
-                    stats['Vol Gate (Live)'] += 1
-                    return Signal(symbol, "HOLD", 0.0, {"reason": "Vol Gate"})
-                if not er_passed:
-                    stats['ER Gate (Live)'] += 1
-                    return Signal(symbol, "HOLD", 0.0, {"reason": "ER Gate"})
 
             # Calculate Final Confidence
             confidence = prob_buy if effective_action == 1 else prob_sell

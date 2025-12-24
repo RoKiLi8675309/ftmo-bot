@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – PHOENIX STRATEGY V1.3 (SAFE MODE RECOVERY)
-# STATUS: CONSERVATIVE / RECOVERY
+# config.yaml – PHOENIX STRATEGY V1.4 (SNIPER MODE)
+# STATUS: DEFENSIVE / HIGH PRECISION
 #
-# AUDIT REMEDIATION (2025-12-23 - POST-MORTEM FIXES):
-# 1. RISK: Reverted Target Vol to 0.25 and Kelly to 0.25 to prevent Death Spiral.
-# 2. GATES: Tightened ER Threshold to 0.40 to filter chop/noise.
-# 3. LABELING: Capped Barrier Width at 3.0 SDs to align with M5 ATR reality.
-# 4. DISCOVERY: Re-enabled risk controls on discovery trades.
+# AUDIT REMEDIATION (2025-12-23 - SNIPER FIX):
+# 1. FILTERS: Tightened Entropy/VPIN to 0.90 (Top 10% filtering).
+# 2. OPTIMIZATION: Capped Barrier Width at 2.5 SD to stop "Fake Positive" training.
+# 3. GATES: Enforced ER > 0.40 to ban chop trading.
+# 4. EXPECTANCY: Aiming for PF > 1.2 by cutting trade frequency by 50%.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -105,8 +105,8 @@ features:
   
   d1_ema_period: 200
   entropy_window: 100
-  # AUDIT FIX: Restored strict entropy filter to avoid random walk regimes
-  entropy_threshold: 0.95
+  # AUDIT FIX: Tightened to 0.90 to filter chop/noise
+  entropy_threshold: 0.90
   ofi_alpha: 0.1
   
   fractional_differentiation:
@@ -121,11 +121,11 @@ features:
 # --- MICROSTRUCTURE FILTERS ---
 microstructure:
   vpin_bucket_size: 1000
-  # AUDIT FIX: Restored strict VPIN filter to avoid toxic flow
-  vpin_threshold: 0.95
+  # AUDIT FIX: Tightened to 0.90 to filter toxic flow
+  vpin_threshold: 0.90
   er_threshold_noise: 0.30
   er_threshold_trend: 0.60
-  # AUDIT FIX: Tightened Gate to 0.40 (Trend Required) per Remediation Plan
+  # AUDIT FIX: Strict Gate at 0.40 (Trend Required)
   gate_er_threshold: 0.40
   hurst_threshold_mean_revert: 0.45
   hurst_threshold_random_low: 0.45
@@ -137,10 +137,10 @@ risk_management:
   account_currency: "USD"
   risk_timezone: "Europe/Prague"
   
-  # Volatility Targeting (SAFE MODE)
+  # Volatility Targeting (SAFE/SNIPER MODE)
   sizing_method: "volatility_targeting"
-  target_annual_volatility: 0.25 # REMEDIATION: Lowered from 0.60 to 0.25
-  kelly_fraction: 0.25 # REMEDIATION: Lowered from 0.80 to 0.25 (Fractional Kelly)
+  target_annual_volatility: 0.25 # Kept low for safety
+  kelly_fraction: 0.25 # Fractional Kelly
   
   base_risk_per_trade_percent: 1.0
   max_leverage: 30
@@ -150,14 +150,14 @@ risk_management:
   # Constraints
   max_daily_loss_pct: 0.04
   max_total_loss_pct: 0.09
-  max_risk_percent: 1.5 # REMEDIATION: Lowered hard cap per trade to 1.5%
+  max_risk_percent: 1.5 
   hard_stop_equity_usd: 80000.0
-  max_trades_per_day: 50 # REMEDIATION: Capped to prevent over-trading
+  max_trades_per_day: 50
   correlation_penalty_threshold: 0.8
   
   # Execution Guardrails
   min_lot_size: 0.01
-  max_lot_size: 20.0 # Capped max exposure
+  max_lot_size: 20.0
   min_stop_loss_pips: 5.0
   max_loss_usd: 2500.0
   
@@ -217,7 +217,7 @@ online_learning:
   positive_class_weight: 2.0
   negative_class_weight: 2.0
   
-  # REMEDIATION: Raised threshold to 0.60 as per Edge Recovery plan
+  # Edge Recovery: High threshold
   meta_labeling_threshold: 0.60
   
   metric: "F1"
@@ -230,7 +230,7 @@ online_learning:
   
   tbm:
     horizon_minutes: 30
-    # REMEDIATION: Capped barrier width to 2.5 SDs (Realistic for M5)
+    # REMEDIATION: Capped barrier width to 2.5 SDs
     barrier_width: 2.5 
     min_profit_pips: 5.0
     # Drift Threshold
