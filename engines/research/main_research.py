@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (2025-12-23 - SNIPER MODE):
+# AUDIT REMEDIATION (2025-12-24 - SNIPER MODE):
 # 1. SEARCH SPACE: Capped Barrier Width at 3.0 SD (Realistic M5 Targets).
 # 2. FILTERS: Forced stricter search range (0.85-0.95) to ensure noise filtering.
-# 3. SCORING: PnL + SQN (Profit Dominant) maintained.
+# 3. SCORING: PnL + SQN (Profit Dominant) maintained to favor actual returns.
 # =============================================================================
 import sys
 import os

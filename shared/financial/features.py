@@ -5,15 +5,15 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional)
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-23):
-# 1. VPIN: Upgraded to Bulk Volume Classification (BVC) logic for toxicity detection.
-# 2. STATIONARITY: Strict log-return normalization for all price-derived features.
-# 3. REGIME: Enhanced Entropy calculation to detect market ordering vs chaos.
-# 4. ROBUSTNESS: RecursiveEMA hardened against NaN/Inf injection.
+# PHOENIX STRATEGY UPGRADE (2025-12-24 - REGIME AWARENESS):
+# 1. REGIME: Added KaufmanEfficiencyRatio (KER) and FractalDimensionIndex (FDI).
+# 2. VPIN: Maintained Bulk Volume Classification (BVC) logic.
+# 3. STATIONARITY: Log-return normalization for all price inputs.
+# 4. ROBUSTNESS: RecursiveEMA hardened against NaN/Inf.
 #
-# META-LABELING OPTIMIZATION (2025-12-24):
-# 1. MODEL: Upgraded MetaLabeler to Adaptive Random Forest (ARF) for non-linear alpha.
-# 2. INTERACTIONS: Added Volatility*Action and Hurst*Action interaction terms.
+# META-LABELING OPTIMIZATION:
+# 1. MODEL: Adaptive Random Forest (ARF) ready.
+# 2. INTERACTIONS: Added Regime*Action interaction terms.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -74,7 +74,83 @@ class RecursiveEMA:
     def get(self) -> float:
         return self.value if self.value is not None else 0.0
 
-# --- 1. STREAMING INDICATORS (PHASE 2 CORE) ---
+# --- 1. REGIME INDICATORS (NEW) ---
+class KaufmanEfficiencyRatio:
+    """
+    Quantifies trend efficiency (Signal vs Noise).
+    Range: 0.0 (Pure Noise) to 1.0 (Perfect Efficiency).
+    Formula: |Net Change| / Sum(|Individual Changes|)
+    """
+    def __init__(self, window: int = 10):
+        self.window = window
+        # Need window+1 points to calculate 'window' number of changes
+        self.prices = deque(maxlen=window + 1)
+
+    def update(self, price: float) -> float:
+        self.prices.append(price)
+        if len(self.prices) < self.window + 1:
+            return 0.5 # Default to neutral/uncertain
+
+        # Signal: Absolute difference between price now and n periods ago
+        signal = abs(self.prices[-1] - self.prices[0])
+        
+        # Noise: Sum of absolute differences between consecutive bars
+        # Using numpy for speed
+        arr = np.array(self.prices)
+        noise = np.sum(np.abs(np.diff(arr)))
+        
+        if noise == 0:
+            return 1.0 # Pure efficiency (or flat line, but conceptually efficient state retention)
+            
+        return signal / noise
+
+class FractalDimensionIndex:
+    """
+    Measures market complexity/dimensionality based on Chaos Theory.
+    Range: ~1.0 (Linear/Trend) to ~2.0 (Jagged/Mean Reversion).
+    Gate Threshold: > 1.5 indicates Random Walk (Do Not Trade).
+    """
+    def __init__(self, window: int = 30):
+        self.window = window
+        self.prices = deque(maxlen=window)
+
+    def update(self, price: float) -> float:
+        self.prices.append(price)
+        if len(self.prices) < self.window:
+            return 1.5 # Default to Random Walk barrier
+
+        data = np.array(self.prices)
+        
+        # 1. Rescale data to unit square [0,1]x[0,1]
+        min_p, max_p = np.min(data), np.max(data)
+        if max_p == min_p:
+            return 1.0 # Flat line = 1D
+            
+        scaled = (data - min_p) / (max_p - min_p)
+        
+        # 2. Calculate Path Length (L) in normalized space
+        # Time step dt is 1/(N-1)
+        dt = 1.0 / (self.window - 1)
+        diffs = np.diff(scaled)
+        
+        # Pythagorean theorem for each segment length
+        length = np.sum(np.sqrt(diffs**2 + dt**2))
+        
+        if length <= 0: return 1.5
+        
+        # 3. Calculate FDI
+        # Formula approximation: FDI = 1 + (log(L) + log(2)) / log(2*(N-1))
+        try:
+            numerator = np.log(length) + np.log(2)
+            denominator = np.log(2 * (self.window - 1))
+            if denominator == 0: return 1.5
+            
+            fdi = 1 + (numerator / denominator)
+            return fdi
+        except Exception:
+            return 1.5
+
+# --- 2. STREAMING INDICATORS (PHASE 2 CORE) ---
 class StreamingIndicators:
     """
     Recursive implementation of technical indicators.
@@ -151,7 +227,7 @@ class StreamingIndicators:
         self.prev_close = price
         return features
 
-# --- 2. ADAPTIVE TRIPLE BARRIER (SELL SIGNAL ENABLED) ---
+# --- 3. ADAPTIVE TRIPLE BARRIER (SELL SIGNAL ENABLED) ---
 class AdaptiveTripleBarrier:
     """
     Volatility-Adaptive Labeling with Soft Drift Detection.
@@ -252,7 +328,7 @@ class AdaptiveTripleBarrier:
         self.buffer = active
         return resolved
 
-# --- 3. PROBABILITY CALIBRATOR ---
+# --- 4. PROBABILITY CALIBRATOR ---
 class ProbabilityCalibrator:
     def __init__(self, window: int = 1000):
         self.window = window
@@ -277,7 +353,7 @@ class ProbabilityCalibrator:
         except Exception:
             return raw_prob
 
-# --- 4. META LABELER (UPGRADED) ---
+# --- 5. META LABELER (UPGRADED) ---
 class MetaLabeler:
     """
     Secondary model that learns whether a primary signal resulted in profit.
@@ -354,6 +430,11 @@ class MetaLabeler:
         vpin = clean.get('vpin', 0.5)
         clean['vpin_x_action'] = vpin * action
         
+        # 5. Interaction: Regime x Action (NEW for Phoenix)
+        # Are we buying in a Dead Zone (KER < 0.3)?
+        ker = clean.get('ker', 0.5)
+        clean['ker_x_action'] = ker * action
+        
         return clean
 
     def _sanitize(self, features: Dict[str, float]) -> Dict[str, float]:
@@ -365,7 +446,7 @@ class MetaLabeler:
                 clean[k] = 0.0
         return clean
 
-# --- 5. ONLINE FEATURE ENGINEER (PHOENIX: STATIONARY + PHYSICS) ---
+# --- 6. ONLINE FEATURE ENGINEER (PHOENIX: STATIONARY + PHYSICS) ---
 class OnlineFeatureEngineer:
     def __init__(self, window_size: int = 50):
         self.window_size = window_size
@@ -373,10 +454,14 @@ class OnlineFeatureEngineer:
         self.volumes = deque(maxlen=window_size)
         self.returns = deque(maxlen=window_size)
         
-        # Phase 2: Integrated Streaming Indicators (Uses RecursiveEMA)
+        # Phase 2: Integrated Streaming Indicators
         self.indicators = StreamingIndicators()
         
-        # Legacy components (Retained for continuity)
+        # Regime Indicators (NEW)
+        self.ker = KaufmanEfficiencyRatio(window=10)
+        self.fdi = FractalDimensionIndex(window=30)
+        
+        # Legacy components
         self.entropy = EntropyMonitor(window=window_size)
         self.vpin = VPINMonitor(bucket_size=1000)
         self.frac_diff = IncrementalFracDiff(d=0.3, window=window_size)
@@ -387,13 +472,13 @@ class OnlineFeatureEngineer:
         # 1. Cumulative OFI Window
         self.ofi_window = deque(maxlen=20)
         
-        # 2. Volatility Trend EMA (for breakout detection)
+        # 2. Volatility Trend EMA
         self.atr_ema = RecursiveEMA(alpha=0.05)
         
-        # 3. Long-term Volatility Baseline (for Vol Ratio)
+        # 3. Long-term Volatility Baseline
         self.vol_baseline = RecursiveEMA(alpha=0.001)
         
-        # 4. OFI Trend (New Feature: Flow Momentum)
+        # 4. OFI Trend (Flow Momentum)
         self.ofi_ema = RecursiveEMA(alpha=CONFIG['features'].get('ofi_alpha', 0.1))
 
     def update(self, price: float, timestamp: float, volume: float,
@@ -416,7 +501,6 @@ class OnlineFeatureEngineer:
         self.volumes.append(volume)
         
         # 1. Log Returns (Stationary)
-        # Replaces raw linear returns for ML stability
         ret_log = 0.0
         if self.last_price and self.last_price > 0:
             try:
@@ -431,27 +515,28 @@ class OnlineFeatureEngineer:
         tech_feats = self.indicators.update(price, high, low)
         current_atr = tech_feats.get('atr', 0.001)
         
-        # 3. Update Legacy Metrics
+        # 3. Update Regime Metrics (NEW)
+        ker_val = self.ker.update(price)
+        fdi_val = self.fdi.update(price)
+        
+        # 4. Update Legacy Metrics
         entropy_val = self.entropy.update(price)
-        # PHOENIX UPGRADE: Pass explicit Buy/Sell volume for VPIN
         vpin_val = self.vpin.update(volume, price, buy_vol, sell_vol)
         fd_price = self.frac_diff.update(price)
         volatility_val = self.vol_monitor.update(ret_log)
 
-        # 4. Volatility Ratio (Stationary)
-        # Current Short-term Vol vs Long-term Baseline
+        # 5. Volatility Ratio (Stationary)
         self.vol_baseline.update(volatility_val)
         baseline_vol = self.vol_baseline.get()
         vol_ratio = volatility_val / baseline_vol if baseline_vol > 1e-9 else 1.0
 
-        # 5. Hurst Exponent (Market Memory)
+        # 6. Hurst Exponent (Market Memory)
         hurst_val = 0.5
         if len(self.returns) >= 20:
             ret_arr = np.array(list(self.returns), dtype=np.float64)
             hurst_val = calculate_hurst(ret_arr)
 
-        # 6. Order Flow Imbalance (OFI)
-        # Normalized by volume to ensure stationarity
+        # 7. Order Flow Imbalance (OFI)
         denominator = volume if volume > 0 else 1.0
         ofi_val = (buy_vol - sell_vol) / denominator
         
@@ -471,7 +556,7 @@ class OnlineFeatureEngineer:
         atr_trend = self.atr_ema.get()
         vol_breakout = 1.0 if current_atr > (atr_trend * 1.05) else 0.0
 
-        # Efficiency Ratio (ER)
+        # Efficiency Ratio (ER) - Retained for legacy compatibility but superseded by KER
         er_val = 0.5
         if len(self.prices) >= 10:
             price_list = list(self.prices)
@@ -480,8 +565,7 @@ class OnlineFeatureEngineer:
             net_change = abs(price_list[-1] - price_list[0])
             er_val = net_change / abs_change_sum if abs_change_sum > 0 else 0.0
 
-        # --- AUDIT FIX: CANDLE PHYSICS (Stationary) ---
-        # Normalize candle features by range or previous close
+        # --- CANDLE PHYSICS (Stationary) ---
         candle_range = max(high - low, 1e-9)
         prev_close = self.prices[-2] if len(self.prices) > 1 else price
         
@@ -496,7 +580,6 @@ class OnlineFeatureEngineer:
         lower_wick_ratio = lower_wick / candle_range
 
         # Normalized Oscillators
-        # MACD is absolute price difference, normalize by price to make stationary
         macd_norm = tech_feats['macd_line'] / price
         rsi_norm = tech_feats['rsi'] / 100.0 # Scale 0-1
 
@@ -518,11 +601,15 @@ class OnlineFeatureEngineer:
             'volatility': volatility_val,
             # ---------------------------------------------------------
             
+            # Regime Metrics (NEW)
+            'ker': ker_val,
+            'fdi': fdi_val,
+            
             # Stationary Technicals
             'rsi_norm': rsi_norm,
             'macd_norm': macd_norm,
             'macd_hist_norm': tech_feats['macd_hist'] / price,
-            'atr_pct': current_atr / price, # ATR as % of price
+            'atr_pct': current_atr / price, 
             
             # Stationary Volatility
             'vol_ratio': vol_ratio,
@@ -530,16 +617,16 @@ class OnlineFeatureEngineer:
             'log_ret': ret_log,
             
             # Statistical / Microstructure
-            'frac_diff': fd_price / price, # Normalize FracDiff price approx
+            'frac_diff': fd_price / price, 
             'entropy': entropy_val,
             'vpin': vpin_val,
             'hurst': hurst_val,
             'ofi': ofi_val,
-            'efficiency_ratio': er_val,
+            'efficiency_ratio': er_val, # Legacy support
             
             # Context
             'cum_ofi': cum_ofi,
-            'ofi_trend': ofi_trend, # New
+            'ofi_trend': ofi_trend,
             'regime': regime_val,
             'vol_breakout': vol_breakout,
             
@@ -549,8 +636,6 @@ class OnlineFeatureEngineer:
             'lower_wick_ratio': lower_wick_ratio,
             
             # Original inputs (Normalized Z-Scores)
-            # We calculate simple Z-scores on the fly for price/vol
-            # This is locally stationary
             'volume_z': (volume - np.mean(self.volumes)) / (np.std(self.volumes) + 1e-9) if len(self.volumes) > 2 else 0.0,
             
             **lagged_feats,
@@ -568,7 +653,7 @@ class OnlineFeatureEngineer:
                 clean[k] = 0.0
         return clean
 
-# --- 6. LEGACY MONITORS (RETAINED) ---
+# --- 7. LEGACY MONITORS (RETAINED) ---
 class StreamingTripleBarrier:
     """
     Legacy barrier logic. Retained for backward compatibility if needed.

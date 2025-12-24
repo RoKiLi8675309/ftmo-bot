@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – PHOENIX STRATEGY V2.0 (ALPHA SEEKER)
-# STATUS: PROFIT OPTIMIZED / META-LABELING ENABLED
+# config.yaml – PHOENIX STRATEGY V2.1 (REGIME AWARE SNIPER)
+# STATUS: SNIPER MODE ENABLED / REGIME GATES ACTIVE
 #
 # AUDIT REMEDIATION (2025-12-24):
-# 1. RISK: Switched to Volatility Targeting (Target Vol 20%).
-# 2. GATES: Hardened Volatility & Efficiency gates to stop chop trading.
-# 3. META: ARF Meta-Labeler enabled with 0.60 confidence threshold.
-# 4. SAFETY: Drawdown Brake trigger established at 2% DD.
+# 1. REGIME GATES: Added KER (Efficiency) and FDI (Complexity) thresholds.
+# 2. VOLATILITY TARGETING: Strict 20% Annual Vol Target with Quarter Kelly.
+# 3. META-LABELING: ARF Meta-Labeler enabled (0.60 threshold).
+# 4. SAFETY: Drawdown Brake triggers at 2% DD (Risk Halving).
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -122,15 +122,23 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- MICROSTRUCTURE FILTERS ---
+# --- MICROSTRUCTURE FILTERS (REGIME GATES) ---
 microstructure:
   vpin_bucket_size: 1000
   # AUDIT FIX: Tightened to 0.90 to filter toxic flow
   vpin_threshold: 0.90
-  er_threshold_noise: 0.30
-  er_threshold_trend: 0.60
-  # AUDIT FIX: Strict Gate at 0.40 (Trend Required)
+  
+  # REGIME GATE 1: Kaufman Efficiency Ratio (KER)
+  # KER < 0.30 implies Noise/Chop. We only trade if > 0.30.
+  gate_ker_threshold: 0.30
+  
+  # REGIME GATE 2: Fractal Dimension Index (FDI)
+  # FDI > 1.50 implies Random Walk (Pink Noise). We halt.
+  gate_fdi_threshold: 1.50
+  
+  # ER (Legacy check, kept for safety)
   gate_er_threshold: 0.40
+  
   hurst_threshold_mean_revert: 0.45
   hurst_threshold_random_low: 0.45
   hurst_threshold_random_high: 0.55
@@ -148,7 +156,7 @@ risk_management:
   sizing_method: "volatility_targeting"
   
   # Volatility Targeting Params
-  target_annual_volatility: 0.20  # Aim for 20% annualized vol
+  target_annual_volatility: 0.20  # Strict Target (20% Annualized)
   kelly_fraction: 0.25            # Safety factor (Quarter Kelly)
   
   base_risk_per_trade_percent: 1.0
@@ -200,14 +208,14 @@ trading:
 # --- ONLINE LEARNING (RIVER ML) ---
 online_learning:
   model_type: "ARFClassifier"
-  n_models: 25                    # Reduced for speed, increased for robustness
+  n_models: 25                    # Ensemble Size
   
   burn_in_periods: 1000           # Bars required before ANY inference
   
   # Volatility Gate: Rejects Dead Markets
   volatility_gate:
     enabled: true
-    min_atr_spread_ratio: 2.5     # ATR must be > 2.5x Spread
+    min_atr_spread_ratio: 2.5     # ATR must be > 2.5x Spread to engage
   
   # Adaptive Learning
   grace_period: 250

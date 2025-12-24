@@ -6,9 +6,9 @@
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
 # AUDIT REMEDIATION (2025-12-24 - PROFIT OPTIMIZATION):
-# 1. DRAWDOWN BRAKE: Added defensive scaling. If Equity < 98% of Start, Risk *= 0.5.
-# 2. META-SCALING: Prepared logic to accept Meta-Confidence (future proofing).
-# 3. CONVICTION: Power Law scaling (conf^2) maintained for noise reduction.
+# 1. DRAWDOWN BRAKE: Defensive scaling. If Equity < 98% of Start, Risk *= 0.5.
+# 2. VOLATILITY TARGETING: Strict 20% Annual Target implementation.
+# 3. META-SCALING: Power Law scaling (conf^2) for conviction.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -140,7 +140,7 @@ class RiskManager:
 
         # 1. Retrieve Config Parameters
         risk_conf = CONFIG.get('risk_management', {})
-        sizing_method = risk_conf.get('sizing_method', 'inverse_volatility')
+        sizing_method = risk_conf.get('sizing_method', 'volatility_targeting')
 
         # Determine Contract Size
         # Priority: Override arg > Config > Default 100k
@@ -160,7 +160,7 @@ class RiskManager:
 
         # Clamp Risk Budget to Hard Max Risk %
         # SAFEMODE FIX: Lowered hard cap back to 1.5% in Config, logic respects it here.
-        base_risk_pct = risk_conf.get('max_risk_percent', 1.0) / 100.0
+        base_risk_pct = risk_conf.get('max_risk_percent', 1.5) / 100.0
         max_risk_usd = balance * base_risk_pct
         
         # Effective Risk Budget: Min(CPPI Budget, Hard Cap)
@@ -184,7 +184,7 @@ class RiskManager:
         else:
             # Fallback 0.1% of price if ATR missing or zero
             stop_dist = price * 0.001 * atr_mult_sl
-            logger.debug(f"{symbol}: ATR Fallback Used (ATR={atr})")
+            # logger.debug(f"{symbol}: ATR Fallback Used (ATR={atr})")
 
         # --- DEAD PAIR PROTECTION (SPREAD CLAMP) ---
         # If ATR is too small relative to spread, we must widen stop or risk instant stop-out.
@@ -221,7 +221,7 @@ class RiskManager:
             # Formula: TargetExposure = (Equity * TargetAnnualVol) / InstrumentAnnualVol
             # Note: We limit this by the CPPI/MaxRisk calculated above as a ceiling.
             
-            # SAFE FIX: Target Vol reverted to 0.25 in Config
+            # SAFE FIX: Target Vol reverted to 0.20 in Config
             target_ann_vol = risk_conf.get('target_annual_volatility', 0.20)
             
             # Annualize the short-term volatility (M5 data assumption: 288 bars/day * 252 days)
@@ -232,7 +232,7 @@ class RiskManager:
             ann_factor = 269.4
             realized_ann_vol = volatility * ann_factor
             
-            # Volatility Scalar (e.g., 0.25 / 0.13 = ~1.9 leverage)
+            # Volatility Scalar (e.g., 0.20 / 0.13 = ~1.5 leverage)
             vol_scalar = target_ann_vol / realized_ann_vol
             
             # Fractional Kelly Application

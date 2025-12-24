@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages ARF models, Feature Engineering,
 # Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# AUDIT REMEDIATION (2025-12-23 - SNIPER MODE):
+# AUDIT REMEDIATION (2025-12-24 - REGIME GATING):
 # 1. ARCHITECTURE: "Gate-First" Logic. Gates run BEFORE Inference.
-# 2. GATES: Strict rejection of Chop (ER < 0.40) and Dead Markets.
-# 3. DISCOVERY: Bound by strict gates. No exploration in noise.
+# 2. REGIME GATES: Strict rejection of Noise (KER < 0.30) and Chaos (FDI > 1.5).
+# 3. DISCOVERY: Bound by strict gates. No exploration in noise regimes.
 # =============================================================================
 import logging
 import pickle
@@ -98,8 +98,11 @@ class MultiAssetPredictor:
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
         self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.5)
-        # SAFE MODE: ER Threshold 0.40
-        self.min_er_threshold = CONFIG['microstructure'].get('gate_er_threshold', 0.40)
+        
+        # --- REGIME GATES (NOISE FILTER) ---
+        self.min_ker_threshold = CONFIG['microstructure'].get('gate_ker_threshold', 0.30)
+        self.max_fdi_threshold = CONFIG['microstructure'].get('gate_fdi_threshold', 1.50)
+        
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
 
         # Initialize Models
@@ -223,11 +226,19 @@ class MultiAssetPredictor:
                 stats['Vol Gate (Dead Market)'] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "Vol Gate"})
         
-        # 2. Efficiency Ratio Gate (Chop Protection)
-        current_er = features.get('efficiency_ratio', 0.5)
-        if current_er < self.min_er_threshold:
-            stats['Low Efficiency (Chop)'] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "ER Gate"})
+        # 2. Regime Gate: Kaufman Efficiency Ratio (Signal vs Noise)
+        # If KER < 0.30, the market is too noisy to trade directionally.
+        current_ker = features.get('ker', 0.5)
+        if current_ker < self.min_ker_threshold:
+            stats[f'Regime: Low KER ({current_ker:.2f})'] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": f"Regime KER ({current_ker:.2f})"})
+
+        # 3. Regime Gate: Fractal Dimension Index (Complexity)
+        # If FDI > 1.5, price action approaches a random walk (Pink Noise).
+        current_fdi = features.get('fdi', 1.5)
+        if current_fdi > self.max_fdi_threshold:
+            stats[f'Regime: High FDI ({current_fdi:.2f})'] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": f"Regime FDI ({current_fdi:.2f})"})
 
         # 4. Inference (Only runs if Gates Pass)
         current_pred_action = 0
