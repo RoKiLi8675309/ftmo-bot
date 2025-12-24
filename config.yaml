@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – PHOENIX STRATEGY V2.3 (SNIPER MODE)
-# STATUS: HIGH R:R / STRICT FILTERING / HIGH CONFIDENCE
+# config.yaml – PHOENIX STRATEGY V2.4 (OPTIMIZED FOR SQN & FREQUENCY)
+# STATUS: RELAXED FILTERING / SQN PRIORITY / HIGH FREQUENCY
 #
 # AUDIT REMEDIATION (2025-12-24):
-# 1. CONFIDENCE: Raised baseline requirement to 0.85 (85%).
-#    Only trades with exceptionally high probability are allowed.
-# 2. BARRIERS: Standardized barrier width to 2.0x ATR for realistic targets.
-# 3. STOP LOSS: Hardened to 1.0x ATR to force 1:2 R:R ratios.
+# 1. GATES: Relaxed KER (0.20) and FDI (1.60) to capture more opportunities.
+# 2. DATA: Extended training history to 4M candles for full cycle coverage.
+# 3. OPTIMIZATION: Doubled trials (200) for deeper parameter exploration.
+# 4. VOLATILITY: Lowered Vol-Gate (2.0x Spread) to allow selective low-vol trades.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -81,7 +81,7 @@ data:
   volume_bar_threshold: 1000
   download_start_date: "2020-01-01"
   num_candles_producer: 50000
-  num_candles_train: 2000000
+  num_candles_train: 4000000  # AUDIT FIX: Increased to 4M for deeper history
   num_candles_wfo: 10000
   num_candles_backtest: 200000
 
@@ -127,11 +127,12 @@ microstructure:
   vpin_threshold: 0.90
   
   # REGIME GATE 1: KER (Signal/Noise)
-  # AUDIT FIX: 0.40 is good. Trial logs show this works.
-  gate_ker_threshold: 0.40
+  # AUDIT FIX: Relaxed to 0.20 to capture more trades
+  gate_ker_threshold: 0.20
   
   # REGIME GATE 2: FDI (Complexity)
-  gate_fdi_threshold: 1.50
+  # AUDIT FIX: Relaxed to 1.60 to allow slightly more complex regimes
+  gate_fdi_threshold: 1.60
   
   gate_er_threshold: 0.40
   
@@ -165,10 +166,8 @@ risk_management:
   cppi_multiplier: 2.0
   
   # TRADE MANAGEMENT (SNIPER MODE)
-  # AUDIT FIX: Tight stop (1.0 ATR). 
-  # This forces a 1:2 R:R given the barrier width of 2.0.
   stop_loss_atr_mult: 1.0
-  take_profit_atr_mult: 2.0 # Default, overridden by optimizer barrier width
+  take_profit_atr_mult: 2.0 
   
   risk_timezone: "Europe/Prague"
   
@@ -209,8 +208,8 @@ online_learning:
   volatility_gate:
     enabled: true
     # AUDIT FIX: Spread-Adjusted Volatility Gate
-    # ATR must be > 3x Spread. Prevents trading in dead zones.
-    min_atr_spread_ratio: 3.0
+    # Relaxed to 2.0x Spread to allow selectively trading lower vol.
+    min_atr_spread_ratio: 2.0
   
   grace_period: 250
   delta: 0.00001
@@ -226,14 +225,12 @@ online_learning:
   
   tbm:
     horizon_minutes: 60
-    # AUDIT FIX: Realistic Barrier. 2.0x ATR implies we want a standard impulsive move.
+    # Barrier width tunable by Optuna
     barrier_width: 2.0
     min_profit_pips: 5.0
     drift_threshold: 1.0
     
   learning_horizon_sec: 300
-  # AUDIT FIX: HIGH CONFIDENCE REQUIRED
-  # Raised to 0.85 (85%) based on forensic analysis of winning trials.
   min_calibrated_probability: 0.85
 
 # --- NEWS FILTER ---
@@ -265,7 +262,7 @@ forensic_audit:
 
 # --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 100
+  n_trials: 200 # AUDIT FIX: Doubled trials for better exploration
   train_years: 2
   test_months: 6
   min_trades_optimization: 10

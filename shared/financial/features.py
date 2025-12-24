@@ -7,7 +7,7 @@
 #
 # PHOENIX STRATEGY UPGRADE (2025-12-24 - REGIME AWARENESS):
 # 1. REGIME: Added KaufmanEfficiencyRatio (KER) and FractalDimensionIndex (FDI).
-# 2. HMM: Added RegimeDetector using GaussianHMM with Warm Start Fix.
+# 2. HMM: Optimized RegimeDetector (fits every 50 bars) for efficiency.
 # 3. STATIONARITY: Log-return normalization for all price inputs.
 # 4. ROBUSTNESS: RecursiveEMA hardened against NaN/Inf.
 # =============================================================================
@@ -15,6 +15,10 @@ from __future__ import annotations
 import math
 import logging
 import sys
+import os
+import warnings
+import contextlib
+import io
 import numpy as np
 from collections import deque
 from typing import Dict, Any, Optional, List, Tuple
@@ -49,6 +53,8 @@ except ImportError:
 try:
     from river import linear_model, forest, metrics
     from sklearn.isotonic import IsotonicRegression
+    # Import exceptions for warning filtering
+    from sklearn.exceptions import ConvergenceWarning
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
@@ -158,29 +164,39 @@ class RegimeDetector:
     """
     Online Hidden Markov Model (HMM) for market regime classification.
     Identifies latent states (e.g., Low Vol/Range, High Vol/Trend).
+    
+    AUDIT FIX 2025: Reduced n_states to 2 for stability on small windows.
+    Added strict Output Suppression and Frequency Throttling (fit every 50 bars).
     """
-    def __init__(self, n_states: int = 3, window: int = 100):
+    def __init__(self, n_states: int = 2, window: int = 100):
         self.n_states = n_states
         self.window = window
         self.returns = deque(maxlen=window)
         self.last_regime = 0
         self.model = None
+        self.fit_failures = 0
+        self.fit_counter = 0 # Throttling counter
         
         if HMM_AVAILABLE:
             try:
                 self.model = hmm.GaussianHMM(
                     n_components=n_states, 
                     covariance_type="diag", 
-                    n_iter=100,
+                    n_iter=100, 
                     random_state=42,
-                    init_params="stmc" # Initialize start, trans, means, covars
+                    init_params="stmc", 
+                    verbose=False,
+                    min_covar=1e-3, 
+                    tol=1e-4
                 )
             except Exception as e:
                 logger.error(f"HMM Init Failed: {e}")
                 self.model = None
     
     def update(self, ret: float) -> int:
-        self.returns.append(ret)
+        # AUDIT FIX: Scale returns by 100 to prevent underflow/precision loss.
+        self.returns.append(ret * 100.0)
+        self.fit_counter += 1
         
         if not HMM_AVAILABLE or self.model is None:
             return 0
@@ -192,20 +208,44 @@ class RegimeDetector:
             # Reshape for HMM: (n_samples, n_features)
             data = np.array(self.returns).reshape(-1, 1)
             
-            # Re-fit periodically or on every bar
-            self.model.fit(data)
-            
-            # FIX: Disable re-initialization after first fit.
-            # This suppresses the "attribute overwritten" warning and enables Warm Start,
-            # allowing the EM algorithm to converge faster on the rolling window.
-            if self.model.init_params != "":
-                self.model.init_params = ""
-            
-            # Predict state of the most recent return
+            # Optimization: Fit less often to save compute and increase stability
+            # We fit every 50 bars, or if we are in the initial learning phase (<200)
+            should_fit = (self.fit_counter % 50 == 0) or (self.fit_counter < 200)
+
+            if should_fit:
+                # 1. Sanity Check
+                if np.var(data) < 1e-6 or np.isnan(data).any():
+                    return self.last_regime
+
+                # 2. Warm Start Strategy
+                if self.fit_failures > 5:
+                    self.model.init_params = "stmc"
+                    self.fit_failures = 0
+                elif hasattr(self.model, 'startprob_'):
+                    self.model.init_params = ""
+
+                # 3. Fit with Nuclear Suppression
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        warnings.filterwarnings("ignore", category=RuntimeWarning)
+                        warnings.filterwarnings("ignore", category=ConvergenceWarning)
+                        
+                        self.model.fit(data)
+                
+                if not self.model.monitor_.converged:
+                    self.fit_failures += 1
+                else:
+                    self.fit_failures = 0
+
+            # Predict state (Always predict, even if not refit)
             current_state = int(self.model.predict(data[-1].reshape(1, -1))[0])
             self.last_regime = current_state
             return current_state
+
         except Exception:
+            # Fail gracefully, don't crash the bot
+            self.fit_failures += 1
             return self.last_regime
 
 # --- 2. STREAMING INDICATORS (PHASE 2 CORE) ---
@@ -517,7 +557,9 @@ class OnlineFeatureEngineer:
         # Regime Indicators (NEW)
         self.ker = KaufmanEfficiencyRatio(window=10)
         self.fdi = FractalDimensionIndex(window=30)
-        self.regime_detector = RegimeDetector(n_states=3, window=100)
+        
+        # HMM Regime Detector: Reduced states to 2 for stability
+        self.regime_detector = RegimeDetector(n_states=2, window=100)
         
         # Legacy components
         self.entropy = EntropyMonitor(window=window_size)
@@ -570,7 +612,9 @@ class OnlineFeatureEngineer:
         # 3. Update Regime Metrics (NEW)
         ker_val = self.ker.update(price)
         fdi_val = self.fdi.update(price)
-        regime_hmm = self.regime_detector.update(ret_log) # HMM State Update
+        
+        # HMM Update (Safe)
+        regime_hmm = self.regime_detector.update(ret_log) 
         
         # 4. Update Legacy Metrics
         entropy_val = self.entropy.update(price)
@@ -657,7 +701,7 @@ class OnlineFeatureEngineer:
             # Regime Metrics (NEW)
             'ker': ker_val,
             'fdi': fdi_val,
-            'hmm_regime': float(regime_hmm) / (self.regime_detector.n_states - 1), # Norm 0-1
+            'hmm_regime': float(regime_hmm) / (self.regime_detector.n_states - 1) if self.regime_detector.n_states > 1 else 0.0, # Norm 0-1
             'sentiment': sentiment, # New Sentiment Feature
             
             # Stationary Technicals
@@ -908,7 +952,8 @@ def calculate_hurst(ts):
     y = np.log(tau)
     A = np.column_stack((x, np.ones(len(x))))
     m, c = np.linalg.lstsq(A, y)[0]
-    return m
+    hurst = m * 2.0 # Adjusted scale
+    return max(0.0, min(1.0, hurst))
 
 def enrich_with_d1_data(features: Dict[str, float], d1_data: Dict[str, float], current_price: float) -> Dict[str, float]:
     if not d1_data: return features

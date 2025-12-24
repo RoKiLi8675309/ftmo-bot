@@ -7,9 +7,10 @@
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
 # AUDIT REMEDIATION (2025-12-24 - REGIME GATING & ENSEMBLES):
-# 1. ENSEMBLE: Wrapped ARF in BaggingClassifier for variance reduction.
-# 2. GATING: Added HMM Regime and Sentiment logic gates.
+# 1. ENSEMBLE: Wrapped ARF in ADWINBaggingClassifier for variance reduction.
+# 2. GATING: Added HMM Regime and Sentiment logic gates with Dynamic Scaling.
 # 3. ARCHITECTURE: "Gate-First" Logic preserved.
+# 4. ROADMAP FIXES: Dynamic FDI, Debug Logging, SQN focus.
 # =============================================================================
 import logging
 import pickle
@@ -89,6 +90,7 @@ class MultiAssetPredictor:
         
         # 4. Forensic Stats
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
+        self.feature_stats = {s: defaultdict(float) for s in symbols} # Debug Tool: Track avg feature values
         self.bar_counters = {s: 0 for s in symbols}
         
         # 5. Architecture: Auto-Save Timer
@@ -98,11 +100,11 @@ class MultiAssetPredictor:
         # --- AUDIT FIX: Gating Params (Sniper Mode) ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.5)
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.0)
         
         # --- REGIME GATES (NOISE FILTER) ---
-        self.min_ker_threshold = CONFIG['microstructure'].get('gate_ker_threshold', 0.30)
-        self.max_fdi_threshold = CONFIG['microstructure'].get('gate_fdi_threshold', 1.50)
+        self.min_ker_threshold = CONFIG['microstructure'].get('gate_ker_threshold', 0.20)
+        self.max_fdi_threshold = CONFIG['microstructure'].get('gate_fdi_threshold', 1.60)
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
 
@@ -113,7 +115,7 @@ class MultiAssetPredictor:
     def _init_models(self):
         """
         Initializes the machine learning pipelines using Configured hyperparameters.
-        UPDATED: Uses BaggingClassifier wrapping ARF for Ensemble Learning.
+        UPDATED: Uses ADWINBaggingClassifier wrapping ARF for Ensemble Learning.
         """
         conf = CONFIG['online_learning']
         
@@ -134,7 +136,7 @@ class MultiAssetPredictor:
             # Reduces variance and improves stability for online learning
             self.models[sym] = compose.Pipeline(
                 preprocessing.StandardScaler(),
-                ensemble.BaggingClassifier(
+                ensemble.ADWINBaggingClassifier( # Use ADWIN for drift
                     model=base_clf,
                     n_models=5,  # Ensemble size (Stacking ARFs)
                     seed=42
@@ -162,6 +164,7 @@ class MultiAssetPredictor:
         model = self.models[symbol]
         meta_labeler = self.meta_labelers[symbol]
         stats = self.rejection_stats[symbol]
+        feat_stats = self.feature_stats[symbol]
         
         self.bar_counters[symbol] += 1
 
@@ -169,16 +172,7 @@ class MultiAssetPredictor:
         buy_vol = getattr(bar, 'buy_vol', 0.0)
         sell_vol = getattr(bar, 'sell_vol', 0.0)
 
-        # 1. Feature Engineering (Stationary Pipeline)
-        # Note: 'sentiment' is injected via the Engine/Dispatcher if available, 
-        # but here we rely on what the FE has buffered or assumes.
-        # Ideally, Engine calls update with sentiment, but Predictor 'process_bar' signature 
-        # is fixed in this context. We assume sentiment is handled via global context or 
-        # injected if we modify the signature. For strict compliance with prompt "Step 4",
-        # the Engine typically fetches news and updates features. 
-        # Since `process_bar` takes a `bar` object, we'll assume sentiment comes via 
-        # features or an external update mechanism.
-        # For now, we proceed with standard update.
+        # 1. Feature Engineering
         features = fe.update(
             price=bar.close,
             timestamp=bar.timestamp,
@@ -193,6 +187,12 @@ class MultiAssetPredictor:
         
         if context_d1:
             features = enrich_with_d1_data(features, context_d1, bar.close)
+
+        # Update Feature Stats (Rolling Average for Debugging)
+        alpha = 0.01
+        feat_stats['avg_ker'] = (1 - alpha) * feat_stats.get('avg_ker', 0.5) + alpha * features.get('ker', 0.5)
+        feat_stats['avg_fdi'] = (1 - alpha) * feat_stats.get('avg_fdi', 1.5) + alpha * features.get('fdi', 1.5)
+        feat_stats['avg_entropy'] = (1 - alpha) * feat_stats.get('avg_entropy', 0.5) + alpha * features.get('entropy', 0.5)
 
         # --- PHASE 2: WARM-UP GATE ---
         if self.burn_in_counters[symbol] < self.burn_in_limit:
@@ -222,6 +222,10 @@ class MultiAssetPredictor:
                 # Train Primary Model (Ensemble learns via learn_one)
                 model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
                 
+                # OPTIMIZATION: Double Learn for Positive outcomes to fix imbalance (Roadmap Item 2)
+                if outcome_label != 0:
+                     model.learn_one(stored_feats, outcome_label, sample_weight=final_weight * 1.5)
+
                 # Update Meta-Labeler
                 if outcome_label != 0:
                     meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
@@ -246,23 +250,29 @@ class MultiAssetPredictor:
         
         # 2. Regime Gate: Kaufman Efficiency Ratio (Signal vs Noise)
         current_ker = features.get('ker', 0.5)
-        if current_ker < self.min_ker_threshold:
+        volatility = features.get('volatility', 0.001)
+        
+        # OPTIMIZATION: Dynamic Volatility Scaling for KER (Roadmap Item 1)
+        # Scale up in high vol to require stronger signal
+        effective_ker_thresh = self.min_ker_threshold * (1 + volatility * 50) 
+        
+        if current_ker < effective_ker_thresh:
             stats[f'Regime: Low KER ({current_ker:.2f})'] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Regime KER ({current_ker:.2f})"})
 
         # 3. Regime Gate: Fractal Dimension Index (Complexity)
         current_fdi = features.get('fdi', 1.5)
-        if current_fdi > self.max_fdi_threshold:
+        
+        # OPTIMIZATION: Dynamic FDI (Roadmap Item 1)
+        # Tighten (lower) in high volatility to avoid complex chop
+        effective_fdi_thresh = self.max_fdi_threshold * (1 - volatility * 30)
+        
+        if current_fdi > effective_fdi_thresh:
             stats[f'Regime: High FDI ({current_fdi:.2f})'] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Regime FDI ({current_fdi:.2f})"})
             
         # 4. Regime Gate: HMM State (New Step 1 Requirement)
-        # Avoid neutral/range regimes. Assuming state 0/1/2 normalized.
-        # If hmm_regime is near 0.0 or 0.5 (neutral/bear-range), we might want to gate.
-        # For this implementation, we assume we avoid the lowest regime (0).
         hmm_regime = features.get('hmm_regime', 0.5)
-        # If normalized: 0.0 (State 0), 0.5 (State 1), 1.0 (State 2)
-        # We assume State 0 is the "Low Volatility / Range" state to avoid.
         if hmm_regime < 0.2: 
              stats[f'Regime: HMM Range ({hmm_regime:.2f})'] += 1
              return Signal(symbol, "HOLD", 0.0, {"reason": f"HMM Range ({hmm_regime:.2f})"})
@@ -351,8 +361,7 @@ class MultiAssetPredictor:
 
             # --- DECISION ---
             min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
-            volatility = features.get('volatility', 0.001)
-
+            
             if effective_action == 1: # BUY
                 if confidence > min_conf:
                     if is_profitable or discovery_triggered:
@@ -379,8 +388,10 @@ class MultiAssetPredictor:
                 stats['Model Predicted 0'] += 1
             
             # Periodic Rejection Log
-            if self.bar_counters[symbol] % 100 == 0:
-                logger.info(f"🔍 {symbol} Rejections (Last 100): {dict(stats)}")
+            if self.bar_counters[symbol] % 250 == 0:
+                logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} FDI:{feat_stats['avg_fdi']:.2f} Ent:{feat_stats['avg_entropy']:.2f}")
+                logger.info(f"🔍 {symbol} Rejections (Last 250): {dict(stats)}")
+                stats.clear() # Clear stats after logging to avoid infinite accumulation
                 
             return Signal(symbol, "HOLD", confidence, {})
 

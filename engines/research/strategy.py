@@ -6,7 +6,7 @@
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
 # AUDIT REMEDIATION (2025-12-24 - REGIME GATING):
-# 1. REGIME GATES: Implemented strict KER (<0.3) and FDI (>1.5) filters.
+# 1. REGIME GATES: Implemented strict KER (<0.2) and FDI (>1.6) filters.
 # 2. DISCOVERY: Hardened exploration. Random discovery disabled in noise regimes.
 # 3. ARCHITECTURE: "Gate-First" execution prevents ML hallucination on noise.
 # =============================================================================
@@ -92,12 +92,12 @@ class ResearchStrategy:
         # --- AUDIT FIX: VOLATILITY GATE (SNIPER MODE) ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.5)
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.0)
         
         # --- AUDIT FIX: REGIME GATES (NOISE FILTER) ---
-        # Strictly enforce thresholds. Defaults: KER > 0.30, FDI < 1.5
-        self.min_ker_threshold = CONFIG['microstructure'].get('gate_ker_threshold', 0.30)
-        self.max_fdi_threshold = CONFIG['microstructure'].get('gate_fdi_threshold', 1.50)
+        # Relaxed thresholds based on user request: KER > 0.20, FDI < 1.60
+        self.min_ker_threshold = CONFIG['microstructure'].get('gate_ker_threshold', 0.20)
+        self.max_fdi_threshold = CONFIG['microstructure'].get('gate_fdi_threshold', 1.60)
         
         # Load Spread Assumptions for Gating
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
@@ -194,6 +194,10 @@ class ResearchStrategy:
                 
                 self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
                 
+                # OPTIMIZATION: Double Learn for Positive outcomes to fix imbalance
+                if outcome_label != 0:
+                     self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
+
                 if outcome_label != 0:
                     self.meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
 
@@ -217,14 +221,16 @@ class ResearchStrategy:
                 return # STRICT EXIT
         
         # 2. Regime Gate: Kaufman Efficiency Ratio (Signal vs Noise)
-        # If KER < 0.30, the market is too noisy to trade directionally.
         current_ker = features.get('ker', 0.5)
-        if current_ker < self.min_ker_threshold:
+        # OPTIMIZATION: Dynamic Volatility Scaling for KER
+        volatility = features.get('volatility', 0.001)
+        effective_ker_thresh = self.min_ker_threshold * (1 + volatility * 50) # Scale up in high vol
+        
+        if current_ker < effective_ker_thresh:
             self.rejection_stats[f'Regime: Low KER ({current_ker:.2f})'] += 1
             return # STRICT EXIT
 
         # 3. Regime Gate: Fractal Dimension Index (Complexity)
-        # If FDI > 1.5, price action approaches a random walk (Pink Noise).
         current_fdi = features.get('fdi', 1.5)
         if current_fdi > self.max_fdi_threshold:
             self.rejection_stats[f'Regime: High FDI ({current_fdi:.2f})'] += 1

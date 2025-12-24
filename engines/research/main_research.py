@@ -6,9 +6,10 @@
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
 # AUDIT REMEDIATION (2025-12-24 - SNIPER MODE V3):
-# 1. ENSEMBLES: Implemented BaggingClassifier for Model Stability.
-# 2. ADAPTIVE BARRIERS: Optuna tuning for Volatility-Adjusted Barriers.
-# 3. SCORING: Aggressive penalty for negative PnL.
+# 1. ENSEMBLES: Implemented ADWINBaggingClassifier for Drift Adaptation.
+# 2. SCORING: Added SQN (System Quality Number) to objective.
+# 3. PENALTIES: Aggressive penalty for negative PnL.
+# 4. ROADMAP FIX: SQN weighting increased to 3.0 to favor consistency over raw PnL.
 # =============================================================================
 import sys
 import os
@@ -131,11 +132,11 @@ class EmojiCallback:
             print(autopsy_msg, flush=True)
             log.info(autopsy_msg)
 
-def process_data_into_bars(symbol: str, n_ticks: int = 2000000) -> pd.DataFrame:
+def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     """
     Helper to Load Ticks -> Aggregate to Volume Bars -> Return Clean DataFrame.
     Strictly enforcing Volume Bars eliminates "Time-Based noise".
-    UPDATED: Default n_ticks increased to 2M per recommendation.
+    UPDATED: Default n_ticks increased to 4M per recommendation.
     """
     # 1. Load Massive Amount of Ticks (To get sufficient Bars)
     raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2) # Double days for safety
@@ -171,8 +172,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
     optuna.logging.set_verbosity(optuna.logging.INFO)
     
     try:
-        # 1. Load & Aggregate Data (Using updated 2M limit)
-        df = process_data_into_bars(symbol, n_ticks=2000000)
+        # 1. Load & Aggregate Data (Using updated 4M limit)
+        df = process_data_into_bars(symbol, n_ticks=4000000)
         
         if df.empty:
             log.error(f"❌ CRITICAL: No BAR data generated for {symbol}. Aborting worker.")
@@ -242,11 +243,13 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("sharpe", metrics['sharpe'])
             
-            # --- SCORING: PnL DOMINANT ---
-            # Score = (Net Profit / $100) + SQN.
+            # --- SCORING: SQN DOMINANT + PnL ---
+            # Roadmap Step 3: Optimize Directly for SQN
+            # Score = (Net Profit / $100) + (SQN * 3.0)
             
             pnl_score = metrics['total_pnl'] / 100.0
-            final_score = pnl_score + metrics['sqn']
+            sqn_weight = 3.0 # Increased from 2.0 to 3.0 to favor consistency
+            final_score = pnl_score + (metrics['sqn'] * sqn_weight)
             
             # Penalty for Low Activity
             min_trades = CONFIG['wfo'].get('min_trades_optimization', 10)
@@ -261,10 +264,14 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 # Hard fail for near-zero activity to force exploration
                 return -100.0 
 
-            # AGGRESSIVE PENALTY for Negative PnL
-            # If we lose money, we punish the trial heavily to move the optimizer away.
+            # AGGRESSIVE PENALTY for Negative PnL (Roadmap Item 3)
+            # If we lose money, penalize proportional to the loss relative to capital
             if metrics['total_pnl'] < 0:
-                 final_score = -50.0 + (metrics['total_pnl'] / 50.0) # Scales with loss size
+                 # e.g., -1000 loss on 100k = 1% loss. Penalty = 100 * 0.01 = 1.0 (Base)
+                 # Scaled up to be impactful: 100 * (Loss / Capital) * 100
+                 loss_ratio = abs(metrics['total_pnl']) / broker.starting_cash
+                 penalty_factor = 1000.0 * loss_ratio 
+                 final_score -= penalty_factor
 
             # Generate Autopsy if result is poor (Debugging)
             if final_score < 0.5 or broker.is_blown:
@@ -302,8 +309,8 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
     Trains the Final Production Model using the Best Params found.
     """
     try:
-        # 1. Load & Aggregate Data (Using updated 2M limit)
-        df = process_data_into_bars(symbol, n_ticks=2000000)
+        # 1. Load & Aggregate Data (Using updated 4M limit)
+        df = process_data_into_bars(symbol, n_ticks=4000000)
         if df.empty: return
 
         # 2. Get Best Params
@@ -365,7 +372,7 @@ class ResearchPipeline:
         self.reports_dir.mkdir(exist_ok=True)
         
         # Increased Tick counts to ensure Bar generation works
-        self.train_candles = CONFIG['data'].get('num_candles_train', 2000000)
+        self.train_candles = CONFIG['data'].get('num_candles_train', 4000000)
         self.backtest_candles = CONFIG['data'].get('num_candles_backtest', 500000)
         
         self.db_url = CONFIG['wfo']['db_url']
@@ -390,11 +397,11 @@ class ResearchPipeline:
             metric=metrics.F1()
         )
 
-        # ENSEMBLE: Bagging (River)
-        # Wraps ARF in a Bagging Ensemble to reduce variance in Online Learning
+        # ENSEMBLE: ADWIN Bagging (River)
+        # Wraps ARF in an ADWIN Bagging Ensemble to handle drift and variance
         return compose.Pipeline(
             preprocessing.StandardScaler(),
-            ensemble.BaggingClassifier(
+            ensemble.ADWINBaggingClassifier(
                 model=base_clf,
                 n_models=5,  # Ensemble Size (5 ARFs)
                 seed=42
@@ -465,7 +472,8 @@ class ResearchPipeline:
         # Sortino
         metrics['sortino'] = avg_ret / (downside_std + 1e-9)
         
-        # SQN (System Quality Number)
+        # SQN (System Quality Number) - Van Tharp's formula
+        # SQN = sqrt(N) * (Expectancy / StdDev)
         if len(df) > 1 and pnl_std > 1e-9:
             metrics['sqn'] = math.sqrt(len(df)) * (avg_ret / pnl_std)
         
@@ -494,7 +502,7 @@ class ResearchPipeline:
                 log.warning(f"Study init warning {symbol}: {e}")
 
         # 2. Distribute Workers
-        total_trials_per_symbol = CONFIG['wfo'].get('n_trials', 100) # Ensure config aligns with request
+        total_trials_per_symbol = CONFIG['wfo'].get('n_trials', 200) # Ensure config aligns with request
         tasks = []
         workers_per_symbol = max(1, self.total_cores // len(self.symbols))
         trials_per_worker = math.ceil(total_trials_per_symbol / workers_per_symbol)
