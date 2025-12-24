@@ -2,18 +2,14 @@
 # FILENAME: shared/financial/features.py
 # ENVIRONMENT: DUAL COMPATIBILITY (Windows Py3.9 & Linux Py3.11)
 # PATH: shared/financial/features.py
-# DEPENDENCIES: shared, numpy, numba, scipy, river (optional)
+# DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
 # PHOENIX STRATEGY UPGRADE (2025-12-24 - REGIME AWARENESS):
 # 1. REGIME: Added KaufmanEfficiencyRatio (KER) and FractalDimensionIndex (FDI).
-# 2. VPIN: Maintained Bulk Volume Classification (BVC) logic.
+# 2. HMM: Added RegimeDetector using GaussianHMM.
 # 3. STATIONARITY: Log-return normalization for all price inputs.
 # 4. ROBUSTNESS: RecursiveEMA hardened against NaN/Inf.
-#
-# META-LABELING OPTIMIZATION:
-# 1. MODEL: Adaptive Random Forest (ARF) ready.
-# 2. INTERACTIONS: Added Regime*Action interaction terms.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -40,6 +36,14 @@ try:
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
+
+# HMM Learn (Guarded)
+try:
+    from hmmlearn import hmm
+    HMM_AVAILABLE = True
+except ImportError:
+    HMM_AVAILABLE = False
+    # Fallback/Mock if missing will be handled in class
 
 # River / Sklearn imports (Guarded for Windows Producer compatibility)
 try:
@@ -90,7 +94,7 @@ class KaufmanEfficiencyRatio:
         self.prices.append(price)
         if len(self.prices) < self.window + 1:
             return 0.5 # Default to neutral/uncertain
-
+        
         # Signal: Absolute difference between price now and n periods ago
         signal = abs(self.prices[-1] - self.prices[0])
         
@@ -118,7 +122,7 @@ class FractalDimensionIndex:
         self.prices.append(price)
         if len(self.prices) < self.window:
             return 1.5 # Default to Random Walk barrier
-
+        
         data = np.array(self.prices)
         
         # 1. Rescale data to unit square [0,1]x[0,1]
@@ -149,6 +153,55 @@ class FractalDimensionIndex:
             return fdi
         except Exception:
             return 1.5
+
+class RegimeDetector:
+    """
+    Online Hidden Markov Model (HMM) for market regime classification.
+    Identifies latent states (e.g., Low Vol/Range, High Vol/Trend).
+    """
+    def __init__(self, n_states: int = 3, window: int = 100):
+        self.n_states = n_states
+        self.window = window
+        self.returns = deque(maxlen=window)
+        self.last_regime = 0
+        self.model = None
+        
+        if HMM_AVAILABLE:
+            try:
+                self.model = hmm.GaussianHMM(
+                    n_components=n_states, 
+                    covariance_type="diag", 
+                    n_iter=100,
+                    random_state=42
+                )
+            except Exception as e:
+                logger.error(f"HMM Init Failed: {e}")
+                self.model = None
+    
+    def update(self, ret: float) -> int:
+        self.returns.append(ret)
+        
+        if not HMM_AVAILABLE or self.model is None:
+            return 0
+            
+        if len(self.returns) < self.window:
+            return self.last_regime
+            
+        try:
+            # Reshape for HMM: (n_samples, n_features)
+            data = np.array(self.returns).reshape(-1, 1)
+            
+            # Re-fit periodically or on every bar (can be expensive, check perf)
+            # For online efficiency, we might want to fit less often, 
+            # but strict requirements say "Online HMM updates".
+            self.model.fit(data)
+            
+            # Predict state of the most recent return
+            current_state = int(self.model.predict(data[-1].reshape(1, -1))[0])
+            self.last_regime = current_state
+            return current_state
+        except Exception:
+            return self.last_regime
 
 # --- 2. STREAMING INDICATORS (PHASE 2 CORE) ---
 class StreamingIndicators:
@@ -231,10 +284,9 @@ class StreamingIndicators:
 class AdaptiveTripleBarrier:
     """
     Volatility-Adaptive Labeling with Soft Drift Detection.
-    Barriers expand/contract based on ATR.
+    Barriers expand/contract based on ATR and Volatility Regime.
     
-    FIXED: Generates -1 labels for downside breaks to enable Shorting.
-    AUDIT FIX: Drift Threshold Hardened to 0.75 to purge soft-label noise.
+    UPDATED (Step 3): Implements adaptive logic based on Volatility.
     """
     def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.75):
         self.buffer = deque()
@@ -246,16 +298,26 @@ class AdaptiveTripleBarrier:
     def add_trade_opportunity(self, features: Dict[str, float], entry_price: float, current_atr: float, timestamp: float):
         """
         Registers a potential trade setup (Hypothetical entry at current bar).
+        ADAPTIVE UPDATE: Scales barriers by volatility regime.
         """
         # Ensure ATR is valid to prevent zero-width barriers
         if current_atr <= 0: current_atr = entry_price * 0.0001
         
-        # Dynamic Barriers based on ATR
-        # Upper Barrier (Profit for Buy, Stop for Sell)
-        upper_barrier = entry_price + (self.reward_mult * current_atr)
+        # Fetch volatility from features (defaults to low vol if missing)
+        volatility = features.get('volatility', 0.0)
         
-        # Lower Barrier (Stop for Buy, Profit for Sell)
-        lower_barrier = entry_price - (self.risk_mult * current_atr)
+        # Adaptive Scaling: If vol is high, widen barriers to avoid noise stop-outs.
+        # Logic: Multiplier * (1 + Volatility)
+        # Assuming volatility is decimal (e.g., 0.001). We might need a scalar if vol is small.
+        # Using a scalar 100 to make the impact noticeable: 1 + (0.001 * 100) = 1.1x width
+        adaptive_scalar = 1.0 + (volatility * 100.0)
+        
+        effective_risk_mult = self.risk_mult * adaptive_scalar
+        effective_reward_mult = self.reward_mult * adaptive_scalar
+        
+        # Dynamic Barriers
+        upper_barrier = entry_price + (effective_reward_mult * current_atr)
+        lower_barrier = entry_price - (effective_risk_mult * current_atr)
         
         self.buffer.append({
             'features': features,
@@ -289,7 +351,7 @@ class AdaptiveTripleBarrier:
             
             label = None
             realized_ret = 0.0
-
+            
             # 1. Did price hit Upper Barrier?
             if current_high >= trade['tp']:
                 label = 1 # BUY SIGNAL
@@ -307,7 +369,6 @@ class AdaptiveTripleBarrier:
                 drift = current_close - trade['entry']
                 
                 # Threshold to consider this a signal
-                # AUDIT FIX: drift_threshold defaults to 0.75 now
                 drift_req = trade['atr'] * self.drift_threshold
                 
                 if drift > drift_req:
@@ -358,9 +419,6 @@ class MetaLabeler:
     """
     Secondary model that learns whether a primary signal resulted in profit.
     Acts as a 'Gatekeeper' to filter False Positives.
-    
-    UPGRADE (2025-12-24): Switched to ARFClassifier for non-linear alpha detection.
-    Interaction terms added to detect context-specific failures.
     """
     def __init__(self):
         self.model = None
@@ -417,12 +475,10 @@ class MetaLabeler:
         clean['primary_action'] = float(action)
         
         # 2. Interaction: Volatility context for the action
-        # Does this strategy fail in high vol?
         vol = clean.get('volatility', 0.0)
         clean['vol_x_action'] = vol * action
         
         # 3. Interaction: Trend vs Action
-        # Are we fighting the trend? (Hurst < 0.5 = Mean Revert, > 0.5 = Trend)
         hurst = clean.get('hurst', 0.5)
         clean['hurst_x_action'] = (hurst - 0.5) * action
         
@@ -431,7 +487,6 @@ class MetaLabeler:
         clean['vpin_x_action'] = vpin * action
         
         # 5. Interaction: Regime x Action (NEW for Phoenix)
-        # Are we buying in a Dead Zone (KER < 0.3)?
         ker = clean.get('ker', 0.5)
         clean['ker_x_action'] = ker * action
         
@@ -446,7 +501,7 @@ class MetaLabeler:
                 clean[k] = 0.0
         return clean
 
-# --- 6. ONLINE FEATURE ENGINEER (PHOENIX: STATIONARY + PHYSICS) ---
+# --- 6. ONLINE FEATURE ENGINEER (PHOENIX: STATIONARY + PHYSICS + HMM + SENTIMENT) ---
 class OnlineFeatureEngineer:
     def __init__(self, window_size: int = 50):
         self.window_size = window_size
@@ -460,6 +515,7 @@ class OnlineFeatureEngineer:
         # Regime Indicators (NEW)
         self.ker = KaufmanEfficiencyRatio(window=10)
         self.fdi = FractalDimensionIndex(window=30)
+        self.regime_detector = RegimeDetector(n_states=3, window=100)
         
         # Legacy components
         self.entropy = EntropyMonitor(window=window_size)
@@ -468,23 +524,17 @@ class OnlineFeatureEngineer:
         self.vol_monitor = VolatilityMonitor(window=20)
         self.last_price = None
         
-        # --- AUDIT FIX: STATIONARITY & CONTEXT ---
-        # 1. Cumulative OFI Window
+        # --- STATIONARITY & CONTEXT ---
         self.ofi_window = deque(maxlen=20)
-        
-        # 2. Volatility Trend EMA
         self.atr_ema = RecursiveEMA(alpha=0.05)
-        
-        # 3. Long-term Volatility Baseline
         self.vol_baseline = RecursiveEMA(alpha=0.001)
-        
-        # 4. OFI Trend (Flow Momentum)
         self.ofi_ema = RecursiveEMA(alpha=CONFIG['features'].get('ofi_alpha', 0.1))
 
     def update(self, price: float, timestamp: float, volume: float,
                high: Optional[float] = None, low: Optional[float] = None,
                buy_vol: float = 0.0, sell_vol: float = 0.0,
-               time_feats: Dict[str, float] = None) -> Dict[str, float]:
+               time_feats: Dict[str, float] = None,
+               sentiment: float = 0.0) -> Dict[str, float]: # Added sentiment arg
         
         if time_feats is None:
             time_feats = {'sin_hour': 0.0, 'cos_hour': 0.0}
@@ -518,6 +568,7 @@ class OnlineFeatureEngineer:
         # 3. Update Regime Metrics (NEW)
         ker_val = self.ker.update(price)
         fdi_val = self.fdi.update(price)
+        regime_hmm = self.regime_detector.update(ret_log) # HMM State Update
         
         # 4. Update Legacy Metrics
         entropy_val = self.entropy.update(price)
@@ -548,7 +599,7 @@ class OnlineFeatureEngineer:
         self.ofi_ema.update(ofi_val)
         ofi_trend = self.ofi_ema.get()
 
-        # Regime Detection (Trend vs Mean Reversion)
+        # Regime Detection (Legacy Trend vs Mean Reversion + HMM)
         regime_val = 1.0 if hurst_val > 0.55 else (-1.0 if hurst_val < 0.45 else 0.0)
         
         # Volatility Breakout (Expansion)
@@ -556,7 +607,7 @@ class OnlineFeatureEngineer:
         atr_trend = self.atr_ema.get()
         vol_breakout = 1.0 if current_atr > (atr_trend * 1.05) else 0.0
 
-        # Efficiency Ratio (ER) - Retained for legacy compatibility but superseded by KER
+        # Efficiency Ratio (ER) - Retained for legacy compatibility
         er_val = 0.5
         if len(self.prices) >= 10:
             price_list = list(self.prices)
@@ -582,7 +633,7 @@ class OnlineFeatureEngineer:
         # Normalized Oscillators
         macd_norm = tech_feats['macd_line'] / price
         rsi_norm = tech_feats['rsi'] / 100.0 # Scale 0-1
-
+        
         self.last_price = price
 
         # --- LAG GENERATION (Memory) ---
@@ -604,6 +655,8 @@ class OnlineFeatureEngineer:
             # Regime Metrics (NEW)
             'ker': ker_val,
             'fdi': fdi_val,
+            'hmm_regime': float(regime_hmm) / (self.regime_detector.n_states - 1), # Norm 0-1
+            'sentiment': sentiment, # New Sentiment Feature
             
             # Stationary Technicals
             'rsi_norm': rsi_norm,
@@ -755,7 +808,6 @@ class VPINMonitor:
         # Determine Flow Split
         b_vol = 0.0
         s_vol = 0.0
-
         if buy_vol_input > 0 or sell_vol_input > 0:
             b_vol = buy_vol_input
             s_vol = sell_vol_input

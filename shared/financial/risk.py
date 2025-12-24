@@ -8,7 +8,7 @@
 # AUDIT REMEDIATION (2025-12-24 - PROFIT OPTIMIZATION):
 # 1. DRAWDOWN BRAKE: Defensive scaling. If Equity < 98% of Start, Risk *= 0.5.
 # 2. VOLATILITY TARGETING: Strict 20% Annual Target implementation.
-# 3. META-SCALING: Power Law scaling (conf^2) for conviction.
+# 3. ADVANCED SIZING: Dynamic Kelly Criterion scaled by ML Confidence.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -81,7 +81,7 @@ class RiskManager:
             if usdjpy and usdjpy > 0: return 1.0 / usdjpy
             if s == "USDJPY" and price > 0: return 1.0 / price
             return 0.0065 # Fallback ~150
-
+        
         # GBP Pairs (Quote = GBP). Need GBP->USD (GBPUSD).
         if s.endswith("GBP"):
             gbpusd = get_price("GBPUSD")
@@ -115,7 +115,7 @@ class RiskManager:
             if nzdusd: return nzdusd
             if s == "NZDUSD" and price > 0: return price
             return 0.60
-
+            
         # Default fallback
         return 1.0
 
@@ -131,21 +131,20 @@ class RiskManager:
         contract_size_override: Optional[float] = None # NEW: Allow overriding lot size
     ) -> Tuple[Trade, float]:
         """
-        Calculates position size using the configured method (Volatility Targeting or Inverse-Volatility).
+        Calculates position size using Volatility Targeting + Dynamic Kelly.
         Handles risk clamping, dead pair protection, and fractional scaling.
         """
         symbol = context.symbol
         balance = context.account_equity
         price = context.price
-
+        
         # 1. Retrieve Config Parameters
         risk_conf = CONFIG.get('risk_management', {})
         sizing_method = risk_conf.get('sizing_method', 'volatility_targeting')
-
+        
         # Determine Contract Size
-        # Priority: Override arg > Config > Default 100k
         c_size = contract_size_override if contract_size_override else risk_conf.get('contract_size', RiskManager.DEFAULT_CONTRACT_SIZE)
-
+        
         # --- CPPI SAFE EQUITY CUSHION ---
         cppi_floor_pct = risk_conf.get('cppi_floor_pct', 0.08)
         
@@ -157,49 +156,39 @@ class RiskManager:
         
         cppi_mult = risk_conf.get('cppi_multiplier', 2.0)
         risk_budget_usd = cushion * cppi_mult
-
+        
         # Clamp Risk Budget to Hard Max Risk %
-        # SAFEMODE FIX: Lowered hard cap back to 1.5% in Config, logic respects it here.
         base_risk_pct = risk_conf.get('max_risk_percent', 1.5) / 100.0
         max_risk_usd = balance * base_risk_pct
         
         # Effective Risk Budget: Min(CPPI Budget, Hard Cap)
-        # If cushion is 0 (below floor), we risk 0.
         final_risk_usd = min(risk_budget_usd, max_risk_usd)
-
+        
         # --- OPTIMIZATION: DRAWDOWN BRAKE ---
         # If we are in a minor drawdown (> 2%), cut risk in half to prevent spirals.
-        # This gives the bot more "bullets" to recover.
         if balance < (start_equity * 0.98):
             final_risk_usd *= 0.5
-            # logger.debug(f"{symbol}: Drawdown Brake Active. Risk Halved.")
-
+            
         # --- ADAPTIVE STOP LOSS (ATR Based) ---
         atr_mult_sl = risk_conf.get('stop_loss_atr_mult', 1.5)
         atr_mult_tp = risk_conf.get('take_profit_atr_mult', 2.0)
-
+        
         # ATR Fallback Logic
         if atr and atr > 0:
             stop_dist = atr * atr_mult_sl
         else:
             # Fallback 0.1% of price if ATR missing or zero
             stop_dist = price * 0.001 * atr_mult_sl
-            # logger.debug(f"{symbol}: ATR Fallback Used (ATR={atr})")
-
+            
         # --- DEAD PAIR PROTECTION (SPREAD CLAMP) ---
-        # If ATR is too small relative to spread, we must widen stop or risk instant stop-out.
         pip_val, _ = RiskManager.get_pip_info(symbol)
-        
-        # Forensic Fix: Dynamic Spread Buffer
         spread_assumed = CONFIG.get('forensic_audit', {}).get('spread_pips', {}).get(symbol, 1.5)
         
-        # Minimum Stop Loss must be at least 3.0x Spread (Volatility Gate logic applied to risk)
+        # Minimum Stop Loss must be at least 3.0x Spread
         min_stop_req = (spread_assumed * 3.0 * pip_val)
-        
-        # CLAMP: Widen stop to minimum if volatility is compressed
         if stop_dist < min_stop_req:
              stop_dist = min_stop_req
-
+             
         sl_pips = stop_dist / pip_val
 
         # --- CROSS-PAIR PIP VALUE CALCULATION ---
@@ -208,7 +197,7 @@ class RiskManager:
         
         if conversion_rate <= 0:
             return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, "Conversion Error"), 0.0
-
+            
         usd_per_pip_per_lot = pip_value_quote * conversion_rate
         loss_per_lot = sl_pips * usd_per_pip_per_lot
         
@@ -217,60 +206,54 @@ class RiskManager:
         # --- SIZING METHOD SELECTION ---
         
         if sizing_method == 'volatility_targeting':
-            # --- METHOD 1: VOLATILITY TARGETING ---
-            # Formula: TargetExposure = (Equity * TargetAnnualVol) / InstrumentAnnualVol
-            # Note: We limit this by the CPPI/MaxRisk calculated above as a ceiling.
+            # --- METHOD 1: VOLATILITY TARGETING + KELLY ---
             
-            # SAFE FIX: Target Vol reverted to 0.20 in Config
+            # A. Volatility Scalar
             target_ann_vol = risk_conf.get('target_annual_volatility', 0.20)
-            
-            # Annualize the short-term volatility (M5 data assumption: 288 bars/day * 252 days)
-            # Volatility feature is typically std dev of returns.
             if volatility <= 1e-9: volatility = 0.001
-            
-            # M5 Annualization Factor ~ sqrt(72576) approx 269.4
-            ann_factor = 269.4
+            ann_factor = 269.4 # M5 approximation
             realized_ann_vol = volatility * ann_factor
-            
-            # Volatility Scalar (e.g., 0.20 / 0.13 = ~1.5 leverage)
             vol_scalar = target_ann_vol / realized_ann_vol
             
-            # Fractional Kelly Application
-            # SAFE FIX: Kelly Fraction reverted to 0.25 in Config
-            kelly_fraction = risk_conf.get('kelly_fraction', 0.25)
+            # B. Dynamic Kelly Criterion (Step 5)
+            # Formula: f = (p(b+1) - 1) / b
+            # p = Win Rate, b = Risk/Reward Ratio
+            p = context.win_rate
+            b = context.risk_reward_ratio
+            if b <= 0: b = 1.0
             
-            # REMEDIATION FIX: POWER LAW SCALING (Penalty Applied)
-            # If AI is 55% sure, we bet 0.55^2 = 0.30 (30%) of the calculated size.
-            # This strongly penalizes low-confidence signals, preventing noise trading.
-            conviction = conf * conf
+            kelly_optimal = (p * (b + 1) - 1) / b
+            # Clamp Kelly to valid range [0, 1] to prevent negative or infinite sizing
+            kelly_optimal = max(0.0, min(kelly_optimal, 1.0))
             
-            # Apply Fraction
-            final_scalar = vol_scalar * kelly_fraction * conviction
+            # Apply "Fractional Kelly" setting (e.g. 0.25)
+            kelly_fraction_cfg = risk_conf.get('kelly_fraction', 0.25)
+            
+            # C. ML Confidence Scaling (Power Law)
+            # Strongly penalize low-confidence signals (e.g. 0.6^2 = 0.36 multiplier)
+            confidence_scalar = conf * conf
+            
+            # Combine Factors
+            final_scalar = vol_scalar * (kelly_optimal * kelly_fraction_cfg) * confidence_scalar
             
             # Calculate Target Exposure in USD
             target_exposure = balance * final_scalar
             
-            # Convert Exposure to Lots: Exposure / (ContractSize * Price * Conversion)
-            # Note: Price * Conversion gives Price in USD approx
+            # Convert Exposure to Lots
             notional_value_per_lot = c_size * price * conversion_rate
-            
             if notional_value_per_lot > 0:
                 lots = target_exposure / notional_value_per_lot
                 
             # --- CEILING CHECK ---
-            # Ensure this lot size doesn't violate the dollar risk budget (Max Loss)
-            # If (Lots * LossPerLot) > FinalRiskUSD -> Clamp it
+            # Ensure this lot size doesn't violate the dollar risk budget
             current_risk_dollars = lots * loss_per_lot
             if current_risk_dollars > final_risk_usd:
                 lots = final_risk_usd / loss_per_lot if loss_per_lot > 0 else 0.0
 
         else:
             # --- METHOD 2: INVERSE VOLATILITY (LEGACY) ---
-            # Simple fixed dollar risk / stop loss distance
             if loss_per_lot > 0:
                 lots = final_risk_usd / loss_per_lot
-            
-            # Scalar based on confidence
             lots *= conf
 
         # --- CORRELATION PENALTY ---
@@ -284,21 +267,17 @@ class RiskManager:
         max_lev = risk_conf.get('max_leverage', 30.0)
         
         # Leverage Cap
-        # Max Exposure = Balance * MaxLeverage
-        # Lots <= MaxExposure / NotionalPerLot
         notional = c_size * price * conversion_rate
         if notional > 0:
             max_lots_lev = (balance * max_lev) / notional
             lots = min(lots, max_lots_lev)
-
+            
         lots = max(min_lot, min(lots, max_lot))
         lots = round(lots, 2)
         
         actual_risk_usd = lots * loss_per_lot
-
-        # Sanitizer for comment formatting
         atr_val = atr if atr is not None else 0.0
-
+        
         # Construct Trade Object
         trade = Trade(
             symbol=symbol,
@@ -307,7 +286,7 @@ class RiskManager:
             entry_price=price,
             stop_loss=stop_dist,
             take_profit=stop_dist * (atr_mult_tp / atr_mult_sl),
-            comment=f"{'VolTgt' if sizing_method == 'volatility_targeting' else 'InvVol'}|R:${actual_risk_usd:.0f}|ATR:{atr_val:.5f}"
+            comment=f"{'Kelly' if sizing_method == 'volatility_targeting' else 'InvVol'}|R:${actual_risk_usd:.0f}|ATR:{atr_val:.5f}"
         )
         
         return trade, actual_risk_usd
@@ -326,7 +305,7 @@ class HierarchicalRiskParity:
             # 1. Compute Correlation Matrix
             corr = returns_df.corr().fillna(0)
             
-            # 2. Compute Distance Matrix (d = sqrt(2*(1-rho)))
+            # 2. Compute Distance Matrix
             dist = ssd.pdist(corr, metric='euclidean')
             
             # 3. Hierarchical Clustering (Linkage)
@@ -480,7 +459,6 @@ class SessionGuard:
         now_local = datetime.now(self.market_tz)
         weekday = now_local.weekday()
         current_time = now_local.time()
-
         if weekday == 5: return False
         if weekday == 6 and current_time < self.monday_start: return False
         if weekday == 4 and current_time > self.friday_cutoff: return False

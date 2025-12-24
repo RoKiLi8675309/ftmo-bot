@@ -6,11 +6,9 @@
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
 # AUDIT REMEDIATION (2025-12-24 - SNIPER MODE V3):
-# 1. HYPER-CONFIDENCE: Optimizer forced to search 0.80 - 0.95 probability.
-#    (Forensic Analysis: 0.70-0.79 caused $7k losses. >0.85 was profitable.)
-# 2. REALISTIC TARGETS: Barrier Width cap reduced to 3.0x ATR.
-#    (Forensic Analysis: >3.5 ATR barriers timed out or reversed.)
-# 3. SCORING: Aggressive penalty for negative PnL to prune losers faster.
+# 1. ENSEMBLES: Implemented BaggingClassifier for Model Stability.
+# 2. ADAPTIVE BARRIERS: Optuna tuning for Volatility-Adjusted Barriers.
+# 3. SCORING: Aggressive penalty for negative PnL.
 # =============================================================================
 import sys
 import os
@@ -33,7 +31,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
 from joblib import Parallel, delayed
-from river import compose, preprocessing, forest, metrics
+from river import compose, preprocessing, forest, metrics, ensemble
 
 # Ensure project root is in sys.path to resolve 'shared' and 'engines' modules
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -54,7 +52,6 @@ setup_logging("Research")
 log = logging.getLogger("Research")
 
 # --- 1. TELEMETRY & REPORTING UTILS ---
-
 class EmojiCallback:
     """
     Injects FTMO-style Emojis and RICH TELEMETRY into Optuna Trial reporting.
@@ -165,7 +162,6 @@ def process_data_into_bars(symbol: str, n_ticks: int = 2000000) -> pd.DataFrame:
     return df_bars
 
 # --- 2. WORKER FUNCTIONS (ISOLATED PROCESSES) ---
-
 def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url: str) -> None:
     """
     ISOLATED WORKER FUNCTION: Runs in a separate process.
@@ -197,23 +193,21 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'delta': trial.suggest_float('delta', 1e-7, 1e-4, log=True), # Low sensitivity to drift
                 
                 # REMEDIATION (Step 2 - SNIPER MODE): STRICT FILTER RANGES
-                # We do not allow thresholds > 0.95. If the trade requires 0.99 to be safe, it's unsafe.
                 'entropy_threshold': trial.suggest_float('entropy_threshold', 0.85, 0.95),
                 'vpin_threshold': trial.suggest_float('vpin_threshold', 0.85, 0.95),
                 
                 'tbm': {
-                    # AUDIT FIX: SNIPER V3 - REALISTIC TARGETS
-                    # Stop is 1.0 ATR. Target 1.5 - 3.0 ATR.
-                    # Anything > 3.5 failed in previous trials.
+                    # AUDIT FIX: SNIPER V3 - REALISTIC ADAPTIVE TARGETS
+                    # Barrier Width is now a MULTIPLIER for volatility.
+                    # We tune this to find the optimal "R-Multiple" relative to volatility.
                     'barrier_width': trial.suggest_float('barrier_width', 1.5, 3.0),
-                    'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 90), # Narrowed Window
-                    # Stricter Drift Threshold to reduce soft-label noise
+                    'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 90),
+                    
+                    # Adaptive Drift Threshold (Soft Labeling)
                     'drift_threshold': trial.suggest_float('drift_threshold', 0.7, 1.5)
                 },
                 
                 # AUDIT FIX: SNIPER V3 - HYPER CONFIDENCE
-                # 0.70-0.79 caused huge losses. 0.89 was profitable.
-                # Shift range to 0.80 - 0.95.
                 'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.80, 0.95)
             })
             
@@ -319,7 +313,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         if len(study.trials) == 0:
             log.warning(f"No trials found for {symbol}. Skipping finalization.")
             return
-
+            
         best_params = study.best_params
         
         # 3. Save Best Params
@@ -362,7 +356,6 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         log.error(f"CRITICAL FINALIZE ERROR ({symbol}): {e}")
 
 # --- 3. MAIN PIPELINE CLASS ---
-
 class ResearchPipeline:
     def __init__(self):
         self.symbols = CONFIG['trading']['symbols']
@@ -384,19 +377,27 @@ class ResearchPipeline:
         if params is None:
             params = CONFIG['online_learning']
         
-        # FORENSIC REMEDIATION: Using ARFClassifier with F1 Score
+        # Base Classifier: ARF
+        base_clf = forest.ARFClassifier(
+            n_models=params.get('n_models', 25),
+            seed=42,
+            grace_period=params.get('grace_period', 200),
+            delta=params.get('delta', 1e-5),
+            split_criterion='gini',
+            leaf_prediction='mc',
+            max_features='log2',
+            lambda_value=6,
+            metric=metrics.F1()
+        )
+
+        # ENSEMBLE: Bagging (River)
+        # Wraps ARF in a Bagging Ensemble to reduce variance in Online Learning
         return compose.Pipeline(
             preprocessing.StandardScaler(),
-            forest.ARFClassifier(
-                n_models=params.get('n_models', 25),
-                seed=42,
-                grace_period=params.get('grace_period', 200),
-                delta=params.get('delta', 1e-5),
-                split_criterion='gini',
-                leaf_prediction='mc',
-                max_features='log2',
-                lambda_value=6,
-                metric=metrics.F1()
+            ensemble.BaggingClassifier(
+                model=base_clf,
+                n_models=5,  # Ensemble Size (5 ARFs)
+                seed=42
             )
         )
 
@@ -420,7 +421,7 @@ class ResearchPipeline:
         
         if not trade_log:
             return metrics
-
+            
         df = pd.DataFrame(trade_log)
         
         # Basic Stats
@@ -499,6 +500,7 @@ class ResearchPipeline:
         trials_per_worker = math.ceil(total_trials_per_symbol / workers_per_symbol)
         
         log.info(f"DISTRIBUTION: {workers_per_symbol} workers/symbol | {trials_per_worker} trials/worker")
+        
         for symbol in self.symbols:
             for _ in range(workers_per_symbol):
                 tasks.append((symbol, trials_per_worker, self.train_candles, self.db_url))
@@ -550,7 +552,7 @@ class ResearchPipeline:
             if not model_path.exists():
                 log.error(f"Model missing for {symbol}")
                 return []
-
+                
             with open(model_path, "rb") as f: model = pickle.load(f)
             
             params = CONFIG['online_learning'].copy()
