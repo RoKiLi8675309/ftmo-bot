@@ -24,7 +24,7 @@ import optuna
 import numpy as np
 import pandas as pd
 import psutil
-import yaml # Required for Auto-Deployment
+import yaml
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pathlib import Path
@@ -189,10 +189,13 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             params = CONFIG['online_learning'].copy()
             params.update({
                 'n_models': trial.suggest_int('n_models', 20, 50, step=5),
-                'grace_period': trial.suggest_int('grace_period', 100, 500),
-                'delta': trial.suggest_float('delta', 1e-7, 1e-4, log=True),
                 
-                # Strict Filters
+                # AUDIT FIX: High Patience for Sniper Mode
+                'grace_period': trial.suggest_int('grace_period', 100, 500), # Wait longer before split
+                'delta': trial.suggest_float('delta', 1e-7, 1e-4, log=True), # Low sensitivity to drift
+                
+                # REMEDIATION (Step 2 - SNIPER MODE): STRICT FILTER RANGES
+                # We do not allow thresholds > 0.95. If the trade requires 0.99 to be safe, it's unsafe.
                 'entropy_threshold': trial.suggest_float('entropy_threshold', 0.85, 0.95),
                 'vpin_threshold': trial.suggest_float('vpin_threshold', 0.85, 0.95),
                 
@@ -201,6 +204,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                     # Stop is 1.0 ATR (Config). Target must be 2.0 - 4.0 ATR.
                     'barrier_width': trial.suggest_float('barrier_width', 2.0, 4.0),
                     'horizon_minutes': trial.suggest_int('horizon_minutes', 15, 120),
+                    # Stricter Drift Threshold (0.5 - 1.0)
                     'drift_threshold': trial.suggest_float('drift_threshold', 0.5, 1.0)
                 },
                 
