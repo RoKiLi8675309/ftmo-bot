@@ -1,18 +1,17 @@
 # =============================================================================
-# config.yaml – PHOENIX STRATEGY V2.1 (REGIME AWARE SNIPER)
-# STATUS: SNIPER MODE ENABLED / REGIME GATES ACTIVE
+# config.yaml – PHOENIX STRATEGY V2.2 (HARDENED SNIPER)
+# STATUS: HIGH R:R / STRICT FILTERING
 #
 # AUDIT REMEDIATION (2025-12-24):
-# 1. REGIME GATES: Added KER (Efficiency) and FDI (Complexity) thresholds.
-# 2. VOLATILITY TARGETING: Strict 20% Annual Vol Target with Quarter Kelly.
-# 3. META-LABELING: ARF Meta-Labeler enabled (0.60 threshold).
-# 4. SAFETY: Drawdown Brake triggers at 2% DD (Risk Halving).
+# 1. RISK REWARD: Stop Loss tightened to 1.0x ATR. Targets 1.5x-3.0x.
+# 2. GATES: KER threshold raised to 0.40 (Must be trending).
+# 3. VOLATILITY GATE: Raised to 4.0x Spread to ensure room for profit.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
 env:
   initial_balance: 100000.0
-  mode: "RESEARCH" # OPTIONS: LIVE, RESEARCH, PAPER
+  mode: "RESEARCH" 
 
 # --- LOGGING CONFIGURATION ---
 logging:
@@ -25,8 +24,8 @@ logging:
 
 # --- BROKER CONNECTION ---
 mt5:
-  login: null # Set via Env Var
-  password: null # Set via Env Var
+  login: null 
+  password: null
   server: "FTMO-Server"
   path: "C:\\Program Files\\FTMO MetaTrader 5\\terminal64.exe"
   timeout_seconds: 5
@@ -92,7 +91,6 @@ features:
   use_cache: true
   window_size: 50
   
-  # Stationary Features
   use_log_returns: true
   use_vol_ratio: true
   use_normalized_rsi: true
@@ -109,7 +107,6 @@ features:
   
   d1_ema_period: 200
   entropy_window: 100
-  # AUDIT FIX: Tightened to 0.90 to filter chop/noise
   entropy_threshold: 0.90
   ofi_alpha: 0.1
   
@@ -125,18 +122,15 @@ features:
 # --- MICROSTRUCTURE FILTERS (REGIME GATES) ---
 microstructure:
   vpin_bucket_size: 1000
-  # AUDIT FIX: Tightened to 0.90 to filter toxic flow
   vpin_threshold: 0.90
   
-  # REGIME GATE 1: Kaufman Efficiency Ratio (KER)
-  # KER < 0.30 implies Noise/Chop. We only trade if > 0.30.
-  gate_ker_threshold: 0.30
+  # REGIME GATE 1: KER (Signal/Noise)
+  # AUDIT FIX: Raised to 0.40. Market must show 40% efficiency (trend) to trade.
+  gate_ker_threshold: 0.40
   
-  # REGIME GATE 2: Fractal Dimension Index (FDI)
-  # FDI > 1.50 implies Random Walk (Pink Noise). We halt.
+  # REGIME GATE 2: FDI (Complexity)
   gate_fdi_threshold: 1.50
   
-  # ER (Legacy check, kept for safety)
   gate_er_threshold: 0.40
   
   hurst_threshold_mean_revert: 0.45
@@ -144,44 +138,41 @@ microstructure:
   hurst_threshold_random_high: 0.55
   hurst_threshold_trend: 0.55
   
-  # Order Flow Imbalance (OFI)
   use_ofi: true
   ofi_threshold: 0.1
 
-# --- RISK MANAGEMENT (CRITICAL) ---
+# --- RISK MANAGEMENT ---
 risk_management:
   account_currency: "USD"
   
-  # Sizing Method: "volatility_targeting" OR "inverse_volatility"
   sizing_method: "volatility_targeting"
   
-  # Volatility Targeting Params
-  target_annual_volatility: 0.20  # Strict Target (20% Annualized)
-  kelly_fraction: 0.25            # Safety factor (Quarter Kelly)
+  target_annual_volatility: 0.20
+  kelly_fraction: 0.25 
   
   base_risk_per_trade_percent: 1.0
   
-  # Hard Limits
   max_daily_loss_pct: 0.04
   max_total_loss_pct: 0.09
-  max_risk_percent: 1.5           # Hard Cap per trade (Account %)
-  max_leverage: 30.0              # Regulator cap
+  max_risk_percent: 1.5
+  max_leverage: 30.0
   max_lot_size: 50.0
   min_lot_size: 0.01
   
-  # CPPI (Capital Preservation)
-  cppi_floor_pct: 0.08            # Stop trading if equity drops >8% total
+  cppi_floor_pct: 0.08
   cppi_multiplier: 2.0
   
-  # Trade Management
-  stop_loss_atr_mult: 1.5
-  take_profit_atr_mult: 2.0
-  risk_timezone: "Europe/Prague"  # FTMO Timezone
+  # TRADE MANAGEMENT (HIGH R:R)
+  # AUDIT FIX: Tightened Stop to 1.0 ATR.
+  # With Targets of 2.0-3.0 ATR, this forces 1:2 to 1:3 R:R.
+  stop_loss_atr_mult: 1.0
+  take_profit_atr_mult: 2.0 # Default, overridden by optimizer barrier width
+  
+  risk_timezone: "Europe/Prague"
   
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  # Constraints
   max_trades_per_day: 50
   correlation_penalty_threshold: 0.8
   max_loss_usd: 2500.0
@@ -205,35 +196,31 @@ trading:
   magic_number: 621001
   slippage: 5
 
-# --- ONLINE LEARNING (RIVER ML) ---
+# --- ONLINE LEARNING ---
 online_learning:
   model_type: "ARFClassifier"
-  n_models: 25                    # Ensemble Size
+  n_models: 25
   
-  burn_in_periods: 1000           # Bars required before ANY inference
+  burn_in_periods: 1000
   
-  # Volatility Gate: Rejects Dead Markets
+  # Volatility Gate
   volatility_gate:
     enabled: true
-    min_atr_spread_ratio: 2.5     # ATR must be > 2.5x Spread to engage
+    # AUDIT FIX: Raised to 4.0. Spread must be negligible relative to ATR.
+    min_atr_spread_ratio: 4.0
   
-  # Adaptive Learning
   grace_period: 250
   delta: 0.00001
   
-  # Class Weights (Profit Focus)
   positive_class_weight: 2.0
   negative_class_weight: 2.0
   
-  # Meta-Labeling (The Gatekeeper)
-  meta_labeling_threshold: 0.60   # Must be >60% sure of profit
+  meta_labeling_threshold: 0.60
   
-  # Tree Parameters
   metric: "F1"
   max_features: 'sqrt'
   lambda_value: 6
   
-  # TBM (Triple Barrier Method) - Research specific
   tbm:
     horizon_minutes: 30
     barrier_width: 2.5
@@ -257,7 +244,6 @@ news_filter:
     JPY: ["BOJ", "Rate"]
 
 # --- FORENSIC AUDIT ASSUMPTIONS ---
-# Used for Gates when live spreads aren't available in backtest
 forensic_audit:
   enforce_spread: true
   max_slippage_pips: 2.0
@@ -269,9 +255,9 @@ forensic_audit:
     USDJPY: 1.5
     AUDJPY: 2.0
     GBPJPY: 2.5
-    XAUUSD: 30.0 # 3.0 pips (gold digits)
+    XAUUSD: 30.0
 
-# --- WFO OPTIMIZATION (HYPERPARAMS) ---
+# --- WFO OPTIMIZATION ---
 wfo:
   n_trials: 100
   train_years: 2
