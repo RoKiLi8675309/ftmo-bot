@@ -5,11 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - DOCUMENT COMPLIANCE):
-# 1. LOGIC PARITY: Exact match with engines/live/predictor.py.
-# 2. TRIGGER: Bollinger Band Reversion (2.5 SD).
-# 3. FILTER: ADX < 25 (Ranging Market) - Configurable.
-# 4. CONFIRMATION: Microstructure OFI Divergence (Z-Score > 1.0).
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - REGIME SWITCHING):
+# 1. PARITY: Matches engines/live/predictor.py logic strictly.
+# 2. REGIME A (TREND): KER > 0.6 + MTF Align -> Breakouts (Walking Bands).
+# 3. REGIME B (MEAN REV): KER < 0.3 -> Bollinger Reversals.
+# 4. REGIME C (NOISE): 0.3 <= KER <= 0.6 -> HOLD.
 # =============================================================================
 import logging
 import sys
@@ -27,7 +27,6 @@ from shared import (
     AdaptiveTripleBarrier,
     ProbabilityCalibrator,
     RiskManager,
-    enrich_with_d1_data,
     TradeContext,
     LogSymbols,
     Trade
@@ -84,6 +83,12 @@ class ResearchStrategy:
         self.last_price_map = {}
         self.bars_processed = 0
         
+        # MTF Simulation State (for backtesting consistency)
+        self.h4_buffer = deque(maxlen=200) # Store H4 closes for RSI
+        self.d1_buffer = deque(maxlen=200) # Store D1 closes for EMA
+        self.last_h4_idx = -1
+        self.last_d1_idx = -1
+        
         # --- FORENSIC RECORDER ---
         self.decision_log = deque(maxlen=1000)
         self.trade_events = []
@@ -91,14 +96,13 @@ class ResearchStrategy:
         self.feature_importance_counter = Counter() # Tracks top features
         
         # --- STRATEGY PARAMETERS (From Config) ---
-        # Fallback to defaults if config is missing
         feat_conf = CONFIG.get('features', {})
-        self.adx_threshold = feat_conf.get('adx', {}).get('threshold', 25)
         self.bb_dev = feat_conf.get('bollinger_bands', {}).get('std_dev', 2.5)
         
-        # Load Spread Assumptions for Gating
-        self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
-        self.default_spread = self.spread_map.get('default', 1.5)
+        # Thresholds (Regime Gates)
+        self.ker_trend = CONFIG.get('trading', {}).get('ker_threshold_trend', 0.6)
+        self.ker_mean_rev = CONFIG.get('trading', {}).get('ker_threshold_mean_rev', 0.3)
+        self.limit_offset = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.5)
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
@@ -110,6 +114,8 @@ class ResearchStrategy:
         low = snapshot.get_low(self.symbol)
         volume = snapshot.get_price(self.symbol, 'volume')
         
+        if price <= 0: return
+
         # Update Price Map for Risk Calculation
         self.last_price_map = snapshot.to_price_dict()
         if self.symbol not in self.last_price_map:
@@ -122,19 +128,19 @@ class ResearchStrategy:
         try:
             if hasattr(snapshot.timestamp, 'timestamp'):
                 timestamp = snapshot.timestamp.timestamp()
+                dt_ts = snapshot.timestamp
             else:
                 timestamp = float(snapshot.timestamp)
+                dt_ts = datetime.fromtimestamp(timestamp)
         except Exception:
             timestamp = 0.0
+            dt_ts = datetime.now()
 
         # Flow Volumes (Critical for OFI)
         buy_vol = snapshot.get_price(self.symbol, 'buy_vol')
         sell_vol = snapshot.get_price(self.symbol, 'sell_vol')
         
         # --- RETAIL FALLBACK LOGIC ---
-        # Mirrors engines/live/engine.py logic for backtesting parity.
-        # If the Aggregator didn't provide split volume (common in simple backtests),
-        # we estimate it here to prevent the FeatureEngineer from seeing 0/0.
         if buy_vol == 0 and sell_vol == 0:
             if self.last_price > 0:
                 if price > self.last_price:
@@ -152,8 +158,12 @@ class ResearchStrategy:
         
         self.last_price = price
 
+        # --- MTF CONTEXT SIMULATION ---
+        # Since backtest snapshot might not have ctx_d1/ctx_h4, we simulate it
+        # to ensure mtf_alignment feature works correctly.
+        context_data = self._simulate_mtf_context(price, dt_ts)
+
         # A. Feature Engineering
-        # (Generates frac_diff, micro_ofi, adx, bb, etc. internally)
         features = self.fe.update(
             price=price,
             timestamp=timestamp,
@@ -162,7 +172,8 @@ class ResearchStrategy:
             low=low,
             buy_vol=buy_vol,
             sell_vol=sell_vol,
-            time_feats={}
+            time_feats={},
+            context_data=context_data
         )
         
         if features is None: return
@@ -211,58 +222,57 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. STRATEGY LOGIC: GBP/JPY Regime-Adaptive Mean Reversion
+        # D. STRATEGY LOGIC: REGIME SWITCHING (KER & MTF)
         # ============================================================
         
-        # Extract Key Indicators
-        adx_val = features.get('adx', 50.0)
+        # Extract Core Indicators
+        ker_val = features.get('ker', 0.5)
+        mtf_align = features.get('mtf_alignment', 0.0) # 1.0 if aligned
         bb_upper = features.get('bb_upper', 999999.0)
         bb_lower = features.get('bb_lower', 0.0)
-        micro_ofi = features.get('micro_ofi', 0.0) # Z-Score
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
+        regime_label = "C (Noise)"
         
-        # --- CONDITION 1: REGIME IDENTIFICATION (FILTER) ---
-        # Logic: If ADX > Threshold, Market is Trending -> DISABLE Mean Reversion.
-        if adx_val > self.adx_threshold:
-            self.rejection_stats[f"Trend Mode (ADX {adx_val:.1f} > {self.adx_threshold})"] += 1
-            # We exit early because this strategy is strictly Mean Reversion
-            return 
-
-        # --- CONDITION 2: THE TRIGGER (BOLLINGER BANDS) ---
-        # Short Signal: Price > Upper Band
-        if price > bb_upper:
-            proposed_action = -1 # Sell
-        # Long Signal: Price < Lower Band
-        elif price < bb_lower:
-            proposed_action = 1 # Buy
+        # --- REGIME A: EFFICIENT TREND ---
+        if ker_val > self.ker_trend and mtf_align == 1.0:
+            regime_label = "A (Trend)"
+            # Trigger: Breakout / Walking the Bands
+            # Buy if Price > Upper Band (Momentum)
+            if price > bb_upper:
+                proposed_action = 1 # BUY
+            # Sell if Price < Lower Band (Momentum)
+            elif price < bb_lower:
+                proposed_action = -1 # SELL
+            else:
+                self.rejection_stats["Regime A: No Breakout"] += 1
+                
+        # --- REGIME B: MEAN REVERSION ---
+        elif ker_val < self.ker_mean_rev:
+            regime_label = "B (MeanRev)"
+            # Trigger: Reversal
+            # Sell if Price > Upper Band (Overextended)
+            if price > bb_upper:
+                proposed_action = -1 # SELL
+            # Buy if Price < Lower Band (Overextended)
+            elif price < bb_lower:
+                proposed_action = 1 # BUY
+            else:
+                self.rejection_stats["Regime B: Inside Bands"] += 1
+                
+        # --- REGIME C: NOISE ---
         else:
-            # Inside bands -> No Trigger
-            # self.rejection_stats["Inside Bands"] += 1 # Too noisy to log
-            return
+            # 0.3 <= KER <= 0.6 or Trend but misaligned
+            regime_label = "C (Noise)"
+            self.rejection_stats[f"Regime C: KER {ker_val:.2f} / Align {mtf_align}"] += 1
+            return # Explicit HOLD
 
-        # --- CONDITION 3: MICROSTRUCTURE CONFIRMATION (OFI) ---
-        # Logic: Wait for OFI to contradict price direction.
-        # If Price High (Short Trigger), we need Sellers (OFI < -threshold).
-        # If Price Low (Long Trigger), we need Buyers (OFI > threshold).
-        # Threshold: 1.0 Standard Deviations (Z-Score) - Relaxed from 2.0 to ensure execution.
-        
-        ofi_threshold = 1.0 
-        
-        if proposed_action == -1: # Selling
-            if micro_ofi >= -ofi_threshold: # Not enough selling pressure yet (Need < -1.0)
-                self.rejection_stats[f"OFI Wait Sell (OFI {micro_ofi:.2f} >= -{ofi_threshold})"] += 1
-                return
-        elif proposed_action == 1: # Buying
-            if micro_ofi <= ofi_threshold: # Not enough buying pressure yet (Need > 1.0)
-                self.rejection_stats[f"OFI Wait Buy (OFI {micro_ofi:.2f} <= {ofi_threshold})"] += 1
-                return
+        if proposed_action == 0:
+            return
 
         # ============================================================
         # E. ML CONFIRMATION & EXECUTION
         # ============================================================
-        
-        # If we passed the Hard Rules, we consult the ML Model for Sizing/Confidence
         
         try:
             # Primary Prediction
@@ -293,15 +303,65 @@ class ResearchStrategy:
                 return
 
             if is_profitable:
-                dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
-                # Discovery Mode is effectively disabled as we have hard rules now
-                self._execute_logic(confidence, price, features, broker, dt_timestamp, proposed_action, discovery_mode=False)
+                # Execute with Passive Limit Order logic simulated in Broker (handled by entry price logic there or here)
+                # In Backtester, we usually assume fill at close or next open. 
+                # To simulate Limit Order execution: We set limit at Bid/Ask +/- Offset.
+                self._execute_logic(confidence, price, features, broker, dt_ts, proposed_action, regime_label)
             else:
                 self.rejection_stats['Meta-Labeler Reject'] += 1
 
         except Exception as e:
             if self.debug_mode: logger.error(f"Strategy Error: {e}")
             pass
+
+    def _simulate_mtf_context(self, price: float, dt: datetime) -> Dict[str, Any]:
+        """
+        Approximates D1 and H4 context from the M5 stream for Backtesting.
+        This allows 'mtf_alignment' feature to function without external data feeds.
+        """
+        # H4 Approximation (Every 48 M5 bars)
+        # We define H4 bucket by hour // 4
+        h4_idx = (dt.day * 6) + (dt.hour // 4)
+        if h4_idx != self.last_h4_idx:
+            self.h4_buffer.append(price)
+            self.last_h4_idx = h4_idx
+            
+        # D1 Approximation (Every day)
+        d1_idx = dt.toordinal()
+        if d1_idx != self.last_d1_idx:
+            self.d1_buffer.append(price)
+            self.last_d1_idx = d1_idx
+            
+        # Calculate Context
+        ctx = {'d1': {}, 'h4': {}}
+        
+        # D1 EMA 200
+        if len(self.d1_buffer) > 0:
+            # Simple simulation: Mean of buffer as proxy for EMA if buffer small, else EMA
+            arr = np.array(self.d1_buffer)
+            # Efficient EMA calc on last value
+            ema = np.mean(arr) # Fallback to mean for simplicity in simulation or implement recursive
+            ctx['d1']['ema200'] = ema
+            
+        # H4 RSI 14
+        if len(self.h4_buffer) > 14:
+            arr = np.array(self.h4_buffer)
+            changes = np.diff(arr)
+            gains = changes[changes > 0]
+            losses = -changes[changes < 0]
+            avg_gain = np.mean(gains[-14:]) if len(gains) > 0 else 0
+            avg_loss = np.mean(losses[-14:]) if len(losses) > 0 else 0
+            
+            if avg_loss == 0:
+                rsi = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+            ctx['h4']['rsi'] = rsi
+        else:
+            ctx['h4']['rsi'] = 50.0
+            
+        return ctx
 
     def _inject_auxiliary_data(self):
         """Injects static approximations ONLY if missing."""
@@ -313,7 +373,7 @@ class ResearchStrategy:
             if sym not in self.last_price_map:
                 self.last_price_map[sym] = price
 
-    def _execute_logic(self, confidence, price, features, broker, timestamp: datetime, action_int: int, discovery_mode: bool):
+    def _execute_logic(self, confidence, price, features, broker, timestamp: datetime, action_int: int, regime: str):
         """Decides whether to enter a trade using Volatility Targeting."""
         
         # 1. Signal Threshold
@@ -383,20 +443,15 @@ class ResearchStrategy:
             timestamp_created=timestamp,
             stop_loss=sl_price,
             take_profit=tp_price,
-            comment=f"{trade_intent.comment}|Prob:{confidence:.2f}|{'DISC' if discovery_mode else 'AI'}"
+            comment=f"{trade_intent.comment}|Regime:{regime}|MTF:{features.get('mtf_alignment',0):.0f}|Limit:{self.limit_offset}p"
         )
         
         broker.submit_order(order)
         
         # Track Features for Explainability
         imp_feats = []
-        if features.get('adx', 0) < self.adx_threshold: imp_feats.append('Ranging_Mode')
-        if features.get('bb_position', 0.5) > 1.0: imp_feats.append('BB_Upper_Break')
-        elif features.get('bb_position', 0.5) < 0.0: imp_feats.append('BB_Lower_Break')
-        
-        micro_ofi = features.get('micro_ofi', 0.0)
-        if micro_ofi > 1.0: imp_feats.append('OFI_Strong_Buy')
-        elif micro_ofi < -1.0: imp_feats.append('OFI_Strong_Sell')
+        imp_feats.append(regime)
+        if features.get('mtf_alignment', 0) == 1.0: imp_feats.append('MTF_Aligned')
         
         for f in imp_feats:
             self.feature_importance_counter[f] += 1
@@ -408,13 +463,13 @@ class ResearchStrategy:
             'conf': confidence,
             'vpin': features.get('vpin', 0),
             'entropy': features.get('entropy', 0),
-            'ker': features.get('ker', 0),
+            'ker': current_ker,
             'fdi': features.get('fdi', 0),
             'atr': current_atr,
             'volatility': volatility,
             'frac_diff': features.get('frac_diff', 0.0),
-            'micro_ofi': micro_ofi,
-            'forced': discovery_mode,
+            'micro_ofi': features.get('micro_ofi', 0.0),
+            'regime': regime,
             'top_feats': imp_feats
         })
 
@@ -431,11 +486,8 @@ class ResearchStrategy:
             return f"AUTOPSY: No trades. Status: {status}. Top Rejections: {{{reject_str}}}. Bars processed: {self.bars_processed}"
         
         avg_conf = np.mean([t['conf'] for t in self.trade_events])
-        avg_vpin = np.mean([t['vpin'] for t in self.trade_events]) 
+        avg_ker = np.mean([t['ker'] for t in self.trade_events]) 
         avg_ofi = np.mean([t['micro_ofi'] for t in self.trade_events]) 
-        avg_frac = np.mean([t['frac_diff'] for t in self.trade_events]) 
-        
-        forced_count = sum(1 for t in self.trade_events if t['forced'])
         
         sorted_rejects = sorted(self.rejection_stats.items(), key=lambda item: item[1], reverse=True)
         reject_str = ", ".join([f"{k}: {v}" for k, v in sorted_rejects[:5]])
@@ -444,20 +496,12 @@ class ResearchStrategy:
         top_features = self.feature_importance_counter.most_common(5)
         feat_str = str(top_features)
         
-        try:
-            conf_values = [t['conf'] for t in self.trade_events]
-            conf_bins = np.histogram(conf_values, bins=5, range=(0.0, 1.0))[0]
-            dist_str = f"{list(conf_bins)}"
-        except Exception:
-            dist_str = "[]"
-
         report = (
             f"\n --- 💀 STRATEGY AUTOPSY ({self.symbol}) ---\n"
-            f" Trades: {len(self.trade_events)} (Discovery Mode: {forced_count})\n"
-            f" Avg Conf: {avg_conf:.2f} | Dist: {dist_str}\n"
-            f" Avg VPIN: {avg_vpin:.2f} | Avg OFI: {avg_ofi:.2f}\n"
-            f" Avg FracDiff: {avg_frac:.4f}\n"
-            f" Top Drivers: {feat_str}\n"
+            f" Trades: {len(self.trade_events)}\n"
+            f" Avg Conf: {avg_conf:.2f}\n"
+            f" Avg KER: {avg_ker:.2f} | Avg OFI: {avg_ofi:.2f}\n"
+            f" Top Regimes: {feat_str}\n"
             f" Rejections: {{{reject_str}}}\n"
             f" ----------------------------------------\n"
         )

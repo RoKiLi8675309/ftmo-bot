@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – PHOENIX STRATEGY V2.5.3 (GBP/JPY REGIME ADAPTIVE)
-# STATUS: GOLDEN CONFIG / MEAN REVERSION OPTIMIZED
+# config.yaml – PHOENIX STRATEGY V3.0 (MTF REGIME ADAPTIVE)
+# STATUS: GOLDEN CONFIG / MULTI-TIMEFRAME ENABLED
 #
-# AUDIT REMEDIATION (2025-12-25 - QUANT OVERHAUL):
-# 1. FRACDIFF: Tuned d=0.4 for GBP/JPY stationarity preservation.
-# 2. STRATEGY: Added Bollinger Bands (Trigger) and ADX (Filter) parameters.
-# 3. HMM GATE: Disabled (0.0) in favor of ADX/OFI logic.
-# 4. DISCOVERY: Smart Discovery enabled.
+# AUDIT REMEDIATION (2025-12-25 - TOTAL OVERHAUL):
+# 1. EXECUTION: limit_order_offset_pips added for passive entry.
+# 2. REGIMES: ker_threshold parameters added for Trend/MeanRev switching.
+# 3. CONTEXT: H4/D1 Context enabled in features.
+# 4. QUANT: FracDiff d=0.4 standardized for GBP/JPY stationarity.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -197,7 +197,7 @@ risk_management:
   hard_stop_equity_usd: 80000.0
   min_stop_loss_pips: 5.0
 
-# --- TRADING PORTFOLIO ---
+# --- TRADING PORTFOLIO & REGIMES ---
 trading:
   symbols:
     - "GBPJPY"
@@ -213,19 +213,28 @@ trading:
   timeframe: "M5"
   magic_number: 621001
   slippage: 5
+  
+  # --- EXECUTION OPTIMIZATION (NEW) ---
+  # Passive Entry: Place Limit Order x pips better than market
+  limit_order_offset_pips: 0.5
+  
+  # --- REGIME THRESHOLDS (NEW) ---
+  # Kaufman Efficiency Ratio (KER) Gates
+  ker_threshold_trend: 0.60     # > 0.60 = Efficient Trend
+  ker_threshold_mean_rev: 0.30  # < 0.30 = Choppy / Mean Reversion
 
 # --- ONLINE LEARNING (GOLDEN CONFIG) ---
 online_learning:
   model_type: "ARFClassifier"
   
   # GOLDEN CONFIGURATION
-  n_models: 30          # Range 30-50
-  grace_period: 250     # Range 200-500
-  delta: 0.00001        # 1e-5 (Conservative)
-  warning_delta: 0.001  # 1e-3 (Early Warning)
-  lambda_value: 10      # Poisson Weight
-  max_features: 'log2'  # Decorrelation
-  metric: "LogLoss"     # Probability Calibration
+  n_models: 30       # Range 30-50
+  grace_period: 250      # Range 200-500
+  delta: 0.00001         # 1e-5 (Conservative)
+  warning_delta: 0.001   # 1e-3 (Early Warning)
+  lambda_value: 10       # Poisson Weight
+  max_features: 'log2'   # Decorrelation
+  metric: "LogLoss"      # Probability Calibration
   
   burn_in_periods: 1000
   
@@ -277,7 +286,7 @@ forensic_audit:
 
 # --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 200
+  n_trials: 100
   train_years: 2
   test_months: 6
   min_trades_optimization: 10

@@ -8,9 +8,9 @@
 #
 # PHOENIX STRATEGY UPGRADE (2025-12-25 - LIVE PARITY):
 # 1. PARITY: Logic matched 1:1 with engines/research/strategy.py.
-# 2. STRATEGY: ADX Filter (< 25) -> BB Trigger (2.5 SD) -> OFI Confirm (Z > 1.0).
-# 3. FALLBACK: Auto-detects missing L2 data and applies Tick Rule locally.
-# 4. ROBUSTNESS: Persists Feature Engineer state (FracDiff/Welford memory).
+# 2. REGIME A (TREND): KER > 0.6 + MTF Align -> Breakouts.
+# 3. REGIME B (MEAN REV): KER < 0.3 -> Reversals.
+# 4. REGIME C (NOISE): HOLD.
 # =============================================================================
 import logging
 import pickle
@@ -37,7 +37,6 @@ from shared import (
     OnlineFeatureEngineer,
     AdaptiveTripleBarrier,
     ProbabilityCalibrator,
-    enrich_with_d1_data,
     VolumeBar,
     RiskManager
 )
@@ -103,17 +102,15 @@ class MultiAssetPredictor:
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
         self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.0)
         
-        # Regime Gates
-        self.min_ker_threshold = CONFIG['microstructure'].get('gate_ker_threshold', 0.10)
-        self.fdi_min_random = CONFIG['microstructure'].get('fdi_min_random', 1.48)
-        self.fdi_max_random = CONFIG['microstructure'].get('fdi_max_random', 1.52)
-        
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- STRATEGY PARAMETERS (From Config) ---
+        # --- STRATEGY PARAMETERS (Regime & Thresholds) ---
         feat_conf = CONFIG.get('features', {})
-        self.adx_threshold = feat_conf.get('adx', {}).get('threshold', 25)
         self.bb_dev = feat_conf.get('bollinger_bands', {}).get('std_dev', 2.5)
+        
+        # Regime Thresholds
+        self.ker_trend = CONFIG.get('trading', {}).get('ker_threshold_trend', 0.6)
+        self.ker_mean_rev = CONFIG.get('trading', {}).get('ker_threshold_mean_rev', 0.3)
         
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
@@ -166,10 +163,10 @@ class MultiAssetPredictor:
             self.meta_labelers[sym] = MetaLabeler()
             self.calibrators[sym] = ProbabilityCalibrator()
 
-    def process_bar(self, symbol: str, bar: VolumeBar, context_d1: Dict[str, Any] = None) -> Optional[Signal]:
+    def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop.
+        Executes the Learn-Predict Loop with Regime Switching.
         """
         if symbol not in self.symbols: return None
         
@@ -192,8 +189,6 @@ class MultiAssetPredictor:
         sell_vol = getattr(bar, 'sell_vol', 0.0)
         
         # --- RETAIL FALLBACK (PARITY WITH RESEARCH) ---
-        # If flows are zero (missing L2), estimate using Tick Rule locally.
-        # This ensures FeatureEngineer never sees 0/0, preserving OFI stats.
         if buy_vol == 0 and sell_vol == 0:
             if not self.l2_missing_warned[symbol]:
                 logger.warning(f"⚠️ {symbol}: Zero Flow Detected. Using Local Tick Rule Fallback.")
@@ -216,7 +211,7 @@ class MultiAssetPredictor:
         
         self.last_close_prices[symbol] = bar.close
 
-        # 1. Feature Engineering
+        # 1. Feature Engineering (Now digesting D1/H4 Context)
         features = fe.update(
             price=bar.close,
             timestamp=bar.timestamp,
@@ -224,14 +219,12 @@ class MultiAssetPredictor:
             high=bar.high,
             low=bar.low,
             buy_vol=buy_vol,
-            sell_vol=sell_vol
+            sell_vol=sell_vol,
+            context_data=context_data # Pass D1/H4 data
         )
         
         if features is None: return None
         
-        if context_d1:
-            features = enrich_with_d1_data(features, context_d1, bar.close)
-
         # Update Feature Stats (Rolling Average for Monitoring)
         alpha = 0.01
         feat_stats['avg_ker'] = (1 - alpha) * feat_stats.get('avg_ker', 0.5) + alpha * features.get('ker', 0.5)
@@ -277,47 +270,49 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
 
         # ============================================================
-        # 4. STRATEGY LOGIC: Regime-Adaptive Mean Reversion
+        # 4. STRATEGY LOGIC: REGIME SWITCHING (KER & MTF)
         # ============================================================
         
-        adx_val = features.get('adx', 50.0)
+        # Extract Core Indicators
+        ker_val = features.get('ker', 0.5)
+        mtf_align = features.get('mtf_alignment', 0.0) # 1.0 if aligned
         bb_upper = features.get('bb_upper', 999999.0)
         bb_lower = features.get('bb_lower', 0.0)
-        micro_ofi = features.get('micro_ofi', 0.0) # Z-Score
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
+        regime_label = "C (Noise)"
         
-        # --- CONDITION 1: REGIME IDENTIFICATION (FILTER) ---
-        # Logic: If ADX > Threshold, Market is Trending -> DISABLE Mean Reversion.
-        if adx_val > self.adx_threshold:
-            stats[f"Trend Mode (ADX {adx_val:.1f})"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "Trend Mode"})
-
-        # --- CONDITION 2: THE TRIGGER (BOLLINGER BANDS) ---
-        # Short Signal: Price > Upper Band
-        if bar.close > bb_upper:
-            proposed_action = -1 # Sell
-        # Long Signal: Price < Lower Band
-        elif bar.close < bb_lower:
-            proposed_action = 1 # Buy
-        else:
-            # Inside bands -> No Trigger
-            # stats["Inside Bands"] += 1 # Too noisy
-            return Signal(symbol, "HOLD", 0.0, {"reason": "Inside Bands"})
-
-        # --- CONDITION 3: MICROSTRUCTURE CONFIRMATION (OFI) ---
-        # Threshold: 1.0 SD (Relaxed from 2.0 to ensure execution)
-        ofi_threshold = 1.0 
-        
-        if proposed_action == -1: # Selling
-            if micro_ofi >= -ofi_threshold: # Need < -1.0
-                stats[f"OFI Wait Sell ({micro_ofi:.2f})"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "OFI Wait Sell"})
+        # --- REGIME A: EFFICIENT TREND ---
+        if ker_val > self.ker_trend and mtf_align == 1.0:
+            regime_label = "A (Trend)"
+            # Trigger: Breakout / Walking the Bands
+            if bar.close > bb_upper:
+                proposed_action = 1 # BUY
+            elif bar.close < bb_lower:
+                proposed_action = -1 # SELL
+            else:
+                stats["Regime A: No Breakout"] += 1
                 
-        elif proposed_action == 1: # Buying
-            if micro_ofi <= ofi_threshold: # Need > 1.0
-                stats[f"OFI Wait Buy ({micro_ofi:.2f})"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "OFI Wait Buy"})
+        # --- REGIME B: MEAN REVERSION ---
+        elif ker_val < self.ker_mean_rev:
+            regime_label = "B (MeanRev)"
+            # Trigger: Reversal (Price outside -> mean revert)
+            if bar.close > bb_upper:
+                proposed_action = -1 # SELL
+            elif bar.close < bb_lower:
+                proposed_action = 1 # BUY
+            else:
+                stats["Regime B: Inside Bands"] += 1
+                
+        # --- REGIME C: NOISE ---
+        else:
+            # 0.3 <= KER <= 0.6 or Trend but misaligned
+            regime_label = "C (Noise)"
+            stats[f"Regime C: KER {ker_val:.2f} / Align {mtf_align}"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "Regime C (Noise)"})
+
+        if proposed_action == 0:
+            return Signal(symbol, "HOLD", 0.0, {"reason": "No Trigger"})
 
         # 5. ML Confirmation & Execution
         
@@ -351,11 +346,8 @@ class MultiAssetPredictor:
                 
                 # FEATURE IMPORTANCE TRACKING
                 imp_feats = []
-                if adx_val < self.adx_threshold: imp_feats.append('Ranging_Mode')
-                if proposed_action == 1: imp_feats.append('BB_Lower_Break')
-                else: imp_feats.append('BB_Upper_Break')
-                if micro_ofi > 1.0: imp_feats.append('OFI_Strong_Buy')
-                elif micro_ofi < -1.0: imp_feats.append('OFI_Strong_Sell')
+                imp_feats.append(regime_label)
+                if mtf_align == 1.0: imp_feats.append('MTF_Aligned')
                 
                 for f in imp_feats:
                     self.feature_importance_counter[symbol][f] += 1
@@ -365,8 +357,9 @@ class MultiAssetPredictor:
                     "volatility": volatility, 
                     "atr": current_atr, 
                     "ker": current_ker, 
-                    "frac_diff": frac_diff,
-                    "ofi": micro_ofi,
+                    "frac_diff": frac_diff, 
+                    "regime": regime_label,
+                    "mtf_align": mtf_align,
                     "drivers": imp_feats
                 })
         else:
@@ -376,8 +369,7 @@ class MultiAssetPredictor:
         # Periodic Stats Logging
         if self.bar_counters[symbol] % 250 == 0:
             top_drivers = self.feature_importance_counter[symbol].most_common(3)
-            logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} FDI:{feat_stats['avg_fdi']:.2f} OFI:{feat_stats['avg_ofi']:.2f} FD:{frac_diff:.4f}")
-            logger.info(f"🔍 {symbol} Top Drivers: {top_drivers}")
+            logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} FDI:{feat_stats['avg_fdi']:.2f} Regimes:{top_drivers}")
             logger.info(f"🔍 {symbol} Rejections: {dict(stats)}")
             stats.clear()
             

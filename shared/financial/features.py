@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - RETAIL FALLBACK):
-# 1. FRACDIFF: Standardized to d=0.4 for GBP/JPY stationarity.
-# 2. MICROSTRUCTURE: Rewrote OFI for Volume Bars (Net Flow Z-Score).
-# 3. INDICATORS: StreamingBollingerBands & StreamingADX.
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - MTF CONTEXT):
+# 1. MTF MEMORY: OnlineFeatureEngineer now digests D1 & H4 Context.
+# 2. ALIGNMENT: Calculates 'mtf_alignment' (D1 Trend == H4 Trend == M5 Trend).
+# 3. QUANT KERNELS: FracDiff (d=0.4), OFI Z-Score, and VPIN preserved.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -758,7 +758,12 @@ class OnlineFeatureEngineer:
                high: Optional[float] = None, low: Optional[float] = None, 
                buy_vol: float = 0.0, sell_vol: float = 0.0, 
                time_feats: Dict[str, float] = None,
-               sentiment: float = 0.0) -> Dict[str, float]:
+               sentiment: float = 0.0,
+               context_data: Dict[str, Any] = None) -> Dict[str, float]:
+        """
+        Updates internal state and returns a feature vector.
+        NOW ACCEPTS: context_data (Dictionary with D1 and H4 keys).
+        """
         
         if time_feats is None:
             time_feats = {'sin_hour': 0.0, 'cos_hour': 0.0}
@@ -868,6 +873,31 @@ class OnlineFeatureEngineer:
             else:
                 lagged_feats[f'ret_lag_{i}'] = 0.0
 
+        # --- MULTI-TIMEFRAME CONTEXT (D1 & H4) ---
+        d1_trend = 0.0
+        h4_rsi_norm = 0.5
+        mtf_align = 0.0
+        
+        if context_data:
+            # D1
+            d1 = context_data.get('d1', {})
+            d1_ema = d1.get('ema200', 0.0)
+            if d1_ema > 0:
+                d1_trend = 1.0 if price > d1_ema else -1.0
+            
+            # H4
+            h4 = context_data.get('h4', {})
+            h4_rsi = h4.get('rsi', 50.0)
+            h4_rsi_norm = h4_rsi / 100.0
+            h4_trend = 1.0 if h4_rsi > 50 else -1.0
+            
+            # M5 Trend (Derived from MACD Sign)
+            m5_trend = 1.0 if tech_feats['macd_line'] > 0 else -1.0
+            
+            # Alignment: D1 == H4 == M5
+            if d1_trend != 0 and (d1_trend == h4_trend == m5_trend):
+                mtf_align = 1.0
+
         raw_features = {
             'atr': current_atr,
             'volatility': volatility_val,
@@ -883,8 +913,8 @@ class OnlineFeatureEngineer:
             'macd_norm': macd_norm,
             'macd_hist_norm': tech_feats['macd_hist'] / price,
             'atr_pct': current_atr / price, 
-            'adx': tech_feats.get('adx', 0.0), # NEW
-            'bb_width': tech_feats.get('bb_width', 0.0), # NEW
+            'adx': tech_feats.get('adx', 0.0), 
+            'bb_width': tech_feats.get('bb_width', 0.0), 
             
             # BB Relative Position (Price location within bands: 0=Lower, 1=Upper)
             'bb_position': (price - tech_feats.get('bb_lower', price)) / (tech_feats.get('bb_upper', price) - tech_feats.get('bb_lower', price)) if tech_feats.get('bb_width', 0) > 0 else 0.5,
@@ -895,8 +925,8 @@ class OnlineFeatureEngineer:
             'log_ret': ret_log,
             
             # Microstructure & Math
-            'frac_diff': fd_price,          # NEW: Fractionally Differentiated Price
-            'micro_ofi': micro_ofi_z,       # FIXED: Now Z-Scored Flow Imbalance
+            'frac_diff': fd_price,          # Fractionally Differentiated Price
+            'micro_ofi': micro_ofi_z,       # Z-Scored Flow Imbalance
             'entropy': entropy_val,
             'vpin': vpin_val,
             'hurst': hurst_val,
@@ -908,6 +938,11 @@ class OnlineFeatureEngineer:
             'ofi_trend': ofi_trend,
             'regime': regime_val,
             'vol_breakout': vol_breakout,
+            
+            # MTF Context (NEW)
+            'd1_trend': d1_trend,
+            'h4_rsi': h4_rsi_norm,
+            'mtf_alignment': mtf_align,
             
             # Physics
             'body_ratio': body_ratio,
@@ -1089,6 +1124,7 @@ def calculate_hurst(ts):
     return max(0.0, min(1.0, hurst))
 
 def enrich_with_d1_data(features: Dict[str, float], d1_data: Dict[str, float], current_price: float) -> Dict[str, float]:
+    # Kept for backward compatibility, but core logic now in OnlineFeatureEngineer.update
     if not d1_data: return features
     
     prev_high = d1_data.get('high', 0)
