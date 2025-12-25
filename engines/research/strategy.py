@@ -5,10 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - UNBLOCKED):
-# 1. FALLBACK TRIGGERS: Added RSI Extremes for Regime B (Mean Rev) to fix "Inside Bands" block.
-# 2. TREND RELAXATION: Allows strong KER (>0.7) to bypass MTF alignment check.
-# 3. PARITY: Maintained structure for live engine synchronization.
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - UNBLOCKED & RELAXED):
+# 1. LOGIC OVERHAUL: Relaxed entry triggers to fix 100% rejection rate.
+# 2. TREND REGIME: Now enters on Momentum (>0.65 BB Position) not just Breakouts.
+# 3. MEAN REV REGIME: RSI thresholds relaxed to 60/40 to unblock "Neutral" zones.
+# 4. PARITY: Maintained structure for live engine synchronization.
 # =============================================================================
 import logging
 import sys
@@ -151,9 +152,6 @@ class ResearchStrategy:
                 else:
                     buy_vol = volume / 2.0
                     sell_vol = volume / 2.0
-            else:
-                buy_vol = volume / 2.0
-                sell_vol = volume / 2.0
         
         self.last_price = price
 
@@ -219,7 +217,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. STRATEGY LOGIC: REGIME SWITCHING (UNBLOCKED)
+        # D. STRATEGY LOGIC: REGIME SWITCHING (RELAXED & UNBLOCKED)
         # ============================================================
         
         # Extract Core Indicators
@@ -229,44 +227,50 @@ class ResearchStrategy:
         bb_lower = features.get('bb_lower', 0.0)
         rsi_val = features.get('rsi', 50.0)
         
+        # New: BB Position (0=Lower, 0.5=Mid, 1=Upper)
+        bb_pos = features.get('bb_position', 0.5)
+        
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
         
         # --- REGIME A: EFFICIENT TREND ---
-        # UNBLOCK: Allow trade if Trend is aligned OR if Trend is extremely strong (>0.7)
-        if (ker_val > self.ker_trend and mtf_align == 1.0) or (ker_val > 0.7):
+        # UNBLOCK: Trigger on MOMENTUM (High in Band) rather than pure Breakout
+        if (ker_val > self.ker_trend and mtf_align == 1.0) or (ker_val > 0.75):
             regime_label = "A (Trend)"
-            # Trigger: Breakout / Walking the Bands
-            if price > bb_upper:
+            
+            # TRIGGER: Strong Position within Bands (e.g., > 65%)
+            if bb_pos > 0.65:
                 proposed_action = 1 # BUY
-            elif price < bb_lower:
+            elif bb_pos < 0.35:
                 proposed_action = -1 # SELL
             else:
-                self.rejection_stats["Regime A: No Breakout"] += 1
+                self.rejection_stats["Regime A: Weak Momentum"] += 1
                 
-        # --- REGIME B: MEAN REVERSION (CHOOPY) ---
+        # --- REGIME B: MEAN REVERSION (CHOPPY) ---
         elif ker_val < self.ker_mean_rev:
             regime_label = "B (MeanRev)"
-            # Primary Trigger: Bollinger Band Reversal
+            
+            # Trigger 1: Band Reversal (Classic)
             if price > bb_upper:
                 proposed_action = -1 # SELL
             elif price < bb_lower:
                 proposed_action = 1 # BUY
-            # --- SECONDARY TRIGGER (UNBLOCKER) ---
-            # If price is inside bands, check for RSI Extremes to force activity
-            elif rsi_val > 70: 
+                
+            # Trigger 2: RELAXED RSI (Unblocker)
+            # If inside bands, use RSI Extremes to force activity
+            elif rsi_val > 60: # AUDIT FIX: Relaxed from 70
                 proposed_action = -1 # SELL (Overbought)
                 regime_label = "B (RSI-Ext)"
-            elif rsi_val < 30:
+            elif rsi_val < 40: # AUDIT FIX: Relaxed from 30
                 proposed_action = 1 # BUY (Oversold)
                 regime_label = "B (RSI-Ext)"
             else:
-                self.rejection_stats["Regime B: Inside Bands/Neutral RSI"] += 1
+                self.rejection_stats["Regime B: Neutral Zone"] += 1
                 
         # --- REGIME C: NOISE ---
         else:
             # 0.3 <= KER <= 0.6 or Trend but misaligned
-            # UNBLOCK: If we are in the "Dead Zone" but RSI is extreme, take a Mean Rev trade anyway
+            # Sniper Mode: Only take extremes
             if rsi_val > 75:
                 proposed_action = -1
                 regime_label = "C (Sniper-Short)"
@@ -275,7 +279,7 @@ class ResearchStrategy:
                 regime_label = "C (Sniper-Long)"
             else:
                 regime_label = "C (Noise)"
-                self.rejection_stats[f"Regime C: KER {ker_val:.2f} / Align {mtf_align}"] += 1
+                self.rejection_stats[f"Regime C: KER {ker_val:.2f}"] += 1
                 return # Explicit HOLD
 
         if proposed_action == 0:

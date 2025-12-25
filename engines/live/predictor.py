@@ -8,9 +8,9 @@
 #
 # PHOENIX STRATEGY UPGRADE (2025-12-25 - LIVE PARITY):
 # 1. PARITY: Logic matched 1:1 with engines/research/strategy.py.
-# 2. REGIME A (TREND): KER > 0.6 + MTF Align -> Breakouts.
-# 3. REGIME B (MEAN REV): KER < 0.3 -> Reversals.
-# 4. REGIME C (NOISE): HOLD.
+# 2. REGIME A (TREND): KER > 0.6 + MTF Align -> Momentum (>0.65 BB Position).
+# 3. REGIME B (MEAN REV): Relaxed RSI (60/40) for earlier reversals.
+# 4. REGIME C (NOISE): Explicit HOLD unless Sniper Mode triggers.
 # =============================================================================
 import logging
 import pickle
@@ -270,7 +270,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
 
         # ============================================================
-        # 4. STRATEGY LOGIC: REGIME SWITCHING (KER & MTF)
+        # 4. STRATEGY LOGIC: REGIME SWITCHING (RELAXED PARITY)
         # ============================================================
         
         # Extract Core Indicators
@@ -280,44 +280,47 @@ class MultiAssetPredictor:
         bb_lower = features.get('bb_lower', 0.0)
         rsi_val = features.get('rsi', 50.0)
         
+        # New: BB Position (0=Lower, 0.5=Mid, 1=Upper)
+        bb_pos = features.get('bb_position', 0.5)
+        
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
         
         # --- REGIME A: EFFICIENT TREND ---
-        # UNBLOCK: Allow trade if Trend is aligned OR if Trend is extremely strong (>0.7)
-        if (ker_val > self.ker_trend and mtf_align == 1.0) or (ker_val > 0.7):
+        # UNBLOCK: Trigger on MOMENTUM (High in Band) rather than pure Breakout
+        if (ker_val > self.ker_trend and mtf_align == 1.0) or (ker_val > 0.75):
             regime_label = "A (Trend)"
-            # Trigger: Breakout / Walking the Bands
-            if bar.close > bb_upper:
+            # TRIGGER: Strong Position within Bands (e.g., > 65%)
+            if bb_pos > 0.65:
                 proposed_action = 1 # BUY
-            elif bar.close < bb_lower:
+            elif bb_pos < 0.35:
                 proposed_action = -1 # SELL
             else:
-                stats["Regime A: No Breakout"] += 1
+                stats["Regime A: Weak Momentum"] += 1
                 
         # --- REGIME B: MEAN REVERSION ---
         elif ker_val < self.ker_mean_rev:
             regime_label = "B (MeanRev)"
-            # Trigger: Reversal (Price outside -> mean revert)
+            # Trigger 1: Band Reversal (Classic)
             if bar.close > bb_upper:
                 proposed_action = -1 # SELL
             elif bar.close < bb_lower:
                 proposed_action = 1 # BUY
-            # --- SECONDARY TRIGGER (UNBLOCKER) ---
-            # If price is inside bands, check for RSI Extremes to force activity
-            elif rsi_val > 70: 
+            # Trigger 2: RELAXED RSI (Unblocker)
+            # If inside bands, use RSI Extremes to force activity
+            elif rsi_val > 60: # AUDIT FIX: Relaxed from 70
                 proposed_action = -1 # SELL (Overbought)
                 regime_label = "B (RSI-Ext)"
-            elif rsi_val < 30:
+            elif rsi_val < 40: # AUDIT FIX: Relaxed from 30
                 proposed_action = 1 # BUY (Oversold)
                 regime_label = "B (RSI-Ext)"
             else:
-                stats["Regime B: Inside Bands"] += 1
+                stats["Regime B: Neutral Zone"] += 1
                 
         # --- REGIME C: NOISE ---
         else:
             # 0.3 <= KER <= 0.6 or Trend but misaligned
-            # UNBLOCK: If we are in the "Dead Zone" but RSI is extreme, take a Mean Rev trade anyway
+            # Sniper Mode: Only take extremes
             if rsi_val > 75:
                 proposed_action = -1
                 regime_label = "C (Sniper-Short)"
@@ -326,7 +329,7 @@ class MultiAssetPredictor:
                 regime_label = "C (Sniper-Long)"
             else:
                 regime_label = "C (Noise)"
-                stats[f"Regime C: KER {ker_val:.2f} / Align {mtf_align}"] += 1
+                stats[f"Regime C: KER {ker_val:.2f}"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "Regime C (Noise)"})
 
         if proposed_action == 0:
