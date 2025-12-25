@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – PHOENIX STRATEGY V2.5.2 (HMM BYPASS & SMART DISCOVERY)
-# STATUS: GOLDEN CONFIG / RELAXED GATES / SQN PRIORITY
+# config.yaml – PHOENIX STRATEGY V2.5.3 (GBP/JPY REGIME ADAPTIVE)
+# STATUS: GOLDEN CONFIG / MEAN REVERSION OPTIMIZED
 #
-# AUDIT REMEDIATION (2025-12-25):
-# 1. HMM GATE: DISABLED (threshold 0.0) to unblock trading while collecting data.
-# 2. DISCOVERY: "Smart Discovery" (Trend Following) logic enabled in code.
-# 3. KER GATE: Maintained at 0.10.
-# 4. FDI ZONE: Maintained at 1.48-1.52.
+# AUDIT REMEDIATION (2025-12-25 - QUANT OVERHAUL):
+# 1. FRACDIFF: Tuned d=0.4 for GBP/JPY stationarity preservation.
+# 2. STRATEGY: Added Bollinger Bands (Trigger) and ADX (Filter) parameters.
+# 3. HMM GATE: Disabled (0.0) in favor of ADX/OFI logic.
+# 4. DISCOVERY: Smart Discovery enabled.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -111,9 +111,20 @@ features:
   entropy_threshold: 0.90
   ofi_alpha: 0.1
   
+  # STRATEGY UPDATE: Optimized for GBP/JPY Stationarity
   fractional_differentiation:
-    d: 0.3
+    d: 0.4
     window: 30
+    
+  # STRATEGY UPDATE: Mean Reversion Triggers
+  bollinger_bands:
+    period: 20
+    std_dev: 2.5
+    
+  # STRATEGY UPDATE: Regime Filter (Ranging Market)
+  adx:
+    period: 14
+    threshold: 25
     
   cyclical_time: true
   session_awareness: true
@@ -139,7 +150,7 @@ microstructure:
   
   gate_er_threshold: 0.40
   
-  # HMM GATE DISABLED TEMPORARILY
+  # HMM GATE DISABLED (Relies on ADX now)
   gate_hmm_threshold: 0.0 
   
   hurst_threshold_mean_revert: 0.45

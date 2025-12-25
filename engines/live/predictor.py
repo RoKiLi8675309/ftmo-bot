@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - QUANT OVERHAUL):
-# 1. STATE PERSISTENCE: Now saves/loads Feature Engineers to preserve FracDiff memory.
-# 2. MICROSTRUCTURE: Integrates OFI (Order Flow Imbalance) into signal logic.
-# 3. FRACDIFF: Uses Fractionally Differentiated price for stationarity.
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - RETAIL FALLBACK):
+# 1. FALLBACK: Auto-detects missing L2 data (zero buy/sell vol).
+# 2. TICK RULE: Uses Price Delta to estimate flow if L2 is missing.
+# 3. ROBUSTNESS: Prevents "OFI Wait" freeze on Demo accounts.
 # =============================================================================
 import logging
 import pickle
@@ -67,8 +67,6 @@ class MultiAssetPredictor:
         self.models_dir.mkdir(exist_ok=True)
         
         # 1. State Containers
-        # NOTE: OnlineFeatureEngineer now contains stateful kernels (FracDiff, OFI).
-        # Must be persisted to disk to maintain memory.
         self.feature_engineers = {s: OnlineFeatureEngineer(window_size=CONFIG['features']['window_size']) for s in symbols}
         
         # Adaptive Triple Barrier
@@ -108,9 +106,16 @@ class MultiAssetPredictor:
         self.min_ker_threshold = CONFIG['microstructure'].get('gate_ker_threshold', 0.10)
         self.fdi_min_random = CONFIG['microstructure'].get('fdi_min_random', 1.48)
         self.fdi_max_random = CONFIG['microstructure'].get('fdi_max_random', 1.52)
-        self.gate_hmm_threshold = CONFIG['microstructure'].get('gate_hmm_threshold', 0.0)
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
+        
+        # Strategy Specifics
+        self.adx_threshold = CONFIG['features']['adx']['threshold']
+        self.bb_dev = CONFIG['features']['bollinger_bands']['std_dev']
+        
+        # Fallback Tracking
+        self.l2_missing_warned = {s: False for s in symbols}
+        self.last_close_prices = {s: 0.0 for s in symbols}
 
         # Initialize Models & Load State
         self._init_models()
@@ -182,8 +187,34 @@ class MultiAssetPredictor:
 
         buy_vol = getattr(bar, 'buy_vol', 0.0)
         sell_vol = getattr(bar, 'sell_vol', 0.0)
+        
+        # --- RETAIL FALLBACK LOGIC ---
+        # If L2 data is missing (0.0), estimate using Tick Rule (Price Delta)
+        # This prevents the OFI logic from seeing "0.0" and blocking trades.
+        if buy_vol == 0 and sell_vol == 0:
+            if not self.l2_missing_warned[symbol]:
+                logger.warning(f"⚠️ {symbol}: Missing L2 Data. Enabling Tick Rule Fallback for OFI.")
+                self.l2_missing_warned[symbol] = True
+            
+            prev_close = self.last_close_prices[symbol]
+            if prev_close > 0:
+                if bar.close > prev_close:
+                    buy_vol = bar.volume
+                    sell_vol = 0.0
+                elif bar.close < prev_close:
+                    buy_vol = 0.0
+                    sell_vol = bar.volume
+                else:
+                    buy_vol = bar.volume / 2
+                    sell_vol = bar.volume / 2
+            else:
+                buy_vol = bar.volume / 2
+                sell_vol = bar.volume / 2
+                
+        self.last_close_prices[symbol] = bar.close
+        # -----------------------------
 
-        # 1. Feature Engineering (Generates FracDiff & OFI internally)
+        # 1. Feature Engineering
         features = fe.update(
             price=bar.close,
             timestamp=bar.timestamp,
@@ -246,173 +277,116 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
 
         # ============================================================
-        # 4. SMART DISCOVERY & GATING (ARCHITECTURE FIX)
+        # 4. STRATEGY LOGIC: Regime-Adaptive Mean Reversion
         # ============================================================
         
-        is_discovery = self.bar_counters[symbol] < 2500
-        gates_passed = True
-        gate_reason = ""
+        adx_val = features.get('adx', 50.0)
+        bb_upper = features.get('bb_upper', 999999.0)
+        bb_lower = features.get('bb_lower', 0.0)
+        micro_ofi = features.get('micro_ofi', 0.0)
         
-        # 2. Check Gates (ONLY IF NOT IN DISCOVERY)
-        if not is_discovery:
-            # Volatility Gate
-            if self.use_vol_gate:
-                pip_size, _ = RiskManager.get_pip_info(symbol)
-                spread_pips = self.spread_map.get(symbol, 1.5)
-                spread_cost = spread_pips * pip_size
-                
-                if current_atr < (spread_cost * self.min_atr_spread_ratio):
-                    gates_passed = False
-                    gate_reason = "Vol Gate (Dead Market)"
-            
-            # Regime Gate: KER
-            if gates_passed:
-                current_ker = features.get('ker', 0.5)
-                volatility = features.get('volatility', 0.001)
-                effective_ker_thresh = self.min_ker_threshold * (1 + volatility * 50) 
-                
-                if current_ker < effective_ker_thresh:
-                    gates_passed = False
-                    gate_reason = f"Regime: Low KER ({current_ker:.2f})"
-
-            # Regime Gate: FDI Inhibition
-            if gates_passed:
-                current_fdi = features.get('fdi', 1.5)
-                if self.fdi_min_random <= current_fdi <= self.fdi_max_random:
-                    gates_passed = False
-                    gate_reason = f"Regime: FDI Inhibition ({current_fdi:.2f})"
+        proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
+        rejection_reason = ""
         
-        # If Gates Failed and NOT Discovery, Exit
-        if not gates_passed and not is_discovery:
-            stats[gate_reason] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": gate_reason})
+        # --- CONDITION 1: REGIME IDENTIFICATION (FILTER) ---
+        # Logic: If ADX > 25, Market is Trending -> DISABLE Mean Reversion.
+        if adx_val > self.adx_threshold:
+            stats[f"Trend Mode (ADX {adx_val:.1f})"] += 1
+            # Return HOLD early
+            return Signal(symbol, "HOLD", 0.0, {"reason": "Trend Mode"})
 
-        # 5. Inference
-        current_pred_action = 0
-        try:
-            # Filter Enforcement (Strict)
-            entropy_val = features.get('entropy', 0.0)
-            entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.90)
-            
-            if entropy_val > entropy_thresh:
-                stats['High Entropy'] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": f"Max Entropy ({entropy_val:.2f})"})
-            
-            # VPIN / OFI Checks
-            vpin_val = features.get('vpin', 0.0)
-            vpin_thresh = CONFIG['microstructure'].get('vpin_threshold', 0.90)
-            
-            if vpin_val > vpin_thresh:
-                stats['High VPIN'] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": f"Toxic VPIN ({vpin_val:.2f})"})
+        # --- CONDITION 2: THE TRIGGER (BOLLINGER BANDS) ---
+        # Short Signal: Price > Upper Band
+        if bar.close > bb_upper:
+            proposed_action = -1 # Sell
+        # Long Signal: Price < Lower Band
+        elif bar.close < bb_lower:
+            proposed_action = 1 # Buy
+        else:
+            # Inside bands -> No Trigger
+            return Signal(symbol, "HOLD", 0.0, {"reason": "Inside Bands"})
 
-            # NEW: Microstructure OFI Check (Fast Fail)
-            # If OFI is extremely negative (Heavy Selling) but Model says BUY -> Block
-            micro_ofi = features.get('micro_ofi', 0.0)
-            
-            # Prediction
-            pred_class = model.predict_one(features)
-            pred_proba = model.predict_proba_one(features)
-            
-            try:
-                current_pred_action = int(pred_class)
-            except:
-                current_pred_action = 0
+        # --- CONDITION 3: MICROSTRUCTURE CONFIRMATION (OFI) ---
+        ofi_threshold = 2.0 # Aggressive flow required
+        
+        # If we are in Fallback Mode (Tick Rule), reduce threshold because Tick OFI is less granular
+        if self.l2_missing_warned[symbol]:
+            ofi_threshold = 0.5 
+
+        if proposed_action == -1: # Selling
+            if micro_ofi >= -ofi_threshold: # Not enough selling pressure yet
+                stats["OFI Wait (Price High, No Sellers)"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": "OFI Wait Sell"})
+        elif proposed_action == 1: # Buying
+            if micro_ofi <= ofi_threshold: # Not enough buying pressure yet
+                stats["OFI Wait (Price Low, No Buyers)"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": "OFI Wait Buy"})
+
+        # 5. ML Confirmation & Execution
+        
+        # Primary Prediction (Used for Confidence/Sizing only)
+        pred_class = model.predict_one(features)
+        pred_proba = model.predict_proba_one(features)
+        
+        prob_buy = pred_proba.get(1, 0.0)
+        prob_sell = pred_proba.get(-1, 0.0)
+        
+        confidence = prob_buy if proposed_action == 1 else prob_sell
+        
+        # Meta Labeling
+        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.60)
+        is_profitable = meta_labeler.predict(
+            features,
+            proposed_action,
+            threshold=meta_threshold
+        )
+
+        # --- DECISION ---
+        min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.85)
+        current_ker = features.get('ker', 1.0)
+        volatility = features.get('volatility', 0.001)
+        frac_diff = features.get('frac_diff', 0.0)
+        
+        # Safety Check: If ML thinks probability is terrible (< 0.4), skip even if Rule triggers.
+        if confidence < 0.40:
+            stats["ML Disagreement"] += 1
+            return Signal(symbol, "HOLD", confidence, {"reason": "ML Disagreement"})
+
+        if is_profitable:
+                action_str = "BUY" if proposed_action == 1 else "SELL"
                 
-            prob_buy = pred_proba.get(1, 0.0)
-            prob_sell = pred_proba.get(-1, 0.0)
-            
-            # OFI Filter Logic
-            # If proposing BUY but OFI is strongly negative
-            if current_pred_action == 1 and micro_ofi < -2.0:
-                stats['OFI Mismatch (Buy into Sell Flow)'] += 1
-                current_pred_action = 0
-            # If proposing SELL but OFI is strongly positive
-            elif current_pred_action == -1 and micro_ofi > 2.0:
-                stats['OFI Mismatch (Sell into Buy Flow)'] += 1
-                current_pred_action = 0
-
-            # SAFE DISCOVERY LOGIC
-            effective_action = current_pred_action
-            discovery_triggered = False
-            
-            if is_discovery and effective_action == 0:
-                macd_val = features.get('macd_norm', 0.0)
-                if abs(macd_val) > 0.00005: 
-                    if macd_val > 0:
-                        effective_action = 1
-                        discovery_triggered = True
-                    else:
-                        effective_action = -1
-                        discovery_triggered = True
-
-            confidence = prob_buy if effective_action == 1 else prob_sell
-            
-            if discovery_triggered:
-                confidence = 0.55
-
-            # Meta Labeling
-            meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.60)
-            is_profitable = meta_labeler.predict(
-                features,
-                effective_action,
-                threshold=meta_threshold
-            )
-
-            # --- DECISION ---
-            min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.85)
-            current_ker = features.get('ker', 1.0)
-            volatility = features.get('volatility', 0.001)
-            frac_diff = features.get('frac_diff', 0.0)
-            
-            if effective_action in [1, -1]:
-                if confidence > min_conf:
-                    if is_profitable or discovery_triggered:
-                        action_str = "BUY" if effective_action == 1 else "SELL"
-                        
-                        # FEATURE IMPORTANCE TRACKING
-                        imp_feats = []
-                        if features.get('rsi_norm', 0.5) > 0.7: imp_feats.append('RSI_High')
-                        elif features.get('rsi_norm', 0.5) < 0.3: imp_feats.append('RSI_Low')
-                        if features.get('macd_norm', 0) > 0: imp_feats.append('MACD_Pos')
-                        else: imp_feats.append('MACD_Neg')
-                        if features.get('vol_breakout', 0) > 0: imp_feats.append('Vol_Breakout')
-                        if micro_ofi > 1.0: imp_feats.append('OFI_Buy')
-                        elif micro_ofi < -1.0: imp_feats.append('OFI_Sell')
-                        
-                        for f in imp_feats:
-                            self.feature_importance_counter[symbol][f] += 1
-                        
-                        return Signal(symbol, action_str, confidence, {
-                            "meta_ok": True, 
-                            "volatility": volatility, 
-                            "atr": current_atr, 
-                            "ker": current_ker, 
-                            "frac_diff": frac_diff,
-                            "ofi": micro_ofi,
-                            "drivers": imp_feats
-                        })
-                    else:
-                        stats['Meta Rejected'] += 1
-                        return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
-                else:
-                    stats['Low Confidence'] += 1
-                    return Signal(symbol, "HOLD", confidence, {"reason": f"Low Conf ({confidence:.2f})"})
-            else:
-                stats['Model Predicted 0'] += 1
-            
-            if self.bar_counters[symbol] % 250 == 0:
-                top_drivers = self.feature_importance_counter[symbol].most_common(3)
-                logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} FDI:{feat_stats['avg_fdi']:.2f} OFI:{feat_stats['avg_ofi']:.2f} FD:{frac_diff:.4f}")
-                logger.info(f"🔍 {symbol} Top Drivers: {top_drivers}")
-                logger.info(f"🔍 {symbol} Rejections: {dict(stats)}")
-                stats.clear()
+                # FEATURE IMPORTANCE TRACKING
+                imp_feats = []
+                if adx_val < 25: imp_feats.append('Ranging_Mode')
+                if proposed_action == 1: imp_feats.append('BB_Lower_Break')
+                else: imp_feats.append('BB_Upper_Break')
+                if micro_ofi > 2.0: imp_feats.append('OFI_Strong_Buy')
+                elif micro_ofi < -2.0: imp_feats.append('OFI_Strong_Sell')
                 
-            return Signal(symbol, "HOLD", confidence, {})
+                for f in imp_feats:
+                    self.feature_importance_counter[symbol][f] += 1
+                
+                return Signal(symbol, action_str, confidence, {
+                    "meta_ok": True, 
+                    "volatility": volatility, 
+                    "atr": current_atr, 
+                    "ker": current_ker, 
+                    "frac_diff": frac_diff,
+                    "ofi": micro_ofi,
+                    "drivers": imp_feats
+                })
+        else:
+            stats['Meta Rejected'] += 1
+            return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
 
-        except Exception as e:
-            logger.error(f"Inference Error {symbol}: {e}")
-            return None
+        if self.bar_counters[symbol] % 250 == 0:
+            top_drivers = self.feature_importance_counter[symbol].most_common(3)
+            logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} FDI:{feat_stats['avg_fdi']:.2f} OFI:{feat_stats['avg_ofi']:.2f} FD:{frac_diff:.4f}")
+            logger.info(f"🔍 {symbol} Top Drivers: {top_drivers}")
+            logger.info(f"🔍 {symbol} Rejections: {dict(stats)}")
+            stats.clear()
+            
+        return Signal(symbol, "HOLD", confidence, {})
 
     def save_state(self):
         """Saves models AND Feature Engineers to disk."""

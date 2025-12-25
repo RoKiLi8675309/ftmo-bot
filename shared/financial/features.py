@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - QUANT OVERHAUL):
-# 1. FRACDIFF: Added StreamingFracDiff to solve Memory-Stationarity Paradox.
-# 2. MICROSTRUCTURE: Added MicrostructureAnalyzer for OFI (Order Flow Imbalance).
-# 3. ROBUSTNESS: Integrated new math kernels into OnlineFeatureEngineer.
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - RETAIL FALLBACK):
+# 1. FRACDIFF: Standardized to d=0.4 for GBP/JPY stationarity.
+# 2. MICROSTRUCTURE: Enhanced OFI Analyzer with Tick Rule Fallback support.
+# 3. INDICATORS: StreamingBollingerBands & StreamingADX.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -127,13 +127,14 @@ class StreamingFracDiff:
     Solves the Stationarity-Memory Paradox by preserving long-term memory (d < 1)
     while removing non-stationary trends.
     
-    Reference: Lopez de Prado, M. (2018). Advances in Financial Machine Learning.
+    Ref: Lopez de Prado, M. (2018). Advances in Financial Machine Learning.
+    FIX: Default d=0.4 optimized for GBP/JPY.
     """
     def __init__(self, d=0.4, window=2000, tolerance=1e-5):
         """
         Args:
             d (float): The differencing order (0 < d < 1). 
-                       0.4 is recommended for financial time series.
+                       0.4 is optimal for GBP/JPY per analysis.
             window (int): The history window size. 
             tolerance (float): Weight cutoff threshold.
         """
@@ -196,8 +197,6 @@ class MicrostructureAnalyzer:
     Analyzes tick/bar data to calculate Order Flow Imbalance (OFI).
     Acts as a leading indicator for short-term price direction by measuring
     aggressiveness of buyers vs sellers.
-    
-    Ref: Cont, K., Kukanov, A., & Stoikov, S. (2014). The Price Impact of Order Book Events.
     """
     def __init__(self, ema_alpha=0.2):
         self.prev_bid_price = None
@@ -417,10 +416,113 @@ class RegimeDetector:
             self.fit_failures += 1
             return self.last_regime
 
-# --- 3. STREAMING INDICATORS ---
+# --- 3. STREAMING INDICATORS (NEW: BB & ADX) ---
+
+class StreamingBollingerBands:
+    """
+    Online calculation of Bollinger Bands using Welford's Algorithm or Window.
+    Used for the Mean Reversion Trigger (Price touches 2.5 SD).
+    """
+    def __init__(self, period: int = 20, std_dev: float = 2.5):
+        self.period = period
+        self.std_dev = std_dev
+        self.buffer = deque(maxlen=period)
+        
+    def update(self, price: float) -> Dict[str, float]:
+        self.buffer.append(price)
+        
+        if len(self.buffer) < 2:
+            return {'bb_mid': price, 'bb_upper': price, 'bb_lower': price, 'bb_width': 0.0}
+            
+        # Calculation
+        arr = np.array(self.buffer)
+        mean = np.mean(arr)
+        std = np.std(arr)
+        
+        upper = mean + (self.std_dev * std)
+        lower = mean - (self.std_dev * std)
+        width = (upper - lower) / mean if mean != 0 else 0.0
+        
+        return {
+            'bb_mid': mean,
+            'bb_upper': upper,
+            'bb_lower': lower,
+            'bb_width': width
+        }
+
+class StreamingADX:
+    """
+    Online calculation of Average Directional Index (ADX).
+    Used as the Ranging Filter (ADX < 25).
+    """
+    def __init__(self, period: int = 14):
+        self.period = period
+        self.dm_plus_ema = RecursiveEMA(alpha=1/period)
+        self.dm_minus_ema = RecursiveEMA(alpha=1/period)
+        self.tr_ema = RecursiveEMA(alpha=1/period)
+        self.dx_ema = RecursiveEMA(alpha=1/period) # ADX is smoothed DX
+        
+        self.prev_high = None
+        self.prev_low = None
+        self.prev_close = None
+        
+    def update(self, high: float, low: float, close: float) -> float:
+        if self.prev_close is None:
+            self.prev_high = high
+            self.prev_low = low
+            self.prev_close = close
+            return 0.0
+            
+        # 1. True Range
+        tr1 = high - low
+        tr2 = abs(high - self.prev_close)
+        tr3 = abs(low - self.prev_close)
+        true_range = max(tr1, tr2, tr3)
+        
+        # 2. Directional Movement
+        up_move = high - self.prev_high
+        down_move = self.prev_low - low
+        
+        dm_plus = up_move if (up_move > down_move and up_move > 0) else 0.0
+        dm_minus = down_move if (down_move > up_move and down_move > 0) else 0.0
+        
+        # 3. Smoothing
+        self.tr_ema.update(true_range)
+        self.dm_plus_ema.update(dm_plus)
+        self.dm_minus_ema.update(dm_minus)
+        
+        avg_tr = self.tr_ema.get()
+        avg_dm_plus = self.dm_plus_ema.get()
+        avg_dm_minus = self.dm_minus_ema.get()
+        
+        # 4. DI calculation
+        if avg_tr > 0:
+            di_plus = 100 * (avg_dm_plus / avg_tr)
+            di_minus = 100 * (avg_dm_minus / avg_tr)
+        else:
+            di_plus = 0.0
+            di_minus = 0.0
+            
+        # 5. DX and ADX
+        sum_di = di_plus + di_minus
+        if sum_di > 0:
+            dx = 100 * abs(di_plus - di_minus) / sum_di
+        else:
+            dx = 0.0
+            
+        self.dx_ema.update(dx)
+        
+        # Update State
+        self.prev_high = high
+        self.prev_low = low
+        self.prev_close = close
+        
+        return self.dx_ema.get()
+
 class StreamingIndicators:
     """
     Recursive implementation of technical indicators.
+    Now includes Bollinger Bands and ADX.
     """
     def __init__(self, rsi_period=14, macd_fast=12, macd_slow=26, macd_sig=9, atr_period=14):
         # MACD Components
@@ -437,6 +539,10 @@ class StreamingIndicators:
         # ATR Components
         self.atr_mean = RecursiveEMA(alpha=1 / atr_period)
         self.prev_close = None
+        
+        # NEW: Bollinger Bands & ADX
+        self.bb = StreamingBollingerBands(period=20, std_dev=2.5) # Doc specified 2.5 SD
+        self.adx = StreamingADX(period=14)
 
     def update(self, price: float, high: float, low: float) -> Dict[str, float]:
         features = {}
@@ -482,6 +588,14 @@ class StreamingIndicators:
             features['atr'] = self.atr_mean.get()
         else:
             features['atr'] = high - low if (high > 0 and low > 0 and high != low) else 0.001
+            
+        # 4. Bollinger Bands (New)
+        bb_vals = self.bb.update(price)
+        features.update(bb_vals)
+        
+        # 5. ADX (New)
+        adx_val = self.adx.update(high, low, price)
+        features['adx'] = adx_val
             
         self.prev_price = price
         self.prev_close = price
@@ -668,8 +782,9 @@ class OnlineFeatureEngineer:
         # Microstructure & Math Engines
         self.entropy = EntropyMonitor(window=window_size)
         self.vpin = VPINMonitor(bucket_size=1000)
-        self.frac_diff = StreamingFracDiff(d=0.4, window=window_size) # New Math Kernel
-        self.microstructure = MicrostructureAnalyzer(ema_alpha=0.1)   # New OFI Kernel
+        # UPDATE: d=0.4 as per Document optimization for GBP/JPY
+        self.frac_diff = StreamingFracDiff(d=0.4, window=window_size) 
+        self.microstructure = MicrostructureAnalyzer(ema_alpha=0.1)
         self.vol_monitor = VolatilityMonitor(window=20)
         
         self.last_price = None
@@ -707,7 +822,7 @@ class OnlineFeatureEngineer:
         else:
             self.returns.append(0.0)
 
-        # Update Indicators
+        # Update Indicators (includes BB & ADX now)
         tech_feats = self.indicators.update(price, high, low)
         current_atr = tech_feats.get('atr', 0.001)
         
@@ -721,20 +836,14 @@ class OnlineFeatureEngineer:
         vpin_val = self.vpin.update(volume, price, buy_vol, sell_vol)
         volatility_val = self.vol_monitor.update(ret_log)
 
-        # --- NEW: Fractional Differentiation ---
-        # Preserves memory while removing non-stationary trends
+        # --- FracDiff (Memory Preserved) ---
         fd_price = self.frac_diff.update(price)
 
-        # --- NEW: Microstructure Analysis (OFI) ---
-        # Note: We approximate Bid/Ask vols using aggregated flow if raw ticks aren't available
-        # or assuming the passed buy_vol/sell_vol represent the best estimate of flow.
-        # In a bar context: Close is the last price. 
-        # We treat current price/vol as the update.
-        # If strict tick data is missing, we use a simplified proxy or pass aggregated vols.
+        # --- Microstructure (OFI) ---
         micro_ofi = self.microstructure.process_update(
-            bid_price=low,  # Proxy: Low approximates Bid pressure
+            bid_price=low,  
             bid_vol=buy_vol, 
-            ask_price=high, # Proxy: High approximates Ask pressure
+            ask_price=high,
             ask_vol=sell_vol
         )
 
@@ -815,7 +924,12 @@ class OnlineFeatureEngineer:
             'macd_norm': macd_norm,
             'macd_hist_norm': tech_feats['macd_hist'] / price,
             'atr_pct': current_atr / price, 
+            'adx': tech_feats.get('adx', 0.0), # NEW
+            'bb_width': tech_feats.get('bb_width', 0.0), # NEW
             
+            # BB Relative Position (Price location within bands: 0=Lower, 1=Upper)
+            'bb_position': (price - tech_feats.get('bb_lower', price)) / (tech_feats.get('bb_upper', price) - tech_feats.get('bb_lower', price)) if tech_feats.get('bb_width', 0) > 0 else 0.5,
+
             # Volatility
             'vol_ratio': vol_ratio,
             'volatility_log': math.log(volatility_val + 1e-9),
@@ -827,7 +941,7 @@ class OnlineFeatureEngineer:
             'entropy': entropy_val,
             'vpin': vpin_val,
             'hurst': hurst_val,
-            'ofi_simple': ofi_simple,       # Renamed from 'ofi' to avoid confusion
+            'ofi_simple': ofi_simple,       
             'efficiency_ratio': er_val,
             
             # Context

@@ -5,10 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - QUANT OVERHAUL):
-# 1. MICROSTRUCTURE PARITY: Added OFI Mismatch Filter (Fast Fail) to match Live Engine.
-# 2. FRACDIFF: Integrated Fractional Differentiation tracking in Autopsy.
-# 3. EXPLAINABILITY: Tracks Microstructure OFI as a key decision driver.
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - DOCUMENT COMPLIANCE):
+# 1. LOGIC OVERHAUL: Implemented "Regime-Adaptive Mean Reversion".
+# 2. TRIGGER: Bollinger Band Reversion (2.5 SD).
+# 3. FILTER: ADX < 25 (Ranging Market).
+# 4. CONFIRMATION: Microstructure OFI Divergence.
 # =============================================================================
 import logging
 import sys
@@ -51,7 +52,7 @@ class ResearchStrategy:
         self.debug_mode = False
         
         # 1. Feature Engineer (The Eyes)
-        # Note: Now includes FracDiff and Microstructure kernels
+        # Note: Now includes FracDiff, Microstructure, BB, and ADX kernels
         self.fe = OnlineFeatureEngineer(
             window_size=params.get('window_size', 50)
         )
@@ -91,17 +92,9 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() # Tracks top features
         
-        # --- AUDIT FIX: VOLATILITY GATE ---
-        self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
-        self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.0)
-        
-        # --- REGIME GATES (NOISE FILTER) ---
-        self.min_ker_threshold = CONFIG['microstructure'].get('gate_ker_threshold', 0.10)
-        
-        # FDI Inhibition Zone (Random Walk Block)
-        self.fdi_min_random = CONFIG['microstructure'].get('fdi_min_random', 1.48)
-        self.fdi_max_random = CONFIG['microstructure'].get('fdi_max_random', 1.52)
+        # --- STRATEGY PARAMETERS (From Config/Document) ---
+        self.adx_threshold = CONFIG['features']['adx']['threshold'] # 25
+        self.bb_dev = CONFIG['features']['bollinger_bands']['std_dev'] # 2.5
         
         # Load Spread Assumptions for Gating
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
@@ -211,137 +204,94 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. SMART DISCOVERY & GATING
+        # D. STRATEGY LOGIC: GBP/JPY Regime-Adaptive Mean Reversion
         # ============================================================
         
-        # 1. Identify Mode
-        is_discovery = self.bars_processed < 2500
-        gates_passed = True
-        gate_reason = ""
-
-        # 2. Check Gates (ONLY IF NOT IN DISCOVERY)
-        if not is_discovery:
-            # Volatility Gate
-            if self.use_vol_gate:
-                pip_size, _ = RiskManager.get_pip_info(self.symbol)
-                spread_pips = self.spread_map.get(self.symbol, self.default_spread)
-                spread_cost = spread_pips * pip_size
-                if current_atr < (spread_cost * self.min_atr_spread_ratio):
-                    gates_passed = False
-                    gate_reason = "Vol Gate (Dead Market)"
-
-            # Regime Gate: KER
-            if gates_passed:
-                current_ker = features.get('ker', 0.5)
-                volatility = features.get('volatility', 0.001)
-                effective_ker_thresh = self.min_ker_threshold * (1 + volatility * 50) 
-                if current_ker < effective_ker_thresh:
-                    gates_passed = False
-                    gate_reason = f"Regime: Low KER ({current_ker:.2f})"
-
-            # Regime Gate: FDI Inhibition
-            if gates_passed:
-                current_fdi = features.get('fdi', 1.5)
-                if self.fdi_min_random <= current_fdi <= self.fdi_max_random:
-                    gates_passed = False
-                    gate_reason = f"Regime: FDI Inhibition ({current_fdi:.2f})"
-
-            # Regime Gate: HMM ( DISABLED TEMPORARILY )
-            # We skip HMM check here as per plan.
+        # Extract Key Indicators
+        adx_val = features.get('adx', 50.0)
+        bb_upper = features.get('bb_upper', 999999.0)
+        bb_lower = features.get('bb_lower', 0.0)
+        micro_ofi = features.get('micro_ofi', 0.0)
         
-        # If Gates Failed and NOT Discovery, Exit
-        if not gates_passed and not is_discovery:
-            self.rejection_stats[gate_reason] += 1
+        proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
+        rejection_reason = ""
+        
+        # --- CONDITION 1: REGIME IDENTIFICATION (FILTER) ---
+        # Logic: If ADX > 25, Market is Trending -> DISABLE Mean Reversion.
+        if adx_val > self.adx_threshold:
+            self.rejection_stats[f"Trend Mode (ADX {adx_val:.1f})"] += 1
+            # We exit early because this strategy is strictly Mean Reversion
             return 
 
-        # E. Inference
+        # --- CONDITION 2: THE TRIGGER (BOLLINGER BANDS) ---
+        # Short Signal: Price > Upper Band
+        if price > bb_upper:
+            proposed_action = -1 # Sell
+        # Long Signal: Price < Lower Band
+        elif price < bb_lower:
+            proposed_action = 1 # Buy
+        else:
+            # Inside bands -> No Trigger
+            return
+
+        # --- CONDITION 3: MICROSTRUCTURE CONFIRMATION (OFI) ---
+        # Logic: Wait for OFI to contradict price direction.
+        # If Price High (Short Trigger), we need Sellers (OFI < -threshold).
+        # If Price Low (Long Trigger), we need Buyers (OFI > threshold).
+        
+        ofi_threshold = 2.0 # Aggressive flow required
+        
+        if proposed_action == -1: # Selling
+            if micro_ofi >= -ofi_threshold: # Not enough selling pressure yet
+                self.rejection_stats["OFI Wait (Price High, No Sellers)"] += 1
+                return
+        elif proposed_action == 1: # Buying
+            if micro_ofi <= ofi_threshold: # Not enough buying pressure yet
+                self.rejection_stats["OFI Wait (Price Low, No Buyers)"] += 1
+                return
+
+        # ============================================================
+        # E. ML CONFIRMATION & EXECUTION
+        # ============================================================
+        
+        # If we passed the Hard Rules, we consult the ML Model for Sizing/Confidence
+        
         try:
-            # --- FILTER ENFORCEMENT (Strict even in Discovery) ---
-            entropy_val = features.get('entropy', 0)
-            entropy_thresh = self.params.get('entropy_threshold', 0.90)
-            if entropy_val > entropy_thresh:
-                self.rejection_stats['High Entropy'] += 1
-                return
-
-            vpin_val = features.get('vpin', 0)
-            vpin_thresh = self.params.get('vpin_threshold', 0.90)
-            if vpin_val > vpin_thresh:
-                self.rejection_stats['High VPIN'] += 1
-                return
-
-            # --- MICROSTRUCTURE FILTER (Fast Fail) ---
-            micro_ofi = features.get('micro_ofi', 0.0)
-            # Thresholds: If OFI is extremely skewed against the trade direction, kill it.
-            # Example: Model says BUY, but OFI < -2.0 (Heavy Selling) -> Block
-            
             # Primary Prediction
             pred_class = self.model.predict_one(features)
             pred_proba = self.model.predict_proba_one(features)
             
-            try:
-                pred_action = int(pred_class)
-            except:
-                pred_action = 0
-                
             prob_buy = pred_proba.get(1, 0.0)
             prob_sell = pred_proba.get(-1, 0.0)
-
-            # OFI Logic Application
-            effective_action = pred_action
             
-            if effective_action == 1 and micro_ofi < -2.0:
-                self.rejection_stats['OFI Mismatch (Buy into Sell Flow)'] += 1
-                effective_action = 0
-            elif effective_action == -1 and micro_ofi > 2.0:
-                self.rejection_stats['OFI Mismatch (Sell into Buy Flow)'] += 1
-                effective_action = 0
-
-            # F. Execution Logic & Discovery Override
-            dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
-            
-            discovery_triggered = False
-
-            # --- SMART DISCOVERY LOGIC (Trend Following) ---
-            # Replaces random coin flips with a simple heuristic.
-            if is_discovery and effective_action == 0:
-                # Calculate simple Trend using MACD momentum
-                macd_val = features.get('macd_norm', 0.0)
-                
-                if abs(macd_val) > 0.00005: # Minimal momentum threshold
-                    if macd_val > 0:
-                        effective_action = 1
-                        discovery_triggered = True
-                    else:
-                        effective_action = -1
-                        discovery_triggered = True
+            confidence = prob_buy if proposed_action == 1 else prob_sell
             
             # --- META LABELING ---
-            # Always pass if Discovery Triggered OR Meta Model not warmed up
-            if self.meta_label_events < self.meta_warmup_limit or discovery_triggered:
-                is_profitable = True 
-            else:
-                is_profitable = self.meta_labeler.predict(
-                    features,
-                    effective_action,
-                    threshold=self.params.get('meta_labeling_threshold', 0.60)
-                )
+            is_profitable = self.meta_labeler.predict(
+                features,
+                proposed_action,
+                threshold=self.params.get('meta_labeling_threshold', 0.60)
+            )
             
-            if effective_action != 0:
+            if proposed_action != 0:
                 self.meta_label_events += 1
 
             # --- EXECUTION ---
-            if effective_action == 1 or effective_action == -1:
-                if is_profitable:
-                        confidence = prob_buy if effective_action == 1 else prob_sell
-                        
-                        if discovery_triggered:
-                            confidence = 0.55 
-                        
-                        self._execute_logic(confidence, price, features, broker, dt_timestamp, effective_action, discovery_triggered)
-                else:
-                    self.rejection_stats['Meta-Labeler'] += 1
+            # We override the ML's directional decision with our Rule-Based Trigger,
+            # but we use the ML's confidence for sizing.
+            # If ML strongly disagrees (e.g. Rule=Buy, ML=Sell prob 0.9), we might skip.
+            
+            # Safety Check: If ML thinks probability is terrible (< 0.4), skip even if Rule triggers.
+            if confidence < 0.40:
+                self.rejection_stats["ML Disagreement"] += 1
+                return
+
+            if is_profitable:
+                dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
+                # Discovery Mode is effectively disabled as we have hard rules now
+                self._execute_logic(confidence, price, features, broker, dt_timestamp, proposed_action, discovery_mode=False)
             else:
-                self.rejection_stats['Model Predicted 0'] += 1
+                self.rejection_stats['Meta-Labeler'] += 1
 
         except Exception as e:
             if self.debug_mode: logger.error(f"Strategy Error: {e}")
@@ -363,11 +313,12 @@ class ResearchStrategy:
         # 1. Signal Threshold
         min_prob = self.params.get('min_calibrated_probability', 0.85)
         
-        # Bypass confidence check if in Discovery Mode
-        if not discovery_mode:
-            if confidence < min_prob:
-                self.rejection_stats['Low Confidence'] += 1
-                return
+        # Rule-based triggers are high quality, so we can relax ML confidence slightly
+        # if the setup is perfect (e.g. Extreme BB deviation).
+        # For now, we respect the config.
+        if confidence < min_prob:
+            self.rejection_stats['Low Confidence'] += 1
+            return
 
         action = "BUY" if action_int == 1 else "SELL"
 
@@ -436,17 +387,13 @@ class ResearchStrategy:
         
         # Track Features for Explainability
         imp_feats = []
-        if features.get('rsi_norm', 0.5) > 0.7: imp_feats.append('RSI_High')
-        elif features.get('rsi_norm', 0.5) < 0.3: imp_feats.append('RSI_Low')
-        if features.get('macd_norm', 0) > 0: imp_feats.append('MACD_Pos')
-        else: imp_feats.append('MACD_Neg')
-        if features.get('ker', 0) > 0.5: imp_feats.append('KER_High')
-        if features.get('vol_breakout', 0) > 0: imp_feats.append('Vol_Breakout')
+        if features.get('adx', 0) < 25: imp_feats.append('Ranging_Mode')
+        if features.get('bb_position', 0.5) > 1.0: imp_feats.append('BB_Upper_Break')
+        elif features.get('bb_position', 0.5) < 0.0: imp_feats.append('BB_Lower_Break')
         
-        # New Microstructure drivers
         micro_ofi = features.get('micro_ofi', 0.0)
-        if micro_ofi > 1.0: imp_feats.append('OFI_Buy')
-        elif micro_ofi < -1.0: imp_feats.append('OFI_Sell')
+        if micro_ofi > 2.0: imp_feats.append('OFI_Strong_Buy')
+        elif micro_ofi < -2.0: imp_feats.append('OFI_Strong_Sell')
         
         for f in imp_feats:
             self.feature_importance_counter[f] += 1
@@ -462,8 +409,8 @@ class ResearchStrategy:
             'fdi': features.get('fdi', 0),
             'atr': current_atr,
             'volatility': volatility,
-            'frac_diff': features.get('frac_diff', 0.0), # NEW
-            'micro_ofi': micro_ofi, # NEW
+            'frac_diff': features.get('frac_diff', 0.0),
+            'micro_ofi': micro_ofi,
             'forced': discovery_mode,
             'top_feats': imp_feats
         })
@@ -474,13 +421,13 @@ class ResearchStrategy:
         """
         if not self.trade_events:
             reject_str = ", ".join([f"{k}: {v}" for k, v in self.rejection_stats.items()])
-            status = "Waiting for Warm-Up" if not self.burn_in_complete else "Analysis Paralysis"
+            status = "Waiting for Warm-Up" if not self.burn_in_complete else "No Trigger Conditions Met"
             return f"AUTOPSY: No trades. Status: {status}. Rejections: {{{reject_str}}}. Bars processed: {self.bars_processed}"
         
         avg_conf = np.mean([t['conf'] for t in self.trade_events])
         avg_vpin = np.mean([t['vpin'] for t in self.trade_events])
-        avg_ofi = np.mean([t['micro_ofi'] for t in self.trade_events]) # NEW
-        avg_frac = np.mean([t['frac_diff'] for t in self.trade_events]) # NEW
+        avg_ofi = np.mean([t['micro_ofi'] for t in self.trade_events]) 
+        avg_frac = np.mean([t['frac_diff'] for t in self.trade_events]) 
         
         forced_count = sum(1 for t in self.trade_events if t['forced'])
         
