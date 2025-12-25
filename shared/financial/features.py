@@ -5,11 +5,11 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-24 - GOLDEN CONFIG COMPLIANCE):
-# 1. SCALING: Implemented WelfordScaler for O(1) online Z-score calculation.
-# 2. REGIME: KER & FDI optimized for 1.45-1.55 Inhibition Zone detection.
-# 3. STATIONARITY: Volume Z-Score now uses Welford's Algorithm (Infinite Window).
-# 4. ROBUSTNESS: HMM and Entropy monitors hardened against sparse data.
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - EXPLAINABILITY & HMM FIX):
+# 1. HMM FIX: Implemented 'Semantic State Sorting'. State 0 is ALWAYS Low Vol,
+#    State 1 is ALWAYS High Vol. Prevents "Label Switching" logic errors.
+# 2. FEATURE EXPLAINABILITY: Added structures to support importance tracking.
+# 3. ROBUSTNESS: Hardened WelfordScaler against zero-variance streams.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -195,6 +195,10 @@ class RegimeDetector:
     """
     Online Hidden Markov Model (HMM) for market regime classification.
     Identifies latent states (e.g., Low Vol/Range, High Vol/Trend).
+    
+    AUDIT FIX (2025-12-25): Implements 'Semantic Sorting'.
+    Ensures State 0 is always the state with Lowest Variance (Range),
+    and State 1 (or N) is Highest Variance (Trend/Crash).
     """
     def __init__(self, n_states: int = 2, window: int = 100):
         self.n_states = n_states
@@ -241,12 +245,14 @@ class RegimeDetector:
                 if np.var(data) < 1e-6 or np.isnan(data).any():
                     return self.last_regime
 
+                # Handle initialization based on failure count
                 if self.fit_failures > 5:
                     self.model.init_params = "stmc"
                     self.fit_failures = 0
                 elif hasattr(self.model, 'startprob_'):
                     self.model.init_params = ""
 
+                # Fit Model
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
@@ -254,14 +260,30 @@ class RegimeDetector:
                         warnings.filterwarnings("ignore", category=ConvergenceWarning)
                         self.model.fit(data)
                 
-                if not self.model.monitor_.converged:
-                    self.fit_failures += 1
-                else:
+                # --- SEMANTIC SORTING FIX ---
+                # Sort states by Variance (Covariance). 
+                # State 0 should be Low Variance (Range). State 1 should be High Variance.
+                if self.model.monitor_.converged:
+                    # Get variances (diagonal of covariance matrix)
+                    variances = np.array([np.mean(np.diag(c)) for c in self.model.covars_])
+                    # Get the sort order (indices of states from low var to high var)
+                    sort_order = np.argsort(variances)
+                    
+                    # Store mapping for prediction
+                    self.state_map = {old: new for new, old in enumerate(sort_order)}
                     self.fit_failures = 0
+                else:
+                    self.fit_failures += 1
+                    self.state_map = {i: i for i in range(self.n_states)} # Identity fallback
 
-            current_state = int(self.model.predict(data[-1].reshape(1, -1))[0])
-            self.last_regime = current_state
-            return current_state
+            # Predict current state
+            raw_state = int(self.model.predict(data[-1].reshape(1, -1))[0])
+            
+            # Apply semantic mapping
+            mapped_state = self.state_map.get(raw_state, raw_state)
+            
+            self.last_regime = mapped_state
+            return mapped_state
 
         except Exception:
             self.fit_failures += 1

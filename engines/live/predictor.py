@@ -6,11 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-24 - GOLDEN CONFIG):
-# 1. GATING: FDI Inhibition Zone (1.45-1.55) implemented to block Random Walk.
-# 2. METRIC: Switched to LogLoss for probability calibration.
-# 3. WARNINGS: Added ARF Warning Detector (delta=0.001) for early drift sensing.
-# 4. ENSEMBLE: ADWINBaggingClassifier standard.
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - EXPLAINABILITY & SMART DISCOVERY):
+# 1. EXPLAINABILITY: Tracks and logs Top Driver Features for live signals.
+# 2. SMART DISCOVERY: Implements Trend-Following heuristic for warm-up phase.
+# 3. GATING: Discovery Logic bypasses filters; Strict Gates applied otherwise.
 # =============================================================================
 import logging
 import pickle
@@ -18,7 +17,7 @@ import os
 import json
 import time
 import math
-from collections import defaultdict, deque
+from collections import defaultdict, deque, Counter
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -92,6 +91,7 @@ class MultiAssetPredictor:
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
         self.feature_stats = {s: defaultdict(float) for s in symbols}
         self.bar_counters = {s: 0 for s in symbols}
+        self.feature_importance_counter = {s: Counter() for s in symbols}
         
         # 5. Architecture: Auto-Save Timer
         self.last_save_time = time.time()
@@ -103,11 +103,14 @@ class MultiAssetPredictor:
         self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.0)
         
         # --- REGIME GATES (NOISE FILTER) ---
-        self.min_ker_threshold = CONFIG['microstructure'].get('gate_ker_threshold', 0.20)
+        self.min_ker_threshold = CONFIG['microstructure'].get('gate_ker_threshold', 0.10)
         
         # FDI Inhibition Zone (Random Walk Block)
-        self.fdi_min_random = CONFIG['microstructure'].get('fdi_min_random', 1.45)
-        self.fdi_max_random = CONFIG['microstructure'].get('fdi_max_random', 1.55)
+        self.fdi_min_random = CONFIG['microstructure'].get('fdi_min_random', 1.48)
+        self.fdi_max_random = CONFIG['microstructure'].get('fdi_max_random', 1.52)
+        
+        # HMM Threshold (Disabled temporarily)
+        self.gate_hmm_threshold = CONFIG['microstructure'].get('gate_hmm_threshold', 0.0)
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
 
@@ -244,44 +247,60 @@ class MultiAssetPredictor:
         current_atr = features.get('atr', 0.0)
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
 
-        # --- "GATE-FIRST" ARCHITECTURE ---
-        # 1. Volatility Gate
-        if self.use_vol_gate:
-            pip_size, _ = RiskManager.get_pip_info(symbol)
-            spread_pips = self.spread_map.get(symbol, 1.5)
-            spread_cost = spread_pips * pip_size
+        # ============================================================
+        # 4. ARCHITECTURE FIX: SMART DISCOVERY & GATING
+        # ============================================================
+        
+        # 1. Identify Mode
+        is_discovery = self.bar_counters[symbol] < 2500
+        gates_passed = True
+        gate_reason = ""
+        
+        # 2. Check Gates (ONLY IF NOT IN DISCOVERY)
+        if not is_discovery:
+            # Volatility Gate
+            if self.use_vol_gate:
+                pip_size, _ = RiskManager.get_pip_info(symbol)
+                spread_pips = self.spread_map.get(symbol, 1.5)
+                spread_cost = spread_pips * pip_size
+                
+                if current_atr < (spread_cost * self.min_atr_spread_ratio):
+                    gates_passed = False
+                    gate_reason = "Vol Gate (Dead Market)"
             
-            if current_atr < (spread_cost * self.min_atr_spread_ratio):
-                stats['Vol Gate (Dead Market)'] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "Vol Gate"})
-        
-        # 2. Regime Gate: KER (Signal Strength)
-        current_ker = features.get('ker', 0.5)
-        volatility = features.get('volatility', 0.001)
-        effective_ker_thresh = self.min_ker_threshold * (1 + volatility * 50) 
-        
-        if current_ker < effective_ker_thresh:
-            stats[f'Regime: Low KER ({current_ker:.2f})'] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": f"Regime KER ({current_ker:.2f})"})
+            # Regime Gate: KER (Signal Strength)
+            if gates_passed:
+                current_ker = features.get('ker', 0.5)
+                volatility = features.get('volatility', 0.001)
+                effective_ker_thresh = self.min_ker_threshold * (1 + volatility * 50) 
+                
+                if current_ker < effective_ker_thresh:
+                    gates_passed = False
+                    gate_reason = f"Regime: Low KER ({current_ker:.2f})"
 
-        # 3. Regime Gate: FDI Inhibition Zone (Random Walk)
-        # CRITICAL FIX: Explicitly block 1.45 - 1.55 range
-        current_fdi = features.get('fdi', 1.5)
+            # Regime Gate: FDI Inhibition Zone (Random Walk)
+            if gates_passed:
+                current_fdi = features.get('fdi', 1.5)
+                if self.fdi_min_random <= current_fdi <= self.fdi_max_random:
+                    gates_passed = False
+                    gate_reason = f"Regime: FDI Inhibition ({current_fdi:.2f})"
+                
+            # Regime Gate: HMM State (TEMPORARILY DISABLED)
+            if gates_passed and self.gate_hmm_threshold > 0:
+                hmm_regime = features.get('hmm_regime', 0.5)
+                if hmm_regime < self.gate_hmm_threshold:
+                    gates_passed = False
+                    gate_reason = f"Regime: HMM Range ({hmm_regime:.2f})"
         
-        if self.fdi_min_random <= current_fdi <= self.fdi_max_random:
-            stats[f'Regime: FDI Inhibition ({current_fdi:.2f})'] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": f"Random Walk FDI ({current_fdi:.2f})"})
-            
-        # 4. Regime Gate: HMM State
-        hmm_regime = features.get('hmm_regime', 0.5)
-        if hmm_regime < 0.2: 
-             stats[f'Regime: HMM Range ({hmm_regime:.2f})'] += 1
-             return Signal(symbol, "HOLD", 0.0, {"reason": f"HMM Range ({hmm_regime:.2f})"})
+        # If Gates Failed and NOT Discovery, Exit
+        if not gates_passed and not is_discovery:
+            stats[gate_reason] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": gate_reason})
 
-        # 6. Inference
+        # 5. Inference
         current_pred_action = 0
         try:
-            # Filter Enforcement
+            # Filter Enforcement (Strict even in Discovery)
             entropy_val = features.get('entropy', 0.0)
             entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.90)
             
@@ -308,30 +327,17 @@ class MultiAssetPredictor:
             prob_buy = pred_proba.get(1, 0.0)
             prob_sell = pred_proba.get(-1, 0.0)
             
-            # SAFE DISCOVERY LOGIC
-            is_discovery = self.bar_counters[symbol] < 2500
+            # SAFE DISCOVERY LOGIC (TREND FOLLOWING)
             effective_action = current_pred_action
             discovery_triggered = False
             
             if is_discovery and effective_action == 0:
-                max_prob = max(prob_buy, prob_sell)
-                if max_prob > 0.0:
-                    bias_buy = prob_buy > 0.55
-                    bias_sell = prob_sell > 0.55
-                    
-                    if bias_buy and prob_buy > prob_sell:
+                macd_val = features.get('macd_norm', 0.0)
+                if abs(macd_val) > 0.00005: 
+                    if macd_val > 0:
                         effective_action = 1
                         discovery_triggered = True
-                    elif bias_sell and prob_sell > prob_buy:
-                        effective_action = -1
-                        discovery_triggered = True
-                
-                if not discovery_triggered and features.get('vol_breakout', 0) > 0:
-                    ret = features.get('log_ret', 0)
-                    if ret > 0.00001:
-                        effective_action = 1
-                        discovery_triggered = True
-                    elif ret < -0.00001:
+                    else:
                         effective_action = -1
                         discovery_triggered = True
 
@@ -352,12 +358,26 @@ class MultiAssetPredictor:
             # --- DECISION ---
             min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.85)
             current_ker = features.get('ker', 1.0)
+            volatility = features.get('volatility', 0.001)
             
             if effective_action in [1, -1]:
                 if confidence > min_conf:
+                    # Allow trade if Profitable OR Discovery Triggered
                     if is_profitable or discovery_triggered:
                         action_str = "BUY" if effective_action == 1 else "SELL"
-                        return Signal(symbol, action_str, confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr, "ker": current_ker})
+                        
+                        # FEATURE IMPORTANCE TRACKING
+                        imp_feats = []
+                        if features.get('rsi_norm', 0.5) > 0.7: imp_feats.append('RSI_High')
+                        elif features.get('rsi_norm', 0.5) < 0.3: imp_feats.append('RSI_Low')
+                        if features.get('macd_norm', 0) > 0: imp_feats.append('MACD_Pos')
+                        else: imp_feats.append('MACD_Neg')
+                        if features.get('vol_breakout', 0) > 0: imp_feats.append('Vol_Breakout')
+                        
+                        for f in imp_feats:
+                            self.feature_importance_counter[symbol][f] += 1
+                        
+                        return Signal(symbol, action_str, confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr, "ker": current_ker, "drivers": imp_feats})
                     else:
                         stats['Meta Rejected'] += 1
                         return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
@@ -368,8 +388,10 @@ class MultiAssetPredictor:
                 stats['Model Predicted 0'] += 1
             
             if self.bar_counters[symbol] % 250 == 0:
-                logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} FDI:{feat_stats['avg_fdi']:.2f} Ent:{feat_stats['avg_entropy']:.2f}")
-                logger.info(f"🔍 {symbol} Rejections (Last 250): {dict(stats)}")
+                top_drivers = self.feature_importance_counter[symbol].most_common(3)
+                logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} FDI:{feat_stats['avg_fdi']:.2f}")
+                logger.info(f"🔍 {symbol} Top Drivers: {top_drivers}")
+                logger.info(f"🔍 {symbol} Rejections: {dict(stats)}")
                 stats.clear()
                 
             return Signal(symbol, "HOLD", confidence, {})
