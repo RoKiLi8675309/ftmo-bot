@@ -6,10 +6,10 @@
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
 # PHOENIX STRATEGY UPGRADE (2025-12-25 - DOCUMENT COMPLIANCE):
-# 1. LOGIC OVERHAUL: Implemented "Regime-Adaptive Mean Reversion".
+# 1. LOGIC PARITY: Exact match with engines/live/predictor.py.
 # 2. TRIGGER: Bollinger Band Reversion (2.5 SD).
 # 3. FILTER: ADX < 25 (Ranging Market).
-# 4. CONFIRMATION: Microstructure OFI Divergence.
+# 4. CONFIRMATION: Microstructure OFI Divergence (Z-Score > 2.0).
 # =============================================================================
 import logging
 import sys
@@ -131,7 +131,8 @@ class ResearchStrategy:
         buy_vol = snapshot.get_price(self.symbol, 'buy_vol')
         sell_vol = snapshot.get_price(self.symbol, 'sell_vol')
         
-        # Fallback to Tick Rule if flow missing
+        # --- RETAIL FALLBACK LOGIC ---
+        # Mirrors engines/live/engine.py logic for backtesting parity
         if buy_vol == 0 and sell_vol == 0:
             if self.last_price > 0:
                 if price > self.last_price:
@@ -211,10 +212,9 @@ class ResearchStrategy:
         adx_val = features.get('adx', 50.0)
         bb_upper = features.get('bb_upper', 999999.0)
         bb_lower = features.get('bb_lower', 0.0)
-        micro_ofi = features.get('micro_ofi', 0.0)
+        micro_ofi = features.get('micro_ofi', 0.0) # Z-Score
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
-        rejection_reason = ""
         
         # --- CONDITION 1: REGIME IDENTIFICATION (FILTER) ---
         # Logic: If ADX > 25, Market is Trending -> DISABLE Mean Reversion.
@@ -238,8 +238,9 @@ class ResearchStrategy:
         # Logic: Wait for OFI to contradict price direction.
         # If Price High (Short Trigger), we need Sellers (OFI < -threshold).
         # If Price Low (Long Trigger), we need Buyers (OFI > threshold).
+        # Threshold: 2.0 Standard Deviations (Z-Score)
         
-        ofi_threshold = 2.0 # Aggressive flow required
+        ofi_threshold = 2.0 
         
         if proposed_action == -1: # Selling
             if micro_ofi >= -ofi_threshold: # Not enough selling pressure yet
@@ -279,7 +280,6 @@ class ResearchStrategy:
             # --- EXECUTION ---
             # We override the ML's directional decision with our Rule-Based Trigger,
             # but we use the ML's confidence for sizing.
-            # If ML strongly disagrees (e.g. Rule=Buy, ML=Sell prob 0.9), we might skip.
             
             # Safety Check: If ML thinks probability is terrible (< 0.4), skip even if Rule triggers.
             if confidence < 0.40:

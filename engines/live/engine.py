@@ -10,6 +10,7 @@
 # 2. VOLATILITY GATE: Live enforcement of ATR > 3x Spread.
 # 3. AUTO-DETECT: Retrieves real account size from Redis.
 # 4. ROBUSTNESS: Graceful handling of missing NLP libraries.
+# 5. DATA FIX: Extracts 'bid_vol'/'ask_vol' and computes 'price' from quotes.
 # =============================================================================
 import logging
 import time
@@ -161,21 +162,45 @@ class LiveTradingEngine:
     def process_tick(self, tick_data: dict):
         """
         Handles a single raw tick from Redis.
+        Extracts L2 Data (bid_vol/ask_vol) if available.
         """
         try:
             symbol = tick_data.get('symbol')
             if symbol not in self.aggregators: return
             
-            price = float(tick_data.get('price', 0.0))
+            # --- DATA INTEGRITY FIX ---
+            # Producer sends 'bid' and 'ask'. We calculate mid-price if 'price' is missing.
+            bid = float(tick_data.get('bid', 0.0))
+            ask = float(tick_data.get('ask', 0.0))
+            
+            if 'price' in tick_data:
+                price = float(tick_data['price'])
+            elif bid > 0 and ask > 0:
+                price = (bid + ask) / 2.0
+            else:
+                price = 0.0
+                
+            if price <= 0: return # Skip invalid ticks
+
             volume = float(tick_data.get('volume', 1.0))
             timestamp = float(tick_data.get('time', time.time()))
+            
+            # Extract L2 Flows (New in Producer)
+            bid_vol = float(tick_data.get('bid_vol', 0.0))
+            ask_vol = float(tick_data.get('ask_vol', 0.0))
 
             # Update Price Cache for Risk Manager
-            if price > 0:
-                self.latest_prices[symbol] = price
+            self.latest_prices[symbol] = price
 
-            # 1. Feed Aggregator
-            bar = self.aggregators[symbol].process_tick(price, volume, timestamp)
+            # 1. Feed Aggregator with L2 Data
+            # AUDIT FIX: Passing external_buy_vol/sell_vol to Aggregator
+            bar = self.aggregators[symbol].process_tick(
+                price=price, 
+                volume=volume, 
+                timestamp=timestamp,
+                external_buy_vol=bid_vol, 
+                external_sell_vol=ask_vol
+            )
             
             # 2. If Bar Complete -> Predict
             if bar:
@@ -200,10 +225,6 @@ class LiveTradingEngine:
             logger.error(f"Portfolio Update Error: {e}")
         
         # 2. Prepare Context (Sentiment Injection)
-        # We pass sentiment via context_d1 if we can, or rely on Predictor having access.
-        # Since Predictor interface in File 2 is fixed, we inject into the FeatureEngineer 
-        # state if possible, or assume Features.py handles it if updated.
-        # Here we demonstrate getting the value.
         current_sentiment = self.global_sentiment.get('GLOBAL', 0.0)
         
         # 3. Get Signal

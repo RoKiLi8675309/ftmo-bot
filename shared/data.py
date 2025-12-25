@@ -5,8 +5,9 @@
 # DEPENDENCIES: pandas, numpy, psycopg2 (optional), sqlalchemy
 # DESCRIPTION: Data loading with Adaptive Volume Normalization.
 # AUDIT REMEDIATION:
+#   - FIXED (CRITICAL): VolumeBarAggregator now ingests external L2 flows.
 #   - PROBLEM #4 (JPY Bias): Implemented AdaptiveVolumeNormalizer.
-#   - LG-1: Implemented Lee-Ready Algorithm for Tick Rule.
+#   - LG-1: Implemented Lee-Ready Algorithm as Fallback.
 # =============================================================================
 from __future__ import annotations
 import warnings
@@ -119,10 +120,14 @@ class VolumeBarAggregator:
         self.ticks_in_bar = 0
         self.last_ts = None
 
-    def process_tick(self, price: float, volume: float, timestamp: float) -> Optional[VolumeBar]:
+    def process_tick(self, price: float, volume: float, timestamp: float, 
+                     external_buy_vol: float = 0.0, external_sell_vol: float = 0.0) -> Optional[VolumeBar]:
         """
         Ingests a tick. Returns a VolumeBar if threshold reached, else None.
         Handles overshoot via Carry-Over (Recursion for large block trades).
+        
+        AUDIT FIX: Accepts external_buy_vol/external_sell_vol from Producer.
+        If provided (>0), uses them. If not, falls back to Lee-Ready Tick Rule.
         """
         # 1. Update Prices
         if self.open_price is None:
@@ -133,21 +138,45 @@ class VolumeBarAggregator:
         self.close_price = price
         self.last_ts = timestamp
         
-        # --- TICK RULE LOGIC (LEE-READY) ---
-        # AUDIT FIX: LG-1 Implemented memory for neutral ticks
-        if self.last_price is not None:
-            if price > self.last_price:
-                direction = 1  # Buy
-                self.last_tick_direction = 1
-            elif price < self.last_price:
-                direction = -1  # Sell
-                self.last_tick_direction = -1
-            else:
-                # Neutral: Continue previous direction (Lee-Ready)
-                direction = self.last_tick_direction
+        # --- VOLUME DIRECTION LOGIC ---
+        # Priority 1: External L2 Data (Producer)
+        if external_buy_vol > 0 or external_sell_vol > 0:
+            buy_v = external_buy_vol
+            sell_v = external_sell_vol
+            
+            # Update Lee-Ready state for continuity even if we use L2 here
+            if self.last_price is not None:
+                if price > self.last_price: self.last_tick_direction = 1
+                elif price < self.last_price: self.last_tick_direction = -1
+                
         else:
-            direction = 0  # First tick
-            self.last_tick_direction = 0
+            # Priority 2: Lee-Ready Tick Rule Fallback
+            buy_v = 0.0
+            sell_v = 0.0
+            
+            if self.last_price is not None:
+                if price > self.last_price:
+                    direction = 1  # Buy
+                    self.last_tick_direction = 1
+                elif price < self.last_price:
+                    direction = -1  # Sell
+                    self.last_tick_direction = -1
+                else:
+                    # Neutral: Continue previous direction
+                    direction = self.last_tick_direction
+            else:
+                direction = 0  # First tick
+                self.last_tick_direction = 0
+
+            # Assign Flow
+            if direction == 1:
+                buy_v = volume
+            elif direction == -1:
+                sell_v = volume
+            else:
+                # Should rarely happen with Lee-Ready, but fallback to 50/50
+                buy_v = volume / 2
+                sell_v = volume / 2
 
         self.last_price = price
         # -----------------------
@@ -158,12 +187,23 @@ class VolumeBarAggregator:
         
         if volume < remaining_capacity:
             # Case A: Tick fits entirely in current bar
-            self._accumulate(price, volume, direction)
+            self._accumulate(price, volume, buy_v, sell_v)
             return None
         else:
             # Case B: Tick fills the bar and spills over
+            # We need to split the Buy/Sell volume proportionally
+            
+            # Fraction of this tick that completes the bar
+            split_ratio = remaining_capacity / volume if volume > 0 else 0
+            
+            fill_buy = buy_v * split_ratio
+            fill_sell = sell_v * split_ratio
+            
+            rem_buy = buy_v - fill_buy
+            rem_sell = sell_v - fill_sell
+            
             # 1. Fill the current bar
-            self._accumulate(price, remaining_capacity, direction)
+            self._accumulate(price, remaining_capacity, fill_buy, fill_sell)
             
             # 2. Create the Bar
             vwap = self.vwap_sum / self.current_volume if self.current_volume > 0 else price
@@ -177,12 +217,12 @@ class VolumeBarAggregator:
                 volume=self.current_volume,
                 vwap=vwap,
                 tick_count=self.ticks_in_bar,
-                # Add extended attributes for VPIN
+                # CRITICAL: Export Split Volume for VPIN/OFI
                 buy_vol=self.current_buy_vol,
                 sell_vol=self.current_sell_vol
             )
             
-            # 3. Calculate Spillover
+            # 3. Calculate Spillover Volume
             spillover_vol = volume - remaining_capacity
             
             # 4. Reset for the NEXT bar
@@ -197,24 +237,17 @@ class VolumeBarAggregator:
             self.close_price = price
             self.last_ts = timestamp
             
-            self._accumulate(price, spillover_vol, direction)
+            self._accumulate(price, spillover_vol, rem_buy, rem_sell)
             
             return bar
 
-    def _accumulate(self, price: float, volume: float, direction: int):
+    def _accumulate(self, price: float, volume: float, buy_vol: float, sell_vol: float):
         """Helper to update internal counters."""
         self.current_volume += volume
         self.vwap_sum += (price * volume)
         self.ticks_in_bar += 1
-        
-        if direction == 1:
-            self.current_buy_vol += volume
-        elif direction == -1:
-            self.current_sell_vol += volume
-        else:
-            # Should rarely happen with Lee-Ready, but fallback to 50/50 if truly no history
-            self.current_buy_vol += volume / 2
-            self.current_sell_vol += volume / 2
+        self.current_buy_vol += buy_vol
+        self.current_sell_vol += sell_vol
 
     def _reset(self):
         self.current_volume = 0.0
@@ -275,8 +308,6 @@ def load_real_data(
         try:
             # We use a nested cursor/transaction to safely try/catch SQL errors
             with engine.connect() as conn:
-                # Execute purely to check existence/validity, but read_sql handles the fetch
-                # Optimization: pd.read_sql with params
                 df = pd.read_sql(query_ticks, conn, params=params)
         
         except Exception:
@@ -300,8 +331,6 @@ def load_real_data(
 
         # CRITICAL AUDIT FIX: Strict Check for Empty Data
         if df.empty:
-            # Raise strict error so worker fails immediately rather than silently
-            # Exception: Return empty if it's just a small test, but warn
             print(f"WARNING: Database query returned 0 rows for {symbol}. Check DB population!")
             return pd.DataFrame()
 
@@ -319,18 +348,13 @@ def load_real_data(
             df['volume'] = 1.0
 
         # --- DATA MAPPING FIX: Tick Data Compatibility ---
-        # If we loaded Ticks, we likely have 'price' but NOT 'close'/'open'/'high'/'low'.
-        # The Backtester expects OHLC. We must map 'price' to these columns.
         if 'price' in df.columns:
-            # Check and fill missing OHLC columns
             for col in ['open', 'high', 'low', 'close']:
                 if col not in df.columns:
                     df[col] = df['price']
         # ------------------------------------------------
 
         # --- INDEX FIX: Set Index to 'time' ---
-        # This ensures iterating the DataFrame yields a DatetimeIndex, 
-        # preventing "int object has no attribute timestamp" errors in Strategy.
         df.set_index('time', inplace=True, drop=False)
         # --------------------------------------
 
@@ -345,112 +369,56 @@ def load_real_data(
 def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 1000) -> List[Dict[str, Any]]:
     """
     Offline batch processor for converting Tick DF to Volume Bar List.
-    FIX: Now correctly calculates Buy/Sell Volume using Lee-Ready Tick Rule.
-      
+    FIX: Uses Lee-Ready Tick Rule for classification since offline data rarely has 'buy_vol' columns.
+    
     NOTE: If volume_threshold is default (1000), it attempts to auto-calculate 
-    using AdaptiveVolumeNormalizer if possible, otherwise respects input.
+    using AdaptiveVolumeNormalizer if possible.
     """
     
     # Auto-Adapt Threshold if using default and enough data exists
     if volume_threshold == 1000 and len(tick_df) > 10000:
         normalizer = AdaptiveVolumeNormalizer(target_bars_per_day=50)
-        # Assuming tick_df has 'volume' and 'time'
         try:
             dynamic_thresh = normalizer.calculate_threshold(tick_df)
-            # Only apply if it deviates significantly from default, or just use it
             volume_threshold = dynamic_thresh
-            # print(f"DEBUG: Adaptive Threshold applied: {volume_threshold:.2f}")
         except Exception:
-            pass # Fallback to input
+            pass 
 
     bars = []
-    current_vol = 0.0
-    current_buy_vol = 0.0
-    current_sell_vol = 0.0
-    
-    open_p = None
-    high_p = -float('inf')
-    low_p = float('inf')
-    vwap_sum = 0.0
-    tick_count = 0
-    
-    # State for Tick Rule
-    last_price = None
-    last_direction = 0
+    agg = VolumeBarAggregator(symbol="BATCH", threshold=volume_threshold)
     
     for row in tick_df.itertuples():
         price = getattr(row, 'price', getattr(row, 'close', None))
         vol = getattr(row, 'volume', 1.0)
         ts = getattr(row, 'Index', getattr(row, 'time', None))
         
-        if price is None:
-            continue
+        # If DB has pre-calculated flows (rare), use them
+        b_vol = getattr(row, 'buy_vol', 0.0)
+        s_vol = getattr(row, 'sell_vol', 0.0)
         
-        # --- TICK RULE LOGIC (LEE-READY) ---
-        if last_price is not None:
-            if price > last_price:
-                direction = 1  # Buy
-                last_direction = 1
-            elif price < last_price:
-                direction = -1  # Sell
-                last_direction = -1
-            else:
-                # Neutral: Inherit previous
-                direction = last_direction
+        if price is None: continue
+        
+        # Convert TS to float if needed
+        if isinstance(ts, (datetime, pd.Timestamp)):
+            ts_val = ts.timestamp()
         else:
-            direction = 0
-            last_direction = 0
-        
-        last_price = price
-        # -----------------------
+            ts_val = float(ts)
 
-        if open_p is None:
-            open_p = price
-        high_p = max(high_p, price)
-        low_p = min(low_p, price)
+        # Process via Aggregator logic (reusing strict logic)
+        bar = agg.process_tick(price, vol, ts_val, b_vol, s_vol)
         
-        current_vol += vol
-        
-        # Accumulate Buy/Sell Vol
-        if direction == 1:
-            current_buy_vol += vol
-        elif direction == -1:
-            current_sell_vol += vol
-        else:
-            current_buy_vol += vol / 2
-            current_sell_vol += vol / 2
-        
-        vwap_sum += (price * vol)
-        tick_count += 1
-        
-        if current_vol >= volume_threshold:
-            if isinstance(ts, (datetime, pd.Timestamp)):
-                ts_val = ts.timestamp()
-            else:
-                ts_val = float(ts)
-                
+        if bar:
             bars.append({
-                'timestamp': ts_val,
-                'open': open_p,
-                'high': high_p,
-                'low': low_p,
-                'close': price,
-                'volume': current_vol,
-                'vwap': vwap_sum / current_vol if current_vol > 0 else price,
-                'tick_count': tick_count,
-                # CRITICAL FIX: Export Split Volume for VPIN
-                'buy_vol': current_buy_vol,
-                'sell_vol': current_sell_vol
+                'timestamp': bar.timestamp,
+                'open': bar.open,
+                'high': bar.high,
+                'low': bar.low,
+                'close': bar.close,
+                'volume': bar.volume,
+                'vwap': bar.vwap,
+                'tick_count': bar.tick_count,
+                'buy_vol': bar.buy_vol,
+                'sell_vol': bar.sell_vol
             })
-            
-            # Reset
-            current_vol = 0.0
-            current_buy_vol = 0.0
-            current_sell_vol = 0.0
-            open_p = None
-            high_p = -float('inf')
-            low_p = float('inf')
-            vwap_sum = 0.0
-            tick_count = 0
             
     return bars

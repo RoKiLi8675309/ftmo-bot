@@ -8,8 +8,8 @@
 #
 # PHOENIX STRATEGY UPGRADE (2025-12-25 - RETAIL FALLBACK):
 # 1. FALLBACK: Auto-detects missing L2 data (zero buy/sell vol).
-# 2. TICK RULE: Uses Price Delta to estimate flow if L2 is missing.
-# 3. ROBUSTNESS: Prevents "OFI Wait" freeze on Demo accounts.
+# 2. STRATEGY: Implements 3-Step Logic (ADX Filter -> BB Trigger -> OFI Confirm).
+# 3. ROBUSTNESS: Persists Feature Engineer state (FracDiff/Welford memory).
 # =============================================================================
 import logging
 import pickle
@@ -109,9 +109,9 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # Strategy Specifics
-        self.adx_threshold = CONFIG['features']['adx']['threshold']
-        self.bb_dev = CONFIG['features']['bollinger_bands']['std_dev']
+        # Strategy Specifics (From Config/Document)
+        self.adx_threshold = CONFIG['features']['adx']['threshold'] # 25
+        self.bb_dev = CONFIG['features']['bollinger_bands']['std_dev'] # 2.5
         
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
@@ -185,35 +185,20 @@ class MultiAssetPredictor:
         
         self.bar_counters[symbol] += 1
 
+        # Extract Flows (Populated by Aggregator in shared/data.py)
         buy_vol = getattr(bar, 'buy_vol', 0.0)
         sell_vol = getattr(bar, 'sell_vol', 0.0)
         
-        # --- RETAIL FALLBACK LOGIC ---
-        # If L2 data is missing (0.0), estimate using Tick Rule (Price Delta)
-        # This prevents the OFI logic from seeing "0.0" and blocking trades.
+        # --- RETAIL FALLBACK VISIBILITY ---
+        # Although the Aggregator handles the logic, we log here if we detect synthesized flows
+        # (Perfect 50/50 split usually implies fallback if price didn't move much, or if 
+        # both are non-zero but identical which is rare in nature)
         if buy_vol == 0 and sell_vol == 0:
-            if not self.l2_missing_warned[symbol]:
-                logger.warning(f"⚠️ {symbol}: Missing L2 Data. Enabling Tick Rule Fallback for OFI.")
+             # This should technically be impossible if Aggregator works, but safe guard
+             if not self.l2_missing_warned[symbol]:
+                logger.warning(f"⚠️ {symbol}: Zero Flow Detected. Fallback mechanism engaged.")
                 self.l2_missing_warned[symbol] = True
-            
-            prev_close = self.last_close_prices[symbol]
-            if prev_close > 0:
-                if bar.close > prev_close:
-                    buy_vol = bar.volume
-                    sell_vol = 0.0
-                elif bar.close < prev_close:
-                    buy_vol = 0.0
-                    sell_vol = bar.volume
-                else:
-                    buy_vol = bar.volume / 2
-                    sell_vol = bar.volume / 2
-            else:
-                buy_vol = bar.volume / 2
-                sell_vol = bar.volume / 2
-                
-        self.last_close_prices[symbol] = bar.close
-        # -----------------------------
-
+        
         # 1. Feature Engineering
         features = fe.update(
             price=bar.close,
@@ -234,8 +219,6 @@ class MultiAssetPredictor:
         alpha = 0.01
         feat_stats['avg_ker'] = (1 - alpha) * feat_stats.get('avg_ker', 0.5) + alpha * features.get('ker', 0.5)
         feat_stats['avg_fdi'] = (1 - alpha) * feat_stats.get('avg_fdi', 1.5) + alpha * features.get('fdi', 1.5)
-        
-        # New Microstructure Stats
         feat_stats['avg_ofi'] = (1 - alpha) * feat_stats.get('avg_ofi', 0.0) + alpha * features.get('micro_ofi', 0.0)
         
         # --- WARM-UP GATE ---
@@ -283,10 +266,9 @@ class MultiAssetPredictor:
         adx_val = features.get('adx', 50.0)
         bb_upper = features.get('bb_upper', 999999.0)
         bb_lower = features.get('bb_lower', 0.0)
-        micro_ofi = features.get('micro_ofi', 0.0)
+        micro_ofi = features.get('micro_ofi', 0.0) # This is now a Z-Score
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
-        rejection_reason = ""
         
         # --- CONDITION 1: REGIME IDENTIFICATION (FILTER) ---
         # Logic: If ADX > 25, Market is Trending -> DISABLE Mean Reversion.
@@ -307,16 +289,21 @@ class MultiAssetPredictor:
             return Signal(symbol, "HOLD", 0.0, {"reason": "Inside Bands"})
 
         # --- CONDITION 3: MICROSTRUCTURE CONFIRMATION (OFI) ---
-        ofi_threshold = 2.0 # Aggressive flow required
+        # Logic: Wait for OFI to contradict price direction.
+        # If Price High (Short Trigger), we need Sellers (OFI < -threshold).
+        # If Price Low (Long Trigger), we need Buyers (OFI > threshold).
         
-        # If we are in Fallback Mode (Tick Rule), reduce threshold because Tick OFI is less granular
-        if self.l2_missing_warned[symbol]:
-            ofi_threshold = 0.5 
-
+        ofi_threshold = 2.0 # Aggressive flow required (Z-Score)
+        
+        # If we are effectively in Fallback Mode (Tick Rule estimation implies lower variance/granularity),
+        # we might want to relax this slightly, or keep it strict. 
+        # Since Welford normalizes it to Z-Score, 2.0 should ideally hold meaning regardless of raw scale.
+        
         if proposed_action == -1: # Selling
             if micro_ofi >= -ofi_threshold: # Not enough selling pressure yet
                 stats["OFI Wait (Price High, No Sellers)"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "OFI Wait Sell"})
+                
         elif proposed_action == 1: # Buying
             if micro_ofi <= ofi_threshold: # Not enough buying pressure yet
                 stats["OFI Wait (Price Low, No Buyers)"] += 1
@@ -325,9 +312,7 @@ class MultiAssetPredictor:
         # 5. ML Confirmation & Execution
         
         # Primary Prediction (Used for Confidence/Sizing only)
-        pred_class = model.predict_one(features)
         pred_proba = model.predict_proba_one(features)
-        
         prob_buy = pred_proba.get(1, 0.0)
         prob_sell = pred_proba.get(-1, 0.0)
         
@@ -342,7 +327,6 @@ class MultiAssetPredictor:
         )
 
         # --- DECISION ---
-        min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.85)
         current_ker = features.get('ker', 1.0)
         volatility = features.get('volatility', 0.001)
         frac_diff = features.get('frac_diff', 0.0)
@@ -355,7 +339,7 @@ class MultiAssetPredictor:
         if is_profitable:
                 action_str = "BUY" if proposed_action == 1 else "SELL"
                 
-                # FEATURE IMPORTANCE TRACKING
+                # FEATURE IMPORTANCE TRACKING (Approximate)
                 imp_feats = []
                 if adx_val < 25: imp_feats.append('Ranging_Mode')
                 if proposed_action == 1: imp_feats.append('BB_Lower_Break')
@@ -399,7 +383,7 @@ class MultiAssetPredictor:
                 with open(self.models_dir / f"calibrators_{sym}.pkl", "wb") as f:
                     pickle.dump(self.calibrators[sym], f)
                 
-                # NEW: Persist Feature Engineer State (FracDiff memory)
+                # NEW: Persist Feature Engineer State (FracDiff memory & Welford Scalers)
                 with open(self.models_dir / f"feature_engineer_{sym}.pkl", "wb") as f:
                     pickle.dump(self.feature_engineers[sym], f)
                     

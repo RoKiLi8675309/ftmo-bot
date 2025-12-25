@@ -7,7 +7,7 @@
 #
 # PHOENIX STRATEGY UPGRADE (2025-12-25 - RETAIL FALLBACK):
 # 1. FRACDIFF: Standardized to d=0.4 for GBP/JPY stationarity.
-# 2. MICROSTRUCTURE: Enhanced OFI Analyzer with Tick Rule Fallback support.
+# 2. MICROSTRUCTURE: Rewrote OFI for Volume Bars (Net Flow Z-Score).
 # 3. INDICATORS: StreamingBollingerBands & StreamingADX.
 # =============================================================================
 from __future__ import annotations
@@ -64,7 +64,7 @@ class WelfordScaler:
     """
     Online Standardization using Welford's Algorithm.
     Computes running Mean and Variance in a single pass (O(1)).
-    Used to normalize non-stationary features (e.g., Volume) dynamically
+    Used to normalize non-stationary features (e.g., Volume, OFI) dynamically
     without the memory cost or lag of a sliding window.
     """
     def __init__(self):
@@ -194,69 +194,28 @@ class StreamingFracDiff:
 
 class MicrostructureAnalyzer:
     """
-    Analyzes tick/bar data to calculate Order Flow Imbalance (OFI).
-    Acts as a leading indicator for short-term price direction by measuring
-    aggressiveness of buyers vs sellers.
+    Analyzes Volume Bars to calculate Order Flow Imbalance (OFI).
+    
+    AUDIT FIX: Now calculates Flow Imbalance based on Execution (BuyVol - SellVol)
+    rather than Tick Depth Delta, as we are operating on aggregated Bars.
     """
-    def __init__(self, ema_alpha=0.2):
-        self.prev_bid_price = None
-        self.prev_bid_vol = None
-        self.prev_ask_price = None
-        self.prev_ask_vol = None
-        
-        self.ofi_value = 0.0
+    def __init__(self, ema_alpha=0.1):
+        self.ofi_smoothed = 0.0
         self.alpha = ema_alpha
 
-    def process_update(self, bid_price: float, bid_vol: float, ask_price: float, ask_vol: float) -> float:
+    def process_bar(self, buy_vol: float, sell_vol: float) -> float:
         """
-        Ingests current Best Bid and Best Ask data (Level 1) to compute OFI.
-        Can be called per-tick or per-bar (using close prices).
+        Ingests aggregated Buy/Sell volume for the bar.
+        Returns the Smoothed Net Flow (Raw).
+        Normalization (Z-Score) happens in FeatureEngineer via Welford.
         """
-        # Handle first tick initialization
-        if self.prev_bid_price is None:
-            self.prev_bid_price = bid_price
-            self.prev_bid_vol = bid_vol
-            self.prev_ask_price = ask_price
-            self.prev_ask_vol = ask_vol
-            return 0.0
-
-        # --- 1. Analyze Bid Side Flow (Demand) ---
-        if bid_price > self.prev_bid_price:
-            # Price improved: Aggressive buying or limit bids stepping up
-            bid_flow = bid_vol
-        elif bid_price < self.prev_bid_price:
-            # Price dropped: Bids were consumed (selling) or cancelled
-            bid_flow = -self.prev_bid_vol
-        else:
-            # Price unchanged: Change in volume
-            bid_flow = bid_vol - self.prev_bid_vol
-
-        # --- 2. Analyze Ask Side Flow (Supply) ---
-        if ask_price > self.prev_ask_price:
-            # Ask moved higher (Supply retreated / Consumed)
-            # Implies buying pressure consuming liquidity
-            ask_flow = -self.prev_ask_vol 
-        elif ask_price < self.prev_ask_price:
-            # Ask moved lower (Aggressive sellers stepping down)
-            ask_flow = ask_vol
-        else:
-            # Price unchanged
-            ask_flow = ask_vol - self.prev_ask_vol
-
-        # --- 3. Net Imbalance ---
-        # OFI = Bid_Flow - Ask_Flow
-        current_ofi = bid_flow - ask_flow
-
-        # --- 4. Exponential Smoothing (EMA) ---
-        self.ofi_value = (self.alpha * current_ofi) + ((1 - self.alpha) * self.ofi_value)
-
-        # Update State
-        self.prev_bid_price = bid_price
-        self.prev_bid_vol = bid_vol
-        self.prev_ask_price = ask_price
-        self.prev_ask_vol = ask_vol
-
-        return self.ofi_value
+        # Net Flow Imbalance
+        current_imbalance = buy_vol - sell_vol
+        
+        # Exponential Smoothing to reduce noise
+        self.ofi_smoothed = (self.alpha * current_imbalance) + ((1 - self.alpha) * self.ofi_smoothed)
+        
+        return self.ofi_smoothed
 
 # --- 2. REGIME INDICATORS ---
 
@@ -773,6 +732,7 @@ class OnlineFeatureEngineer:
         
         # Welford Scaler for Volume (Infinite Window Stationarity)
         self.welford_volume = WelfordScaler()
+        self.welford_ofi = WelfordScaler() # NEW: Scaler for OFI Z-Score
         
         # Regime Indicators
         self.ker = KaufmanEfficiencyRatio(window=10)
@@ -840,12 +800,11 @@ class OnlineFeatureEngineer:
         fd_price = self.frac_diff.update(price)
 
         # --- Microstructure (OFI) ---
-        micro_ofi = self.microstructure.process_update(
-            bid_price=low,  
-            bid_vol=buy_vol, 
-            ask_price=high,
-            ask_vol=sell_vol
-        )
+        # Calculate raw smoothed OFI
+        raw_ofi_smoothed = self.microstructure.process_bar(buy_vol, sell_vol)
+        
+        # Convert to Z-Score using Welford Scaler
+        micro_ofi_z = self.welford_ofi.update(raw_ofi_smoothed)
 
         # Volatility Ratio
         self.vol_baseline.update(volatility_val)
@@ -937,11 +896,11 @@ class OnlineFeatureEngineer:
             
             # Microstructure & Math
             'frac_diff': fd_price,          # NEW: Fractionally Differentiated Price
-            'micro_ofi': micro_ofi,         # NEW: Microstructure OFI
+            'micro_ofi': micro_ofi_z,       # FIXED: Now Z-Scored Flow Imbalance
             'entropy': entropy_val,
             'vpin': vpin_val,
             'hurst': hurst_val,
-            'ofi_simple': ofi_simple,       
+            'ofi_simple': ofi_simple,        
             'efficiency_ratio': er_val,
             
             # Context
