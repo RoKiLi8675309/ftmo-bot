@@ -9,6 +9,7 @@
 # 1. MTF MEMORY: OnlineFeatureEngineer now digests D1 & H4 Context.
 # 2. ALIGNMENT: Calculates 'mtf_alignment' (D1 Trend == H4 Trend == M5 Trend).
 # 3. QUANT KERNELS: FracDiff (d=0.4), OFI Z-Score, and VPIN preserved.
+# 4. CONFIG AWARENESS: StreamingIndicators now respect config.yaml parameters.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -382,7 +383,7 @@ class StreamingBollingerBands:
     Online calculation of Bollinger Bands using Welford's Algorithm or Window.
     Used for the Mean Reversion Trigger (Price touches 2.5 SD).
     """
-    def __init__(self, period: int = 20, std_dev: float = 2.5):
+    def __init__(self, period: int = 20, std_dev: float = 2.0):
         self.period = period
         self.std_dev = std_dev
         self.buffer = deque(maxlen=period)
@@ -482,6 +483,7 @@ class StreamingIndicators:
     """
     Recursive implementation of technical indicators.
     Now includes Bollinger Bands and ADX.
+    AUDIT FIX: Now dynamically loads STD_DEV from CONFIG to fix 'Inside Bands' blockage.
     """
     def __init__(self, rsi_period=14, macd_fast=12, macd_slow=26, macd_sig=9, atr_period=14):
         # MACD Components
@@ -499,8 +501,10 @@ class StreamingIndicators:
         self.atr_mean = RecursiveEMA(alpha=1 / atr_period)
         self.prev_close = None
         
-        # NEW: Bollinger Bands & ADX
-        self.bb = StreamingBollingerBands(period=20, std_dev=2.5) # Doc specified 2.5 SD
+        # NEW: Bollinger Bands & ADX with Config Awareness
+        # Default to 2.0 if not specified to allow Mean Rev triggers
+        bb_dev = CONFIG.get('features', {}).get('bollinger_bands', {}).get('std_dev', 2.0)
+        self.bb = StreamingBollingerBands(period=20, std_dev=bb_dev)
         self.adx = StreamingADX(period=14)
 
     def update(self, price: float, high: float, low: float) -> Dict[str, float]:

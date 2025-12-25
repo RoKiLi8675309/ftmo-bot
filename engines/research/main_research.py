@@ -248,6 +248,10 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             if total_trades > 50:
                 final_score += 2.0 
             
+            # AUDIT FIX: Generate Autopsy BEFORE pruning to reveal blockage
+            if total_trades < min_trades or final_score < 0.5 or broker.is_blown:
+                trial.set_user_attr("autopsy", strategy.generate_autopsy())
+
             if total_trades < min_trades:
                 trial.set_user_attr("pruned", True)
                 return -100.0 
@@ -257,10 +261,6 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                  loss_ratio = abs(metrics['total_pnl']) / broker.starting_cash
                  penalty_factor = 1000.0 * loss_ratio 
                  final_score -= penalty_factor
-
-            # Generate Autopsy if result is poor
-            if final_score < 0.5 or broker.is_blown:
-                trial.set_user_attr("autopsy", strategy.generate_autopsy())
                 
             if broker.is_blown:
                 trial.set_user_attr("blown", True)

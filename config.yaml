@@ -1,12 +1,11 @@
 # =============================================================================
-# config.yaml – PHOENIX STRATEGY V3.0 (MTF REGIME ADAPTIVE)
+# config.yaml – PHOENIX STRATEGY V3.1 (UNBLOCKED)
 # STATUS: GOLDEN CONFIG / MULTI-TIMEFRAME ENABLED
 #
-# AUDIT REMEDIATION (2025-12-25 - TOTAL OVERHAUL):
-# 1. EXECUTION: limit_order_offset_pips added for passive entry.
-# 2. REGIMES: ker_threshold parameters added for Trend/MeanRev switching.
-# 3. CONTEXT: H4/D1 Context enabled in features.
-# 4. QUANT: FracDiff d=0.4 standardized for GBP/JPY stationarity.
+# AUDIT REMEDIATION (2025-12-25 - PARAMETER RELAXATION):
+# 1. UNBLOCK: Bollinger Bands std_dev reduced to 2.0 (was 2.5) to fix 99% rejection rate.
+# 2. REGIMES: KER Gap narrowed (0.40 - 0.50) to minimize "Noise" dead zone.
+# 3. ADAPTIVITY: Delta increased to 1e-4 for faster model reaction.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -116,10 +115,10 @@ features:
     d: 0.4
     window: 30
     
-  # STRATEGY UPDATE: Mean Reversion Triggers
+  # STRATEGY UPDATE: Mean Reversion Triggers (RELAXED)
   bollinger_bands:
     period: 20
-    std_dev: 2.5
+    std_dev: 2.0 # AUDIT FIX: Lowered from 2.5 to unblock trades
     
   # STRATEGY UPDATE: Regime Filter (Ranging Market)
   adx:
@@ -218,10 +217,11 @@ trading:
   # Passive Entry: Place Limit Order x pips better than market
   limit_order_offset_pips: 0.5
   
-  # --- REGIME THRESHOLDS (NEW) ---
+  # --- REGIME THRESHOLDS (NARROWED DEAD ZONE) ---
   # Kaufman Efficiency Ratio (KER) Gates
-  ker_threshold_trend: 0.60     # > 0.60 = Efficient Trend
-  ker_threshold_mean_rev: 0.30  # < 0.30 = Choppy / Mean Reversion
+  # Gap reduced to 0.40 - 0.50 (was 0.30 - 0.60)
+  ker_threshold_trend: 0.50     # > 0.50 = Efficient Trend
+  ker_threshold_mean_rev: 0.40  # < 0.40 = Choppy / Mean Reversion
 
 # --- ONLINE LEARNING (GOLDEN CONFIG) ---
 online_learning:
@@ -230,7 +230,7 @@ online_learning:
   # GOLDEN CONFIGURATION
   n_models: 30       # Range 30-50
   grace_period: 250      # Range 200-500
-  delta: 0.00001         # 1e-5 (Conservative)
+  delta: 0.0001          # 1e-4 (Faster Adaptation)
   warning_delta: 0.001   # 1e-3 (Early Warning)
   lambda_value: 10       # Poisson Weight
   max_features: 'log2'   # Decorrelation
