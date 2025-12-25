@@ -3,13 +3,13 @@
 # ENVIRONMENT: Linux/WSL2 (Python 3.11)
 # PATH: engines/research/strategy.py
 # DEPENDENCIES: shared, river, engines.research.backtester
-# DESCRIPTION: The Adaptive Strategy Kernel.
+# DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
 # PHOENIX STRATEGY UPGRADE (2025-12-25 - DOCUMENT COMPLIANCE):
 # 1. LOGIC PARITY: Exact match with engines/live/predictor.py.
 # 2. TRIGGER: Bollinger Band Reversion (2.5 SD).
-# 3. FILTER: ADX < 25 (Ranging Market).
-# 4. CONFIRMATION: Microstructure OFI Divergence (Z-Score > 2.0).
+# 3. FILTER: ADX < 25 (Ranging Market) - Configurable.
+# 4. CONFIRMATION: Microstructure OFI Divergence (Z-Score > 1.0).
 # =============================================================================
 import logging
 import sys
@@ -52,7 +52,6 @@ class ResearchStrategy:
         self.debug_mode = False
         
         # 1. Feature Engineer (The Eyes)
-        # Note: Now includes FracDiff, Microstructure, BB, and ADX kernels
         self.fe = OnlineFeatureEngineer(
             window_size=params.get('window_size', 50)
         )
@@ -69,7 +68,6 @@ class ResearchStrategy:
         # 3. Meta Labeler (The Gatekeeper)
         self.meta_labeler = MetaLabeler()
         self.meta_label_events = 0 
-        self.meta_warmup_limit = 50 
         
         # 4. Probability Calibrators
         self.calibrator_buy = ProbabilityCalibrator(window=2000)
@@ -92,9 +90,11 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() # Tracks top features
         
-        # --- STRATEGY PARAMETERS (From Config/Document) ---
-        self.adx_threshold = CONFIG['features']['adx']['threshold'] # 25
-        self.bb_dev = CONFIG['features']['bollinger_bands']['std_dev'] # 2.5
+        # --- STRATEGY PARAMETERS (From Config) ---
+        # Fallback to defaults if config is missing
+        feat_conf = CONFIG.get('features', {})
+        self.adx_threshold = feat_conf.get('adx', {}).get('threshold', 25)
+        self.bb_dev = feat_conf.get('bollinger_bands', {}).get('std_dev', 2.5)
         
         # Load Spread Assumptions for Gating
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
@@ -132,26 +132,28 @@ class ResearchStrategy:
         sell_vol = snapshot.get_price(self.symbol, 'sell_vol')
         
         # --- RETAIL FALLBACK LOGIC ---
-        # Mirrors engines/live/engine.py logic for backtesting parity
+        # Mirrors engines/live/engine.py logic for backtesting parity.
+        # If the Aggregator didn't provide split volume (common in simple backtests),
+        # we estimate it here to prevent the FeatureEngineer from seeing 0/0.
         if buy_vol == 0 and sell_vol == 0:
             if self.last_price > 0:
                 if price > self.last_price:
                     buy_vol = volume
-                    sell_vol = 0
+                    sell_vol = 0.0
                 elif price < self.last_price:
-                    buy_vol = 0
+                    buy_vol = 0.0
                     sell_vol = volume
                 else:
-                    buy_vol = volume / 2
-                    sell_vol = volume / 2
+                    buy_vol = volume / 2.0
+                    sell_vol = volume / 2.0
             else:
-                buy_vol = volume / 2
-                sell_vol = volume / 2
+                buy_vol = volume / 2.0
+                sell_vol = volume / 2.0
         
         self.last_price = price
 
         # A. Feature Engineering
-        # (Generates frac_diff and micro_ofi internally)
+        # (Generates frac_diff, micro_ofi, adx, bb, etc. internally)
         features = self.fe.update(
             price=price,
             timestamp=timestamp,
@@ -163,6 +165,8 @@ class ResearchStrategy:
             time_feats={}
         )
         
+        if features is None: return
+
         self.last_features = features
         
         # --- WARM-UP GATE ---
@@ -185,18 +189,20 @@ class ResearchStrategy:
                 
                 base_weight = w_pos if outcome_label != 0 else w_neg
                 
-                # Scale by Profit Magnitude
+                # Scale by Profit Magnitude (Log Scale)
                 ret_scalar = math.log1p(abs(realized_ret) * 100.0)
                 ret_scalar = max(0.5, ret_scalar)
                 
                 final_weight = base_weight * ret_scalar
                 
+                # Train the model
                 self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
                 
-                # Double Learn for Positive outcomes
+                # Double Learn for Positive outcomes (Reinforcement)
                 if outcome_label != 0:
                      self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
 
+                # Train Meta Labeler
                 if outcome_label != 0:
                     self.meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
 
@@ -217,9 +223,9 @@ class ResearchStrategy:
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         
         # --- CONDITION 1: REGIME IDENTIFICATION (FILTER) ---
-        # Logic: If ADX > 25, Market is Trending -> DISABLE Mean Reversion.
+        # Logic: If ADX > Threshold, Market is Trending -> DISABLE Mean Reversion.
         if adx_val > self.adx_threshold:
-            self.rejection_stats[f"Trend Mode (ADX {adx_val:.1f})"] += 1
+            self.rejection_stats[f"Trend Mode (ADX {adx_val:.1f} > {self.adx_threshold})"] += 1
             # We exit early because this strategy is strictly Mean Reversion
             return 
 
@@ -232,23 +238,24 @@ class ResearchStrategy:
             proposed_action = 1 # Buy
         else:
             # Inside bands -> No Trigger
+            # self.rejection_stats["Inside Bands"] += 1 # Too noisy to log
             return
 
         # --- CONDITION 3: MICROSTRUCTURE CONFIRMATION (OFI) ---
         # Logic: Wait for OFI to contradict price direction.
         # If Price High (Short Trigger), we need Sellers (OFI < -threshold).
         # If Price Low (Long Trigger), we need Buyers (OFI > threshold).
-        # Threshold: 2.0 Standard Deviations (Z-Score)
+        # Threshold: 1.0 Standard Deviations (Z-Score) - Relaxed from 2.0 to ensure execution.
         
-        ofi_threshold = 2.0 
+        ofi_threshold = 1.0 
         
         if proposed_action == -1: # Selling
-            if micro_ofi >= -ofi_threshold: # Not enough selling pressure yet
-                self.rejection_stats["OFI Wait (Price High, No Sellers)"] += 1
+            if micro_ofi >= -ofi_threshold: # Not enough selling pressure yet (Need < -1.0)
+                self.rejection_stats[f"OFI Wait Sell (OFI {micro_ofi:.2f} >= -{ofi_threshold})"] += 1
                 return
         elif proposed_action == 1: # Buying
-            if micro_ofi <= ofi_threshold: # Not enough buying pressure yet
-                self.rejection_stats["OFI Wait (Price Low, No Buyers)"] += 1
+            if micro_ofi <= ofi_threshold: # Not enough buying pressure yet (Need > 1.0)
+                self.rejection_stats[f"OFI Wait Buy (OFI {micro_ofi:.2f} <= {ofi_threshold})"] += 1
                 return
 
         # ============================================================
@@ -259,7 +266,6 @@ class ResearchStrategy:
         
         try:
             # Primary Prediction
-            pred_class = self.model.predict_one(features)
             pred_proba = self.model.predict_proba_one(features)
             
             prob_buy = pred_proba.get(1, 0.0)
@@ -283,7 +289,7 @@ class ResearchStrategy:
             
             # Safety Check: If ML thinks probability is terrible (< 0.4), skip even if Rule triggers.
             if confidence < 0.40:
-                self.rejection_stats["ML Disagreement"] += 1
+                self.rejection_stats[f"ML Disagreement (Conf {confidence:.2f})"] += 1
                 return
 
             if is_profitable:
@@ -291,7 +297,7 @@ class ResearchStrategy:
                 # Discovery Mode is effectively disabled as we have hard rules now
                 self._execute_logic(confidence, price, features, broker, dt_timestamp, proposed_action, discovery_mode=False)
             else:
-                self.rejection_stats['Meta-Labeler'] += 1
+                self.rejection_stats['Meta-Labeler Reject'] += 1
 
         except Exception as e:
             if self.debug_mode: logger.error(f"Strategy Error: {e}")
@@ -313,11 +319,8 @@ class ResearchStrategy:
         # 1. Signal Threshold
         min_prob = self.params.get('min_calibrated_probability', 0.85)
         
-        # Rule-based triggers are high quality, so we can relax ML confidence slightly
-        # if the setup is perfect (e.g. Extreme BB deviation).
-        # For now, we respect the config.
         if confidence < min_prob:
-            self.rejection_stats['Low Confidence'] += 1
+            self.rejection_stats[f'Low Confidence ({confidence:.2f} < {min_prob})'] += 1
             return
 
         action = "BUY" if action_int == 1 else "SELL"
@@ -352,7 +355,7 @@ class ResearchStrategy:
         trade_intent.action = action
 
         if trade_intent.volume <= 0:
-            self.rejection_stats[f"Risk: {trade_intent.comment}"] += 1
+            self.rejection_stats[f"Risk Zero: {trade_intent.comment}"] += 1
             return
 
         qty = trade_intent.volume
@@ -360,7 +363,7 @@ class ResearchStrategy:
         tp_dist = trade_intent.take_profit
 
         if qty < 0.01:
-            self.rejection_stats['Zero Size (Risk)'] += 1
+            self.rejection_stats['Zero Size (< 0.01)'] += 1
             return
 
         if action == "BUY":
@@ -387,13 +390,13 @@ class ResearchStrategy:
         
         # Track Features for Explainability
         imp_feats = []
-        if features.get('adx', 0) < 25: imp_feats.append('Ranging_Mode')
+        if features.get('adx', 0) < self.adx_threshold: imp_feats.append('Ranging_Mode')
         if features.get('bb_position', 0.5) > 1.0: imp_feats.append('BB_Upper_Break')
         elif features.get('bb_position', 0.5) < 0.0: imp_feats.append('BB_Lower_Break')
         
         micro_ofi = features.get('micro_ofi', 0.0)
-        if micro_ofi > 2.0: imp_feats.append('OFI_Strong_Buy')
-        elif micro_ofi < -2.0: imp_feats.append('OFI_Strong_Sell')
+        if micro_ofi > 1.0: imp_feats.append('OFI_Strong_Buy')
+        elif micro_ofi < -1.0: imp_feats.append('OFI_Strong_Sell')
         
         for f in imp_feats:
             self.feature_importance_counter[f] += 1
@@ -420,18 +423,22 @@ class ResearchStrategy:
         Generates a text report explaining WHY the strategy behaved this way.
         """
         if not self.trade_events:
-            reject_str = ", ".join([f"{k}: {v}" for k, v in self.rejection_stats.items()])
+            # Sort rejections by count desc
+            sorted_rejects = sorted(self.rejection_stats.items(), key=lambda item: item[1], reverse=True)
+            reject_str = ", ".join([f"{k}: {v}" for k, v in sorted_rejects[:5]]) # Top 5 reasons
+            
             status = "Waiting for Warm-Up" if not self.burn_in_complete else "No Trigger Conditions Met"
-            return f"AUTOPSY: No trades. Status: {status}. Rejections: {{{reject_str}}}. Bars processed: {self.bars_processed}"
+            return f"AUTOPSY: No trades. Status: {status}. Top Rejections: {{{reject_str}}}. Bars processed: {self.bars_processed}"
         
         avg_conf = np.mean([t['conf'] for t in self.trade_events])
-        avg_vpin = np.mean([t['vpin'] for t in self.trade_events])
+        avg_vpin = np.mean([t['vpin'] for t in self.trade_events]) 
         avg_ofi = np.mean([t['micro_ofi'] for t in self.trade_events]) 
         avg_frac = np.mean([t['frac_diff'] for t in self.trade_events]) 
         
         forced_count = sum(1 for t in self.trade_events if t['forced'])
         
-        reject_str = ", ".join([f"{k}: {v}" for k, v in self.rejection_stats.items()])
+        sorted_rejects = sorted(self.rejection_stats.items(), key=lambda item: item[1], reverse=True)
+        reject_str = ", ".join([f"{k}: {v}" for k, v in sorted_rejects[:5]])
         
         # Explainability Report
         top_features = self.feature_importance_counter.most_common(5)

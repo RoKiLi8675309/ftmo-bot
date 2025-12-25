@@ -6,8 +6,8 @@
 # DESCRIPTION: Data loading with Adaptive Volume Normalization.
 # AUDIT REMEDIATION:
 #   - FIXED (CRITICAL): VolumeBarAggregator now ingests external L2 flows.
+#   - FALLBACK: Implemented Lee-Ready (Tick Rule) for Retail Brokers/Backtesting.
 #   - PROBLEM #4 (JPY Bias): Implemented AdaptiveVolumeNormalizer.
-#   - LG-1: Implemented Lee-Ready Algorithm as Fallback.
 # =============================================================================
 from __future__ import annotations
 import warnings
@@ -208,8 +208,14 @@ class VolumeBarAggregator:
             # 2. Create the Bar
             vwap = self.vwap_sum / self.current_volume if self.current_volume > 0 else price
             
+            # Timestamps must be datetime objects for Models
+            if isinstance(self.last_ts, float) or isinstance(self.last_ts, int):
+                dt_ts = datetime.fromtimestamp(self.last_ts, pytz.utc)
+            else:
+                dt_ts = self.last_ts
+
             bar = VolumeBar(
-                timestamp=self.last_ts,
+                timestamp=dt_ts,
                 open=self.open_price,
                 high=self.high_price,
                 low=self.low_price,
