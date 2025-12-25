@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PHOENIX STRATEGY V3.3 (UNBLOCKED & RELAXED)
+# config.yaml – PHOENIX STRATEGY V3.4 (INNER BAND MOMENTUM)
 # STATUS: GOLDEN CONFIG / MULTI-TIMEFRAME ENABLED
 #
-# AUDIT REMEDIATION (2025-12-25 - THRESHOLD OPTIMIZATION):
-# 1. UNBLOCK: Lowered 'min_calibrated_probability' to 0.65 to allow Neutral Zone trades.
-# 2. REGIMES: KER Dead Zone eliminated (0.45 split).
-# 3. EXECUTION: Reduced Volatility Gate to 1.5x Spread.
+# AUDIT REMEDIATION (2025-12-25 - WIN RATE OPTIMIZATION):
+# 1. LOGIC: Regime B now targets Inner Band Breakouts (Expansion) vs Midline Bounces.
+# 2. TARGETS: Reduced 'take_profit_atr_mult' to 1.5 to secure profits in chop.
+# 3. CONFIDENCE: Kept at 0.65 to allow sufficient trade frequency for ML filtering.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -183,7 +183,8 @@ risk_management:
   
   # TRADE MANAGEMENT (SNIPER MODE)
   stop_loss_atr_mult: 1.0
-  take_profit_atr_mult: 2.0 
+  # AUDIT FIX: Reduced from 2.0 to 1.5 to improve Win Rate in mean-reversion
+  take_profit_atr_mult: 1.5 
   
   risk_timezone: "Europe/Prague"
   
@@ -255,7 +256,7 @@ online_learning:
     drift_threshold: 1.0
     
   learning_horizon_sec: 300
-  # AUDIT FIX: Lowered to 0.65 to allow Neutral Zone trades
+  # AUDIT FIX: Kept at 0.65 to accommodate new Inner Band setups
   min_calibrated_probability: 0.65
 
 # --- NEWS FILTER ---
