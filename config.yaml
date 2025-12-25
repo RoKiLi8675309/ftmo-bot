@@ -1,5 +1,5 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V1.0 (VOLATILITY EXPANSION & MOMENTUM)
+# config.yaml – PROJECT PHOENIX V1.1 (OPTIMIZED PARAMETERS)
 # STATUS: GREENFIELD REDESIGN
 #
 # AUDIT REMEDIATION (2025-12-25 - STRATEGY PIVOT):
@@ -7,6 +7,11 @@
 # 2. DATA: L1 Feature Engineering proxies (Parkinson, Amihud, RVol) replacing L2 dependency.
 # 3. EXECUTION: Passive Limit Orders (Ask - 0.2) with strict 60s Timeout.
 # 4. PORTFOLIO: Excluded CHF/CAD to reduce mean-reversion noise.
+#
+# OPTIMIZATION V1.1:
+# - Widened Stop Loss to 1.5 ATR (Breathing room).
+# - Relaxed Range Gate to 1.2 ATR (Capture earlier expansion).
+# - Tightened Trend Gate (KER > 0.70) to filter chop.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -138,11 +143,11 @@ phoenix_strategy:
   vol_expansion_threshold: 1.5  # Parkinson Vol > 1.5 * Baseline
   
   # Regime B: Momentum Trend
-  ker_trend_threshold: 0.60     # Efficiency Ratio > 0.6
+  ker_trend_threshold: 0.70     # AUDIT FIX: Tightened from 0.60 to filter noise
   
   # Entry Gates
-  range_gate_atr_mult: 1.5      # Current Bar Range > 1.5 * ATR
-  volume_gate_ratio: 1.2        # Relative Volume > 1.2
+  range_gate_atr_mult: 1.2      # AUDIT FIX: Relaxed from 1.5 to 1.2
+  volume_gate_ratio: 1.1        # AUDIT FIX: Relaxed from 1.2 to 1.1
   ml_confirmation_threshold: 0.60
   
   # Microstructure Filters (Proxies)
@@ -172,7 +177,7 @@ risk_management:
   cppi_multiplier: 2.0
   
   # PROJECT PHOENIX EXIT LOGIC
-  stop_loss_atr_mult: 1.0       # Tight Stop: Momentum fails -> Get Out
+  stop_loss_atr_mult: 1.5       # AUDIT FIX: Widened from 1.0 to 1.5 to reduce premature stops
   take_profit_atr_mult: 5.0     # Open-Ended (Managed by Trailing Stop)
   
   # TRAILING STOP

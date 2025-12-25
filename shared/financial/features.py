@@ -9,7 +9,7 @@
 # 1. CORE FEATURES: Implemented 7 Core L1 Proxies (Parkinson, Amihud, RVol, etc.).
 # 2. VOLATILITY: Added High-Low Range Volatility (Parkinson) for expansion detection.
 # 3. LIQUIDITY: Added Amihud Illiquidity Proxy (Return / DollarVolume).
-# 4. MOMENTUM: Added Aggressor Ratio (Close vs Range) and Relative Volume.
+# 4. MOMENTUM: Added Aggressor Ratio (Close vs Range) and Relative Volume (Duration Intensity).
 # =============================================================================
 from __future__ import annotations
 import math
@@ -176,21 +176,36 @@ class StreamingAmihudLiquidity:
 
 class StreamingRelativeVolume:
     """
-    Ratio of current volume to historical moving average.
-    RVol > 1.0 implies higher than average activity.
-    RVol > 2.0 implies a volume spike (Breakout validation).
+    Measures Duration Intensity for Volume Bars.
+    Since volume is constant in Volume Bars, we measure Time to Fill.
+    Intensity = AvgDuration / CurrentDuration.
+    High Intensity (> 1.0) = Fast filling bars = High Momentum.
     """
     def __init__(self, window: int = 20):
-        self.vol_ema = RecursiveEMA(alpha=2.0/(window+1))
+        self.dur_ema = RecursiveEMA(alpha=2.0/(window+1))
+        self.last_ts = None
 
-    def update(self, volume: float) -> float:
-        avg_vol = self.vol_ema.get()
-        self.vol_ema.update(volume)
-        
-        if avg_vol <= 1e-9:
-            return 1.0 # Baseline
+    def update(self, timestamp: float) -> float:
+        if self.last_ts is None:
+            self.last_ts = timestamp
+            return 1.0 # First bar baseline
             
-        return volume / avg_vol
+        duration = timestamp - self.last_ts
+        self.last_ts = timestamp
+        
+        if duration <= 0: duration = 0.001 # Prevent div by zero (instant fill)
+        
+        avg_dur = self.dur_ema.get()
+        
+        # Initialize EMA if first real update
+        if avg_dur == 0.0:
+            self.dur_ema.update(duration)
+            return 1.0
+            
+        self.dur_ema.update(duration)
+        
+        # Intensity: If Avg is 60s and Current is 10s -> Intensity = 6.0
+        return avg_dur / duration
 
 class StreamingAggressorRatio:
     """
@@ -775,7 +790,7 @@ class OnlineFeatureEngineer:
         # Update L1 Proxies (Project Phoenix)
         parkinson_val = self.parkinson.update(high, low)
         amihud_val = self.amihud.update(abs(ret_log), price, volume)
-        rvol_val = self.rvol.update(volume)
+        rvol_val = self.rvol.update(timestamp) # <-- CHANGED: Pass timestamp for Duration Intensity
         aggressor_val = self.aggressor.update(high, low, price)
         
         # Update Other Metrics
