@@ -5,12 +5,12 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - INNER BAND MOMENTUM):
-# 1. HYPOTHESIS FIX: Replaced "Midline Bounce" with "Inner Band Breakout".
-#    - Buy Zone: BB Position > 0.75 (Escaping Mean).
-#    - Sell Zone: BB Position < 0.25 (Escaping Mean).
-#    - Dead Zone: 0.25 - 0.75 (Noise Filter).
-# 2. OFI GATE: Relaxed slightly to -0.30 to prevent filtering valid breakouts.
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - VOLATILITY EXPANSION):
+# 1. PHILOSOPHY: Abandoned Mean Reversion. Now chasing Volatility Expansion.
+# 2. LOGIC: 
+#    - Regime A (Expansion): Range > 1.5ATR AND RVol > 1.2 AND Aggressor Conf.
+#    - Regime B (Trend): KER > 0.60 AND Aggressor Conf.
+# 3. GATES: Hard filters for Volume (RVol) and Candle Shape (Aggressor).
 # =============================================================================
 import logging
 import sys
@@ -59,8 +59,8 @@ class ResearchStrategy:
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
         self.labeler = AdaptiveTripleBarrier(
-            horizon_ticks=tbm_conf.get('horizon_minutes', 30),
-            risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'],
+            horizon_ticks=tbm_conf.get('horizon_minutes', 60),
+            risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'], # Tight stops (1.0)
             reward_mult=tbm_conf.get('barrier_width', 2.0),
             drift_threshold=tbm_conf.get('drift_threshold', 1.0)
         )
@@ -94,16 +94,17 @@ class ResearchStrategy:
         self.decision_log = deque(maxlen=1000)
         self.trade_events = []
         self.rejection_stats = defaultdict(int) 
-        self.feature_importance_counter = Counter() # Tracks top features
+        self.feature_importance_counter = Counter() 
         
-        # --- STRATEGY PARAMETERS (From Config) ---
-        feat_conf = CONFIG.get('features', {})
-        self.bb_dev = feat_conf.get('bollinger_bands', {}).get('std_dev', 2.0)
+        # --- PHOENIX STRATEGY PARAMETERS ---
+        phx_conf = CONFIG.get('phoenix_strategy', {})
+        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.5)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.60)
         
-        # Thresholds (Regime Gates)
-        self.ker_trend = CONFIG.get('trading', {}).get('ker_threshold_trend', 0.6)
-        self.ker_mean_rev = CONFIG.get('trading', {}).get('ker_threshold_mean_rev', 0.3)
-        self.limit_offset = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.5)
+        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.5)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.2)
+        
+        self.limit_offset = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
@@ -137,11 +138,11 @@ class ResearchStrategy:
             timestamp = 0.0
             dt_ts = datetime.now()
 
-        # Flow Volumes (Critical for OFI)
+        # Flow Volumes (L2 Proxies now handled by Feature Engineer if missing)
         buy_vol = snapshot.get_price(self.symbol, 'buy_vol')
         sell_vol = snapshot.get_price(self.symbol, 'sell_vol')
         
-        # --- RETAIL FALLBACK LOGIC ---
+        # --- RETAIL FALLBACK LOGIC (Pre-Feature Engineer) ---
         if buy_vol == 0 and sell_vol == 0:
             if self.last_price > 0:
                 if price > self.last_price:
@@ -218,82 +219,63 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. STRATEGY LOGIC: REGIME SWITCHING (INNER BAND MOMENTUM)
+        # D. PROJECT PHOENIX: LOGIC GATES
         # ============================================================
         
-        # Extract Core Indicators
+        # 1. Extract Phoenix Indicators
+        rvol = features.get('rvol', 1.0)
+        parkinson = features.get('parkinson_vol', 0.0)
         ker_val = features.get('ker', 0.5)
-        mtf_align = features.get('mtf_alignment', 0.0) # 1.0 if aligned
-        bb_upper = features.get('bb_upper', 999999.0)
-        bb_lower = features.get('bb_lower', 0.0)
-        rsi_val = features.get('rsi', 50.0)
+        aggressor = features.get('aggressor', 0.5)
+        amihud = features.get('amihud', 0.0)
+        atr_val = features.get('atr', 0.0001)
         
-        # BB Position (0=Lower, 0.5=Mid, 1=Upper)
-        bb_pos = features.get('bb_position', 0.5)
+        # 2. Gate Definitions
+        bar_range = high - low
+        
+        # Gate A: Range Expansion (Market is waking up)
+        range_gate = bar_range > (self.range_gate_mult * atr_val)
+        
+        # Gate B: Volume Participation (Move is supported)
+        vol_gate = rvol > self.vol_gate_ratio
+        
+        # Gate C: Momentum Direction (Aggressor Ratio)
+        # > 0.6 = Bullish Close, < 0.4 = Bearish Close
+        is_bullish_candle = aggressor > 0.60
+        is_bearish_candle = aggressor < 0.40
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
         
-        # --- REGIME A: EFFICIENT TREND ---
-        # Trigger on MOMENTUM (High in Band) rather than pure Breakout
-        if (ker_val > self.ker_trend and mtf_align == 1.0) or (ker_val > 0.75):
-            regime_label = "A (Trend)"
-            
-            # TRIGGER: Strong Position within Bands (e.g., > 65%)
-            if bb_pos > 0.65:
-                proposed_action = 1 # BUY
-            elif bb_pos < 0.35:
-                proposed_action = -1 # SELL
-            else:
-                self.rejection_stats["Regime A: Weak Momentum"] += 1
-                
-        # --- REGIME B: MEAN REVERSION / CHOPPY (The Fix) ---
-        elif ker_val < self.ker_mean_rev:
-            regime_label = "B (MeanRev)"
-            
-            # TRIGGER: Inner Band Momentum (Expansion Logic)
-            # Assumption: BB Bands are 2.0 SD. 
-            # 1.0 SD (Inner Band) is approx at 0.75 (Upper) and 0.25 (Lower).
-            
-            # If price escapes the 1.0 SD inner noise zone to the upside -> Long
-            if bb_pos > 0.75:
-                # Filter: Don't buy if already overextended (Price > Upper)
-                if price < bb_upper:
-                    proposed_action = 1
-                    regime_label = "B (Inner-Buy)"
-                else:
-                    proposed_action = -1 # Reversal at extreme
-                    regime_label = "B (Extreme-Fade)"
-            
-            # If price escapes the 1.0 SD inner noise zone to the downside -> Short
-            elif bb_pos < 0.25:
-                # Filter: Don't sell if already overextended (Price < Lower)
-                if price > bb_lower:
-                    proposed_action = -1
-                    regime_label = "B (Inner-Sell)"
-                else:
-                    proposed_action = 1 # Reversal at extreme
-                    regime_label = "B (Extreme-Fade)"
-            
-            else:
-                # Dead Center (0.25 to 0.75) -> NOISE. Do NOT trade.
-                # This is the "Analysis Paralysis" zone we intentionally avoid.
-                self.rejection_stats["Regime B: Dead Center (0.25-0.75)"] += 1
-                
-        # --- REGIME C: NOISE ---
-        else:
-            # 0.3 <= KER <= 0.6
-            # Sniper Mode: Only take extremes
-            if rsi_val > 75:
-                proposed_action = -1
-                regime_label = "C (Sniper-Short)"
-            elif rsi_val < 25:
+        # --- REGIME A: VOLATILITY EXPANSION (THE DRAGON) ---
+        # Logic: Big Range + High Volume + Directional Close
+        if range_gate and vol_gate:
+            if is_bullish_candle:
                 proposed_action = 1
-                regime_label = "C (Sniper-Long)"
+                regime_label = "A (Exp-Long)"
+            elif is_bearish_candle:
+                proposed_action = -1
+                regime_label = "A (Exp-Short)"
             else:
-                regime_label = "C (Noise)"
-                self.rejection_stats[f"Regime C: KER {ker_val:.2f}"] += 1
-                return # Explicit HOLD
+                self.rejection_stats["Regime A: Indecision Candle"] += 1
+                
+        # --- REGIME B: EFFICIENT TREND CONTINUATION ---
+        # Logic: High Efficiency (KER) + Momentum align
+        elif ker_val > self.ker_thresh:
+            if is_bullish_candle:
+                proposed_action = 1
+                regime_label = "B (Trend-Long)"
+            elif is_bearish_candle:
+                proposed_action = -1
+                regime_label = "B (Trend-Short)"
+            else:
+                self.rejection_stats["Regime B: Weak Candle"] += 1
+                
+        # --- REGIME C: NOISE / CHOP ---
+        else:
+            regime_label = "C (Noise)"
+            self.rejection_stats[f"Noise (KER {ker_val:.2f} | RVol {rvol:.2f})"] += 1
+            return # Explicit HOLD
 
         if proposed_action == 0:
             return
@@ -313,8 +295,8 @@ class ResearchStrategy:
             
             # --- META LABELING ---
             is_profitable = self.meta_labeler.predict(
-                features,
-                proposed_action,
+                features, 
+                proposed_action, 
                 threshold=self.params.get('meta_labeling_threshold', 0.60)
             )
             
@@ -339,10 +321,8 @@ class ResearchStrategy:
     def _simulate_mtf_context(self, price: float, dt: datetime) -> Dict[str, Any]:
         """
         Approximates D1 and H4 context from the M5 stream for Backtesting.
-        This allows 'mtf_alignment' feature to function without external data feeds.
         """
         # H4 Approximation (Every 48 M5 bars)
-        # We define H4 bucket by hour // 4
         h4_idx = (dt.day * 6) + (dt.hour // 4)
         if h4_idx != self.last_h4_idx:
             self.h4_buffer.append(price)
@@ -360,7 +340,7 @@ class ResearchStrategy:
         # D1 EMA 200
         if len(self.d1_buffer) > 0:
             arr = np.array(self.d1_buffer)
-            ema = np.mean(arr) # Fallback to mean for simplicity in simulation
+            ema = np.mean(arr) 
             ctx['d1']['ema200'] = ema
             
         # H4 RSI 14
@@ -397,7 +377,7 @@ class ResearchStrategy:
         """Decides whether to enter a trade using Volatility Targeting."""
         
         # 1. Signal Threshold
-        min_prob = self.params.get('min_calibrated_probability', 0.85)
+        min_prob = self.params.get('min_calibrated_probability', 0.60)
         
         if confidence < min_prob:
             self.rejection_stats[f'Low Confidence ({confidence:.2f} < {min_prob})'] += 1
@@ -405,17 +385,12 @@ class ResearchStrategy:
 
         action = "BUY" if action_int == 1 else "SELL"
 
-        # 2. Hard Microstructure Filter (The Profit Guard)
-        # Relaxed slightly to -0.30 to allow for lag in OFI calculation
-        micro_ofi = features.get('micro_ofi', 0.0)
-        
-        if action == "BUY" and micro_ofi < -0.30:
-            self.rejection_stats["OFI Mismatch (Buy into Sell Flow)"] += 1
-            return
-        
-        if action == "SELL" and micro_ofi > 0.30:
-            self.rejection_stats["OFI Mismatch (Sell into Buy Flow)"] += 1
-            return
+        # 2. Hard Microstructure Filter (Amihud & OFI)
+        # Avoid trading into extreme illiquidity unless volatility justifies it
+        amihud = features.get('amihud', 0.0)
+        if amihud > 10.0: # Arbitrary high illiquidity proxy threshold
+             self.rejection_stats["High Illiquidity (Amihud)"] += 1
+             # return # Disabled for now, monitoring only
 
         # 3. Position Sizing
         if broker.get_position(self.symbol): return
@@ -475,7 +450,7 @@ class ResearchStrategy:
             timestamp_created=timestamp,
             stop_loss=sl_price,
             take_profit=tp_price,
-            comment=f"{trade_intent.comment}|Regime:{regime}|MTF:{features.get('mtf_alignment',0):.0f}|Limit:{self.limit_offset}p"
+            comment=f"{trade_intent.comment}|Regime:{regime}|Limit:{self.limit_offset}p"
         )
         
         broker.submit_order(order)
@@ -483,7 +458,8 @@ class ResearchStrategy:
         # Track Features for Explainability
         imp_feats = []
         imp_feats.append(regime)
-        if features.get('mtf_alignment', 0) == 1.0: imp_feats.append('MTF_Aligned')
+        if features.get('rvol', 0) > 1.2: imp_feats.append('High_Volume')
+        if features.get('parkinson_vol', 0) > 0.002: imp_feats.append('High_Parkinson')
         
         for f in imp_feats:
             self.feature_importance_counter[f] += 1
@@ -493,14 +469,11 @@ class ResearchStrategy:
             'action': action,
             'price': price,
             'conf': confidence,
-            'vpin': features.get('vpin', 0),
-            'entropy': features.get('entropy', 0),
+            'rvol': features.get('rvol', 0),
+            'parkinson': features.get('parkinson_vol', 0),
+            'aggressor': features.get('aggressor', 0.5),
             'ker': current_ker,
-            'fdi': features.get('fdi', 0),
             'atr': current_atr,
-            'volatility': volatility,
-            'frac_diff': features.get('frac_diff', 0.0),
-            'micro_ofi': features.get('micro_ofi', 0.0),
             'regime': regime,
             'top_feats': imp_feats
         })
@@ -510,30 +483,28 @@ class ResearchStrategy:
         Generates a text report explaining WHY the strategy behaved this way.
         """
         if not self.trade_events:
-            # Sort rejections by count desc
             sorted_rejects = sorted(self.rejection_stats.items(), key=lambda item: item[1], reverse=True)
-            reject_str = ", ".join([f"{k}: {v}" for k, v in sorted_rejects[:5]]) # Top 5 reasons
+            reject_str = ", ".join([f"{k}: {v}" for k, v in sorted_rejects[:5]])
             
             status = "Waiting for Warm-Up" if not self.burn_in_complete else "No Trigger Conditions Met"
             return f"AUTOPSY: No trades. Status: {status}. Top Rejections: {{{reject_str}}}. Bars processed: {self.bars_processed}"
         
         avg_conf = np.mean([t['conf'] for t in self.trade_events])
-        avg_ker = np.mean([t['ker'] for t in self.trade_events]) 
-        avg_ofi = np.mean([t['micro_ofi'] for t in self.trade_events]) 
+        avg_rvol = np.mean([t['rvol'] for t in self.trade_events]) 
+        avg_park = np.mean([t['parkinson'] for t in self.trade_events]) 
         
         sorted_rejects = sorted(self.rejection_stats.items(), key=lambda item: item[1], reverse=True)
         reject_str = ", ".join([f"{k}: {v}" for k, v in sorted_rejects[:5]])
         
-        # Explainability Report
         top_features = self.feature_importance_counter.most_common(5)
         feat_str = str(top_features)
         
         report = (
-            f"\n --- 💀 STRATEGY AUTOPSY ({self.symbol}) ---\n"
+            f"\n --- 💀 PHOENIX AUTOPSY ({self.symbol}) ---\n"
             f" Trades: {len(self.trade_events)}\n"
             f" Avg Conf: {avg_conf:.2f}\n"
-            f" Avg KER: {avg_ker:.2f} | Avg OFI: {avg_ofi:.2f}\n"
-            f" Top Regimes: {feat_str}\n"
+            f" Avg RVol: {avg_rvol:.2f} | Avg Parkinson: {avg_park:.5f}\n"
+            f" Top Drivers: {feat_str}\n"
             f" Rejections: {{{reject_str}}}\n"
             f" ----------------------------------------\n"
         )

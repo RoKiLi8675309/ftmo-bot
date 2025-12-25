@@ -8,9 +8,9 @@
 #
 # PHOENIX STRATEGY UPGRADE (2025-12-25 - LIVE PARITY):
 # 1. PARITY: Logic matched 1:1 with engines/research/strategy.py.
-# 2. REGIME A (TREND): KER > 0.6 + MTF Align -> Momentum (>0.65 BB Position).
-# 3. REGIME B (MEAN REV): Relaxed RSI (60/40) for earlier reversals.
-# 4. REGIME C (NOISE): Explicit HOLD unless Sniper Mode triggers.
+# 2. REGIME A (EXPANSION): Range > 1.5 ATR + RVol > 1.2 + Aggressor.
+# 3. REGIME B (TREND): KER > 0.6 + Aggressor.
+# 4. REGIME C (NOISE): Explicit HOLD.
 # =============================================================================
 import logging
 import pickle
@@ -104,13 +104,13 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- STRATEGY PARAMETERS (Regime & Thresholds) ---
-        feat_conf = CONFIG.get('features', {})
-        self.bb_dev = feat_conf.get('bollinger_bands', {}).get('std_dev', 2.0) # Updated default
+        # --- PHOENIX STRATEGY PARAMETERS ---
+        phx_conf = CONFIG.get('phoenix_strategy', {})
+        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.5)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.60)
         
-        # Regime Thresholds
-        self.ker_trend = CONFIG.get('trading', {}).get('ker_threshold_trend', 0.6)
-        self.ker_mean_rev = CONFIG.get('trading', {}).get('ker_threshold_mean_rev', 0.3)
+        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.5)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.2)
         
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
@@ -166,7 +166,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Regime Switching.
+        Executes the Learn-Predict Loop with Project Phoenix Logic.
         """
         if symbol not in self.symbols: return None
         
@@ -228,8 +228,8 @@ class MultiAssetPredictor:
         # Update Feature Stats (Rolling Average for Monitoring)
         alpha = 0.01
         feat_stats['avg_ker'] = (1 - alpha) * feat_stats.get('avg_ker', 0.5) + alpha * features.get('ker', 0.5)
-        feat_stats['avg_fdi'] = (1 - alpha) * feat_stats.get('avg_fdi', 1.5) + alpha * features.get('fdi', 1.5)
-        feat_stats['avg_ofi'] = (1 - alpha) * feat_stats.get('avg_ofi', 0.0) + alpha * features.get('micro_ofi', 0.0)
+        feat_stats['avg_rvol'] = (1 - alpha) * feat_stats.get('avg_rvol', 1.0) + alpha * features.get('rvol', 1.0)
+        feat_stats['avg_park'] = (1 - alpha) * feat_stats.get('avg_park', 0.0) + alpha * features.get('parkinson_vol', 0.0)
         
         # --- WARM-UP GATE ---
         if self.burn_in_counters[symbol] < self.burn_in_limit:
@@ -270,67 +270,60 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
 
         # ============================================================
-        # 4. STRATEGY LOGIC: REGIME SWITCHING (RELAXED PARITY)
+        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES
         # ============================================================
         
         # Extract Core Indicators
+        rvol = features.get('rvol', 1.0)
         ker_val = features.get('ker', 0.5)
-        mtf_align = features.get('mtf_alignment', 0.0) # 1.0 if aligned
-        bb_upper = features.get('bb_upper', 999999.0)
-        bb_lower = features.get('bb_lower', 0.0)
-        rsi_val = features.get('rsi', 50.0)
+        aggressor = features.get('aggressor', 0.5)
+        amihud = features.get('amihud', 0.0)
+        atr_val = features.get('atr', 0.0001)
         
-        # New: BB Position (0=Lower, 0.5=Mid, 1=Upper)
-        bb_pos = features.get('bb_position', 0.5)
+        # Gate Definitions
+        bar_range = bar.high - bar.low
+        
+        # Gate A: Range Expansion (Market is waking up)
+        range_gate = bar_range > (self.range_gate_mult * atr_val)
+        
+        # Gate B: Volume Participation (Move is supported)
+        vol_gate = rvol > self.vol_gate_ratio
+        
+        # Gate C: Momentum Direction (Aggressor Ratio)
+        # > 0.6 = Bullish Close, < 0.4 = Bearish Close
+        is_bullish_candle = aggressor > 0.60
+        is_bearish_candle = aggressor < 0.40
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
         
-        # --- REGIME A: EFFICIENT TREND ---
-        # UNBLOCK: Trigger on MOMENTUM (High in Band) rather than pure Breakout
-        if (ker_val > self.ker_trend and mtf_align == 1.0) or (ker_val > 0.75):
-            regime_label = "A (Trend)"
-            # TRIGGER: Strong Position within Bands (e.g., > 65%)
-            if bb_pos > 0.65:
-                proposed_action = 1 # BUY
-            elif bb_pos < 0.35:
-                proposed_action = -1 # SELL
+        # --- REGIME A: VOLATILITY EXPANSION (THE DRAGON) ---
+        if range_gate and vol_gate:
+            if is_bullish_candle:
+                proposed_action = 1
+                regime_label = "A (Exp-Long)"
+            elif is_bearish_candle:
+                proposed_action = -1
+                regime_label = "A (Exp-Short)"
             else:
-                stats["Regime A: Weak Momentum"] += 1
+                stats["Regime A: Indecision Candle"] += 1
                 
-        # --- REGIME B: MEAN REVERSION ---
-        elif ker_val < self.ker_mean_rev:
-            regime_label = "B (MeanRev)"
-            # Trigger 1: Band Reversal (Classic)
-            if bar.close > bb_upper:
-                proposed_action = -1 # SELL
-            elif bar.close < bb_lower:
-                proposed_action = 1 # BUY
-            # Trigger 2: RELAXED RSI (Unblocker)
-            # If inside bands, use RSI Extremes to force activity
-            elif rsi_val > 60: # AUDIT FIX: Relaxed from 70
-                proposed_action = -1 # SELL (Overbought)
-                regime_label = "B (RSI-Ext)"
-            elif rsi_val < 40: # AUDIT FIX: Relaxed from 30
-                proposed_action = 1 # BUY (Oversold)
-                regime_label = "B (RSI-Ext)"
+        # --- REGIME B: EFFICIENT TREND CONTINUATION ---
+        elif ker_val > self.ker_thresh:
+            if is_bullish_candle:
+                proposed_action = 1
+                regime_label = "B (Trend-Long)"
+            elif is_bearish_candle:
+                proposed_action = -1
+                regime_label = "B (Trend-Short)"
             else:
-                stats["Regime B: Neutral Zone"] += 1
-                
+                stats["Regime B: Weak Candle"] += 1
+        
         # --- REGIME C: NOISE ---
         else:
-            # 0.3 <= KER <= 0.6 or Trend but misaligned
-            # Sniper Mode: Only take extremes
-            if rsi_val > 75:
-                proposed_action = -1
-                regime_label = "C (Sniper-Short)"
-            elif rsi_val < 25:
-                proposed_action = 1
-                regime_label = "C (Sniper-Long)"
-            else:
-                regime_label = "C (Noise)"
-                stats[f"Regime C: KER {ker_val:.2f}"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "Regime C (Noise)"})
+            regime_label = "C (Noise)"
+            stats[f"Noise (KER {ker_val:.2f} | RVol {rvol:.2f})"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "Regime C (Noise)"})
 
         if proposed_action == 0:
             return Signal(symbol, "HOLD", 0.0, {"reason": "No Trigger"})
@@ -347,15 +340,16 @@ class MultiAssetPredictor:
         # Meta Labeling
         meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.60)
         is_profitable = meta_labeler.predict(
-            features,
-            proposed_action,
+            features, 
+            proposed_action, 
             threshold=meta_threshold
         )
 
         # --- DECISION ---
         current_ker = features.get('ker', 1.0)
         volatility = features.get('volatility', 0.001)
-        frac_diff = features.get('frac_diff', 0.0)
+        parkinson = features.get('parkinson_vol', 0.0)
+        mtf_align = features.get('mtf_alignment', 0.0)
         
         # Safety Check: If ML thinks probability is terrible (< 0.4), skip even if Rule triggers.
         if confidence < 0.40:
@@ -368,6 +362,8 @@ class MultiAssetPredictor:
                 # FEATURE IMPORTANCE TRACKING
                 imp_feats = []
                 imp_feats.append(regime_label)
+                if rvol > 1.2: imp_feats.append('High_Volume')
+                if parkinson > 0.002: imp_feats.append('High_Parkinson')
                 if mtf_align == 1.0: imp_feats.append('MTF_Aligned')
                 
                 for f in imp_feats:
@@ -378,7 +374,9 @@ class MultiAssetPredictor:
                     "volatility": volatility, 
                     "atr": current_atr, 
                     "ker": current_ker, 
-                    "frac_diff": frac_diff, 
+                    "parkinson_vol": parkinson,
+                    "rvol": rvol,
+                    "amihud": amihud,
                     "regime": regime_label,
                     "mtf_align": mtf_align,
                     "drivers": imp_feats
@@ -390,7 +388,7 @@ class MultiAssetPredictor:
         # Periodic Stats Logging
         if self.bar_counters[symbol] % 250 == 0:
             top_drivers = self.feature_importance_counter[symbol].most_common(3)
-            logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} FDI:{feat_stats['avg_fdi']:.2f} Regimes:{top_drivers}")
+            logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} RVol:{feat_stats['avg_rvol']:.2f} Regimes:{top_drivers}")
             logger.info(f"🔍 {symbol} Rejections: {dict(stats)}")
             stats.clear()
             
@@ -407,7 +405,7 @@ class MultiAssetPredictor:
                 with open(self.models_dir / f"calibrators_{sym}.pkl", "wb") as f:
                     pickle.dump(self.calibrators[sym], f)
                 
-                # Persist Feature Engineer State (FracDiff memory & Welford Scalers)
+                # Persist Feature Engineer State
                 with open(self.models_dir / f"feature_engineer_{sym}.pkl", "wb") as f:
                     pickle.dump(self.feature_engineers[sym], f)
                     
