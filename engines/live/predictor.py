@@ -106,7 +106,7 @@ class MultiAssetPredictor:
         
         # --- STRATEGY PARAMETERS (Regime & Thresholds) ---
         feat_conf = CONFIG.get('features', {})
-        self.bb_dev = feat_conf.get('bollinger_bands', {}).get('std_dev', 2.5)
+        self.bb_dev = feat_conf.get('bollinger_bands', {}).get('std_dev', 2.0) # Updated default
         
         # Regime Thresholds
         self.ker_trend = CONFIG.get('trading', {}).get('ker_threshold_trend', 0.6)
@@ -278,12 +278,14 @@ class MultiAssetPredictor:
         mtf_align = features.get('mtf_alignment', 0.0) # 1.0 if aligned
         bb_upper = features.get('bb_upper', 999999.0)
         bb_lower = features.get('bb_lower', 0.0)
+        rsi_val = features.get('rsi', 50.0)
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
         
         # --- REGIME A: EFFICIENT TREND ---
-        if ker_val > self.ker_trend and mtf_align == 1.0:
+        # UNBLOCK: Allow trade if Trend is aligned OR if Trend is extremely strong (>0.7)
+        if (ker_val > self.ker_trend and mtf_align == 1.0) or (ker_val > 0.7):
             regime_label = "A (Trend)"
             # Trigger: Breakout / Walking the Bands
             if bar.close > bb_upper:
@@ -301,15 +303,31 @@ class MultiAssetPredictor:
                 proposed_action = -1 # SELL
             elif bar.close < bb_lower:
                 proposed_action = 1 # BUY
+            # --- SECONDARY TRIGGER (UNBLOCKER) ---
+            # If price is inside bands, check for RSI Extremes to force activity
+            elif rsi_val > 70: 
+                proposed_action = -1 # SELL (Overbought)
+                regime_label = "B (RSI-Ext)"
+            elif rsi_val < 30:
+                proposed_action = 1 # BUY (Oversold)
+                regime_label = "B (RSI-Ext)"
             else:
                 stats["Regime B: Inside Bands"] += 1
                 
         # --- REGIME C: NOISE ---
         else:
             # 0.3 <= KER <= 0.6 or Trend but misaligned
-            regime_label = "C (Noise)"
-            stats[f"Regime C: KER {ker_val:.2f} / Align {mtf_align}"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "Regime C (Noise)"})
+            # UNBLOCK: If we are in the "Dead Zone" but RSI is extreme, take a Mean Rev trade anyway
+            if rsi_val > 75:
+                proposed_action = -1
+                regime_label = "C (Sniper-Short)"
+            elif rsi_val < 25:
+                proposed_action = 1
+                regime_label = "C (Sniper-Long)"
+            else:
+                regime_label = "C (Noise)"
+                stats[f"Regime C: KER {ker_val:.2f} / Align {mtf_align}"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": "Regime C (Noise)"})
 
         if proposed_action == 0:
             return Signal(symbol, "HOLD", 0.0, {"reason": "No Trigger"})

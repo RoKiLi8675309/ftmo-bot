@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - REGIME SWITCHING):
-# 1. PARITY: Matches engines/live/predictor.py logic strictly.
-# 2. REGIME A (TREND): KER > 0.6 + MTF Align -> Breakouts (Walking Bands).
-# 3. REGIME B (MEAN REV): KER < 0.3 -> Bollinger Reversals.
-# 4. REGIME C (NOISE): 0.3 <= KER <= 0.6 -> HOLD.
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - UNBLOCKED):
+# 1. FALLBACK TRIGGERS: Added RSI Extremes for Regime B (Mean Rev) to fix "Inside Bands" block.
+# 2. TREND RELAXATION: Allows strong KER (>0.7) to bypass MTF alignment check.
+# 3. PARITY: Maintained structure for live engine synchronization.
 # =============================================================================
 import logging
 import sys
@@ -97,7 +96,7 @@ class ResearchStrategy:
         
         # --- STRATEGY PARAMETERS (From Config) ---
         feat_conf = CONFIG.get('features', {})
-        self.bb_dev = feat_conf.get('bollinger_bands', {}).get('std_dev', 2.5)
+        self.bb_dev = feat_conf.get('bollinger_bands', {}).get('std_dev', 2.0)
         
         # Thresholds (Regime Gates)
         self.ker_trend = CONFIG.get('trading', {}).get('ker_threshold_trend', 0.6)
@@ -159,8 +158,6 @@ class ResearchStrategy:
         self.last_price = price
 
         # --- MTF CONTEXT SIMULATION ---
-        # Since backtest snapshot might not have ctx_d1/ctx_h4, we simulate it
-        # to ensure mtf_alignment feature works correctly.
         context_data = self._simulate_mtf_context(price, dt_ts)
 
         # A. Feature Engineering
@@ -222,7 +219,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. STRATEGY LOGIC: REGIME SWITCHING (KER & MTF)
+        # D. STRATEGY LOGIC: REGIME SWITCHING (UNBLOCKED)
         # ============================================================
         
         # Extract Core Indicators
@@ -230,42 +227,56 @@ class ResearchStrategy:
         mtf_align = features.get('mtf_alignment', 0.0) # 1.0 if aligned
         bb_upper = features.get('bb_upper', 999999.0)
         bb_lower = features.get('bb_lower', 0.0)
+        rsi_val = features.get('rsi', 50.0)
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
         
         # --- REGIME A: EFFICIENT TREND ---
-        if ker_val > self.ker_trend and mtf_align == 1.0:
+        # UNBLOCK: Allow trade if Trend is aligned OR if Trend is extremely strong (>0.7)
+        if (ker_val > self.ker_trend and mtf_align == 1.0) or (ker_val > 0.7):
             regime_label = "A (Trend)"
             # Trigger: Breakout / Walking the Bands
-            # Buy if Price > Upper Band (Momentum)
             if price > bb_upper:
                 proposed_action = 1 # BUY
-            # Sell if Price < Lower Band (Momentum)
             elif price < bb_lower:
                 proposed_action = -1 # SELL
             else:
                 self.rejection_stats["Regime A: No Breakout"] += 1
                 
-        # --- REGIME B: MEAN REVERSION ---
+        # --- REGIME B: MEAN REVERSION (CHOOPY) ---
         elif ker_val < self.ker_mean_rev:
             regime_label = "B (MeanRev)"
-            # Trigger: Reversal
-            # Sell if Price > Upper Band (Overextended)
+            # Primary Trigger: Bollinger Band Reversal
             if price > bb_upper:
                 proposed_action = -1 # SELL
-            # Buy if Price < Lower Band (Overextended)
             elif price < bb_lower:
                 proposed_action = 1 # BUY
+            # --- SECONDARY TRIGGER (UNBLOCKER) ---
+            # If price is inside bands, check for RSI Extremes to force activity
+            elif rsi_val > 70: 
+                proposed_action = -1 # SELL (Overbought)
+                regime_label = "B (RSI-Ext)"
+            elif rsi_val < 30:
+                proposed_action = 1 # BUY (Oversold)
+                regime_label = "B (RSI-Ext)"
             else:
-                self.rejection_stats["Regime B: Inside Bands"] += 1
+                self.rejection_stats["Regime B: Inside Bands/Neutral RSI"] += 1
                 
         # --- REGIME C: NOISE ---
         else:
             # 0.3 <= KER <= 0.6 or Trend but misaligned
-            regime_label = "C (Noise)"
-            self.rejection_stats[f"Regime C: KER {ker_val:.2f} / Align {mtf_align}"] += 1
-            return # Explicit HOLD
+            # UNBLOCK: If we are in the "Dead Zone" but RSI is extreme, take a Mean Rev trade anyway
+            if rsi_val > 75:
+                proposed_action = -1
+                regime_label = "C (Sniper-Short)"
+            elif rsi_val < 25:
+                proposed_action = 1
+                regime_label = "C (Sniper-Long)"
+            else:
+                regime_label = "C (Noise)"
+                self.rejection_stats[f"Regime C: KER {ker_val:.2f} / Align {mtf_align}"] += 1
+                return # Explicit HOLD
 
         if proposed_action == 0:
             return
@@ -294,18 +305,12 @@ class ResearchStrategy:
                 self.meta_label_events += 1
 
             # --- EXECUTION ---
-            # We override the ML's directional decision with our Rule-Based Trigger,
-            # but we use the ML's confidence for sizing.
-            
             # Safety Check: If ML thinks probability is terrible (< 0.4), skip even if Rule triggers.
             if confidence < 0.40:
                 self.rejection_stats[f"ML Disagreement (Conf {confidence:.2f})"] += 1
                 return
 
             if is_profitable:
-                # Execute with Passive Limit Order logic simulated in Broker (handled by entry price logic there or here)
-                # In Backtester, we usually assume fill at close or next open. 
-                # To simulate Limit Order execution: We set limit at Bid/Ask +/- Offset.
                 self._execute_logic(confidence, price, features, broker, dt_ts, proposed_action, regime_label)
             else:
                 self.rejection_stats['Meta-Labeler Reject'] += 1
@@ -337,10 +342,8 @@ class ResearchStrategy:
         
         # D1 EMA 200
         if len(self.d1_buffer) > 0:
-            # Simple simulation: Mean of buffer as proxy for EMA if buffer small, else EMA
             arr = np.array(self.d1_buffer)
-            # Efficient EMA calc on last value
-            ema = np.mean(arr) # Fallback to mean for simplicity in simulation or implement recursive
+            ema = np.mean(arr) # Fallback to mean for simplicity in simulation
             ctx['d1']['ema200'] = ema
             
         # H4 RSI 14
