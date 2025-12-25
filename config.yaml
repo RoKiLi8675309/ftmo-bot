@@ -3,7 +3,7 @@
 # STATUS: GOLDEN CONFIG / MULTI-TIMEFRAME ENABLED
 #
 # AUDIT REMEDIATION (2025-12-25 - THRESHOLD OPTIMIZATION):
-# 1. UNBLOCK: Lowered 'min_calibrated_probability' to 0.70 to allow model to learn.
+# 1. UNBLOCK: Lowered 'min_calibrated_probability' to 0.65 to allow Neutral Zone trades.
 # 2. REGIMES: KER Dead Zone eliminated (0.45 split).
 # 3. EXECUTION: Reduced Volatility Gate to 1.5x Spread.
 # =============================================================================
@@ -255,8 +255,8 @@ online_learning:
     drift_threshold: 1.0
     
   learning_horizon_sec: 300
-  # AUDIT FIX: Lowered to 0.70 to allow initial trades
-  min_calibrated_probability: 0.70
+  # AUDIT FIX: Lowered to 0.65 to allow Neutral Zone trades
+  min_calibrated_probability: 0.65
 
 # --- NEWS FILTER ---
 news_filter:

@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - UNBLOCKED & RELAXED):
-# 1. LOGIC OVERHAUL: Relaxed entry triggers to fix 100% rejection rate.
-# 2. TREND REGIME: Now enters on Momentum (>0.65 BB Position) not just Breakouts.
-# 3. MEAN REV REGIME: RSI thresholds relaxed to 60/40 to unblock "Neutral" zones.
-# 4. PARITY: Maintained structure for live engine synchronization.
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - NEUTRAL ZONE UNLOCK & OFI GATE):
+# 1. REGIME B (NEUTRAL ZONE): Added logic to trade RSI 40-60 using BB Midline.
+# 2. EXECUTION: Added Hard Order Flow Imbalance (OFI) Gate to prevent fighting flow.
+# 3. PARITY: Maintained structure for live engine synchronization.
 # =============================================================================
 import logging
 import sys
@@ -217,7 +216,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. STRATEGY LOGIC: REGIME SWITCHING (RELAXED & UNBLOCKED)
+        # D. STRATEGY LOGIC: REGIME SWITCHING (UNLOCKED)
         # ============================================================
         
         # Extract Core Indicators
@@ -234,7 +233,7 @@ class ResearchStrategy:
         regime_label = "C (Noise)"
         
         # --- REGIME A: EFFICIENT TREND ---
-        # UNBLOCK: Trigger on MOMENTUM (High in Band) rather than pure Breakout
+        # Trigger on MOMENTUM (High in Band) rather than pure Breakout
         if (ker_val > self.ker_trend and mtf_align == 1.0) or (ker_val > 0.75):
             regime_label = "A (Trend)"
             
@@ -246,26 +245,37 @@ class ResearchStrategy:
             else:
                 self.rejection_stats["Regime A: Weak Momentum"] += 1
                 
-        # --- REGIME B: MEAN REVERSION (CHOPPY) ---
+        # --- REGIME B: MEAN REVERSION (CHOPPY & NEUTRAL ZONE) ---
         elif ker_val < self.ker_mean_rev:
             regime_label = "B (MeanRev)"
             
-            # Trigger 1: Band Reversal (Classic)
+            # Trigger 1: Band Reversal (Classic Extremes)
             if price > bb_upper:
                 proposed_action = -1 # SELL
             elif price < bb_lower:
                 proposed_action = 1 # BUY
                 
-            # Trigger 2: RELAXED RSI (Unblocker)
-            # If inside bands, use RSI Extremes to force activity
-            elif rsi_val > 60: # AUDIT FIX: Relaxed from 70
+            # Trigger 2: Relaxed RSI Extremes
+            elif rsi_val > 60: 
                 proposed_action = -1 # SELL (Overbought)
                 regime_label = "B (RSI-Ext)"
-            elif rsi_val < 40: # AUDIT FIX: Relaxed from 30
+            elif rsi_val < 40: 
                 proposed_action = 1 # BUY (Oversold)
                 regime_label = "B (RSI-Ext)"
+            
+            # Trigger 3: NEUTRAL ZONE / MIDLINE BOUNCE (The Unblocker)
+            # If RSI is 40-60, trade the cross of the basis (BB Midline)
             else:
-                self.rejection_stats["Regime B: Neutral Zone"] += 1
+                # If Price > BB Mid (0.5) and RSI > 50 -> Buy (Support Bounce/Re-join)
+                if bb_pos > 0.5 and rsi_val > 50:
+                    proposed_action = 1
+                    regime_label = "B (Neutral-Buy)"
+                # If Price < BB Mid (0.5) and RSI < 50 -> Sell (Resistance Reject)
+                elif bb_pos < 0.5 and rsi_val < 50:
+                    proposed_action = -1
+                    regime_label = "B (Neutral-Sell)"
+                else:
+                    self.rejection_stats["Regime B: Dead Center"] += 1
                 
         # --- REGIME C: NOISE ---
         else:
@@ -392,7 +402,20 @@ class ResearchStrategy:
 
         action = "BUY" if action_int == 1 else "SELL"
 
-        # 2. Position Sizing
+        # 2. Hard Microstructure Filter (The Profit Guard)
+        # Prevent buying when aggressive sellers dominate (OFI < -0.25)
+        # Prevent selling when aggressive buyers dominate (OFI > 0.25)
+        micro_ofi = features.get('micro_ofi', 0.0)
+        
+        if action == "BUY" and micro_ofi < -0.25:
+            self.rejection_stats["OFI Mismatch (Buy into Sell Flow)"] += 1
+            return
+        
+        if action == "SELL" and micro_ofi > 0.25:
+            self.rejection_stats["OFI Mismatch (Sell into Buy Flow)"] += 1
+            return
+
+        # 3. Position Sizing
         if broker.get_position(self.symbol): return
         
         volatility = features.get('volatility', 0.001)
