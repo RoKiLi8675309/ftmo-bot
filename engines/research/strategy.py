@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
-# AUDIT REMEDIATION (2025-12-24 - REGIME GATING):
-# 1. REGIME GATES: Implemented strict KER (<0.2) and FDI (>1.6) filters.
-# 2. DISCOVERY: Hardened exploration. Random discovery disabled in noise regimes.
-# 3. ARCHITECTURE: "Gate-First" execution prevents ML hallucination on noise.
+# PHOENIX STRATEGY UPGRADE (2025-12-24 - GOLDEN CONFIG):
+# 1. GATING: FDI Inhibition Zone (1.45-1.55) implemented to match Predictor.
+# 2. DISCOVERY: Safe Discovery disabled in Noise Regimes.
+# 3. ARCHITECTURE: Strict "Gate-First" execution.
 # =============================================================================
 import logging
 import sys
@@ -94,10 +94,12 @@ class ResearchStrategy:
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
         self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.0)
         
-        # --- AUDIT FIX: REGIME GATES (NOISE FILTER) ---
-        # Relaxed thresholds based on user request: KER > 0.20, FDI < 1.60
+        # --- REGIME GATES (NOISE FILTER) ---
         self.min_ker_threshold = CONFIG['microstructure'].get('gate_ker_threshold', 0.20)
-        self.max_fdi_threshold = CONFIG['microstructure'].get('gate_fdi_threshold', 1.60)
+        
+        # FDI Inhibition Zone (Random Walk Block)
+        self.fdi_min_random = CONFIG['microstructure'].get('fdi_min_random', 1.45)
+        self.fdi_max_random = CONFIG['microstructure'].get('fdi_max_random', 1.55)
         
         # Load Spread Assumptions for Gating
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
@@ -194,7 +196,7 @@ class ResearchStrategy:
                 
                 self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
                 
-                # OPTIMIZATION: Double Learn for Positive outcomes to fix imbalance
+                # Double Learn for Positive outcomes
                 if outcome_label != 0:
                      self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
 
@@ -207,7 +209,6 @@ class ResearchStrategy:
 
         # --- AUDIT FIX: "GATE-FIRST" ARCHITECTURE ---
         # We reject bad market conditions BEFORE invoking the ML model.
-        # This saves compute and prevents the model from hallucinating in noise.
 
         # 1. Volatility Gate (Dead Market Protection)
         if self.use_vol_gate:
@@ -215,26 +216,32 @@ class ResearchStrategy:
             spread_pips = self.spread_map.get(self.symbol, self.default_spread)
             spread_cost = spread_pips * pip_size
             
-            # Gate Requirement: ATR must be > K * Spread
             if current_atr < (spread_cost * self.min_atr_spread_ratio):
                 self.rejection_stats['Vol Gate (Dead Market)'] += 1
                 return # STRICT EXIT
         
-        # 2. Regime Gate: Kaufman Efficiency Ratio (Signal vs Noise)
+        # 2. Regime Gate: KER (Signal Strength)
         current_ker = features.get('ker', 0.5)
-        # OPTIMIZATION: Dynamic Volatility Scaling for KER
         volatility = features.get('volatility', 0.001)
-        effective_ker_thresh = self.min_ker_threshold * (1 + volatility * 50) # Scale up in high vol
+        effective_ker_thresh = self.min_ker_threshold * (1 + volatility * 50) 
         
         if current_ker < effective_ker_thresh:
             self.rejection_stats[f'Regime: Low KER ({current_ker:.2f})'] += 1
             return # STRICT EXIT
 
-        # 3. Regime Gate: Fractal Dimension Index (Complexity)
+        # 3. Regime Gate: FDI Inhibition Zone (Random Walk)
+        # CRITICAL FIX: Explicitly block 1.45 - 1.55 range
         current_fdi = features.get('fdi', 1.5)
-        if current_fdi > self.max_fdi_threshold:
-            self.rejection_stats[f'Regime: High FDI ({current_fdi:.2f})'] += 1
+        
+        if self.fdi_min_random <= current_fdi <= self.fdi_max_random:
+            self.rejection_stats[f'Regime: FDI Inhibition ({current_fdi:.2f})'] += 1
             return # STRICT EXIT
+            
+        # 4. Regime Gate: HMM State
+        hmm_regime = features.get('hmm_regime', 0.5)
+        if hmm_regime < 0.2: 
+             self.rejection_stats[f'Regime: HMM Range ({hmm_regime:.2f})'] += 1
+             return # STRICT EXIT
 
         # D. Inference (Only runs if Gates Pass)
         try:
@@ -269,15 +276,12 @@ class ResearchStrategy:
             dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
             
             # --- SAFE DISCOVERY LOGIC ---
-            # We only explore if we haven't seen enough data AND the market isn't chop/dead (Gates passed)
             is_discovery = self.bars_processed < 2500
             effective_action = pred_action
             discovery_triggered = False
 
             if is_discovery and effective_action == 0:
                 max_prob = max(prob_buy, prob_sell)
-                
-                # 1. Bias Check (Must show conviction even for discovery)
                 if max_prob > 0.0:
                     bias_buy = prob_buy > 0.55
                     bias_sell = prob_sell > 0.55
@@ -289,10 +293,8 @@ class ResearchStrategy:
                         effective_action = -1
                         discovery_triggered = True
                 
-                # 2. Volatility Breakout Fallback
                 if not discovery_triggered and features.get('vol_breakout', 0) > 0:
                     ret = features.get('log_ret', 0)
-                    # Filter tiny breakouts (noise)
                     if ret > 0.00001:
                         effective_action = 1
                         discovery_triggered = True
@@ -300,8 +302,7 @@ class ResearchStrategy:
                         effective_action = -1
                         discovery_triggered = True
             
-            # --- META LABELING (GATEKEEPER) ---
-            # If we are in "Sniper Mode" (after warm-up), the Meta-Labeler must approve.
+            # --- META LABELING ---
             if self.meta_label_events < self.meta_warmup_limit or discovery_triggered:
                 is_profitable = True # Auto-approve during learning phase
             else:
@@ -311,18 +312,15 @@ class ResearchStrategy:
                     threshold=self.params.get('meta_labeling_threshold', 0.60)
                 )
             
-            # Increment meta-counter if we took a real trade (Buy/Sell)
             if effective_action != 0:
                 self.meta_label_events += 1
 
             # --- EXECUTION ---
             if effective_action == 1 or effective_action == -1:
                 if is_profitable:
-                        # For AI trades, use actual probability.
                         confidence = prob_buy if effective_action == 1 else prob_sell
                         
                         if discovery_triggered:
-                            # SAFE MODE: Clamp confidence for Risk Manager.
                             confidence = 0.55 
                         
                         self._execute_logic(confidence, price, features, broker, dt_timestamp, effective_action, discovery_triggered)
@@ -348,8 +346,8 @@ class ResearchStrategy:
     def _execute_logic(self, confidence, price, features, broker, timestamp: datetime, action_int: int, discovery_mode: bool):
         """Decides whether to enter a trade using Volatility Targeting."""
         
-        # 1. Signal Threshold (Only applies to AI trades, not Discovery)
-        min_prob = self.params.get('min_calibrated_probability', 0.55)
+        # 1. Signal Threshold
+        min_prob = self.params.get('min_calibrated_probability', 0.85)
         
         if not discovery_mode:
             if confidence < min_prob:
@@ -358,11 +356,12 @@ class ResearchStrategy:
 
         action = "BUY" if action_int == 1 else "SELL"
 
-        # 2. Position Sizing & Risk
+        # 2. Position Sizing
         if broker.get_position(self.symbol): return
         
         volatility = features.get('volatility', 0.001)
         current_atr = features.get('atr', 0.001)
+        current_ker = features.get('ker', 1.0) 
 
         ctx = TradeContext(
             symbol=self.symbol,
@@ -380,12 +379,12 @@ class ResearchStrategy:
             volatility=volatility,
             active_correlations=0,
             market_prices=self.last_price_map,
-            atr=current_atr # Explicit ATR pass for Volatility Targeting
+            atr=current_atr, 
+            ker=current_ker  
         )
 
         trade_intent.action = action
 
-        # 3. SAFETY: Check if Risk Manager Rejected the trade
         if trade_intent.volume <= 0:
             self.rejection_stats[f"Risk: {trade_intent.comment}"] += 1
             return
@@ -420,7 +419,6 @@ class ResearchStrategy:
         
         broker.submit_order(order)
         
-        # Record detailed trade event
         self.trade_events.append({
             'time': timestamp,
             'action': action,

@@ -6,11 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# AUDIT REMEDIATION (2025-12-24 - REGIME GATING & ENSEMBLES):
-# 1. ENSEMBLE: Wrapped ARF in ADWINBaggingClassifier for variance reduction.
-# 2. GATING: Added HMM Regime and Sentiment logic gates with Dynamic Scaling.
-# 3. ARCHITECTURE: "Gate-First" Logic preserved.
-# 4. ROADMAP FIXES: Dynamic FDI, Debug Logging, SQN focus.
+# PHOENIX STRATEGY UPGRADE (2025-12-24 - GOLDEN CONFIG):
+# 1. GATING: FDI Inhibition Zone (1.45-1.55) implemented to block Random Walk.
+# 2. METRIC: Switched to LogLoss for probability calibration.
+# 3. WARNINGS: Added ARF Warning Detector (delta=0.001) for early drift sensing.
+# 4. ENSEMBLE: ADWINBaggingClassifier standard.
 # =============================================================================
 import logging
 import pickle
@@ -70,41 +70,44 @@ class MultiAssetPredictor:
         # 1. State Containers
         self.feature_engineers = {s: OnlineFeatureEngineer(window_size=CONFIG['features']['window_size']) for s in symbols}
         
-        # PHASE 2: Adaptive Triple Barrier (ATR-based)
+        # Phase 2: Adaptive Triple Barrier
         tbm_conf = CONFIG['online_learning']['tbm']
         self.labelers = {s: AdaptiveTripleBarrier(
-            horizon_ticks=tbm_conf['horizon_minutes'], # Converted to ticks implicitly by usage
+            horizon_ticks=tbm_conf['horizon_minutes'], 
             risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'],
-            reward_mult=tbm_conf['barrier_width'], # Uses barrier width as TP mult
-            drift_threshold=tbm_conf.get('drift_threshold', 1.0) # AUDIT: 1.0 Default
+            reward_mult=tbm_conf['barrier_width'], 
+            drift_threshold=tbm_conf.get('drift_threshold', 1.0)
         ) for s in symbols}
 
         # 2. Models (River Ensembles)
         self.models = {}
-        self.meta_labelers = {} # Secondary Filter
+        self.meta_labelers = {}
         self.calibrators = {}
         
-        # 3. Warm-up State (Phase 2 Requirement)
+        # 3. Warm-up State
         self.burn_in_counters = {s: 0 for s in symbols}
         self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 1000)
         
         # 4. Forensic Stats
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
-        self.feature_stats = {s: defaultdict(float) for s in symbols} # Debug Tool: Track avg feature values
+        self.feature_stats = {s: defaultdict(float) for s in symbols}
         self.bar_counters = {s: 0 for s in symbols}
         
         # 5. Architecture: Auto-Save Timer
         self.last_save_time = time.time()
         self.save_interval = 300 # 5 Minutes
 
-        # --- AUDIT FIX: Gating Params (Sniper Mode) ---
+        # --- AUDIT FIX: Gating Params ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
         self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.0)
         
         # --- REGIME GATES (NOISE FILTER) ---
         self.min_ker_threshold = CONFIG['microstructure'].get('gate_ker_threshold', 0.20)
-        self.max_fdi_threshold = CONFIG['microstructure'].get('gate_fdi_threshold', 1.60)
+        
+        # FDI Inhibition Zone (Random Walk Block)
+        self.fdi_min_random = CONFIG['microstructure'].get('fdi_min_random', 1.45)
+        self.fdi_max_random = CONFIG['microstructure'].get('fdi_max_random', 1.55)
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
 
@@ -114,31 +117,40 @@ class MultiAssetPredictor:
 
     def _init_models(self):
         """
-        Initializes the machine learning pipelines using Configured hyperparameters.
-        UPDATED: Uses ADWINBaggingClassifier wrapping ARF for Ensemble Learning.
+        Initializes the machine learning pipelines using Golden Config hyperparameters.
         """
         conf = CONFIG['online_learning']
         
+        # Map metric string to River object
+        metric_map = {
+            "LogLoss": metrics.LogLoss(),
+            "F1": metrics.F1(),
+            "Accuracy": metrics.Accuracy(),
+            "ROCAUC": metrics.ROCAUC()
+        }
+        selected_metric = metric_map.get(conf.get('metric', 'LogLoss'), metrics.LogLoss())
+        
         for sym in self.symbols:
-            # Base Classifier: ARF
+            # Base Classifier: ARF with Golden Config
             base_clf = forest.ARFClassifier(
                 n_models=conf['n_models'],
                 grace_period=conf['grace_period'],
                 delta=conf['delta'],
                 split_criterion='gini',
                 leaf_prediction='mc',
-                max_features='log2',
-                lambda_value=conf['lambda_value'],
-                metric=metrics.F1()
+                max_features=conf.get('max_features', 'log2'),
+                lambda_value=conf.get('lambda_value', 10),
+                metric=selected_metric,
+                warning_detector=drift.ADWIN(delta=conf.get('warning_delta', 0.001)), # Early warning
+                drift_detector=drift.ADWIN(delta=conf['delta'])
             )
             
             # Ensemble Wrapper (Bagging)
-            # Reduces variance and improves stability for online learning
             self.models[sym] = compose.Pipeline(
                 preprocessing.StandardScaler(),
-                ensemble.ADWINBaggingClassifier( # Use ADWIN for drift
+                ensemble.ADWINBaggingClassifier(
                     model=base_clf,
-                    n_models=5,  # Ensemble size (Stacking ARFs)
+                    n_models=5,
                     seed=42
                 )
             )
@@ -168,7 +180,6 @@ class MultiAssetPredictor:
         
         self.bar_counters[symbol] += 1
 
-        # Extract Real Flow (BVC logic handled inside Feature Engineer if 0)
         buy_vol = getattr(bar, 'buy_vol', 0.0)
         sell_vol = getattr(bar, 'sell_vol', 0.0)
 
@@ -188,13 +199,13 @@ class MultiAssetPredictor:
         if context_d1:
             features = enrich_with_d1_data(features, context_d1, bar.close)
 
-        # Update Feature Stats (Rolling Average for Debugging)
+        # Update Feature Stats (Rolling Average)
         alpha = 0.01
         feat_stats['avg_ker'] = (1 - alpha) * feat_stats.get('avg_ker', 0.5) + alpha * features.get('ker', 0.5)
         feat_stats['avg_fdi'] = (1 - alpha) * feat_stats.get('avg_fdi', 1.5) + alpha * features.get('fdi', 1.5)
         feat_stats['avg_entropy'] = (1 - alpha) * feat_stats.get('avg_entropy', 0.5) + alpha * features.get('entropy', 0.5)
 
-        # --- PHASE 2: WARM-UP GATE ---
+        # --- WARM-UP GATE ---
         if self.burn_in_counters[symbol] < self.burn_in_limit:
             self.burn_in_counters[symbol] += 1
             remaining = self.burn_in_limit - self.burn_in_counters[symbol]
@@ -207,7 +218,6 @@ class MultiAssetPredictor:
         
         if resolved_labels:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
-                # --- PROFIT WEIGHTED LEARNING ---
                 w_pos = CONFIG['online_learning'].get('positive_class_weight', 2.0)
                 w_neg = CONFIG['online_learning'].get('negative_class_weight', 2.0)
                 
@@ -219,10 +229,10 @@ class MultiAssetPredictor:
                 
                 final_weight = base_weight * ret_scalar
                 
-                # Train Primary Model (Ensemble learns via learn_one)
+                # Train Primary Model
                 model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
                 
-                # OPTIMIZATION: Double Learn for Positive outcomes to fix imbalance (Roadmap Item 2)
+                # Double Learn for Positive outcomes
                 if outcome_label != 0:
                      model.learn_one(stored_feats, outcome_label, sample_weight=final_weight * 1.5)
 
@@ -234,60 +244,44 @@ class MultiAssetPredictor:
         current_atr = features.get('atr', 0.0)
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
 
-        # --- AUDIT FIX: "GATE-FIRST" ARCHITECTURE (SNIPER MODE) ---
-        # We reject bad market conditions BEFORE invoking the ML model.
-        
-        # 1. Volatility Gate (Dead Market Protection)
+        # --- "GATE-FIRST" ARCHITECTURE ---
+        # 1. Volatility Gate
         if self.use_vol_gate:
             pip_size, _ = RiskManager.get_pip_info(symbol)
             spread_pips = self.spread_map.get(symbol, 1.5)
             spread_cost = spread_pips * pip_size
             
-            # Gate Requirement: ATR must be > K * Spread
             if current_atr < (spread_cost * self.min_atr_spread_ratio):
                 stats['Vol Gate (Dead Market)'] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "Vol Gate"})
         
-        # 2. Regime Gate: Kaufman Efficiency Ratio (Signal vs Noise)
+        # 2. Regime Gate: KER (Signal Strength)
         current_ker = features.get('ker', 0.5)
         volatility = features.get('volatility', 0.001)
-        
-        # OPTIMIZATION: Dynamic Volatility Scaling for KER (Roadmap Item 1)
-        # Scale up in high vol to require stronger signal
         effective_ker_thresh = self.min_ker_threshold * (1 + volatility * 50) 
         
         if current_ker < effective_ker_thresh:
             stats[f'Regime: Low KER ({current_ker:.2f})'] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Regime KER ({current_ker:.2f})"})
 
-        # 3. Regime Gate: Fractal Dimension Index (Complexity)
+        # 3. Regime Gate: FDI Inhibition Zone (Random Walk)
+        # CRITICAL FIX: Explicitly block 1.45 - 1.55 range
         current_fdi = features.get('fdi', 1.5)
         
-        # OPTIMIZATION: Dynamic FDI (Roadmap Item 1)
-        # Tighten (lower) in high volatility to avoid complex chop
-        effective_fdi_thresh = self.max_fdi_threshold * (1 - volatility * 30)
-        
-        if current_fdi > effective_fdi_thresh:
-            stats[f'Regime: High FDI ({current_fdi:.2f})'] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": f"Regime FDI ({current_fdi:.2f})"})
+        if self.fdi_min_random <= current_fdi <= self.fdi_max_random:
+            stats[f'Regime: FDI Inhibition ({current_fdi:.2f})'] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": f"Random Walk FDI ({current_fdi:.2f})"})
             
-        # 4. Regime Gate: HMM State (New Step 1 Requirement)
+        # 4. Regime Gate: HMM State
         hmm_regime = features.get('hmm_regime', 0.5)
         if hmm_regime < 0.2: 
              stats[f'Regime: HMM Range ({hmm_regime:.2f})'] += 1
              return Signal(symbol, "HOLD", 0.0, {"reason": f"HMM Range ({hmm_regime:.2f})"})
-             
-        # 5. Sentiment Gate (New Step 4 Requirement)
-        # Reject if news sentiment is strongly negative (<-0.2)
-        sentiment = features.get('sentiment', 0.0)
-        if sentiment < -0.2:
-            stats[f'Sentiment Gate ({sentiment:.2f})'] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": f"Negative Sentiment ({sentiment:.2f})"})
 
-        # 6. Inference (Only runs if Gates Pass)
+        # 6. Inference
         current_pred_action = 0
         try:
-            # --- FILTER ENFORCEMENT (Strict 0.90) ---
+            # Filter Enforcement
             entropy_val = features.get('entropy', 0.0)
             entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.90)
             
@@ -302,7 +296,7 @@ class MultiAssetPredictor:
                 stats['High VPIN'] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"Toxic VPIN ({vpin_val:.2f})"})
 
-            # Primary Prediction
+            # Prediction
             pred_class = model.predict_one(features)
             pred_proba = model.predict_proba_one(features)
             
@@ -314,15 +308,13 @@ class MultiAssetPredictor:
             prob_buy = pred_proba.get(1, 0.0)
             prob_sell = pred_proba.get(-1, 0.0)
             
-            # 7. SAFE DISCOVERY LOGIC & EXECUTION
+            # SAFE DISCOVERY LOGIC
             is_discovery = self.bar_counters[symbol] < 2500
             effective_action = current_pred_action
             discovery_triggered = False
             
             if is_discovery and effective_action == 0:
                 max_prob = max(prob_buy, prob_sell)
-                
-                # Bias Check (> 0.55 required)
                 if max_prob > 0.0:
                     bias_buy = prob_buy > 0.55
                     bias_sell = prob_sell > 0.55
@@ -334,7 +326,6 @@ class MultiAssetPredictor:
                         effective_action = -1
                         discovery_triggered = True
                 
-                # Breakout Fallback
                 if not discovery_triggered and features.get('vol_breakout', 0) > 0:
                     ret = features.get('log_ret', 0)
                     if ret > 0.00001:
@@ -348,7 +339,6 @@ class MultiAssetPredictor:
             confidence = prob_buy if effective_action == 1 else prob_sell
             
             if discovery_triggered:
-                # SAFE MODE FORCE: 0.55 Confidence -> 0.30 Sizing
                 confidence = 0.55
 
             # Meta Labeling Check
@@ -360,38 +350,27 @@ class MultiAssetPredictor:
             )
 
             # --- DECISION ---
-            min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
+            min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.85)
+            current_ker = features.get('ker', 1.0)
             
-            if effective_action == 1: # BUY
+            if effective_action in [1, -1]:
                 if confidence > min_conf:
                     if is_profitable or discovery_triggered:
-                        return Signal(symbol, "BUY", confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr})
+                        action_str = "BUY" if effective_action == 1 else "SELL"
+                        return Signal(symbol, action_str, confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr, "ker": current_ker})
                     else:
                         stats['Meta Rejected'] += 1
                         return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
                 else:
                     stats['Low Confidence'] += 1
                     return Signal(symbol, "HOLD", confidence, {"reason": f"Low Conf ({confidence:.2f})"})
-            
-            elif effective_action == -1: # SELL
-                if confidence > min_conf:
-                    if is_profitable or discovery_triggered:
-                        return Signal(symbol, "SELL", confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr})
-                    else:
-                        stats['Meta Rejected'] += 1
-                        return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
-                else:
-                    stats['Low Confidence'] += 1
-                    return Signal(symbol, "HOLD", confidence, {"reason": f"Low Conf ({confidence:.2f})"})
-            
             else:
                 stats['Model Predicted 0'] += 1
             
-            # Periodic Rejection Log
             if self.bar_counters[symbol] % 250 == 0:
                 logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} FDI:{feat_stats['avg_fdi']:.2f} Ent:{feat_stats['avg_entropy']:.2f}")
                 logger.info(f"🔍 {symbol} Rejections (Last 250): {dict(stats)}")
-                stats.clear() # Clear stats after logging to avoid infinite accumulation
+                stats.clear()
                 
             return Signal(symbol, "HOLD", confidence, {})
 
@@ -405,13 +384,10 @@ class MultiAssetPredictor:
             for sym in self.symbols:
                 with open(self.models_dir / f"river_pipeline_{sym}.pkl", "wb") as f:
                     pickle.dump(self.models[sym], f)
-                
                 with open(self.models_dir / f"meta_model_{sym}.pkl", "wb") as f:
                     pickle.dump(self.meta_labelers[sym], f)
-                
                 with open(self.models_dir / f"calibrators_{sym}.pkl", "wb") as f:
                     pickle.dump(self.calibrators[sym], f)
-                    
             logger.info(f"{LogSymbols.DATABASE} Models Auto-Saved (5-min Checkpoint).")
         except Exception as e:
             logger.error(f"{LogSymbols.ERROR} Failed to save models: {e}")

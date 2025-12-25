@@ -9,6 +9,7 @@
 # 1. DRAWDOWN BRAKE: Defensive scaling. If Equity < 98% of Start, Risk *= 0.5.
 # 2. VOLATILITY TARGETING: Strict 20% Annual Target implementation.
 # 3. ADVANCED SIZING: Dynamic Kelly Criterion scaled by ML Confidence.
+# 4. KER SCALING (NEW): Position size scaled by Market Efficiency (Signal-to-Noise).
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -128,7 +129,8 @@ class RiskManager:
         market_prices: Optional[Dict[str, float]] = None,
         atr: Optional[float] = None,
         account_size: Optional[float] = None, # NEW ARGUMENT for Auto-Detection
-        contract_size_override: Optional[float] = None # NEW: Allow overriding lot size
+        contract_size_override: Optional[float] = None, # NEW: Allow overriding lot size
+        ker: float = 1.0 # AUDIT FIX: Kaufman Efficiency Ratio input
     ) -> Tuple[Trade, float]:
         """
         Calculates position size using Volatility Targeting + Dynamic Kelly.
@@ -261,6 +263,12 @@ class RiskManager:
             penalty_factor = 1.0 / (1.0 + (0.5 * active_correlations))
             lots *= penalty_factor
 
+        # --- AUDIT FIX: KER SCALING (EFFICIENCY) ---
+        # Scale down size if trend efficiency (KER) is low (noisy market).
+        # We clamp KER between 0.5 (noise penalty) and 1.0 (full size).
+        ker_scalar = max(0.5, min(ker, 1.0))
+        lots *= ker_scalar
+
         # --- CONSTRAINTS & SANITIZATION ---
         min_lot = risk_conf.get('min_lot_size', 0.01)
         max_lot = risk_conf.get('max_lot_size', 10.0)
@@ -286,7 +294,7 @@ class RiskManager:
             entry_price=price,
             stop_loss=stop_dist,
             take_profit=stop_dist * (atr_mult_tp / atr_mult_sl),
-            comment=f"{'Kelly' if sizing_method == 'volatility_targeting' else 'InvVol'}|R:${actual_risk_usd:.0f}|ATR:{atr_val:.5f}"
+            comment=f"{'Kelly' if sizing_method == 'volatility_targeting' else 'InvVol'}|R:${actual_risk_usd:.0f}|ATR:{atr_val:.5f}|KER:{ker_scalar:.2f}"
         )
         
         return trade, actual_risk_usd

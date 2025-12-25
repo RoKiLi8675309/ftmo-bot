@@ -5,11 +5,11 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (2025-12-24 - SNIPER MODE V3):
-# 1. ENSEMBLES: Implemented ADWINBaggingClassifier for Drift Adaptation.
-# 2. SCORING: Added SQN (System Quality Number) to objective.
-# 3. PENALTIES: Aggressive penalty for negative PnL.
-# 4. ROADMAP FIX: SQN weighting increased to 3.0 to favor consistency over raw PnL.
+# PHOENIX STRATEGY UPGRADE (2025-12-24 - GOLDEN CONFIG):
+# 1. SCORING: SQN Weight increased to 3.0 to favor consistent equity curves.
+# 2. METRICS: Added LogLoss support for probability calibration.
+# 3. PENALTIES: Aggressive drawdown penalty to prune toxic parameters early.
+# 4. ENSEMBLE: ADWINBaggingClassifier implemented as standard model.
 # =============================================================================
 import sys
 import os
@@ -32,7 +32,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
 from joblib import Parallel, delayed
-from river import compose, preprocessing, forest, metrics, ensemble
+from river import compose, preprocessing, forest, metrics, ensemble, drift
 
 # Ensure project root is in sys.path to resolve 'shared' and 'engines' modules
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -119,13 +119,12 @@ class EmojiCallback:
         log.info(msg.strip())
         
         # 6. Conditional Autopsy (Debug Info for Failed/Weak/Pruned Trials)
-        # VISIBILITY FIX: Always show autopsy for Pruned/Blown trials so we see Vol Gate activity
         show_autopsy = False
         if 'autopsy' in attrs:
             if attrs.get('blown', False): show_autopsy = True
             elif attrs.get('pruned', False): show_autopsy = True
             elif val is not None and val < 0.5: show_autopsy = True
-            elif trades < 50 and trades > 0: show_autopsy = True # Show why low activity (but not zero)
+            elif trades < 50 and trades > 0: show_autopsy = True 
             
         if show_autopsy:
             autopsy_msg = f"\n🔎 AUTOPSY (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
@@ -136,10 +135,9 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     """
     Helper to Load Ticks -> Aggregate to Volume Bars -> Return Clean DataFrame.
     Strictly enforcing Volume Bars eliminates "Time-Based noise".
-    UPDATED: Default n_ticks increased to 4M per recommendation.
     """
     # 1. Load Massive Amount of Ticks (To get sufficient Bars)
-    raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2) # Double days for safety
+    raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2) 
     
     if raw_ticks.empty:
         return pd.DataFrame()
@@ -156,7 +154,6 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     df_bars = pd.DataFrame(bars_list)
     
     # 4. Set Index to Datetime for Snapshot compatibility
-    # Ensure 'timestamp' from aggregator (which is float) is converted to datetime
     df_bars['time'] = pd.to_datetime(df_bars['timestamp'], unit='s', utc=True)
     df_bars.set_index('time', inplace=True, drop=False)
     
@@ -168,11 +165,10 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
     ISOLATED WORKER FUNCTION: Runs in a separate process.
     Executes Optuna Optimization for a single symbol.
     """
-    # RESTORED: Optuna INFO Logging for Analysis
     optuna.logging.set_verbosity(optuna.logging.INFO)
     
     try:
-        # 1. Load & Aggregate Data (Using updated 4M limit)
+        # 1. Load & Aggregate Data 
         df = process_data_into_bars(symbol, n_ticks=4000000)
         
         if df.empty:
@@ -187,28 +183,28 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             # Define Search Space (Focused on Profitability & Exploration)
             params = CONFIG['online_learning'].copy()
             params.update({
-                'n_models': trial.suggest_int('n_models', 20, 50, step=5),
+                'n_models': trial.suggest_int('n_models', 30, 50, step=5),
                 
-                # AUDIT FIX: High Patience for Sniper Mode
-                'grace_period': trial.suggest_int('grace_period', 200, 600), # Wait longer before split
-                'delta': trial.suggest_float('delta', 1e-7, 1e-4, log=True), # Low sensitivity to drift
+                # High Patience for Sniper Mode
+                'grace_period': trial.suggest_int('grace_period', 200, 600), 
+                'delta': trial.suggest_float('delta', 1e-6, 1e-4, log=True),
                 
-                # REMEDIATION (Step 2 - SNIPER MODE): STRICT FILTER RANGES
+                # Strict Filter Ranges
                 'entropy_threshold': trial.suggest_float('entropy_threshold', 0.85, 0.95),
                 'vpin_threshold': trial.suggest_float('vpin_threshold', 0.85, 0.95),
                 
+                # Log2 Features for Decorrelation
+                'max_features': trial.suggest_categorical('max_features', ['log2', 'sqrt']),
+                'lambda_value': trial.suggest_int('lambda_value', 6, 15),
+                
                 'tbm': {
-                    # AUDIT FIX: SNIPER V3 - REALISTIC ADAPTIVE TARGETS
-                    # Barrier Width is now a MULTIPLIER for volatility.
-                    # We tune this to find the optimal "R-Multiple" relative to volatility.
+                    # Barrier Width as Volatility Multiplier
                     'barrier_width': trial.suggest_float('barrier_width', 1.5, 3.0),
                     'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 90),
-                    
-                    # Adaptive Drift Threshold (Soft Labeling)
                     'drift_threshold': trial.suggest_float('drift_threshold', 0.7, 1.5)
                 },
                 
-                # AUDIT FIX: SNIPER V3 - HYPER CONFIDENCE
+                # Hyper Confidence for Sniper Mode
                 'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.80, 0.95)
             })
             
@@ -223,10 +219,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 snapshot = MarketSnapshot(timestamp=index, data=row)
                 if snapshot.get_price(symbol, 'close') == 0: continue
                 
-                # Check broker pending orders (stops/limits)
                 broker.process_pending(snapshot)
-                
-                # Strategy makes decisions
                 strategy.on_data(snapshot, broker)
                 
                 if broker.is_blown: break
@@ -234,7 +227,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             # --- RICH METRICS EXTRACTION ---
             metrics = pipeline_inst.calculate_performance_metrics(broker.trade_log, broker.starting_cash)
             
-            # Pass metrics to Callback (Crucial for Emojis)
+            # Pass metrics to Callback
             trial.set_user_attr("pnl", metrics['total_pnl'])
             trial.set_user_attr("max_dd_pct", metrics['max_dd_pct'])
             trial.set_user_attr("win_rate", metrics['win_rate'])
@@ -243,43 +236,35 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("sharpe", metrics['sharpe'])
             
-            # --- SCORING: SQN DOMINANT + PnL ---
-            # Roadmap Step 3: Optimize Directly for SQN
-            # Score = (Net Profit / $100) + (SQN * 3.0)
-            
+            # --- SCORING: SQN DOMINANT (Weight 3.0) + PnL ---
             pnl_score = metrics['total_pnl'] / 100.0
-            sqn_weight = 3.0 # Increased from 2.0 to 3.0 to favor consistency
+            sqn_weight = 3.0 # Golden Config: High weight on stability
             final_score = pnl_score + (metrics['sqn'] * sqn_weight)
             
             # Penalty for Low Activity
             min_trades = CONFIG['wfo'].get('min_trades_optimization', 10)
             total_trades = metrics['total_trades']
             
-            # Volume Bonus (Reward Statistical Significance)
             if total_trades > 50:
                 final_score += 2.0 
             
             if total_trades < min_trades:
                 trial.set_user_attr("pruned", True)
-                # Hard fail for near-zero activity to force exploration
                 return -100.0 
 
-            # AGGRESSIVE PENALTY for Negative PnL (Roadmap Item 3)
-            # If we lose money, penalize proportional to the loss relative to capital
+            # AGGRESSIVE PENALTY for Negative PnL
             if metrics['total_pnl'] < 0:
-                 # e.g., -1000 loss on 100k = 1% loss. Penalty = 100 * 0.01 = 1.0 (Base)
-                 # Scaled up to be impactful: 100 * (Loss / Capital) * 100
                  loss_ratio = abs(metrics['total_pnl']) / broker.starting_cash
                  penalty_factor = 1000.0 * loss_ratio 
                  final_score -= penalty_factor
 
-            # Generate Autopsy if result is poor (Debugging)
+            # Generate Autopsy if result is poor
             if final_score < 0.5 or broker.is_blown:
                 trial.set_user_attr("autopsy", strategy.generate_autopsy())
                 
             if broker.is_blown:
                 trial.set_user_attr("blown", True)
-                return -1000.0 # Max Penalty
+                return -1000.0 
             
             return final_score
 
@@ -295,7 +280,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
         # 4. Execute Optimization
         study.optimize(objective, n_trials=n_trials, callbacks=[EmojiCallback()])
         
-        # Cleanup memory for this worker
+        # Cleanup
         del df
         gc.collect()
 
@@ -309,7 +294,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
     Trains the Final Production Model using the Best Params found.
     """
     try:
-        # 1. Load & Aggregate Data (Using updated 4M limit)
+        # 1. Load & Aggregate Data
         df = process_data_into_bars(symbol, n_ticks=4000000)
         if df.empty: return
 
@@ -371,7 +356,6 @@ class ResearchPipeline:
         self.reports_dir = Path("reports")
         self.reports_dir.mkdir(exist_ok=True)
         
-        # Increased Tick counts to ensure Bar generation works
         self.train_candles = CONFIG['data'].get('num_candles_train', 4000000)
         self.backtest_candles = CONFIG['data'].get('num_candles_backtest', 500000)
         
@@ -384,34 +368,40 @@ class ResearchPipeline:
         if params is None:
             params = CONFIG['online_learning']
         
+        # Configure Metric
+        metric_map = {
+            "LogLoss": metrics.LogLoss(),
+            "F1": metrics.F1(),
+            "Accuracy": metrics.Accuracy()
+        }
+        selected_metric = metric_map.get(params.get('metric', 'LogLoss'), metrics.LogLoss())
+
         # Base Classifier: ARF
         base_clf = forest.ARFClassifier(
-            n_models=params.get('n_models', 25),
+            n_models=params.get('n_models', 30),
             seed=42,
-            grace_period=params.get('grace_period', 200),
+            grace_period=params.get('grace_period', 250),
             delta=params.get('delta', 1e-5),
             split_criterion='gini',
             leaf_prediction='mc',
-            max_features='log2',
-            lambda_value=6,
-            metric=metrics.F1()
+            max_features=params.get('max_features', 'log2'),
+            lambda_value=params.get('lambda_value', 10),
+            metric=selected_metric,
+            warning_detector=drift.ADWIN(delta=params.get('warning_delta', 0.001)),
+            drift_detector=drift.ADWIN(delta=params.get('delta', 1e-5))
         )
 
-        # ENSEMBLE: ADWIN Bagging (River)
-        # Wraps ARF in an ADWIN Bagging Ensemble to handle drift and variance
+        # ENSEMBLE: ADWIN Bagging
         return compose.Pipeline(
             preprocessing.StandardScaler(),
             ensemble.ADWINBaggingClassifier(
                 model=base_clf,
-                n_models=5,  # Ensemble Size (5 ARFs)
+                n_models=5, 
                 seed=42
             )
         )
 
     def calculate_performance_metrics(self, trade_log: List[Dict], initial_capital=100000.0) -> Dict[str, float]:
-        """
-        Calculates extended metrics for robust debugging and scoring.
-        """
         metrics = {
             'score': -10.0,
             'total_pnl': 0.0,
@@ -456,7 +446,7 @@ class ResearchPipeline:
         metrics['max_dd_pct'] = abs(max_dd_val / initial_capital)
 
         # Fail Conditions
-        if metrics['max_dd_pct'] > 0.10: # 10% Hard Limit
+        if metrics['max_dd_pct'] > 0.10: 
             metrics['score'] = -100.0
             return metrics
         
@@ -466,26 +456,18 @@ class ResearchPipeline:
         pnl_std = df['Net_PnL'].std() if len(df) > 1 else 1.0
         downside_std = losers['Net_PnL'].std() if len(losers) > 1 else 1.0
         
-        # Sharpe (Annualized approx assuming these are sequential trades in sample)
         metrics['sharpe'] = avg_ret / (pnl_std + 1e-9)
-        
-        # Sortino
         metrics['sortino'] = avg_ret / (downside_std + 1e-9)
         
-        # SQN (System Quality Number) - Van Tharp's formula
-        # SQN = sqrt(N) * (Expectancy / StdDev)
+        # SQN
         if len(df) > 1 and pnl_std > 1e-9:
             metrics['sqn'] = math.sqrt(len(df)) * (avg_ret / pnl_std)
-        
-        # Scoring Formula is calculated in objective function now
-        metrics['score'] = 0.0 # Placeholder
         
         return metrics
 
     def run_training(self, fresh_start: bool = False):
         log.info(f"{LogSymbols.TIME} STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
         
-        # 1. Init DB Studies
         for symbol in self.symbols:
             study_name = f"study_{symbol}"
             if fresh_start:
@@ -501,8 +483,8 @@ class ResearchPipeline:
             except Exception as e:
                 log.warning(f"Study init warning {symbol}: {e}")
 
-        # 2. Distribute Workers
-        total_trials_per_symbol = CONFIG['wfo'].get('n_trials', 200) # Ensure config aligns with request
+        # Distribute Workers
+        total_trials_per_symbol = CONFIG['wfo'].get('n_trials', 200)
         tasks = []
         workers_per_symbol = max(1, self.total_cores // len(self.symbols))
         trials_per_worker = math.ceil(total_trials_per_symbol / workers_per_symbol)
@@ -519,7 +501,6 @@ class ResearchPipeline:
             delayed(_worker_optimize_task)(*t) for t in tasks
         )
         
-        # 3. Finalize
         duration = time.time() - start_time
         log.info(f"{LogSymbols.SUCCESS} Swarm Optimization Complete in {duration:.2f}s")
         log.info(f"{LogSymbols.DATABASE} Finalizing Models & Artifacts...")
@@ -598,9 +579,8 @@ class ResearchPipeline:
             return
 
         df = pd.DataFrame(trade_log)
-        initial_capital = 100000.0 # Assumed start
+        initial_capital = 100000.0 
         
-        # Metrics
         total_pnl = df['Net_PnL'].sum()
         win_rate = len(df[df['Net_PnL']>0]) / len(df)
         
@@ -609,13 +589,11 @@ class ResearchPipeline:
         log.info(f"Win Rate: {win_rate:.1%}")
         log.info(f"Trades: {len(df)}")
         
-        # Save CSV
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_path = self.reports_dir / f"backtest_trades_{timestamp_str}.csv"
         df.to_csv(csv_path)
         log.info(f"{LogSymbols.DATABASE} Saved Trades to {csv_path}")
 
-        # --- PLOTLY VISUALIZATION ---
         try:
             df['Entry_Time'] = pd.to_datetime(df['Entry_Time'])
             df = df.sort_values('Entry_Time')
@@ -632,13 +610,11 @@ class ResearchPipeline:
                             vertical_spacing=0.05, row_heights=[0.7, 0.3],
                             subplot_titles=("Equity Curve", "Drawdown"))
 
-        # Equity Line
         fig.add_trace(
             go.Scatter(x=df_equity['Entry_Time'], y=df_equity['Equity'], mode='lines', name='Equity', line=dict(color='#00ff00')),
             row=1, col=1
         )
         
-        # Drawdown Area
         fig.add_trace(
             go.Scatter(x=df_equity['Entry_Time'], y=df_equity['Drawdown'], mode='lines', name='Drawdown', fill='tozeroy', line=dict(color='#ff0000')),
             row=2, col=1
