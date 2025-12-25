@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - EXPLAINABILITY & SMART DISCOVERY):
-# 1. EXPLAINABILITY: Tracks and logs Top Driver Features for live signals.
-# 2. SMART DISCOVERY: Implements Trend-Following heuristic for warm-up phase.
-# 3. GATING: Discovery Logic bypasses filters; Strict Gates applied otherwise.
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - QUANT OVERHAUL):
+# 1. STATE PERSISTENCE: Now saves/loads Feature Engineers to preserve FracDiff memory.
+# 2. MICROSTRUCTURE: Integrates OFI (Order Flow Imbalance) into signal logic.
+# 3. FRACDIFF: Uses Fractionally Differentiated price for stationarity.
 # =============================================================================
 import logging
 import pickle
@@ -67,9 +67,11 @@ class MultiAssetPredictor:
         self.models_dir.mkdir(exist_ok=True)
         
         # 1. State Containers
+        # NOTE: OnlineFeatureEngineer now contains stateful kernels (FracDiff, OFI).
+        # Must be persisted to disk to maintain memory.
         self.feature_engineers = {s: OnlineFeatureEngineer(window_size=CONFIG['features']['window_size']) for s in symbols}
         
-        # Phase 2: Adaptive Triple Barrier
+        # Adaptive Triple Barrier
         tbm_conf = CONFIG['online_learning']['tbm']
         self.labelers = {s: AdaptiveTripleBarrier(
             horizon_ticks=tbm_conf['horizon_minutes'], 
@@ -97,24 +99,20 @@ class MultiAssetPredictor:
         self.last_save_time = time.time()
         self.save_interval = 300 # 5 Minutes
 
-        # --- AUDIT FIX: Gating Params ---
+        # --- Gating Params ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
         self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.0)
         
-        # --- REGIME GATES (NOISE FILTER) ---
+        # Regime Gates
         self.min_ker_threshold = CONFIG['microstructure'].get('gate_ker_threshold', 0.10)
-        
-        # FDI Inhibition Zone (Random Walk Block)
         self.fdi_min_random = CONFIG['microstructure'].get('fdi_min_random', 1.48)
         self.fdi_max_random = CONFIG['microstructure'].get('fdi_max_random', 1.52)
-        
-        # HMM Threshold (Disabled temporarily)
         self.gate_hmm_threshold = CONFIG['microstructure'].get('gate_hmm_threshold', 0.0)
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
 
-        # Initialize Models
+        # Initialize Models & Load State
         self._init_models()
         self._load_state()
 
@@ -124,7 +122,6 @@ class MultiAssetPredictor:
         """
         conf = CONFIG['online_learning']
         
-        # Map metric string to River object
         metric_map = {
             "LogLoss": metrics.LogLoss(),
             "F1": metrics.F1(),
@@ -134,7 +131,7 @@ class MultiAssetPredictor:
         selected_metric = metric_map.get(conf.get('metric', 'LogLoss'), metrics.LogLoss())
         
         for sym in self.symbols:
-            # Base Classifier: ARF with Golden Config
+            # Base Classifier: ARF
             base_clf = forest.ARFClassifier(
                 n_models=conf['n_models'],
                 grace_period=conf['grace_period'],
@@ -144,7 +141,7 @@ class MultiAssetPredictor:
                 max_features=conf.get('max_features', 'log2'),
                 lambda_value=conf.get('lambda_value', 10),
                 metric=selected_metric,
-                warning_detector=drift.ADWIN(delta=conf.get('warning_delta', 0.001)), # Early warning
+                warning_detector=drift.ADWIN(delta=conf.get('warning_delta', 0.001)),
                 drift_detector=drift.ADWIN(delta=conf['delta'])
             )
             
@@ -153,12 +150,12 @@ class MultiAssetPredictor:
                 preprocessing.StandardScaler(),
                 ensemble.ADWINBaggingClassifier(
                     model=base_clf,
-                    n_models=5,
+                    n_models=5, 
                     seed=42
                 )
             )
             
-            # Meta Model: Profitability Filter
+            # Meta Model & Calibrator
             self.meta_labelers[sym] = MetaLabeler()
             self.calibrators[sym] = ProbabilityCalibrator()
 
@@ -186,7 +183,7 @@ class MultiAssetPredictor:
         buy_vol = getattr(bar, 'buy_vol', 0.0)
         sell_vol = getattr(bar, 'sell_vol', 0.0)
 
-        # 1. Feature Engineering
+        # 1. Feature Engineering (Generates FracDiff & OFI internally)
         features = fe.update(
             price=bar.close,
             timestamp=bar.timestamp,
@@ -202,12 +199,14 @@ class MultiAssetPredictor:
         if context_d1:
             features = enrich_with_d1_data(features, context_d1, bar.close)
 
-        # Update Feature Stats (Rolling Average)
+        # Update Feature Stats (Rolling Average for Monitoring)
         alpha = 0.01
         feat_stats['avg_ker'] = (1 - alpha) * feat_stats.get('avg_ker', 0.5) + alpha * features.get('ker', 0.5)
         feat_stats['avg_fdi'] = (1 - alpha) * feat_stats.get('avg_fdi', 1.5) + alpha * features.get('fdi', 1.5)
-        feat_stats['avg_entropy'] = (1 - alpha) * feat_stats.get('avg_entropy', 0.5) + alpha * features.get('entropy', 0.5)
-
+        
+        # New Microstructure Stats
+        feat_stats['avg_ofi'] = (1 - alpha) * feat_stats.get('avg_ofi', 0.0) + alpha * features.get('micro_ofi', 0.0)
+        
         # --- WARM-UP GATE ---
         if self.burn_in_counters[symbol] < self.burn_in_limit:
             self.burn_in_counters[symbol] += 1
@@ -216,7 +215,7 @@ class MultiAssetPredictor:
                 logger.info(f"🔥 {symbol} Warm-up: {self.burn_in_counters[symbol]}/{self.burn_in_limit}")
             return Signal(symbol, "WARMUP", 0.0, {"remaining": remaining})
 
-        # 2. Delayed Training (Label Resolution via Adaptive Barrier)
+        # 2. Delayed Training (Label Resolution)
         resolved_labels = labeler.resolve_labels(bar.high, bar.low)
         
         if resolved_labels:
@@ -226,16 +225,15 @@ class MultiAssetPredictor:
                 
                 base_weight = w_pos if outcome_label != 0 else w_neg
                 
-                # Scale by Log Return Magnitude
+                # Scale by Profit Magnitude (Log Scale)
                 ret_scalar = math.log1p(abs(realized_ret) * 100.0)
                 ret_scalar = max(0.5, min(ret_scalar, 5.0))
-                
                 final_weight = base_weight * ret_scalar
                 
                 # Train Primary Model
                 model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
                 
-                # Double Learn for Positive outcomes
+                # Double Learn for Positive outcomes (Reinforcement)
                 if outcome_label != 0:
                      model.learn_one(stored_feats, outcome_label, sample_weight=final_weight * 1.5)
 
@@ -248,10 +246,9 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
 
         # ============================================================
-        # 4. ARCHITECTURE FIX: SMART DISCOVERY & GATING
+        # 4. SMART DISCOVERY & GATING (ARCHITECTURE FIX)
         # ============================================================
         
-        # 1. Identify Mode
         is_discovery = self.bar_counters[symbol] < 2500
         gates_passed = True
         gate_reason = ""
@@ -268,7 +265,7 @@ class MultiAssetPredictor:
                     gates_passed = False
                     gate_reason = "Vol Gate (Dead Market)"
             
-            # Regime Gate: KER (Signal Strength)
+            # Regime Gate: KER
             if gates_passed:
                 current_ker = features.get('ker', 0.5)
                 volatility = features.get('volatility', 0.001)
@@ -278,19 +275,12 @@ class MultiAssetPredictor:
                     gates_passed = False
                     gate_reason = f"Regime: Low KER ({current_ker:.2f})"
 
-            # Regime Gate: FDI Inhibition Zone (Random Walk)
+            # Regime Gate: FDI Inhibition
             if gates_passed:
                 current_fdi = features.get('fdi', 1.5)
                 if self.fdi_min_random <= current_fdi <= self.fdi_max_random:
                     gates_passed = False
                     gate_reason = f"Regime: FDI Inhibition ({current_fdi:.2f})"
-                
-            # Regime Gate: HMM State (TEMPORARILY DISABLED)
-            if gates_passed and self.gate_hmm_threshold > 0:
-                hmm_regime = features.get('hmm_regime', 0.5)
-                if hmm_regime < self.gate_hmm_threshold:
-                    gates_passed = False
-                    gate_reason = f"Regime: HMM Range ({hmm_regime:.2f})"
         
         # If Gates Failed and NOT Discovery, Exit
         if not gates_passed and not is_discovery:
@@ -300,7 +290,7 @@ class MultiAssetPredictor:
         # 5. Inference
         current_pred_action = 0
         try:
-            # Filter Enforcement (Strict even in Discovery)
+            # Filter Enforcement (Strict)
             entropy_val = features.get('entropy', 0.0)
             entropy_thresh = CONFIG['features'].get('entropy_threshold', 0.90)
             
@@ -308,6 +298,7 @@ class MultiAssetPredictor:
                 stats['High Entropy'] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"Max Entropy ({entropy_val:.2f})"})
             
+            # VPIN / OFI Checks
             vpin_val = features.get('vpin', 0.0)
             vpin_thresh = CONFIG['microstructure'].get('vpin_threshold', 0.90)
             
@@ -315,6 +306,10 @@ class MultiAssetPredictor:
                 stats['High VPIN'] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"Toxic VPIN ({vpin_val:.2f})"})
 
+            # NEW: Microstructure OFI Check (Fast Fail)
+            # If OFI is extremely negative (Heavy Selling) but Model says BUY -> Block
+            micro_ofi = features.get('micro_ofi', 0.0)
+            
             # Prediction
             pred_class = model.predict_one(features)
             pred_proba = model.predict_proba_one(features)
@@ -327,7 +322,17 @@ class MultiAssetPredictor:
             prob_buy = pred_proba.get(1, 0.0)
             prob_sell = pred_proba.get(-1, 0.0)
             
-            # SAFE DISCOVERY LOGIC (TREND FOLLOWING)
+            # OFI Filter Logic
+            # If proposing BUY but OFI is strongly negative
+            if current_pred_action == 1 and micro_ofi < -2.0:
+                stats['OFI Mismatch (Buy into Sell Flow)'] += 1
+                current_pred_action = 0
+            # If proposing SELL but OFI is strongly positive
+            elif current_pred_action == -1 and micro_ofi > 2.0:
+                stats['OFI Mismatch (Sell into Buy Flow)'] += 1
+                current_pred_action = 0
+
+            # SAFE DISCOVERY LOGIC
             effective_action = current_pred_action
             discovery_triggered = False
             
@@ -341,13 +346,12 @@ class MultiAssetPredictor:
                         effective_action = -1
                         discovery_triggered = True
 
-            # Calculate Final Confidence
             confidence = prob_buy if effective_action == 1 else prob_sell
             
             if discovery_triggered:
                 confidence = 0.55
 
-            # Meta Labeling Check
+            # Meta Labeling
             meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.60)
             is_profitable = meta_labeler.predict(
                 features,
@@ -359,10 +363,10 @@ class MultiAssetPredictor:
             min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.85)
             current_ker = features.get('ker', 1.0)
             volatility = features.get('volatility', 0.001)
+            frac_diff = features.get('frac_diff', 0.0)
             
             if effective_action in [1, -1]:
                 if confidence > min_conf:
-                    # Allow trade if Profitable OR Discovery Triggered
                     if is_profitable or discovery_triggered:
                         action_str = "BUY" if effective_action == 1 else "SELL"
                         
@@ -373,11 +377,21 @@ class MultiAssetPredictor:
                         if features.get('macd_norm', 0) > 0: imp_feats.append('MACD_Pos')
                         else: imp_feats.append('MACD_Neg')
                         if features.get('vol_breakout', 0) > 0: imp_feats.append('Vol_Breakout')
+                        if micro_ofi > 1.0: imp_feats.append('OFI_Buy')
+                        elif micro_ofi < -1.0: imp_feats.append('OFI_Sell')
                         
                         for f in imp_feats:
                             self.feature_importance_counter[symbol][f] += 1
                         
-                        return Signal(symbol, action_str, confidence, {"meta_ok": True, "volatility": volatility, "atr": current_atr, "ker": current_ker, "drivers": imp_feats})
+                        return Signal(symbol, action_str, confidence, {
+                            "meta_ok": True, 
+                            "volatility": volatility, 
+                            "atr": current_atr, 
+                            "ker": current_ker, 
+                            "frac_diff": frac_diff,
+                            "ofi": micro_ofi,
+                            "drivers": imp_feats
+                        })
                     else:
                         stats['Meta Rejected'] += 1
                         return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
@@ -389,7 +403,7 @@ class MultiAssetPredictor:
             
             if self.bar_counters[symbol] % 250 == 0:
                 top_drivers = self.feature_importance_counter[symbol].most_common(3)
-                logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} FDI:{feat_stats['avg_fdi']:.2f}")
+                logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} FDI:{feat_stats['avg_fdi']:.2f} OFI:{feat_stats['avg_ofi']:.2f} FD:{frac_diff:.4f}")
                 logger.info(f"🔍 {symbol} Top Drivers: {top_drivers}")
                 logger.info(f"🔍 {symbol} Rejections: {dict(stats)}")
                 stats.clear()
@@ -401,7 +415,7 @@ class MultiAssetPredictor:
             return None
 
     def save_state(self):
-        """Saves models to disk."""
+        """Saves models AND Feature Engineers to disk."""
         try:
             for sym in self.symbols:
                 with open(self.models_dir / f"river_pipeline_{sym}.pkl", "wb") as f:
@@ -410,28 +424,39 @@ class MultiAssetPredictor:
                     pickle.dump(self.meta_labelers[sym], f)
                 with open(self.models_dir / f"calibrators_{sym}.pkl", "wb") as f:
                     pickle.dump(self.calibrators[sym], f)
-            logger.info(f"{LogSymbols.DATABASE} Models Auto-Saved (5-min Checkpoint).")
+                
+                # NEW: Persist Feature Engineer State (FracDiff memory)
+                with open(self.models_dir / f"feature_engineer_{sym}.pkl", "wb") as f:
+                    pickle.dump(self.feature_engineers[sym], f)
+                    
+            logger.info(f"{LogSymbols.DATABASE} Models & State Auto-Saved.")
         except Exception as e:
             logger.error(f"{LogSymbols.ERROR} Failed to save models: {e}")
 
     def _load_state(self):
-        """Loads models from disk."""
+        """Loads models AND Feature Engineers from disk."""
         loaded_count = 0
         for sym in self.symbols:
             model_path = self.models_dir / f"river_pipeline_{sym}.pkl"
             meta_path = self.models_dir / f"meta_model_{sym}.pkl"
+            fe_path = self.models_dir / f"feature_engineer_{sym}.pkl"
             
             if model_path.exists():
                 try:
-                    with open(model_path, "rb") as f:
-                        self.models[sym] = pickle.load(f)
+                    with open(model_path, "rb") as f: self.models[sym] = pickle.load(f)
                     loaded_count += 1
                 except Exception: pass
             
             if meta_path.exists():
                 try:
-                    with open(meta_path, "rb") as f:
-                        self.meta_labelers[sym] = pickle.load(f)
+                    with open(meta_path, "rb") as f: self.meta_labelers[sym] = pickle.load(f)
+                except Exception: pass
+                
+            # NEW: Load Feature Engineer State
+            if fe_path.exists():
+                try:
+                    with open(fe_path, "rb") as f: self.feature_engineers[sym] = pickle.load(f)
+                    logger.info(f"Loaded Feature State for {sym}")
                 except Exception: pass
                 
         if loaded_count > 0:

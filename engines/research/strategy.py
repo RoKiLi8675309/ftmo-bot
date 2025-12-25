@@ -5,12 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - EXPLAINABILITY & SMART DISCOVERY):
-# 1. EXPLAINABILITY: Tracks Feature Importance (Information Gain) for "Autopsy".
-# 2. SMART DISCOVERY: Replaced random warmup with Simple Trend Following.
-#    - Rule: If Price > EMA(50) -> BUY, Else -> SELL.
-#    - Rationale: Provides better initial training samples than coin flips.
-# 3. GATING: Gates remain "Gate-Last" relative to Discovery (Discovery bypasses).
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - QUANT OVERHAUL):
+# 1. MICROSTRUCTURE PARITY: Added OFI Mismatch Filter (Fast Fail) to match Live Engine.
+# 2. FRACDIFF: Integrated Fractional Differentiation tracking in Autopsy.
+# 3. EXPLAINABILITY: Tracks Microstructure OFI as a key decision driver.
 # =============================================================================
 import logging
 import sys
@@ -53,6 +51,7 @@ class ResearchStrategy:
         self.debug_mode = False
         
         # 1. Feature Engineer (The Eyes)
+        # Note: Now includes FracDiff and Microstructure kernels
         self.fe = OnlineFeatureEngineer(
             window_size=params.get('window_size', 50)
         )
@@ -135,7 +134,7 @@ class ResearchStrategy:
         except Exception:
             timestamp = 0.0
 
-        # Flow Volumes
+        # Flow Volumes (Critical for OFI)
         buy_vol = snapshot.get_price(self.symbol, 'buy_vol')
         sell_vol = snapshot.get_price(self.symbol, 'sell_vol')
         
@@ -158,6 +157,7 @@ class ResearchStrategy:
         self.last_price = price
 
         # A. Feature Engineering
+        # (Generates frac_diff and micro_ofi internally)
         features = self.fe.update(
             price=price,
             timestamp=timestamp,
@@ -211,7 +211,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. ARCHITECTURE FIX: SMART DISCOVERY & GATING
+        # D. SMART DISCOVERY & GATING
         # ============================================================
         
         # 1. Identify Mode
@@ -246,8 +246,8 @@ class ResearchStrategy:
                     gates_passed = False
                     gate_reason = f"Regime: FDI Inhibition ({current_fdi:.2f})"
 
-            # Regime Gate: HMM ( DISABLED TEMPORARILY via Config Logic or Manual )
-            # We skip HMM check here as per plan to unblock trading.
+            # Regime Gate: HMM ( DISABLED TEMPORARILY )
+            # We skip HMM check here as per plan.
         
         # If Gates Failed and NOT Discovery, Exit
         if not gates_passed and not is_discovery:
@@ -269,17 +269,14 @@ class ResearchStrategy:
                 self.rejection_stats['High VPIN'] += 1
                 return
 
+            # --- MICROSTRUCTURE FILTER (Fast Fail) ---
+            micro_ofi = features.get('micro_ofi', 0.0)
+            # Thresholds: If OFI is extremely skewed against the trade direction, kill it.
+            # Example: Model says BUY, but OFI < -2.0 (Heavy Selling) -> Block
+            
             # Primary Prediction
             pred_class = self.model.predict_one(features)
             pred_proba = self.model.predict_proba_one(features)
-            
-            # --- FEATURE IMPORTANCE TRACKING ---
-            # Extract top contributing features for this prediction (if supported by model wrapper)
-            # Standard River ARF doesn't easily expose instance-level importance,
-            # so we track global importance if available or skip.
-            # Assuming ADWINBaggingClassifier -> Base ARF -> Tree
-            # We can't easily get it per-instance without a custom wrapper.
-            # Fallback: We will log the *values* of key features when a trade is taken.
             
             try:
                 pred_action = int(pred_class)
@@ -289,18 +286,25 @@ class ResearchStrategy:
             prob_buy = pred_proba.get(1, 0.0)
             prob_sell = pred_proba.get(-1, 0.0)
 
+            # OFI Logic Application
+            effective_action = pred_action
+            
+            if effective_action == 1 and micro_ofi < -2.0:
+                self.rejection_stats['OFI Mismatch (Buy into Sell Flow)'] += 1
+                effective_action = 0
+            elif effective_action == -1 and micro_ofi > 2.0:
+                self.rejection_stats['OFI Mismatch (Sell into Buy Flow)'] += 1
+                effective_action = 0
+
             # F. Execution Logic & Discovery Override
             dt_timestamp = datetime.fromtimestamp(timestamp) if timestamp > 0 else datetime.now()
             
-            effective_action = pred_action
             discovery_triggered = False
 
             # --- SMART DISCOVERY LOGIC (Trend Following) ---
-            # Replaces random coin flips with a simple heuristic to generate better training data.
+            # Replaces random coin flips with a simple heuristic.
             if is_discovery and effective_action == 0:
-                # Calculate simple Trend: Price vs EMA(50) (approx)
-                # We don't have EMA50 directly in features, but we have 'macd_norm'.
-                # If MACD > 0, it implies Momentum UP.
+                # Calculate simple Trend using MACD momentum
                 macd_val = features.get('macd_norm', 0.0)
                 
                 if abs(macd_val) > 0.00005: # Minimal momentum threshold
@@ -431,8 +435,6 @@ class ResearchStrategy:
         broker.submit_order(order)
         
         # Track Features for Explainability
-        # We define "Importance" loosely as "Extreme Values" that likely triggered the tree split
-        # e.g., if RSI is 80, that's important for a Sell.
         imp_feats = []
         if features.get('rsi_norm', 0.5) > 0.7: imp_feats.append('RSI_High')
         elif features.get('rsi_norm', 0.5) < 0.3: imp_feats.append('RSI_Low')
@@ -440,6 +442,11 @@ class ResearchStrategy:
         else: imp_feats.append('MACD_Neg')
         if features.get('ker', 0) > 0.5: imp_feats.append('KER_High')
         if features.get('vol_breakout', 0) > 0: imp_feats.append('Vol_Breakout')
+        
+        # New Microstructure drivers
+        micro_ofi = features.get('micro_ofi', 0.0)
+        if micro_ofi > 1.0: imp_feats.append('OFI_Buy')
+        elif micro_ofi < -1.0: imp_feats.append('OFI_Sell')
         
         for f in imp_feats:
             self.feature_importance_counter[f] += 1
@@ -455,6 +462,8 @@ class ResearchStrategy:
             'fdi': features.get('fdi', 0),
             'atr': current_atr,
             'volatility': volatility,
+            'frac_diff': features.get('frac_diff', 0.0), # NEW
+            'micro_ofi': micro_ofi, # NEW
             'forced': discovery_mode,
             'top_feats': imp_feats
         })
@@ -470,6 +479,9 @@ class ResearchStrategy:
         
         avg_conf = np.mean([t['conf'] for t in self.trade_events])
         avg_vpin = np.mean([t['vpin'] for t in self.trade_events])
+        avg_ofi = np.mean([t['micro_ofi'] for t in self.trade_events]) # NEW
+        avg_frac = np.mean([t['frac_diff'] for t in self.trade_events]) # NEW
+        
         forced_count = sum(1 for t in self.trade_events if t['forced'])
         
         reject_str = ", ".join([f"{k}: {v}" for k, v in self.rejection_stats.items()])
@@ -488,9 +500,9 @@ class ResearchStrategy:
         report = (
             f"\n --- 💀 STRATEGY AUTOPSY ({self.symbol}) ---\n"
             f" Trades: {len(self.trade_events)} (Discovery Mode: {forced_count})\n"
-            f" Avg Conf: {avg_conf:.2f}\n"
-            f" Conf Dist: {dist_str}\n"
-            f" Avg VPIN: {avg_vpin:.2f}\n"
+            f" Avg Conf: {avg_conf:.2f} | Dist: {dist_str}\n"
+            f" Avg VPIN: {avg_vpin:.2f} | Avg OFI: {avg_ofi:.2f}\n"
+            f" Avg FracDiff: {avg_frac:.4f}\n"
             f" Top Drivers: {feat_str}\n"
             f" Rejections: {{{reject_str}}}\n"
             f" ----------------------------------------\n"
