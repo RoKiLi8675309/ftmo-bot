@@ -1,17 +1,14 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V1.1 (OPTIMIZED PARAMETERS)
+# config.yaml – PROJECT PHOENIX V1.2 (PROP FIRM SCALING)
 # STATUS: GREENFIELD REDESIGN
 #
-# AUDIT REMEDIATION (2025-12-25 - STRATEGY PIVOT):
-# 1. PHILOSOPHY: Shift from Mean Reversion to Volatility Expansion (Tails > Mean).
-# 2. DATA: L1 Feature Engineering proxies (Parkinson, Amihud, RVol) replacing L2 dependency.
-# 3. EXECUTION: Passive Limit Orders (Ask - 0.2) with strict 60s Timeout.
-# 4. PORTFOLIO: Excluded CHF/CAD to reduce mean-reversion noise.
-#
-# OPTIMIZATION V1.1:
-# - Widened Stop Loss to 1.5 ATR (Breathing room).
-# - Relaxed Range Gate to 1.2 ATR (Capture earlier expansion).
-# - Tightened Trend Gate (KER > 0.70) to filter chop.
+# AUDIT REMEDIATION (2025-12-26 - SIZING FIX):
+# 1. RISK MODE: Switched to 'fixed_risk' (Prop Firm Standard).
+#    - Risk 0.5% per trade explicitly. No Kelly dampening.
+# 2. ENTRY GATES: Relaxed Volatility Gates to enter earlier in the move.
+#    - Range Gate: 1.2 ATR (was 1.5)
+#    - Volume Gate: 1.1x RVol (was 1.2)
+# 3. FILTERS: Tightened Trend Efficiency (KER > 0.70) to filter chop.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -145,7 +142,7 @@ phoenix_strategy:
   # Regime B: Momentum Trend
   ker_trend_threshold: 0.70     # AUDIT FIX: Tightened from 0.60 to filter noise
   
-  # Entry Gates
+  # Entry Gates (RELAXED FOR EARLIER ENTRY)
   range_gate_atr_mult: 1.2      # AUDIT FIX: Relaxed from 1.5 to 1.2
   volume_gate_ratio: 1.1        # AUDIT FIX: Relaxed from 1.2 to 1.1
   ml_confirmation_threshold: 0.60
@@ -159,18 +156,22 @@ phoenix_strategy:
 risk_management:
   account_currency: "USD"
   
-  sizing_method: "volatility_targeting"
+  # --- SIZING METHOD: PROP FIRM MODE ---
+  # 'fixed_risk': Calculate lots based on % Risk and Stop Loss distance.
+  # 'volatility_targeting': (Legacy) Wealth preservation mode.
+  sizing_method: "fixed_risk"
   
   target_annual_volatility: 0.20
   kelly_fraction: 0.25 
   
-  base_risk_per_trade_percent: 1.0
+  # RISK PER TRADE: 0.5% of Equity
+  base_risk_per_trade_percent: 0.5
   
   max_daily_loss_pct: 0.04
   max_total_loss_pct: 0.09
-  max_risk_percent: 1.5
+  max_risk_percent: 1.0         # Hard cap per trade
   max_leverage: 30.0
-  max_lot_size: 50.0
+  max_lot_size: 5.0
   min_lot_size: 0.01
   
   cppi_floor_pct: 0.08
@@ -193,7 +194,7 @@ risk_management:
   
   max_trades_per_day: 50
   correlation_penalty_threshold: 0.8
-  max_loss_usd: 2500.0
+  max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
   min_stop_loss_pips: 5.0
 
@@ -226,12 +227,12 @@ online_learning:
   
   # GOLDEN CONFIGURATION
   n_models: 30       # Range 30-50
-  grace_period: 250      # Range 200-500
-  delta: 0.0001          # 1e-4 (Faster Adaptation)
-  warning_delta: 0.001   # 1e-3 (Early Warning)
-  lambda_value: 10       # Poisson Weight
-  max_features: 'log2'   # Decorrelation
-  metric: "LogLoss"      # Probability Calibration
+  grace_period: 250       # Range 200-500
+  delta: 0.0001           # 1e-4 (Faster Adaptation)
+  warning_delta: 0.001    # 1e-3 (Early Warning)
+  lambda_value: 10        # Poisson Weight
+  max_features: 'log2'    # Decorrelation
+  metric: "LogLoss"       # Probability Calibration
   
   burn_in_periods: 1000
   

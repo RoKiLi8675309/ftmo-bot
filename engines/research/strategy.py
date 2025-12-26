@@ -5,12 +5,12 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - VOLATILITY EXPANSION):
-# 1. PHILOSOPHY: Abandoned Mean Reversion. Now chasing Volatility Expansion.
-# 2. LOGIC: 
-#    - Regime A (Expansion): Range > 1.5ATR AND RVol > 1.2 AND Aggressor Conf.
-#    - Regime B (Trend): KER > 0.60 AND Aggressor Conf.
-# 3. GATES: Hard filters for Volume (RVol) and Candle Shape (Aggressor).
+# PHOENIX STRATEGY UPGRADE (2025-12-26 - SIZING & GATES):
+# 1. INTEGRATION: Now utilizes RiskManager's 'fixed_risk' logic with dynamic equity.
+# 2. ENTRY GATES: Relaxed thresholds (1.2 ATR) to catch moves earlier.
+# 3. REGIMES: 
+#    - Regime A (Expansion): Range > 1.2 ATR AND RVol > 1.1.
+#    - Regime B (Trend): KER > 0.70.
 # =============================================================================
 import logging
 import sys
@@ -60,7 +60,7 @@ class ResearchStrategy:
         tbm_conf = params.get('tbm', {})
         self.labeler = AdaptiveTripleBarrier(
             horizon_ticks=tbm_conf.get('horizon_minutes', 60),
-            risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'], # Tight stops (1.0)
+            risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'], # Uses Config (1.5)
             reward_mult=tbm_conf.get('barrier_width', 2.0),
             drift_threshold=tbm_conf.get('drift_threshold', 1.0)
         )
@@ -96,13 +96,14 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX STRATEGY PARAMETERS ---
+        # --- PHOENIX STRATEGY PARAMETERS (Refreshed from Config) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.5)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.60)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.70)
         
-        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.5)
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.2)
+        # Relaxed Entry Gates (Fix for Top Buying)
+        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.2)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.1)
         
         self.limit_offset = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
 
@@ -219,7 +220,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. PROJECT PHOENIX: LOGIC GATES
+        # D. PROJECT PHOENIX: LOGIC GATES (UPDATED)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
@@ -234,9 +235,11 @@ class ResearchStrategy:
         bar_range = high - low
         
         # Gate A: Range Expansion (Market is waking up)
+        # RELAXED to 1.2 * ATR via Config
         range_gate = bar_range > (self.range_gate_mult * atr_val)
         
         # Gate B: Volume Participation (Move is supported)
+        # RELAXED to 1.1x Average via Config
         vol_gate = rvol > self.vol_gate_ratio
         
         # Gate C: Momentum Direction (Aggressor Ratio)
@@ -261,6 +264,7 @@ class ResearchStrategy:
                 
         # --- REGIME B: EFFICIENT TREND CONTINUATION ---
         # Logic: High Efficiency (KER) + Momentum align
+        # KER Threshold tightened to 0.70 via Config
         elif ker_val > self.ker_thresh:
             if is_bullish_candle:
                 proposed_action = 1
@@ -374,7 +378,7 @@ class ResearchStrategy:
                 self.last_price_map[sym] = price
 
     def _execute_logic(self, confidence, price, features, broker, timestamp: datetime, action_int: int, regime: str):
-        """Decides whether to enter a trade using Volatility Targeting."""
+        """Decides whether to enter a trade using Fixed Risk (Prop Firm Mode)."""
         
         # 1. Signal Threshold
         min_prob = self.params.get('min_calibrated_probability', 0.60)
@@ -409,6 +413,8 @@ class ResearchStrategy:
             risk_reward_ratio=2.0
         )
 
+        # AUDIT FIX: Pass broker.equity implicitly via ctx AND account_size explicitly
+        # This ensures the RiskManager sees the dynamic equity for scaling.
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=confidence,
@@ -416,7 +422,8 @@ class ResearchStrategy:
             active_correlations=0,
             market_prices=self.last_price_map,
             atr=current_atr, 
-            ker=current_ker  
+            ker=current_ker,
+            account_size=broker.equity # CRITICAL FIX: Dynamic Equity
         )
 
         trade_intent.action = action
