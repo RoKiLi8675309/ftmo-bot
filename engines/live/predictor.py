@@ -8,8 +8,8 @@
 #
 # PHOENIX STRATEGY UPGRADE (2025-12-26 - LIVE PARITY):
 # 1. PARITY: Logic matched 1:1 with engines/research/strategy.py.
-# 2. REGIME A (EXPANSION): Range > 1.2 ATR + RVol > 1.1 + Aggressor.
-# 3. REGIME B (TREND): KER > 0.70 + Aggressor.
+# 2. REGIME A (EXPANSION): Range > 0.7 ATR + RVol > 0.8 + Aggressor.
+# 3. REGIME B (TREND): KER > 0.40 + Aggressor.
 # 4. MEAN REVERSION FILTER: Blocks Short signals if RSI < 30 or Price < Lower BB.
 # =============================================================================
 import logging
@@ -85,7 +85,7 @@ class MultiAssetPredictor:
         
         # 3. Warm-up State
         self.burn_in_counters = {s: 0 for s in symbols}
-        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 1000)
+        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 500) # Reduced
         
         # 4. Forensic Stats
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
@@ -100,17 +100,18 @@ class MultiAssetPredictor:
         # --- Gating Params ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 2.0)
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.5)
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
         # --- PHOENIX STRATEGY PARAMETERS ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.5)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.70)
+        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.2)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.40)
         
-        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.2)
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.1)
+        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 0.7)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 0.8)
+        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55)
         
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
@@ -290,9 +291,8 @@ class MultiAssetPredictor:
         vol_gate = rvol > self.vol_gate_ratio
         
         # Gate C: Momentum Direction (Aggressor Ratio)
-        # > 0.6 = Bullish Close, < 0.4 = Bearish Close
-        is_bullish_candle = aggressor > 0.60
-        is_bearish_candle = aggressor < 0.40
+        is_bullish_candle = aggressor > self.aggressor_thresh
+        is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
@@ -341,6 +341,11 @@ class MultiAssetPredictor:
             if bb_pos < 0.0 or rsi_val < 0.30:
                 stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "Mean Rev Filter"})
+        elif proposed_action == 1: # BUY
+            # Don't buy the top (Price > Upper Band or RSI > 70)
+            if bb_pos > 1.0 or rsi_val > 0.70:
+                stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": "Mean Rev Filter"})
         # ---------------------------------------------------------------------
 
         # 5. ML Confirmation & Execution
@@ -353,7 +358,7 @@ class MultiAssetPredictor:
         confidence = prob_buy if proposed_action == 1 else prob_sell
         
         # Meta Labeling
-        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.60)
+        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.55)
         is_profitable = meta_labeler.predict(
             features, 
             proposed_action, 
@@ -366,8 +371,11 @@ class MultiAssetPredictor:
         parkinson = features.get('parkinson_vol', 0.0)
         mtf_align = features.get('mtf_alignment', 0.0)
         
-        # Safety Check: If ML thinks probability is terrible (< 0.4), skip even if Rule triggers.
-        if confidence < 0.40:
+        # Relaxed ML Threshold to 0.51 via Config logic in main loop, here we ensure parity
+        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.51)
+
+        # Safety Check: If ML thinks probability is terrible (< min_prob), skip.
+        if confidence < min_prob:
             stats["ML Disagreement"] += 1
             return Signal(symbol, "HOLD", confidence, {"reason": "ML Disagreement"})
 

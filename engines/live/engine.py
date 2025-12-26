@@ -6,11 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates bars, generates signals.
 #
 # AUDIT REMEDIATION (SNIPER MODE & SENTIMENT):
-# 1. NEWS THREAD: Background fetching of Forex Factory news + TextBlob Sentiment.
-# 2. VOLATILITY GATE: Live enforcement of ATR > 3x Spread.
-# 3. AUTO-DETECT: Retrieves real account size from Redis.
-# 4. ROBUSTNESS: Graceful handling of missing NLP libraries.
-# 5. DATA FIX: Extracts 'bid_vol'/'ask_vol' and computes 'price' from quotes.
+# 1. FRIDAY LIQUIDATION: Forces 'CLOSE_ALL' if SessionGuard indicates weekend close.
+# 2. VOLATILITY GATE: Live enforcement of ATR > Spread Ratio.
+# 3. AUTO-DETECT: Retrieves real account size from Redis for accurate sizing.
+# 4. DATA FIX: Extracts 'bid_vol'/'ask_vol' and computes 'price' from quotes.
 # =============================================================================
 import logging
 import time
@@ -118,11 +117,12 @@ class LiveTradingEngine:
         self.is_warm = False
         self.last_corr_update = time.time()
         self.latest_prices = {}
+        self.liquidation_triggered_map = {sym: False for sym in CONFIG['trading']['symbols']}
 
         # --- AUDIT FIX: Volatility Gate Config ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 3.0)
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.5)
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
 
     def fetch_news_loop(self):
@@ -234,6 +234,30 @@ class LiveTradingEngine:
         
         if not signal: return
 
+        # --- FRIDAY LIQUIDATION CHECK (GAP PROTECTION) ---
+        if self.session_guard.should_liquidate():
+            if not self.liquidation_triggered_map[bar.symbol]:
+                logger.warning(f"{LogSymbols.CLOSE} FRIDAY LIQUIDATION: Closing all {bar.symbol} trades for weekend.")
+                
+                # Send CLOSE_ALL Trade Intent
+                close_intent = Trade(
+                    symbol=bar.symbol,
+                    action="CLOSE_ALL",
+                    volume=0.0, # Irrelevant for Close All
+                    entry_price=0.0,
+                    stop_loss=0.0,
+                    take_profit=0.0,
+                    comment="Friday Liquidation"
+                )
+                self.dispatcher.send_order(close_intent, 0.0)
+                self.liquidation_triggered_map[bar.symbol] = True
+            return # Block new entries
+        else:
+            # Reset trigger if we are out of the liquidation window (e.g. Monday)
+            if self.liquidation_triggered_map[bar.symbol]:
+                self.liquidation_triggered_map[bar.symbol] = False
+        # -------------------------------------------------
+
         # --- PHASE 2: WARM-UP GATE ---
         if signal.action == "WARMUP":
             return
@@ -260,13 +284,22 @@ class LiveTradingEngine:
         if not self._check_risk_gates(bar.symbol):
             return
 
-        # 6. Calculate Size (Volatility Targeting + Kelly)
+        # 6. Calculate Size (Fixed Risk Mode)
         volatility = signal.meta_data.get('volatility', 0.001)
         
         active_corrs = self.portfolio_mgr.get_correlation_count(
             bar.symbol, 
             threshold=CONFIG['risk_management']['correlation_penalty_threshold']
         )
+
+        # --- AUTO-DETECT: Retrieve Account Size from Redis ---
+        # The Windows Producer updates 'bot:account_info' and 'bot:account_size'.
+        # We fetch this to ensure sizing is based on real equity.
+        try:
+            cached_size = self.stream_mgr.r.get("bot:account_size")
+            account_size = float(cached_size) if cached_size else self.ftmo_guard.equity
+        except:
+            account_size = self.ftmo_guard.equity
 
         ctx = TradeContext(
             symbol=bar.symbol,
@@ -278,13 +311,6 @@ class LiveTradingEngine:
             risk_reward_ratio=2.0 
         )
 
-        # --- AUTO-DETECT: Retrieve Account Size from Redis ---
-        try:
-            cached_size = self.stream_mgr.r.get("bot:account_size")
-            account_size = float(cached_size) if cached_size else None
-        except:
-            account_size = None
-
         # Calculate Size
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
@@ -293,7 +319,7 @@ class LiveTradingEngine:
             active_correlations=active_corrs,
             market_prices=self.latest_prices,
             atr=current_atr,
-            account_size=account_size
+            account_size=account_size # Use real account size
         )
 
         if trade_intent.volume <= 0:
@@ -361,6 +387,7 @@ class LiveTradingEngine:
                             self.process_tick(data)
                             self.stream_mgr.r.xack(stream_key, group, message_id)
                 
+                # Update local equity cache from Redis (pushed by Producer)
                 try:
                     cached_eq = self.stream_mgr.r.get(CONFIG['redis']['risk_keys']['current_equity'])
                     if cached_eq:

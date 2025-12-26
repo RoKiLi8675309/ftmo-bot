@@ -5,11 +5,11 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-24 - GOLDEN CONFIG):
-# 1. SCORING: SQN Weight increased to 3.0 to favor consistent equity curves.
-# 2. METRICS: Added LogLoss support for probability calibration.
-# 3. PENALTIES: Aggressive drawdown penalty to prune toxic parameters early.
-# 4. ENSEMBLE: ADWINBaggingClassifier implemented as standard model.
+# PHOENIX STRATEGY UPGRADE (2025-12-26 - REPORTING & FREQUENCY):
+# 1. VICTORY LAPS: Generates detailed reports for PROFIT/ALPHA trials to explain *why* they won.
+# 2. FULL LOGGING: Captures "Autopsy" data for all trials (Win or Loss) in the main log.
+# 3. FREQUENCY TUNING: Adjusted scoring to heavily penalize low trade counts (< 50).
+# 4. SCORING: SQN Weight 3.0 (Stability) + PnL Weight.
 # =============================================================================
 import sys
 import os
@@ -118,18 +118,13 @@ class EmojiCallback:
         # 5. Log to File (for persistence)
         log.info(msg.strip())
         
-        # 6. Conditional Autopsy (Debug Info for Failed/Weak/Pruned Trials)
-        show_autopsy = False
-        if 'autopsy' in attrs:
-            if attrs.get('blown', False): show_autopsy = True
-            elif attrs.get('pruned', False): show_autopsy = True
-            elif val is not None and val < 0.5: show_autopsy = True
-            elif trades < 50 and trades > 0: show_autopsy = True 
-            
-        if show_autopsy:
-            autopsy_msg = f"\n🔎 AUTOPSY (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
-            print(autopsy_msg, flush=True)
-            log.info(autopsy_msg)
+        # 6. Detailed Analysis (Victory Lap or Autopsy)
+        # We now print this for ALL non-idle trials to understand drivers
+        if 'autopsy' in attrs and trades > 0:
+            report_type = "🏁 VICTORY LAP" if pnl > 0 else "🔎 AUTOPSY"
+            report_msg = f"\n{report_type} (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
+            print(report_msg, flush=True)
+            log.info(report_msg)
 
 def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     """
@@ -204,8 +199,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                     'drift_threshold': trial.suggest_float('drift_threshold', 0.7, 1.5)
                 },
                 
-                # Hyper Confidence for Sniper Mode
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.80, 0.95)
+                # Hyper Confidence for Sniper Mode (Relaxed slightly for frequency)
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.55, 0.85)
             })
             
             # Instantiate Pipeline locally
@@ -236,22 +231,18 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("sharpe", metrics['sharpe'])
             
+            # ALWAYS Generate Autopsy/Victory Lap Report for analysis
+            trial.set_user_attr("autopsy", strategy.generate_autopsy())
+            
             # --- SCORING: SQN DOMINANT (Weight 3.0) + PnL ---
             pnl_score = metrics['total_pnl'] / 100.0
             sqn_weight = 3.0 # Golden Config: High weight on stability
             final_score = pnl_score + (metrics['sqn'] * sqn_weight)
             
-            # Penalty for Low Activity
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 10)
+            # Constraint: Minimum Trades (Configurable)
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 50)
             total_trades = metrics['total_trades']
             
-            if total_trades > 50:
-                final_score += 2.0 
-            
-            # AUDIT FIX: Generate Autopsy BEFORE pruning to reveal blockage
-            if total_trades < min_trades or final_score < 0.5 or broker.is_blown:
-                trial.set_user_attr("autopsy", strategy.generate_autopsy())
-
             if total_trades < min_trades:
                 trial.set_user_attr("pruned", True)
                 return -100.0 

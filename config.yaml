@@ -1,14 +1,12 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V1.2 (PROP FIRM SCALING)
-# STATUS: GREENFIELD REDESIGN
+# config.yaml – PROJECT PHOENIX V1.3 (HIGH FREQUENCY & PROP FIRM TUNED)
+# STATUS: OPTIMIZED FOR TRADE FREQUENCY & FRIDAY LIQUIDATION
 #
-# AUDIT REMEDIATION (2025-12-26 - WIN RATE STABILIZATION):
-# 1. RISK MODE: Switched to 'fixed_risk' (Prop Firm Standard).
-#    - Risk 0.5% per trade explicitly. No Kelly dampening.
-# 2. ENTRY GATES: Relaxed Volatility Gates to enter earlier in the move.
-#    - Range Gate: 1.2 ATR (was 1.5)
-#    - Volume Gate: 1.1x RVol (was 1.2)
-# 3. TBM UPDATE: Tightened Barrier Width to 1.5 to boost Win Rate (34-40% Target).
+# AUDIT REMEDIATION (2025-12-26 - FREQUENCY & COMPLIANCE):
+# 1. GATES RELAXED: Drastically lowered ATR/Vol/KER thresholds to fix "Low Trade Count".
+# 2. RISK MODE: Strictly 'fixed_risk' (0.5% per trade). Kelly removed.
+# 3. COMPLIANCE: Added 'friday_liquidation_hour_server' (21:00) for 3h buffer.
+# 4. LOGGING: Enhanced Audit settings for rich CSV generation.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -83,7 +81,7 @@ data:
   volume_bar_threshold: 1000
   download_start_date: "2020-01-01"
   num_candles_producer: 50000
-  num_candles_train: 4000000  # AUDIT: 4M for full cycle coverage
+  num_candles_train: 4000000 
   num_candles_wfo: 10000
   num_candles_backtest: 200000
 
@@ -137,15 +135,17 @@ features:
 # --- PHOENIX STRATEGY PARAMETERS ---
 phoenix_strategy:
   # Regime A: Volatility Expansion
-  vol_expansion_threshold: 1.5  # Parkinson Vol > 1.5 * Baseline
+  vol_expansion_threshold: 1.2  # Parkinson Vol > 1.2 * Baseline (Relaxed from 1.5)
   
   # Regime B: Momentum Trend
-  ker_trend_threshold: 0.70     # AUDIT FIX: Tightened from 0.60 to filter noise
+  ker_trend_threshold: 0.40     # Efficiency Ratio > 0.40 (Relaxed from 0.70)
   
-  # Entry Gates (RELAXED FOR EARLIER ENTRY)
-  range_gate_atr_mult: 1.2      # AUDIT FIX: Relaxed from 1.5 to 1.2
-  volume_gate_ratio: 1.1        # AUDIT FIX: Relaxed from 1.2 to 1.1
-  ml_confirmation_threshold: 0.60
+  # Entry Gates (AGGRESSIVELY RELAXED FOR FREQUENCY)
+  range_gate_atr_mult: 0.7      # Bar Range > 0.7x ATR (Was 1.2) - Catch standard moves
+  volume_gate_ratio: 0.8        # RVol > 0.8 (Was 1.1) - Allow slight flow drops
+  aggressor_threshold: 0.55     # Close > 55% of High-Low (Bull) or < 45% (Bear)
+  
+  ml_confirmation_threshold: 0.51 # Take any positive probability edge
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -156,13 +156,9 @@ phoenix_strategy:
 risk_management:
   account_currency: "USD"
   
-  # --- SIZING METHOD: PROP FIRM MODE ---
-  # 'fixed_risk': Calculate lots based on % Risk and Stop Loss distance.
-  # 'volatility_targeting': (Legacy) Wealth preservation mode.
+  # --- SIZING METHOD: STRICT PROP FIRM MODE ---
+  # Only 'fixed_risk' is supported. Kelly Criterion has been removed.
   sizing_method: "fixed_risk"
-  
-  target_annual_volatility: 0.20
-  kelly_fraction: 0.25 
   
   # RISK PER TRADE: 0.5% of Equity
   base_risk_per_trade_percent: 0.5
@@ -171,23 +167,21 @@ risk_management:
   max_total_loss_pct: 0.09
   max_risk_percent: 1.0         # Hard cap per trade
   max_leverage: 30.0
-  max_lot_size: 5.0
+  max_lot_size: 50.0
   min_lot_size: 0.01
   
-  cppi_floor_pct: 0.08
-  cppi_multiplier: 2.0
-  
   # PROJECT PHOENIX EXIT LOGIC
-  stop_loss_atr_mult: 1.5       # AUDIT FIX: Widened from 1.0 to 1.5 to reduce premature stops
-  take_profit_atr_mult: 5.0     # Open-Ended (Managed by Trailing Stop)
+  stop_loss_atr_mult: 1.5       # Standard Stop
+  take_profit_atr_mult: 3.0     # Fixed 1:2 RR baseline (managed by Trail)
   
   # TRAILING STOP
   trailing_stop:
     enabled: true
-    activation_atr: 1.5         # Start trailing when profit > 1.5 ATR
-    step_atr: 0.5               # Move stop every 0.5 ATR
+    activation_atr: 1.0         # Start trailing earlier (1.0 ATR profit)
+    step_atr: 0.3               # Tighter steps to lock profit
   
   risk_timezone: "Europe/Prague"
+  friday_liquidation_hour_server: 21 # 21:00 Server Time (approx 3h before close)
   
   commission_per_lot_rt: 5.0
   contract_size: 100000
@@ -196,7 +190,7 @@ risk_management:
   correlation_penalty_threshold: 0.8
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
-  min_stop_loss_pips: 5.0
+  min_stop_loss_pips: 3.0
 
 # --- TRADING PORTFOLIO (AUTOCORRELATED PAIRS) ---
 trading:
@@ -226,15 +220,15 @@ online_learning:
   model_type: "ARFClassifier"
   
   # GOLDEN CONFIGURATION
-  n_models: 30       # Range 30-50
+  n_models: 30        # Range 30-50
   grace_period: 250       # Range 200-500
-  delta: 0.00005          # AUDIT FIX: 5e-5 (Slower Adaptation for Stability)
-  warning_delta: 0.001    # 1e-3 (Early Warning)
+  delta: 0.00005          # Adaptation Rate
+  warning_delta: 0.001    # Early Warning
   lambda_value: 10        # Poisson Weight
   max_features: 'log2'    # Decorrelation
   metric: "LogLoss"       # Probability Calibration
   
-  burn_in_periods: 1000
+  burn_in_periods: 500    # Reduced from 1000 for faster start
   
   # Volatility Gate
   volatility_gate:
@@ -244,16 +238,16 @@ online_learning:
   positive_class_weight: 2.0
   negative_class_weight: 2.0
   
-  meta_labeling_threshold: 0.60
+  meta_labeling_threshold: 0.55 # Lowered from 0.60
   
   tbm:
     horizon_minutes: 60
-    barrier_width: 1.5      # AUDIT FIX: Tightened from 2.0 to 1.5 for Higher WR
+    barrier_width: 1.5      # Volatility Multiplier
     min_profit_pips: 5.0
-    drift_threshold: 1.2    # AUDIT FIX: Relaxed from 1.0 to 1.2
+    drift_threshold: 1.2 
     
   learning_horizon_sec: 300
-  min_calibrated_probability: 0.60
+  min_calibrated_probability: 0.51 # Aggressively lowered for Frequency
 
 # --- NEWS FILTER ---
 news_filter:
@@ -284,7 +278,7 @@ forensic_audit:
 
 # --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 100
+  n_trials: 5
   train_years: 2
   test_months: 6
-  min_trades_optimization: 10
+  min_trades_optimization: 50 # Raised requirement since gates are relaxed

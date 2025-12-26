@@ -5,13 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-26 - SIZING & GATES):
-# 1. INTEGRATION: Now utilizes RiskManager's 'fixed_risk' logic with dynamic equity.
-# 2. ENTRY GATES: Relaxed thresholds (1.2 ATR) to catch moves earlier.
-# 3. REGIMES: 
-#    - Regime A (Expansion): Range > 1.2 ATR AND RVol > 1.1.
-#    - Regime B (Trend): KER > 0.70.
-# 4. MEAN REVERSION FILTER: Blocks Short signals if RSI < 30 or Price < Lower BB.
+# PHOENIX STRATEGY UPGRADE (2025-12-26 - FREQUENCY & LIQUIDATION):
+# 1. LIQUIDATION: Enforces Friday 21:00 forced close (Friday Gap Protection).
+# 2. GATES: Relaxed thresholds (ATR 0.7, RVol 0.8) to fix low trade count.
+# 3. METADATA: Passes rich metadata (Confidence, Regime) to Broker for CSV.
+# 4. SIZING: Strictly Fixed Risk (0.5%).
 # =============================================================================
 import logging
 import sys
@@ -61,9 +59,9 @@ class ResearchStrategy:
         tbm_conf = params.get('tbm', {})
         self.labeler = AdaptiveTripleBarrier(
             horizon_ticks=tbm_conf.get('horizon_minutes', 60),
-            risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'], # Uses Config (1.5)
-            reward_mult=tbm_conf.get('barrier_width', 2.0),
-            drift_threshold=tbm_conf.get('drift_threshold', 1.0)
+            risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'], # Uses Config
+            reward_mult=tbm_conf.get('barrier_width', 1.5),
+            drift_threshold=tbm_conf.get('drift_threshold', 1.2)
         )
         
         # 3. Meta Labeler (The Gatekeeper)
@@ -75,7 +73,7 @@ class ResearchStrategy:
         self.calibrator_sell = ProbabilityCalibrator(window=2000)
         
         # 5. Warm-up State
-        self.burn_in_limit = params.get('burn_in_periods', 1000)
+        self.burn_in_limit = params.get('burn_in_periods', 500) # Reduced for Frequency
         self.burn_in_counter = 0
         self.burn_in_complete = False
         
@@ -99,14 +97,18 @@ class ResearchStrategy:
         
         # --- PHOENIX STRATEGY PARAMETERS (Refreshed from Config) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.5)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.70)
+        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.2)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.40)
         
         # Relaxed Entry Gates (Fix for Top Buying)
-        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.2)
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.1)
+        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 0.7)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 0.8)
+        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55)
         
         self.limit_offset = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
+        
+        # Friday Liquidation
+        self.friday_close_hour = CONFIG.get('risk_management', {}).get('friday_liquidation_hour_server', 21)
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
@@ -139,6 +141,16 @@ class ResearchStrategy:
         except Exception:
             timestamp = 0.0
             dt_ts = datetime.now()
+
+        # --- FRIDAY LIQUIDATION CHECK (GAP PROTECTION) ---
+        # If it's Friday and past the liquidation hour, Close ALL and Return
+        if dt_ts.weekday() == 4 and dt_ts.hour >= self.friday_close_hour:
+            if self.symbol in broker.positions:
+                pos = broker.positions[self.symbol]
+                broker._close_partial_position(pos, pos.quantity, price, dt_ts, "Friday Liquidation")
+                if self.debug_mode: logger.info(f"🚫 {self.symbol} Liquidated for Weekend (Friday {dt_ts.hour}:00)")
+            return # Block new entries
+        # -------------------------------------------------
 
         # Flow Volumes (L2 Proxies now handled by Feature Engineer if missing)
         buy_vol = snapshot.get_price(self.symbol, 'buy_vol')
@@ -221,7 +233,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. PROJECT PHOENIX: LOGIC GATES (UPDATED)
+        # D. PROJECT PHOENIX: LOGIC GATES (RELAXED FOR FREQUENCY)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
@@ -236,17 +248,17 @@ class ResearchStrategy:
         bar_range = high - low
         
         # Gate A: Range Expansion (Market is waking up)
-        # RELAXED to 1.2 * ATR via Config
+        # RELAXED to 0.7 * ATR via Config to catch standard moves
         range_gate = bar_range > (self.range_gate_mult * atr_val)
         
         # Gate B: Volume Participation (Move is supported)
-        # RELAXED to 1.1x Average via Config
+        # RELAXED to 0.8x Average to allow flows to dip slightly
         vol_gate = rvol > self.vol_gate_ratio
         
         # Gate C: Momentum Direction (Aggressor Ratio)
-        # > 0.6 = Bullish Close, < 0.4 = Bearish Close
-        is_bullish_candle = aggressor > 0.60
-        is_bearish_candle = aggressor < 0.40
+        # > 0.55 = Bullish, < 0.45 = Bearish (Wider Indecision Zone removed)
+        is_bullish_candle = aggressor > self.aggressor_thresh
+        is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
@@ -264,8 +276,8 @@ class ResearchStrategy:
                 self.rejection_stats["Regime A: Indecision Candle"] += 1
                 
         # --- REGIME B: EFFICIENT TREND CONTINUATION ---
-        # Logic: High Efficiency (KER) + Momentum align
-        # KER Threshold tightened to 0.70 via Config
+        # Logic: Efficiency (KER) + Momentum align
+        # KER Threshold relaxed to 0.40
         elif ker_val > self.ker_thresh:
             if is_bullish_candle:
                 proposed_action = 1
@@ -286,7 +298,7 @@ class ResearchStrategy:
             return
 
         # ---------------------------------------------------------------------
-        # MEAN REVERSION FILTER (AUDIT REMEDIATION)
+        # MEAN REVERSION FILTER (Safety)
         # Prevent "Selling the Hole" (Shorting when Price < BB Lower or RSI < 30)
         # ---------------------------------------------------------------------
         bb_pos = features.get('bb_position', 0.5)
@@ -296,6 +308,11 @@ class ResearchStrategy:
             # bb_position < 0.0 implies Price < Lower Band
             # rsi_norm < 0.30 implies RSI < 30
             if bb_pos < 0.0 or rsi_val < 0.30:
+                self.rejection_stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
+                return
+        elif proposed_action == 1: # BUY
+            # Don't buy the top (Price > Upper Band or RSI > 70)
+            if bb_pos > 1.0 or rsi_val > 0.70:
                 self.rejection_stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
                 return
         # ---------------------------------------------------------------------
@@ -317,16 +334,18 @@ class ResearchStrategy:
             is_profitable = self.meta_labeler.predict(
                 features, 
                 proposed_action, 
-                threshold=self.params.get('meta_labeling_threshold', 0.60)
+                threshold=self.params.get('meta_labeling_threshold', 0.55) # Relaxed Meta Threshold
             )
             
             if proposed_action != 0:
                 self.meta_label_events += 1
 
             # --- EXECUTION ---
-            # Safety Check: If ML thinks probability is terrible (< 0.4), skip.
-            if confidence < 0.40:
-                self.rejection_stats[f"ML Disagreement (Conf {confidence:.2f})"] += 1
+            # Relaxed ML Threshold to 0.51 via Config
+            min_prob = self.params.get('min_calibrated_probability', 0.51)
+            
+            if confidence < min_prob:
+                self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob})"] += 1
                 return
 
             if is_profitable:
@@ -396,23 +415,15 @@ class ResearchStrategy:
     def _execute_logic(self, confidence, price, features, broker, timestamp: datetime, action_int: int, regime: str):
         """Decides whether to enter a trade using Fixed Risk (Prop Firm Mode)."""
         
-        # 1. Signal Threshold
-        min_prob = self.params.get('min_calibrated_probability', 0.60)
-        
-        if confidence < min_prob:
-            self.rejection_stats[f'Low Confidence ({confidence:.2f} < {min_prob})'] += 1
-            return
-
         action = "BUY" if action_int == 1 else "SELL"
 
-        # 2. Hard Microstructure Filter (Amihud & OFI)
-        # Avoid trading into extreme illiquidity unless volatility justifies it
+        # Hard Microstructure Filter (Amihud & OFI)
         amihud = features.get('amihud', 0.0)
-        if amihud > 10.0: # Arbitrary high illiquidity proxy threshold
+        if amihud > 15.0: # Relaxed illiquidity filter
              self.rejection_stats["High Illiquidity (Amihud)"] += 1
-             # return # Disabled for now, monitoring only
+             # return 
 
-        # 3. Position Sizing
+        # Position Sizing
         if broker.get_position(self.symbol): return
         
         volatility = features.get('volatility', 0.001)
@@ -429,8 +440,7 @@ class ResearchStrategy:
             risk_reward_ratio=2.0
         )
 
-        # AUDIT FIX: Pass broker.equity implicitly via ctx AND account_size explicitly
-        # This ensures the RiskManager sees the dynamic equity for scaling.
+        # Calculate Size (Fixed Risk)
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=confidence,
@@ -439,7 +449,7 @@ class ResearchStrategy:
             market_prices=self.last_price_map,
             atr=current_atr, 
             ker=current_ker,
-            account_size=broker.equity # CRITICAL FIX: Dynamic Equity
+            account_size=broker.equity
         )
 
         trade_intent.action = action
@@ -465,7 +475,7 @@ class ResearchStrategy:
             tp_price = price - tp_dist
             side = -1
 
-        # Submit Order
+        # Submit Order with Enriched Metadata
         order = BacktestOrder(
             symbol=self.symbol,
             side=side,
@@ -473,7 +483,16 @@ class ResearchStrategy:
             timestamp_created=timestamp,
             stop_loss=sl_price,
             take_profit=tp_price,
-            comment=f"{trade_intent.comment}|Regime:{regime}|Limit:{self.limit_offset}p"
+            comment=f"{trade_intent.comment}|Regime:{regime}|Limit:{self.limit_offset}p",
+            # METADATA FOR CSV LOGGING
+            metadata={
+                'regime': regime,
+                'confidence': float(confidence),
+                'rvol': features.get('rvol', 0),
+                'parkinson': features.get('parkinson_vol', 0),
+                'ker': current_ker,
+                'atr': current_atr
+            }
         )
         
         broker.submit_order(order)

@@ -6,11 +6,11 @@
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
 # AUDIT REMEDIATION (2025-12-26 - PROP FIRM OVERHAUL):
-# 1. NEW SIZING METHOD: 'fixed_risk'. Explicitly calculates lots based on % Risk.
+# 1. NEW SIZING METHOD: Strict 'fixed_risk'. Removed Kelly/VolTargeting.
 #    Formula: Lots = (Equity * Risk%) / (SL_Distance * PipValue).
-# 2. DRAWDOWN BRAKE: Relaxed. Only cuts risk if DD > 4% (was 2%).
-# 3. KER SCALING: Retained but clamped to [0.8, 1.0] to prevent over-penalizing.
-# 4. CONVERSION FIX: Hardened get_conversion_rate for cross-pairs.
+# 2. FRIDAY LIQUIDATION: Added SessionGuard.should_liquidate() logic.
+# 3. DRAWDOWN BRAKE: Relaxed. Only cuts risk if DD > 4%.
+# 4. KER SCALING: Clamped to [0.8, 1.0] to prevent over-penalizing.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -41,7 +41,7 @@ logger = logging.getLogger("RiskManager")
 class RiskManager:
     """
     Stateless utilities for Pip value calculations, Exchange Rates,
-    and Advanced Position Sizing (Volatility Targeting, Kelly, CPPI).
+    and Advanced Position Sizing (Fixed Risk for Prop Firms).
     """
     # Default fallback, but logic now prefers config/override
     DEFAULT_CONTRACT_SIZE = 100_000
@@ -133,11 +133,11 @@ class RiskManager:
         atr: Optional[float] = None,
         account_size: Optional[float] = None, # NEW ARGUMENT for Auto-Detection
         contract_size_override: Optional[float] = None, # NEW: Allow overriding lot size
-        ker: float = 1.0 # AUDIT FIX: Kaufman Efficiency Ratio input
+        ker: float = 1.0 # Kaufman Efficiency Ratio input
     ) -> Tuple[Trade, float]:
         """
-        Calculates position size. 
-        Supports 'fixed_risk' (Prop Firm) and 'volatility_targeting' (Hedge Fund).
+        Calculates position size using 'fixed_risk' logic only.
+        Kelly Criterion has been removed as requested.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -145,22 +145,17 @@ class RiskManager:
         
         # 1. Retrieve Config Parameters
         risk_conf = CONFIG.get('risk_management', {})
-        sizing_method = risk_conf.get('sizing_method', 'fixed_risk') # Default to fixed risk now
         
         # Determine Contract Size
         c_size = contract_size_override if contract_size_override else risk_conf.get('contract_size', RiskManager.DEFAULT_CONTRACT_SIZE)
         
         # USE DETECTED ACCOUNT SIZE (if available), else default to Config
         # This handles the case where backtester has varying equity
-        equity_base = balance
-        
-        # --- CPPI SAFE EQUITY CUSHION (For Volatility Targeting) ---
-        cppi_floor_pct = risk_conf.get('cppi_floor_pct', 0.08)
         start_equity = account_size if account_size else float(CONFIG.get('env', {}).get('initial_balance', 100000.0))
         
         # --- ADAPTIVE STOP LOSS (ATR Based) ---
         atr_mult_sl = risk_conf.get('stop_loss_atr_mult', 1.5)
-        atr_mult_tp = risk_conf.get('take_profit_atr_mult', 2.0)
+        atr_mult_tp = risk_conf.get('take_profit_atr_mult', 3.0)
         
         # ATR Fallback Logic
         if atr and atr > 0:
@@ -195,58 +190,30 @@ class RiskManager:
         lots = 0.0
         calculated_risk_usd = 0.0
         
-        # --- SIZING METHOD SELECTION ---
+        # --- PROP FIRM STANDARD: Risk % of Equity ---
+        risk_pct = risk_conf.get('base_risk_per_trade_percent', 0.5)
         
-        if sizing_method == 'fixed_risk':
-            # --- PROP FIRM STANDARD: Risk % of Equity ---
-            risk_pct = risk_conf.get('base_risk_per_trade_percent', 1.0)
-            
-            # Drawdown Brake: If in significant drawdown (>4%), reduce risk
-            if balance < (start_equity * 0.96):
-                risk_pct *= 0.75 # Reduce risk by 25%
-            
-            # Calculate Risk Amount in USD
-            calculated_risk_usd = balance * (risk_pct / 100.0)
-            
-            # KER Scaling: Minor penalty for chop, but don't kill the trade
-            # Clamp KER between 0.8 and 1.0
-            ker_scalar = max(0.8, min(ker, 1.0))
-            calculated_risk_usd *= ker_scalar
-            
-            # Confidence Scaling: Boost high confidence, trim low
-            # If conf > 0.8, full size. If conf < 0.6, half size.
-            conf_scalar = min(1.0, max(0.5, conf / 0.8))
-            calculated_risk_usd *= conf_scalar
+        # Drawdown Brake: If in significant drawdown (>4%), reduce risk
+        # This helps survive bad streaks without blowing the account
+        if balance < (start_equity * 0.96):
+            risk_pct *= 0.75 # Reduce risk by 25% (e.g., 0.5% -> 0.375%)
+        
+        # Calculate Risk Amount in USD
+        calculated_risk_usd = balance * (risk_pct / 100.0)
+        
+        # KER Scaling: Minor penalty for chop, but don't kill the trade
+        # Clamp KER between 0.8 and 1.0 (Audit Requirement)
+        ker_scalar = max(0.8, min(ker, 1.0))
+        calculated_risk_usd *= ker_scalar
+        
+        # Confidence Scaling: Boost high confidence, trim low
+        # If conf > 0.8, full size. If conf < 0.6, half size.
+        conf_scalar = min(1.0, max(0.5, conf / 0.8))
+        calculated_risk_usd *= conf_scalar
 
-            # Calculate Lots
-            if loss_per_lot_usd > 0:
-                lots = calculated_risk_usd / loss_per_lot_usd
-            
-        elif sizing_method == 'volatility_targeting':
-            # --- HEDGE FUND STANDARD: Volatility Targeting (Legacy) ---
-            # ... (Existing logic for reference, compacted)
-            target_ann_vol = risk_conf.get('target_annual_volatility', 0.20)
-            if volatility <= 1e-9: volatility = 0.001
-            ann_factor = 269.4 
-            realized_ann_vol = volatility * ann_factor
-            vol_scalar = target_ann_vol / realized_ann_vol
-            
-            p = context.win_rate
-            b = context.risk_reward_ratio
-            if b <= 0: b = 1.0
-            kelly_optimal = (p * (b + 1) - 1) / b
-            kelly_optimal = max(0.0, min(kelly_optimal, 1.0))
-            kelly_fraction_cfg = risk_conf.get('kelly_fraction', 0.25)
-            
-            confidence_scalar = conf * conf
-            final_scalar = vol_scalar * (kelly_optimal * kelly_fraction_cfg) * confidence_scalar
-            target_exposure = balance * final_scalar
-            
-            notional_value_per_lot = c_size * price * conversion_rate
-            if notional_value_per_lot > 0:
-                lots = target_exposure / notional_value_per_lot
-                
-            calculated_risk_usd = lots * loss_per_lot_usd
+        # Calculate Lots
+        if loss_per_lot_usd > 0:
+            lots = calculated_risk_usd / loss_per_lot_usd
 
         # --- CORRELATION PENALTY ---
         if active_correlations > 0:
@@ -255,7 +222,7 @@ class RiskManager:
 
         # --- CONSTRAINTS & SANITIZATION ---
         min_lot = risk_conf.get('min_lot_size', 0.01)
-        max_lot = risk_conf.get('max_lot_size', 100.0)
+        max_lot = risk_conf.get('max_lot_size', 50.0) # Cap at 50 lots
         max_lev = risk_conf.get('max_leverage', 30.0)
         
         # 1. Leverage Cap (Broker Constraint)
@@ -280,7 +247,7 @@ class RiskManager:
             entry_price=price,
             stop_loss=stop_dist,
             take_profit=stop_dist * (atr_mult_tp / atr_mult_sl),
-            comment=f"{'FixRisk' if sizing_method == 'fixed_risk' else 'VolTgt'}|R:${final_risk_usd:.0f}|ATR:{atr_val:.5f}|C:{conf:.2f}"
+            comment=f"FixRisk|R:${final_risk_usd:.0f}|ATR:{atr_val:.5f}|C:{conf:.2f}"
         )
         
         return trade, final_risk_usd
@@ -448,11 +415,15 @@ class SessionGuard:
         self.monday_start = dt_time(1, 0)
         self.rollover_start = dt_time(23, 50)
         self.rollover_end = dt_time(1, 15)
+        
+        # For Liquidation (Uses Server Time usually, simplified to local/config time)
+        self.liquidation_hour = risk_conf.get('friday_liquidation_hour_server', 21)
 
     def is_trading_allowed(self) -> bool:
         now_local = datetime.now(self.market_tz)
         weekday = now_local.weekday()
         current_time = now_local.time()
+        
         if weekday == 5: return False
         if weekday == 6 and current_time < self.monday_start: return False
         if weekday == 4 and current_time > self.friday_cutoff: return False
@@ -461,3 +432,17 @@ class SessionGuard:
             return False
             
         return True
+
+    def should_liquidate(self) -> bool:
+        """
+        Returns True if it is Friday and past the liquidation hour.
+        This forces the bot to close all trades before the weekend.
+        """
+        now_local = datetime.now(self.market_tz)
+        weekday = now_local.weekday()
+        
+        # Check if Friday (4) and hour >= liquidation hour (e.g., 21:00)
+        if weekday == 4 and now_local.hour >= self.liquidation_hour:
+            return True
+            
+        return False

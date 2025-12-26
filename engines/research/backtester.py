@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared
 # DESCRIPTION: Event-Driven Backtesting Broker. Simulates execution, spread,
 # commissions, and PnL tracking for strategy validation.
-# AUDIT REMEDIATION (GROK):
-# 1. Added Random Slippage (0-2 pips).
-# 2. Added Commission Logic ($5/lot).
-# 3. VERIFIED: trade_log keys match main_research.py requirements.
+# AUDIT REMEDIATION (GROK + ANALYSIS):
+# 1. ADDED: MFE/MAE Tracking for detailed trade analysis.
+# 2. ADDED: Metadata support (Regime, Confidence) in Trade Log.
+# 3. VERIFIED: Random Slippage (0-2 pips) & Commissions ($5/lot).
 # =============================================================================
 from __future__ import annotations
 import pandas as pd
@@ -103,6 +103,8 @@ class BacktestOrder:
     stop_loss: float = 0.0
     take_profit: float = 0.0
     comment: str = ""
+    # NEW: Carry metadata (Regime, Confidence, Features)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class BacktestPosition:
@@ -115,6 +117,10 @@ class BacktestPosition:
     take_profit: float = 0.0
     unrealized_pnl: float = 0.0
     entry_time: datetime = field(default_factory=datetime.now)
+    # NEW: MFE/MAE Tracking
+    highest_price: float = -1.0
+    lowest_price: float = float('inf')
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 class BacktestBroker:
     """
@@ -172,6 +178,9 @@ class BacktestBroker:
         # FIX: Ensure Aux data is present so RiskManager doesn't warn/fail
         self._inject_aux_data()
 
+        # 0. Update MFE/MAE Stats for open positions
+        self._update_position_stats(snapshot)
+
         # 1. Check Stops and Limits first (Priority)
         self._check_sl_tp(snapshot)
 
@@ -201,6 +210,22 @@ class BacktestBroker:
                     'Status': 'CRITICAL',
                     'Comment': f"Account Blown: Equity {self.equity:.2f} < Limit"
                 })
+
+    def _update_position_stats(self, snapshot: MarketSnapshot) -> None:
+        """
+        Updates Highest and Lowest price seen for MFE/MAE calculations.
+        """
+        for symbol, pos in self.positions.items():
+            high = snapshot.get_high(symbol)
+            low = snapshot.get_low(symbol)
+            if high == 0 or low == 0: continue
+            
+            if pos.highest_price == -1.0:
+                pos.highest_price = high
+            else:
+                pos.highest_price = max(pos.highest_price, high)
+                
+            pos.lowest_price = min(pos.lowest_price, low)
 
     def _execute_order(self, order: BacktestOrder, snapshot: MarketSnapshot) -> None:
         base_price = snapshot.get_open(order.symbol)
@@ -246,9 +271,6 @@ class BacktestBroker:
                 # Hedge / Close
                 self._close_partial_position(pos, order.quantity, fill_price, snapshot.timestamp, order.comment)
         else:
-            # DEBUG: Log Entry Costs
-            # logger.debug(f"🔵 ENTRY {order.symbol}: Base={base_price:.5f} | Fill={fill_price:.5f} | {cost_desc}")
-            
             self.positions[order.symbol] = BacktestPosition(
                 symbol=order.symbol,
                 entry_price=fill_price,
@@ -256,12 +278,16 @@ class BacktestBroker:
                 side=order.side,
                 stop_loss=order.stop_loss,
                 take_profit=order.take_profit,
-                entry_time=snapshot.timestamp
+                entry_time=snapshot.timestamp,
+                highest_price=fill_price, # Init
+                lowest_price=fill_price,  # Init
+                metadata=order.metadata # Pass metadata through
             )
 
     def _close_partial_position(self, pos: BacktestPosition, qty_to_close: float, exit_price: float, timestamp: datetime, reason: str) -> None:
         """
         Closes position and deducts COMMISSIONS + SWAP (simplified).
+        Calculates MFE/MAE and logs extended metadata.
         """
         closed_qty = min(pos.quantity, qty_to_close)
         
@@ -274,17 +300,37 @@ class BacktestBroker:
         rate = self._get_simulation_conversion_rate(pos.symbol, exit_price)
         pnl_usd = pnl_quote * rate
         
-        # GROK REMEDIATION: Commission Deduction (Round Turn)
-        # $5 per lot -> $5 * lots
+        # Commission Deduction (Round Turn)
         comm_cost = self.commission_per_lot * closed_qty
         
         net_pnl = pnl_usd - comm_cost
         
         self.cash += net_pnl
         
-        # DEBUG: Log Exit Costs
-        # logger.debug(f"💸 EXIT {pos.symbol}: Gross=${pnl_usd:.2f} | Comm=${comm_cost:.2f} | Net=${net_pnl:.2f} | {reason}")
+        # --- CALCULATE MFE / MAE ---
+        pip_size, _ = RiskManager.get_pip_info(pos.symbol)
+        
+        # MFE: Max Favorable Excursion (Max Profit potential)
+        # MAE: Max Adverse Excursion (Max Drawdown endured)
+        if pos.side == 1: # BUY
+            mfe_price = pos.highest_price
+            mae_price = pos.lowest_price
+            mfe_pips = (mfe_price - pos.entry_price) / pip_size
+            mae_pips = (pos.entry_price - mae_price) / pip_size
+        else: # SELL
+            mfe_price = pos.lowest_price
+            mae_price = pos.highest_price
+            mfe_pips = (pos.entry_price - mfe_price) / pip_size
+            mae_pips = (mae_price - pos.entry_price) / pip_size
 
+        duration = timestamp - pos.entry_time
+        duration_min = duration.total_seconds() / 60.0
+
+        # Retrieve Metadata
+        regime = pos.metadata.get('regime', 'Unknown')
+        conf = pos.metadata.get('confidence', 0.0)
+        
+        # Build Trade Record
         self.trade_log.append({
             'Entry_Time': pos.entry_time,
             'Exit_Time': timestamp,
@@ -297,7 +343,13 @@ class BacktestBroker:
             'Commission': round(comm_cost, 2),
             'Net_PnL': round(net_pnl, 2),
             'Status': 'CLOSED',
-            'Comment': reason
+            'Comment': reason,
+            # NEW FIELDS
+            'MFE_Pips': round(mfe_pips, 1),
+            'MAE_Pips': round(mae_pips, 1),
+            'Duration_Min': int(duration_min),
+            'Regime': regime,
+            'Confidence': round(conf, 3)
         })
         
         remaining = pos.quantity - closed_qty
@@ -316,7 +368,7 @@ class BacktestBroker:
             # SL Logic
             if pos.stop_loss > 0:
                 if (pos.side == 1 and low <= pos.stop_loss):
-                    # GROK REMEDIATION: Slippage applies to SL too!
+                    # Slippage applies to SL too!
                     slippage = np.random.uniform(0, self.max_slippage) * RiskManager.get_pip_info(symbol)[0]
                     exec_price = pos.stop_loss - slippage
                     to_close.append((symbol, exec_price, "SL_HIT"))
@@ -327,7 +379,7 @@ class BacktestBroker:
                     to_close.append((symbol, exec_price, "SL_HIT"))
                     continue
 
-            # TP Logic (Assume limit fill at price, usually positive slippage if gap, but we stay conservative)
+            # TP Logic (Assume limit fill at price)
             if pos.take_profit > 0:
                 if (pos.side == 1 and high >= pos.take_profit):
                     to_close.append((symbol, pos.take_profit, "TP_HIT"))
