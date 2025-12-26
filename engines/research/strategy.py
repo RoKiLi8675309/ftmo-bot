@@ -11,6 +11,7 @@
 # 3. REGIMES: 
 #    - Regime A (Expansion): Range > 1.2 ATR AND RVol > 1.1.
 #    - Regime B (Trend): KER > 0.70.
+# 4. MEAN REVERSION FILTER: Blocks Short signals if RSI < 30 or Price < Lower BB.
 # =============================================================================
 import logging
 import sys
@@ -283,6 +284,21 @@ class ResearchStrategy:
 
         if proposed_action == 0:
             return
+
+        # ---------------------------------------------------------------------
+        # MEAN REVERSION FILTER (AUDIT REMEDIATION)
+        # Prevent "Selling the Hole" (Shorting when Price < BB Lower or RSI < 30)
+        # ---------------------------------------------------------------------
+        bb_pos = features.get('bb_position', 0.5)
+        rsi_val = features.get('rsi_norm', 0.5)
+        
+        if proposed_action == -1: # SELL
+            # bb_position < 0.0 implies Price < Lower Band
+            # rsi_norm < 0.30 implies RSI < 30
+            if bb_pos < 0.0 or rsi_val < 0.30:
+                self.rejection_stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
+                return
+        # ---------------------------------------------------------------------
 
         # ============================================================
         # E. ML CONFIRMATION & EXECUTION

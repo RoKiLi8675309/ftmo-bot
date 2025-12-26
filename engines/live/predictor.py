@@ -6,11 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - LIVE PARITY):
+# PHOENIX STRATEGY UPGRADE (2025-12-26 - LIVE PARITY):
 # 1. PARITY: Logic matched 1:1 with engines/research/strategy.py.
-# 2. REGIME A (EXPANSION): Range > 1.5 ATR + RVol > 1.2 + Aggressor.
-# 3. REGIME B (TREND): KER > 0.6 + Aggressor.
-# 4. REGIME C (NOISE): Explicit HOLD.
+# 2. REGIME A (EXPANSION): Range > 1.2 ATR + RVol > 1.1 + Aggressor.
+# 3. REGIME B (TREND): KER > 0.70 + Aggressor.
+# 4. MEAN REVERSION FILTER: Blocks Short signals if RSI < 30 or Price < Lower BB.
 # =============================================================================
 import logging
 import pickle
@@ -107,10 +107,10 @@ class MultiAssetPredictor:
         # --- PHOENIX STRATEGY PARAMETERS ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.5)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.60)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.70)
         
-        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.5)
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.2)
+        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.2)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.1)
         
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
@@ -327,6 +327,21 @@ class MultiAssetPredictor:
 
         if proposed_action == 0:
             return Signal(symbol, "HOLD", 0.0, {"reason": "No Trigger"})
+
+        # ---------------------------------------------------------------------
+        # MEAN REVERSION FILTER (AUDIT REMEDIATION)
+        # Prevent "Selling the Hole" (Shorting when Price < BB Lower or RSI < 30)
+        # ---------------------------------------------------------------------
+        bb_pos = features.get('bb_position', 0.5)
+        rsi_val = features.get('rsi_norm', 0.5)
+        
+        if proposed_action == -1: # SELL
+            # bb_position < 0.0 implies Price < Lower Band
+            # rsi_norm < 0.30 implies RSI < 30
+            if bb_pos < 0.0 or rsi_val < 0.30:
+                stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": "Mean Rev Filter"})
+        # ---------------------------------------------------------------------
 
         # 5. ML Confirmation & Execution
         
