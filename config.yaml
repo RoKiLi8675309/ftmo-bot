@@ -2,13 +2,13 @@
 # config.yaml – PROJECT PHOENIX V1.2 (PROP FIRM SCALING)
 # STATUS: GREENFIELD REDESIGN
 #
-# AUDIT REMEDIATION (2025-12-26 - SIZING FIX):
+# AUDIT REMEDIATION (2025-12-26 - WIN RATE STABILIZATION):
 # 1. RISK MODE: Switched to 'fixed_risk' (Prop Firm Standard).
 #    - Risk 0.5% per trade explicitly. No Kelly dampening.
 # 2. ENTRY GATES: Relaxed Volatility Gates to enter earlier in the move.
 #    - Range Gate: 1.2 ATR (was 1.5)
 #    - Volume Gate: 1.1x RVol (was 1.2)
-# 3. FILTERS: Tightened Trend Efficiency (KER > 0.70) to filter chop.
+# 3. TBM UPDATE: Tightened Barrier Width to 1.5 to boost Win Rate (34-40% Target).
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -228,7 +228,7 @@ online_learning:
   # GOLDEN CONFIGURATION
   n_models: 30       # Range 30-50
   grace_period: 250       # Range 200-500
-  delta: 0.0001           # 1e-4 (Faster Adaptation)
+  delta: 0.00005          # AUDIT FIX: 5e-5 (Slower Adaptation for Stability)
   warning_delta: 0.001    # 1e-3 (Early Warning)
   lambda_value: 10        # Poisson Weight
   max_features: 'log2'    # Decorrelation
@@ -248,9 +248,9 @@ online_learning:
   
   tbm:
     horizon_minutes: 60
-    barrier_width: 2.0
+    barrier_width: 1.5      # AUDIT FIX: Tightened from 2.0 to 1.5 for Higher WR
     min_profit_pips: 5.0
-    drift_threshold: 1.0
+    drift_threshold: 1.2    # AUDIT FIX: Relaxed from 1.0 to 1.2
     
   learning_horizon_sec: 300
   min_calibrated_probability: 0.60
