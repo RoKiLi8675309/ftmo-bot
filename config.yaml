@@ -279,7 +279,7 @@ forensic_audit:
 
 # --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 100
+  n_trials: 50
   train_years: 2
   test_months: 6
   min_trades_optimization: 25 # Reduced min trades to match tighter gates
