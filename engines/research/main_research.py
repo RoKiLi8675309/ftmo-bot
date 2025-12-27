@@ -5,14 +5,13 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-26 - MIDDLE GROUND & FULL AUDIT):
-# 1. FULL AUDIT LOGGING: Ensures EVERY trial (Win/Loss/Blown) writes a detailed
-#    Autopsy report to the main log file for analysis.
-# 2. MIDDLE GROUND TUNING: Adjusted pruning thresholds (min 25 trades) to match
-#    the new V1.4 config gates.
-# 3. SCORING: SQN Weight 3.0 (Stability) + PnL Weight + Activity Bonus.
-# 4. ARCHITECTURE FIX: Explicit logging setup in worker processes.
-# 5. CONSOLE CLEANUP: Moved hardware detection logs to main process only.
+# PHOENIX STRATEGY UPGRADE (2025-12-26 - SNIPER MODE & AUDIT FIX):
+# 1. DUPLICATE LOGGING FIX: Removed explicit print() calls in EmojiCallback.
+#    Relies strictly on log.info() to prevent double console output.
+# 2. CONFIG DYNAMICS: Automatically pulls new '15 trades' threshold from Config.
+# 3. SCORING: Retained SQN Weight 3.0 (Stability) + PnL Weight + Activity Bonus.
+# 4. WORKER VISIBILITY: Explicit logging setup in worker processes ensures
+#    output reaches the main console via StreamHandler without duplication.
 # =============================================================================
 import sys
 import os
@@ -59,7 +58,7 @@ log = logging.getLogger("Research")
 class EmojiCallback:
     """
     Injects FTMO-style Emojis and RICH TELEMETRY into Optuna Trial reporting.
-    Uses sys.stdout.write to ensure output visibility in parallel workers.
+    AUDIT FIX: Removed explicit print() calls to prevent duplicate console output.
     """
     def __call__(self, study, trial):
         val = trial.value
@@ -115,15 +114,11 @@ class EmojiCallback:
             f"#️⃣ {trades:<4}"
         )
         
-        # 4. FORCE PRINT to Console (Bypass Logger Buffering)
-        # CRITICAL: flush=True ensures real-time updates in joblib
-        print(msg, flush=True)
-        
-        # 5. Log to File (for persistence)
-        # Note: Workers need explicit logger setup to write to file (handled in _worker_optimize_task)
+        # 4. Log to File & Console (Standard Logging handles both now)
+        # Workers need explicit logger setup to write to file (handled in _worker_optimize_task)
         log.info(msg.strip())
         
-        # 6. Detailed Analysis (Victory Lap OR Autopsy for ALL active trials)
+        # 5. Detailed Analysis (Victory Lap OR Autopsy for ALL active trials)
         if 'autopsy' in attrs and trades > 0:
             if pnl > 0:
                 report_type = "🏁 VICTORY LAP"
@@ -132,8 +127,7 @@ class EmojiCallback:
                 
             report_msg = f"\n{report_type} (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
             
-            # Explicitly log to file AND console
-            print(report_msg, flush=True)
+            # Explicitly log to file AND console via logger
             log.info(report_msg)
 
 def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
@@ -187,8 +181,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             log.error(f"❌ CRITICAL: No BAR data generated for {symbol}. Aborting worker.")
             return
         
-        # Force print to show progress
-        print(f"📥 {symbol}: Generated {len(df)} Volume Bars for training.", flush=True)
+        # Log progress (Logger handles output)
+        log.info(f"📥 {symbol}: Generated {len(df)} Volume Bars for training.")
 
         # 2. Define Objective
         def objective(trial):
@@ -216,7 +210,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                     'drift_threshold': trial.suggest_float('drift_threshold', 0.7, 1.5)
                 },
                 
-                # Middle Ground Confidence (Raised floor to 0.60 per Audit)
+                # High Conviction Threshold (Raised per V1.5 Config)
                 'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.60, 0.85)
             })
             
@@ -257,8 +251,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             final_score = pnl_score + (metrics['sqn'] * sqn_weight)
             
             # Constraint: Minimum Trades (Configurable)
-            # V1.4: Config uses 25
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 25) 
+            # V1.5: Config uses 15 (Reduced to allow high quality trades)
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 15) 
             total_trades = metrics['total_trades']
             
             # Activity Bonus (Encourage active bots)
