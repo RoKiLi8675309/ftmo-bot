@@ -1,13 +1,12 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V1.5 (HIGH CONVICTION SNIPER)
-# STATUS: TUNED FOR SURVIVAL & PROFITABILITY
+# config.yaml – PROJECT PHOENIX V1.6 (REMEDIATION PATCH)
+# STATUS: TUNED FOR LOW VOLATILITY SURVIVAL & CLIMAX FILTERING
 #
-# AUDIT REMEDIATION (2025-12-26 - SNIPER MODE):
-# 1. GATES TIGHTENED: Shifted from "Middle Ground" to "High Conviction".
-#    - ATR: 1.2 (was 0.9) | RVol: 1.1 (was 0.9) | KER: 0.60 (was 0.50)
-# 2. AGGRESSOR: Raised to 0.60 to reject "Indecision Candles" seen in logs.
-# 3. RISK: Lowered to 0.25% per trade to survive learning drawdowns.
-# 4. ML THRESHOLD: Raised to 0.65 to filter low-confidence noise.
+# CRITICAL FIXES (2025-12-26):
+# 1. RISK REDUCTION: Base risk slashed to 0.15% until Profit Factor > 1.2.
+# 2. STOP LOSS WIDENED: Increased to 2.5 ATR to survive low-volatility noise.
+# 3. ML THRESHOLD: Raised to 0.78. We only take "Sure Things" now.
+# 4. EXHAUSTION FILTER: Added max_relative_volume to stop shorting bottoms.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -124,40 +123,40 @@ features:
     window: 30
     
   # Regime Filter (ADX)
+  # REMEDIATION: Raised to 30 to force Strong Trends Only
   adx:
     period: 14
-    threshold: 25
+    threshold: 30
     
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V1.5 HIGH CONVICTION) ---
+# --- PHOENIX STRATEGY PARAMETERS (V1.6 REMEDIATION) ---
 phoenix_strategy:
   # Regime A: Volatility Expansion
-  vol_expansion_threshold: 1.5  # Raised from 1.2 to filter minor pops
+  vol_expansion_threshold: 2.0  # Raised from 1.5 to demand significant moves
+  
+  # REMEDIATION: New Cap to prevent Volume Climax/Exhaustion entries
+  max_relative_volume: 2.2      # Reject if RVol > 2.2 (Reversal Risk)
   
   # Regime B: Momentum Trend
-  # AUDIT FIX: Raised to 0.60 (was 0.50) to ensure established trends
   ker_trend_threshold: 0.60      
   
-  # Entry Gates (V1.5 TUNING)
-  # AUDIT FIX: Raised to 1.2 (was 0.9) to filter chop/noise
+  # Entry Gates
   range_gate_atr_mult: 1.2      
-  
-  # AUDIT FIX: Raised to 1.1 (was 0.9) to ensure volume support
   volume_gate_ratio: 1.1        
   
-  # AUDIT FIX: Raised to 0.60 to reject indecision candles (Dojos)
-  aggressor_threshold: 0.60     # Close > 60% of High-Low
+  # REMEDIATION: Raised to 0.70. Indecision candles are killers.
+  aggressor_threshold: 0.70     # Close > 70% of High-Low
   
-  ml_confirmation_threshold: 0.60 # Base threshold for MetaLabeler
+  ml_confirmation_threshold: 0.65 
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
   vpin_threshold: 0.90
-  gate_fdi_threshold: 1.60      # Complexity filter
+  gate_fdi_threshold: 1.60      
 
 # --- RISK MANAGEMENT ---
 risk_management:
@@ -166,9 +165,8 @@ risk_management:
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # RISK PER TRADE: 0.25% of Equity (Survival Mode)
-  # Lowered from 0.5% to prevent blowout strings
-  base_risk_per_trade_percent: 0.25
+  # REMEDIATION: 0.15% Risk. We are bleeding. Stop the bleeding.
+  base_risk_per_trade_percent: 0.15
   
   max_daily_loss_pct: 0.04
   max_total_loss_pct: 0.09
@@ -177,18 +175,18 @@ risk_management:
   max_lot_size: 5.0
   min_lot_size: 0.01
   
-  # PROJECT PHOENIX EXIT LOGIC
-  stop_loss_atr_mult: 1.5       # Standard Stop
-  take_profit_atr_mult: 3.0     # Fixed 1:2 RR baseline (managed by Trail)
+  # PROJECT PHOENIX EXIT LOGIC (REMEDIATION TUNING)
+  stop_loss_atr_mult: 2.5       # WIDENED: Give trades room to breathe in low vol
+  take_profit_atr_mult: 3.5     # ADJUSTED: Maintain R:R with wider stop
   
   # TRAILING STOP
   trailing_stop:
     enabled: true
-    activation_atr: 1.2         # Start trailing at 1.2 ATR profit
-    step_atr: 0.3               # Tighter steps to lock profit
+    activation_atr: 1.5         # Start trailing later
+    step_atr: 0.5               # Slower trail to avoid noise wick-outs
   
   risk_timezone: "Europe/Prague"
-  friday_liquidation_hour_server: 21 # 21:00 Server Time (approx 3h before close)
+  friday_liquidation_hour_server: 21 
   
   commission_per_lot_rt: 5.0
   contract_size: 100000
@@ -207,8 +205,6 @@ trading:
     - "USDJPY"  # Macro Trends
     - "AUDUSD"  # Commodities Proxy
   
-  # Excluded: CHF (Intervention), CAD (Choppy)
-  
   auxiliary_symbols:
     - "GBPUSD"
     - "USDCAD"
@@ -218,24 +214,23 @@ trading:
   slippage: 5
   
   # --- EXECUTION OPTIMIZATION ---
-  # Passive Front-Running: Limit Order inside spread
   limit_order_offset_pips: 0.2 
-  limit_order_ttl_seconds: 60   # Momentum is fleeting
+  limit_order_ttl_seconds: 60   
 
 # --- ONLINE LEARNING ---
 online_learning:
   model_type: "ARFClassifier"
   
   # GOLDEN CONFIGURATION
-  n_models: 30        # Range 30-50
-  grace_period: 250       # Range 200-500
-  delta: 0.00005          # Adaptation Rate
-  warning_delta: 0.001    # Early Warning
-  lambda_value: 10        # Poisson Weight
-  max_features: 'log2'    # Decorrelation
-  metric: "LogLoss"       # Probability Calibration
+  n_models: 30        
+  grace_period: 250       
+  delta: 0.00005          
+  warning_delta: 0.001    
+  lambda_value: 10        
+  max_features: 'log2'    
+  metric: "LogLoss"       
   
-  burn_in_periods: 500    # Reduced from 1000 for faster start
+  burn_in_periods: 500    
   
   # Volatility Gate
   volatility_gate:
@@ -249,14 +244,14 @@ online_learning:
   
   tbm:
     horizon_minutes: 60
-    barrier_width: 1.5      # Volatility Multiplier
+    barrier_width: 1.5      
     min_profit_pips: 5.0
     drift_threshold: 1.2 
     
   learning_horizon_sec: 300
   
-  # AUDIT FIX: Raised to 0.65 to ensure high conviction (was 0.60)
-  min_calibrated_probability: 0.65 
+  # REMEDIATION: Raised to 0.78. If it's not a sniper shot, we don't take it.
+  min_calibrated_probability: 0.78
 
 # --- NEWS FILTER ---
 news_filter:
@@ -290,5 +285,4 @@ wfo:
   n_trials: 50
   train_years: 2
   test_months: 6
-  # AUDIT FIX: Reduced to 15 to account for stricter gates (was 25)
   min_trades_optimization: 15

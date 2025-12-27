@@ -5,11 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-26 - MIDDLE GROUND):
-# 1. MIDDLE GROUND TUNING: ATR 0.9, RVol 0.9, KER 0.50.
-# 2. LIQUIDATION: Enforces Friday 21:00 forced close (Friday Gap Protection).
-# 3. METADATA: Passes rich metadata (Confidence, Regime) to Broker for CSV.
-# 4. SIZING: Strictly Fixed Risk (0.5%).
+# PHOENIX STRATEGY UPGRADE (2025-12-26 - REMEDIATION PATCH):
+# 1. EXHAUSTION FILTER: Blocks entries if RVol > max_relative_volume (2.2).
+# 2. CONVICTION GATES: Raised thresholds for Range, RVol, and Aggressor.
+# 3. STOP LOSS: Widened to 2.5 ATR to survive low-volatility noise.
+# 4. ML FILTER: Enforces stricter probability threshold (0.78).
 # =============================================================================
 import logging
 import sys
@@ -59,7 +59,7 @@ class ResearchStrategy:
         tbm_conf = params.get('tbm', {})
         self.labeler = AdaptiveTripleBarrier(
             horizon_ticks=tbm_conf.get('horizon_minutes', 60),
-            risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'], # Uses Config
+            risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'], # Uses Config (2.5)
             reward_mult=tbm_conf.get('barrier_width', 1.5),
             drift_threshold=tbm_conf.get('drift_threshold', 1.2)
         )
@@ -73,7 +73,7 @@ class ResearchStrategy:
         self.calibrator_sell = ProbabilityCalibrator(window=2000)
         
         # 5. Warm-up State
-        self.burn_in_limit = params.get('burn_in_periods', 500) # Reduced for Frequency
+        self.burn_in_limit = params.get('burn_in_periods', 500) 
         self.burn_in_counter = 0
         self.burn_in_complete = False
         
@@ -97,14 +97,16 @@ class ResearchStrategy:
         
         # --- PHOENIX STRATEGY PARAMETERS (Refreshed from Config) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.2)
         
-        # Middle Ground Tuning (V1.4)
-        # AUDIT FIX: Defaults aligned with Config
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.50)
-        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 0.9)
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 0.9)
-        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55)
+        # REMEDIATION: Load the new Exhaustion Cap
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 2.2)
+        
+        # Thresholds (Aligned with V1.6 Config)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.60)
+        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.2)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.1)
+        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.60)
+        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0)
         
         self.limit_offset = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
         
@@ -234,7 +236,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. PROJECT PHOENIX: LOGIC GATES (TUNED MIDDLE GROUND)
+        # D. PROJECT PHOENIX: LOGIC GATES (REMEDIATION MODE)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
@@ -245,19 +247,23 @@ class ResearchStrategy:
         amihud = features.get('amihud', 0.0)
         atr_val = features.get('atr', 0.0001)
         
+        # --- CRITICAL FIX 1: VOLUME EXHAUSTION FILTER ---
+        # Rejects Volume Climaxes (Panic Selling / Blow-off Tops)
+        if rvol > self.max_rvol_thresh:
+            self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
+            return # Force HOLD
+            
         # 2. Gate Definitions
         bar_range = high - low
         
         # Gate A: Range Expansion (Market is waking up)
-        # V1.4: Tuned to 0.9 * ATR (Stable entry point)
         range_gate = bar_range > (self.range_gate_mult * atr_val)
         
         # Gate B: Volume Participation (Move is supported)
-        # V1.4: Tuned to 0.9x Average (Avoid dead zones)
         vol_gate = rvol > self.vol_gate_ratio
         
         # Gate C: Momentum Direction (Aggressor Ratio)
-        # > 0.55 = Bullish, < 0.45 = Bearish
+        # Stricter > 0.60 = Bullish, < 0.40 = Bearish
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
@@ -278,7 +284,6 @@ class ResearchStrategy:
                 
         # --- REGIME B: EFFICIENT TREND CONTINUATION ---
         # Logic: Efficiency (KER) + Momentum align
-        # V1.4: KER Threshold raised to 0.50
         elif ker_val > self.ker_thresh:
             if is_bullish_candle:
                 proposed_action = 1
@@ -335,15 +340,15 @@ class ResearchStrategy:
             is_profitable = self.meta_labeler.predict(
                 features, 
                 proposed_action, 
-                threshold=self.params.get('meta_labeling_threshold', 0.55) # Middle Ground
+                threshold=self.params.get('meta_labeling_threshold', 0.55)
             )
             
             if proposed_action != 0:
                 self.meta_label_events += 1
 
             # --- EXECUTION ---
-            # V1.4: Config uses 0.60 floor for confidence (Coin flip protection)
-            min_prob = self.params.get('min_calibrated_probability', 0.60)
+            # REMEDIATION: Using STRICT 0.78 probability from Params/Config
+            min_prob = self.params.get('min_calibrated_probability', 0.78)
             
             if confidence < min_prob:
                 self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob})"] += 1

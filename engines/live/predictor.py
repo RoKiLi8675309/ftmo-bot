@@ -6,12 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-26 - LIVE PARITY):
-# 1. PARITY: Logic matched 1:1 with engines/research/strategy.py.
-# 2. REGIME A (EXPANSION): Range > 0.9 ATR + RVol > 0.9 + Aggressor.
-# 3. REGIME B (TREND): KER > 0.50 + Aggressor.
-# 4. MEAN REVERSION FILTER: Blocks Short signals if RSI < 30 or Price < Lower BB.
-# 5. COIN FLIP PROTECTION: Confidence floor raised to 0.60.
+# PHOENIX STRATEGY UPGRADE (2025-12-26 - REMEDIATION PATCH):
+# 1. EXHAUSTION FILTER: Rejects signals if RVol > 2.2 (Climax protection).
+# 2. CONVICTION GATES: Syncs thresholds with V1.6 Config (Sniper Mode).
+# 3. CONFIDENCE FLOOR: Raised to 0.78 to match Research remediation.
 # =============================================================================
 import logging
 import pickle
@@ -86,7 +84,7 @@ class MultiAssetPredictor:
         
         # 3. Warm-up State
         self.burn_in_counters = {s: 0 for s in symbols}
-        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 500) # Reduced
+        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 500) 
         
         # 4. Forensic Stats
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
@@ -105,15 +103,18 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (Matched to V1.4 Config) ---
+        # --- PHOENIX STRATEGY PARAMETERS (Matched to V1.6 Config) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.2)
         
-        # Middle Ground Tuning (V1.4)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.50)
-        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 0.9)
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 0.9)
-        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55)
+        # REMEDIATION: Exhaustion Cap
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 2.2)
+        
+        # Conviction Thresholds
+        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.60)
+        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.2)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.1)
+        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.60)
         
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
@@ -273,7 +274,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
 
         # ============================================================
-        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V1.4)
+        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V1.6)
         # ============================================================
         
         # Extract Core Indicators
@@ -283,19 +284,22 @@ class MultiAssetPredictor:
         amihud = features.get('amihud', 0.0)
         atr_val = features.get('atr', 0.0001)
         
+        # --- CRITICAL FIX 1: VOLUME EXHAUSTION FILTER ---
+        if rvol > self.max_rvol_thresh:
+            stats[f"Volume Climax (RVol {rvol:.2f})"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
+        
         # Gate Definitions
         bar_range = bar.high - bar.low
         
         # Gate A: Range Expansion (Market is waking up)
-        # V1.4: Tuned to 0.9 * ATR
         range_gate = bar_range > (self.range_gate_mult * atr_val)
         
         # Gate B: Volume Participation (Move is supported)
-        # V1.4: Tuned to 0.9x Average
         vol_gate = rvol > self.vol_gate_ratio
         
         # Gate C: Momentum Direction (Aggressor Ratio)
-        # > 0.55 = Bullish, < 0.45 = Bearish
+        # Stricter thresholds for Sniper Mode
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
@@ -373,8 +377,8 @@ class MultiAssetPredictor:
         parkinson = features.get('parkinson_vol', 0.0)
         mtf_align = features.get('mtf_alignment', 0.0)
         
-        # V1.4: Config uses 0.60 floor for confidence (Coin flip protection)
-        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.60)
+        # V1.6: Config uses 0.78 floor for confidence (Sniper Mode)
+        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.78)
 
         # Safety Check: If ML thinks probability is terrible (< min_prob), skip.
         if confidence < min_prob:
