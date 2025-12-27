@@ -100,6 +100,7 @@ class ResearchStrategy:
         self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.2)
         
         # Middle Ground Tuning (V1.4)
+        # AUDIT FIX: Defaults aligned with Config
         self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.50)
         self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 0.9)
         self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 0.9)
@@ -341,8 +342,8 @@ class ResearchStrategy:
                 self.meta_label_events += 1
 
             # --- EXECUTION ---
-            # V1.4: Config uses 0.55 floor for confidence
-            min_prob = self.params.get('min_calibrated_probability', 0.55)
+            # V1.4: Config uses 0.60 floor for confidence (Coin flip protection)
+            min_prob = self.params.get('min_calibrated_probability', 0.60)
             
             if confidence < min_prob:
                 self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob})"] += 1

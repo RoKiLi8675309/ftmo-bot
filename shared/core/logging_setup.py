@@ -133,7 +133,7 @@ def setup_logging(component_name: str = "FTMO_Bot", log_level_override: Optional
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
         
-        # Explicit feedback on log location
+        # Explicit feedback on log location (AUDIT FIX: Issue 1)
         print(f"📝 Log File initialized at: {os.path.abspath(log_file_path)}")
         
     except Exception as e:

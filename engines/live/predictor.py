@@ -11,6 +11,7 @@
 # 2. REGIME A (EXPANSION): Range > 0.9 ATR + RVol > 0.9 + Aggressor.
 # 3. REGIME B (TREND): KER > 0.50 + Aggressor.
 # 4. MEAN REVERSION FILTER: Blocks Short signals if RSI < 30 or Price < Lower BB.
+# 5. COIN FLIP PROTECTION: Confidence floor raised to 0.60.
 # =============================================================================
 import logging
 import pickle
@@ -104,7 +105,7 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS ---
+        # --- PHOENIX STRATEGY PARAMETERS (Matched to V1.4 Config) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.2)
         
@@ -272,7 +273,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
 
         # ============================================================
-        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES
+        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V1.4)
         # ============================================================
         
         # Extract Core Indicators
@@ -286,12 +287,15 @@ class MultiAssetPredictor:
         bar_range = bar.high - bar.low
         
         # Gate A: Range Expansion (Market is waking up)
+        # V1.4: Tuned to 0.9 * ATR
         range_gate = bar_range > (self.range_gate_mult * atr_val)
         
         # Gate B: Volume Participation (Move is supported)
+        # V1.4: Tuned to 0.9x Average
         vol_gate = rvol > self.vol_gate_ratio
         
         # Gate C: Momentum Direction (Aggressor Ratio)
+        # > 0.55 = Bullish, < 0.45 = Bearish
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
@@ -330,20 +334,17 @@ class MultiAssetPredictor:
             return Signal(symbol, "HOLD", 0.0, {"reason": "No Trigger"})
 
         # ---------------------------------------------------------------------
-        # MEAN REVERSION FILTER (AUDIT REMEDIATION)
+        # MEAN REVERSION FILTER (Safety Check)
         # Prevent "Selling the Hole" (Shorting when Price < BB Lower or RSI < 30)
         # ---------------------------------------------------------------------
         bb_pos = features.get('bb_position', 0.5)
         rsi_val = features.get('rsi_norm', 0.5)
         
         if proposed_action == -1: # SELL
-            # bb_position < 0.0 implies Price < Lower Band
-            # rsi_norm < 0.30 implies RSI < 30
             if bb_pos < 0.0 or rsi_val < 0.30:
                 stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "Mean Rev Filter"})
         elif proposed_action == 1: # BUY
-            # Don't buy the top (Price > Upper Band or RSI > 70)
             if bb_pos > 1.0 or rsi_val > 0.70:
                 stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "Mean Rev Filter"})
@@ -372,8 +373,8 @@ class MultiAssetPredictor:
         parkinson = features.get('parkinson_vol', 0.0)
         mtf_align = features.get('mtf_alignment', 0.0)
         
-        # V1.4: Config uses 0.55 floor for confidence
-        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
+        # V1.4: Config uses 0.60 floor for confidence (Coin flip protection)
+        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.60)
 
         # Safety Check: If ML thinks probability is terrible (< min_prob), skip.
         if confidence < min_prob:

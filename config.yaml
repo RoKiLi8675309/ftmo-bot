@@ -5,9 +5,9 @@
 # AUDIT REMEDIATION (2025-12-26 - MIDDLE GROUND):
 # 1. GATES TUNED: Found middle ground between V1.2 (Strict) and V1.3 (Loose).
 #    - ATR: 0.9 (was 0.7) | RVol: 0.9 (was 0.8) | KER: 0.50 (was 0.40)
-# 2. ML THRESHOLD: Raised to 0.55 to filter low-conviction noise.
+# 2. ML THRESHOLD: Raised to 0.60 to stop taking "coin flip" trades (~0.52).
 # 3. COMPLIANCE: Friday Liquidation enabled (21:00 Server Time).
-# 4. LOGGING: Enhanced Audit settings.
+# 4. PRUNING: Reduced min trades to 25 to account for tighter gates.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -133,20 +133,25 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS ---
+# --- PHOENIX STRATEGY PARAMETERS (V1.4 MIDDLE GROUND) ---
 phoenix_strategy:
   # Regime A: Volatility Expansion
   vol_expansion_threshold: 1.2  # Parkinson Vol > 1.2 * Baseline
   
   # Regime B: Momentum Trend
-  ker_trend_threshold: 0.50     # Efficiency Ratio > 0.50 (Middle Ground)
+  # AUDIT FIX: Raised to 0.50 (was 0.40) to define clearer trends
+  ker_trend_threshold: 0.50     
   
-  # Entry Gates (MIDDLE GROUND TUNING)
-  range_gate_atr_mult: 0.9      # Bar Range > 0.9x ATR (Stable Entry)
-  volume_gate_ratio: 0.9        # RVol > 0.9x Average (Flow Support)
+  # Entry Gates (V1.4 TUNING)
+  # AUDIT FIX: Raised to 0.9 (was 0.7) to filter choppy noise
+  range_gate_atr_mult: 0.9      
+  
+  # AUDIT FIX: Raised to 0.9 (was 0.8) for better flow confirmation
+  volume_gate_ratio: 0.9        
+  
   aggressor_threshold: 0.55     # Close > 55% of High-Low
   
-  ml_confirmation_threshold: 0.55 # Increased convinction required
+  ml_confirmation_threshold: 0.55 # Base threshold for MetaLabeler
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -168,7 +173,7 @@ risk_management:
   max_total_loss_pct: 0.09
   max_risk_percent: 1.0         # Hard cap per trade
   max_leverage: 30.0
-  max_lot_size: 50.0
+  max_lot_size: 5.0
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC
@@ -187,7 +192,7 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 50
+  max_trades_per_day: 5
   correlation_penalty_threshold: 0.8
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
@@ -248,7 +253,9 @@ online_learning:
     drift_threshold: 1.2 
     
   learning_horizon_sec: 300
-  min_calibrated_probability: 0.55 # Raised floor to avoid coin-flips
+  
+  # AUDIT FIX: Raised to 0.60 to avoid coin-flip trades (was 0.51)
+  min_calibrated_probability: 0.60 
 
 # --- NEWS FILTER ---
 news_filter:
@@ -282,4 +289,5 @@ wfo:
   n_trials: 50
   train_years: 2
   test_months: 6
-  min_trades_optimization: 25 # Reduced min trades to match tighter gates
+  # AUDIT FIX: Reduced to 25 to account for tighter gates (was 50)
+  min_trades_optimization: 25

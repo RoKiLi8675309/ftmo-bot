@@ -11,6 +11,7 @@
 # 2. MIDDLE GROUND TUNING: Adjusted pruning thresholds (min 25 trades) to match
 #    the new V1.4 config gates.
 # 3. SCORING: SQN Weight 3.0 (Stability) + PnL Weight + Activity Bonus.
+# 4. ARCHITECTURE FIX: Explicit logging setup in worker processes.
 # =============================================================================
 import sys
 import os
@@ -114,13 +115,14 @@ class EmojiCallback:
         )
         
         # 4. FORCE PRINT to Console (Bypass Logger Buffering)
+        # CRITICAL: flush=True ensures real-time updates in joblib
         print(msg, flush=True)
         
         # 5. Log to File (for persistence)
+        # Note: Workers need explicit logger setup to write to file (handled in _worker_optimize_task)
         log.info(msg.strip())
         
         # 6. Detailed Analysis (Victory Lap OR Autopsy for ALL active trials)
-        # AUDIT FIX: We now print this for ALL non-idle trials to ensure full visibility.
         if 'autopsy' in attrs and trades > 0:
             if pnl > 0:
                 report_type = "🏁 VICTORY LAP"
@@ -167,6 +169,13 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
     ISOLATED WORKER FUNCTION: Runs in a separate process.
     Executes Optuna Optimization for a single symbol.
     """
+    # --- AUDIT FIX: SETUP LOGGING IN WORKER ---
+    # Joblib workers do not inherit file handles. We must re-initialize logging here.
+    setup_logging(f"Worker_{symbol}")
+    # Re-acquire logger for this process
+    log = logging.getLogger(f"Worker_{symbol}")
+    
+    # Silence third-party libs in worker
     optuna.logging.set_verbosity(optuna.logging.INFO)
     
     try:
@@ -206,8 +215,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                     'drift_threshold': trial.suggest_float('drift_threshold', 0.7, 1.5)
                 },
                 
-                # Middle Ground Confidence (Raised floor to 0.55)
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.55, 0.85)
+                # Middle Ground Confidence (Raised floor to 0.60 per Audit)
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.60, 0.85)
             })
             
             # Instantiate Pipeline locally
@@ -247,7 +256,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             final_score = pnl_score + (metrics['sqn'] * sqn_weight)
             
             # Constraint: Minimum Trades (Configurable)
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 25) # Tuned to 25
+            # V1.4: Config uses 25
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 25) 
             total_trades = metrics['total_trades']
             
             # Activity Bonus (Encourage active bots)
@@ -294,7 +304,11 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
 def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_dir: Path) -> None:
     """
     Trains the Final Production Model using the Best Params found.
+    Also needs logging setup for isolated execution.
     """
+    setup_logging(f"Worker_Final_{symbol}")
+    log = logging.getLogger(f"Worker_Final_{symbol}")
+    
     try:
         # 1. Load & Aggregate Data
         df = process_data_into_bars(symbol, n_ticks=4000000)
