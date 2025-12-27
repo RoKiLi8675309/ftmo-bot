@@ -1,12 +1,15 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V2.1 (SCALED TREND HUNTER)
-# STATUS: RISK SCALED FOR FTMO CHALLENGE PASSING
+# config.yaml – PROJECT PHOENIX V2.2 (UNLEASHED)
+# STATUS: GATES RELAXED FOR HIGHER FREQUENCY & VOLATILITY CAPTURE
 #
-# UPDATES (2025-12-27):
-# 1. RISK SCALING: Increased to 0.50% per trade. (Targeting $10k Profit).
-# 2. GATES RELAXED: Aggressor > 0.60 (was 0.65) to catch earlier entries.
-# 3. RANGE GATE: Lowered to 1.0x ATR to enter on standard expansion candles.
-# 4. SAFETY: Regime A (Climax) entries remain DISABLED.
+# UPDATES (2025-12-27 - V2.2):
+# 1. REGIME A ENABLED: Volatility Expansion entries are now ACTIVE.
+# 2. GATES OPENED:
+#    - KER Threshold: Lowered to 0.40 (Accepts noisy trends).
+#    - Aggressor: Lowered to 0.55 (Accepts moderate conviction).
+#    - Range Gate: Lowered to 0.9x ATR (Accepts standard expansion).
+# 3. JPY TUNING: Max RVol raised to 4.0 to stop filtering valid JPY spikes.
+# 4. SAFETY: D1 Trend Lock remains the primary safety net.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -132,30 +135,30 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V2.1 SCALED) ---
+# --- PHOENIX STRATEGY PARAMETERS (V2.2 UNLEASHED) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: false  # KILL SWITCH: No entries on Volatility Expansion
-  require_d1_trend: true          # GOLDEN RULE: Must align with D1 EMA200
+  enable_regime_a_entries: true   # UNLEASHED: Allow Volatility Expansion entries (The Dragon)
+  require_d1_trend: true          # GOLDEN RULE: Must align with D1 EMA200 (Primary Safety Net)
   
   # --- FILTER THRESHOLDS ---
-  # Volume Exhaustion
-  max_relative_volume: 2.5       
+  # Volume Exhaustion (Raised for JPY Spikes)
+  max_relative_volume: 4.0        # Was 2.5. Allows aggressive liquidity grabs.
   
-  # Trend Efficiency
-  ker_trend_threshold: 0.70       
+  # Trend Efficiency (Lowered for Real-World Noise)
+  ker_trend_threshold: 0.40       # Was 0.70. Allows "noisy" trends (common in Forex).
   
-  # Volatility Expansion (Entries disabled, used for logging)
+  # Volatility Expansion
   vol_expansion_threshold: 2.0 
   
-  # Entry Gates (RELAXED V2.1)
-  range_gate_atr_mult: 1.0      # Was 1.1. Lowered to catch standard expansion.
+  # Entry Gates (RELAXED V2.2)
+  range_gate_atr_mult: 0.9      # Was 1.0. Catches standard expansion candles.
   volume_gate_ratio: 1.2        # Must have volume backing
   
-  # Momentum Conviction (RELAXED V2.1)
-  aggressor_threshold: 0.60     # Was 0.65. Close > 60% of High-Low is Bullish.
+  # Momentum Conviction (RELAXED V2.2)
+  aggressor_threshold: 0.55     # Was 0.60. Close > 55% of High-Low is Bullish.
   
-  ml_confirmation_threshold: 0.70 # High confidence requirement
+  ml_confirmation_threshold: 0.60 # Lowered base threshold (let MetaLabeler decide)
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -171,7 +174,6 @@ risk_management:
   
   # Risk Per Trade (SCALED UP FOR PASSING)
   # 0.50% per trade. If Equity = $100k, Risk = $500.
-  # 10 Net Wins = $10,000 Profit (Pass).
   base_risk_per_trade_percent: 0.50 
   
   max_daily_loss_pct: 0.04
@@ -182,14 +184,14 @@ risk_management:
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (1:2 RISK:REWARD)
-  stop_loss_atr_mult: 1.5        
-  take_profit_atr_mult: 3.0      
+  stop_loss_atr_mult: 1.5       
+  take_profit_atr_mult: 3.0       
   
   # TRAILING STOP
   trailing_stop:
     enabled: true
-    activation_atr: 2.0          
-    step_atr: 0.5                
+    activation_atr: 2.0         
+    step_atr: 0.5               
   
   risk_timezone: "Europe/Prague"
   friday_liquidation_hour_server: 21 
@@ -197,7 +199,7 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 10        # Increased slightly
+  max_trades_per_day: 20        # Increased for higher frequency
   correlation_penalty_threshold: 0.8
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0

@@ -5,11 +5,11 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (2025-12-27 - DATA FIDELITY PATCH):
-# 1. FIDELITY FIX: Forced Backtest to use 'train_candles' (4M) instead of
-#    'backtest_candles' (200k). This ensures Volume Bar alignment.
-# 2. WORKER SAFETY: Kept 20 workers + Single Threading.
-# 3. TYPING: Preserved all imports.
+# AUDIT REMEDIATION (2025-12-27 - V2.2 UNLEASHED PATCH):
+# 1. OPTIMIZATION: Widened 'min_calibrated_probability' to 0.55-0.85.
+#    This allows the model to accept trades with >55% confidence (profitable at 2:1 RR).
+# 2. FIDELITY: Maintains Volume Bar alignment using 'train_candles'.
+# 3. SAFETY: Enforces single-threading for stability.
 # =============================================================================
 import os
 import sys
@@ -215,8 +215,9 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                     'drift_threshold': trial.suggest_float('drift_threshold', 0.7, 1.5)
                 },
                 
-                # High Conviction Threshold (Raised per V1.5 Config)
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.60, 0.85)
+                # High Conviction Threshold (Relaxed to 0.55 per V2.2)
+                # Previously 0.60-0.85, now 0.55-0.85 to capture profitable trades
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.55, 0.85)
             })
             
             # Instantiate Pipeline locally
