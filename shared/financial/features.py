@@ -10,7 +10,7 @@
 # 2. VOLATILITY: Added High-Low Range Volatility (Parkinson) for expansion detection.
 # 3. LIQUIDITY: Added Amihud Illiquidity Proxy (Return / DollarVolume).
 # 4. MOMENTUM: Added Aggressor Ratio (Close vs Range) and Relative Volume (Duration Intensity).
-# 5. AUDIT FIX: Silenced HMM Convergence Warnings to clean up console output.
+# 5. AUDIT FIX: Hard-silenced hmmlearn loggers to ERROR level.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -341,6 +341,11 @@ class RegimeDetector:
         self.fit_counter = 0 
         
         if HMM_AVAILABLE:
+            # FORCE SILENCE HMM LOGGERS
+            # These emit warnings via the logging module, not the warnings module
+            logging.getLogger("hmmlearn").setLevel(logging.ERROR)
+            logging.getLogger("hmmlearn.base").setLevel(logging.ERROR)
+            
             try:
                 self.model = hmm.GaussianHMM(
                     n_components=n_states, 
@@ -380,12 +385,11 @@ class RegimeDetector:
                 elif hasattr(self.model, 'startprob_'):
                     self.model.init_params = ""
 
-                # --- AUDIT FIX: SILENCE HMM WARNINGS ---
+                # Standard Warning suppression + context capture
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     with warnings.catch_warnings():
-                        warnings.simplefilter("ignore") # Ignore all warnings during fit
+                        warnings.simplefilter("ignore") 
                         self.model.fit(data)
-                # --------------------------------------
                 
                 if self.model.monitor_.converged:
                     variances = np.array([np.mean(np.diag(c)) for c in self.model.covars_])

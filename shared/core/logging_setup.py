@@ -7,13 +7,15 @@
 # CRITICAL: Python 3.9 Compatible. Unmutes Optuna for Research Transparency.
 # AUDIT REMEDIATION:
 #   - CLEANUP: Removed initialization print statement to reduce console spam.
-#   - SILENCE: Added 'hmmlearn' to noisy_libs to suppress convergence warnings.
+#   - SILENCE: Added 'hmmlearn' to noisy_libs and suppressed Python warnings.
+#   - FIX: Removed 'Logging Initialized' console log to stop worker spam.
 # =============================================================================
 
 import logging
 import logging.handlers
 import sys
 import os
+import warnings
 from typing import Optional
 from .config import CONFIG
 
@@ -85,6 +87,15 @@ def setup_logging(component_name: str = "FTMO_Bot", log_level_override: Optional
     1. RotatingFileHandler (Full Verbosity)
     2. StreamHandler (Console, Filtered)
     """
+    # Global Warning Suppression for libraries that don't use standard logging
+    warnings.simplefilter("ignore", category=FutureWarning)
+    warnings.simplefilter("ignore", category=UserWarning)
+    try:
+        from sklearn.exceptions import ConvergenceWarning
+        warnings.simplefilter("ignore", category=ConvergenceWarning)
+    except ImportError:
+        pass
+
     # 1. Determine Paths and Levels
     log_dir = "logs"
     try:
@@ -136,8 +147,7 @@ def setup_logging(component_name: str = "FTMO_Bot", log_level_override: Optional
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
         
-        # AUDIT FIX: Removed print statement to clean up console output
-        # print(f"📝 Log File initialized at: {os.path.abspath(log_file_path)}")
+        # AUDIT FIX: Removed print statement entirely
         
     except Exception as e:
         print(f"Logging setup failed (File Handler): {e}")
@@ -154,7 +164,7 @@ def setup_logging(component_name: str = "FTMO_Bot", log_level_override: Optional
 
     # 5. Silence Noisy Third-Party Libraries
     # These libraries are very chatty at DEBUG/INFO levels
-    # AUDIT FIX: Added 'hmmlearn' to suppress convergence warnings
+    # AUDIT FIX: Added 'hmmlearn' and others to suppress noise
     noisy_libs = [
         "optuna", 
         "stable_baselines3", 
@@ -168,11 +178,12 @@ def setup_logging(component_name: str = "FTMO_Bot", log_level_override: Optional
         "faker",
         "PIL",
         "websockets",
-        "hmmlearn" 
+        "hmmlearn",
+        "river"
     ]
     
     for lib in noisy_libs:
         logging.getLogger(lib).setLevel(logging.WARNING)
 
-    # Initial Log
-    logging.info(f"{LogSymbols.SUCCESS} Logging Initialized for {component_name} (Level: {config_log_level_str})")
+    # AUDIT FIX: Removed the "Logging Initialized" info log to prevent worker spam
+    # logging.info(f"{LogSymbols.SUCCESS} Logging Initialized for {component_name} (Level: {config_log_level_str})")

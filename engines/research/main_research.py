@@ -176,8 +176,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
     # Re-acquire logger for this process
     log = logging.getLogger(f"Worker_{symbol}")
     
-    # Silence third-party libs in worker
-    optuna.logging.set_verbosity(optuna.logging.INFO)
+    # Silence third-party libs in worker (Warning/Error only)
+    optuna.logging.set_verbosity(optuna.logging.WARN)
     
     try:
         # 1. Load & Aggregate Data 
@@ -379,8 +379,7 @@ class ResearchPipeline:
         self.db_url = CONFIG['wfo']['db_url']
         self.total_cores = max(1, psutil.cpu_count(logical=True) - 2)
         
-        # AUDIT FIX: Removed hardware logging here to prevent worker spam.
-        # It is now logged once in run_training.
+        # AUDIT FIX: Removed hardware logging from __init__ to prevent worker spam.
 
     def get_fresh_model(self, params: Dict[str, Any] = None) -> Any:
         if params is None:
@@ -485,6 +484,7 @@ class ResearchPipeline:
 
     def run_training(self, fresh_start: bool = False):
         log.info(f"{LogSymbols.TIME} STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
+        # MOVED: Hardware logging happens ONCE here, not in every worker via __init__
         log.info(f"HARDWARE DETECTED: {psutil.cpu_count(logical=True)} Cores. Using {self.total_cores} workers.")
         
         for symbol in self.symbols:
@@ -651,7 +651,7 @@ class ResearchPipeline:
         log.info(f"{LogSymbols.SUCCESS} HTML Report saved to: {output_file}")
 
 def main():
-    optuna.logging.set_verbosity(optuna.logging.INFO)
+    optuna.logging.set_verbosity(optuna.logging.WARN)
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--train', action='store_true')
