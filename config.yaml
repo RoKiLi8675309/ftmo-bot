@@ -1,12 +1,13 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V1.3 (HIGH FREQUENCY & PROP FIRM TUNED)
-# STATUS: OPTIMIZED FOR TRADE FREQUENCY & FRIDAY LIQUIDATION
+# config.yaml – PROJECT PHOENIX V1.4 (MIDDLE GROUND TUNING)
+# STATUS: BALANCED FOR FREQUENCY & STABILITY
 #
-# AUDIT REMEDIATION (2025-12-26 - FREQUENCY & COMPLIANCE):
-# 1. GATES RELAXED: Drastically lowered ATR/Vol/KER thresholds to fix "Low Trade Count".
-# 2. RISK MODE: Strictly 'fixed_risk' (0.5% per trade). Kelly removed.
-# 3. COMPLIANCE: Added 'friday_liquidation_hour_server' (21:00) for 3h buffer.
-# 4. LOGGING: Enhanced Audit settings for rich CSV generation.
+# AUDIT REMEDIATION (2025-12-26 - MIDDLE GROUND):
+# 1. GATES TUNED: Found middle ground between V1.2 (Strict) and V1.3 (Loose).
+#    - ATR: 0.9 (was 0.7) | RVol: 0.9 (was 0.8) | KER: 0.50 (was 0.40)
+# 2. ML THRESHOLD: Raised to 0.55 to filter low-conviction noise.
+# 3. COMPLIANCE: Friday Liquidation enabled (21:00 Server Time).
+# 4. LOGGING: Enhanced Audit settings.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -135,17 +136,17 @@ features:
 # --- PHOENIX STRATEGY PARAMETERS ---
 phoenix_strategy:
   # Regime A: Volatility Expansion
-  vol_expansion_threshold: 1.2  # Parkinson Vol > 1.2 * Baseline (Relaxed from 1.5)
+  vol_expansion_threshold: 1.2  # Parkinson Vol > 1.2 * Baseline
   
   # Regime B: Momentum Trend
-  ker_trend_threshold: 0.40     # Efficiency Ratio > 0.40 (Relaxed from 0.70)
+  ker_trend_threshold: 0.50     # Efficiency Ratio > 0.50 (Middle Ground)
   
-  # Entry Gates (AGGRESSIVELY RELAXED FOR FREQUENCY)
-  range_gate_atr_mult: 0.7      # Bar Range > 0.7x ATR (Was 1.2) - Catch standard moves
-  volume_gate_ratio: 0.8        # RVol > 0.8 (Was 1.1) - Allow slight flow drops
-  aggressor_threshold: 0.55     # Close > 55% of High-Low (Bull) or < 45% (Bear)
+  # Entry Gates (MIDDLE GROUND TUNING)
+  range_gate_atr_mult: 0.9      # Bar Range > 0.9x ATR (Stable Entry)
+  volume_gate_ratio: 0.9        # RVol > 0.9x Average (Flow Support)
+  aggressor_threshold: 0.55     # Close > 55% of High-Low
   
-  ml_confirmation_threshold: 0.51 # Take any positive probability edge
+  ml_confirmation_threshold: 0.55 # Increased convinction required
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -157,7 +158,7 @@ risk_management:
   account_currency: "USD"
   
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
-  # Only 'fixed_risk' is supported. Kelly Criterion has been removed.
+  # Only 'fixed_risk' is supported. Kelly Criterion removed.
   sizing_method: "fixed_risk"
   
   # RISK PER TRADE: 0.5% of Equity
@@ -177,7 +178,7 @@ risk_management:
   # TRAILING STOP
   trailing_stop:
     enabled: true
-    activation_atr: 1.0         # Start trailing earlier (1.0 ATR profit)
+    activation_atr: 1.2         # Start trailing at 1.2 ATR profit (Secures Break-even)
     step_atr: 0.3               # Tighter steps to lock profit
   
   risk_timezone: "Europe/Prague"
@@ -238,7 +239,7 @@ online_learning:
   positive_class_weight: 2.0
   negative_class_weight: 2.0
   
-  meta_labeling_threshold: 0.55 # Lowered from 0.60
+  meta_labeling_threshold: 0.55
   
   tbm:
     horizon_minutes: 60
@@ -247,7 +248,7 @@ online_learning:
     drift_threshold: 1.2 
     
   learning_horizon_sec: 300
-  min_calibrated_probability: 0.51 # Aggressively lowered for Frequency
+  min_calibrated_probability: 0.55 # Raised floor to avoid coin-flips
 
 # --- NEWS FILTER ---
 news_filter:
@@ -278,7 +279,7 @@ forensic_audit:
 
 # --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 5
+  n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 50 # Raised requirement since gates are relaxed
+  min_trades_optimization: 25 # Reduced min trades to match tighter gates

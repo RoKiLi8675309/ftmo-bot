@@ -8,8 +8,8 @@
 #
 # PHOENIX STRATEGY UPGRADE (2025-12-26 - LIVE PARITY):
 # 1. PARITY: Logic matched 1:1 with engines/research/strategy.py.
-# 2. REGIME A (EXPANSION): Range > 0.7 ATR + RVol > 0.8 + Aggressor.
-# 3. REGIME B (TREND): KER > 0.40 + Aggressor.
+# 2. REGIME A (EXPANSION): Range > 0.9 ATR + RVol > 0.9 + Aggressor.
+# 3. REGIME B (TREND): KER > 0.50 + Aggressor.
 # 4. MEAN REVERSION FILTER: Blocks Short signals if RSI < 30 or Price < Lower BB.
 # =============================================================================
 import logging
@@ -107,10 +107,11 @@ class MultiAssetPredictor:
         # --- PHOENIX STRATEGY PARAMETERS ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.2)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.40)
         
-        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 0.7)
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 0.8)
+        # Middle Ground Tuning (V1.4)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.50)
+        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 0.9)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 0.9)
         self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55)
         
         # Fallback Tracking
@@ -371,8 +372,8 @@ class MultiAssetPredictor:
         parkinson = features.get('parkinson_vol', 0.0)
         mtf_align = features.get('mtf_alignment', 0.0)
         
-        # Relaxed ML Threshold to 0.51 via Config logic in main loop, here we ensure parity
-        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.51)
+        # V1.4: Config uses 0.55 floor for confidence
+        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
 
         # Safety Check: If ML thinks probability is terrible (< min_prob), skip.
         if confidence < min_prob:

@@ -5,9 +5,9 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-26 - FREQUENCY & LIQUIDATION):
-# 1. LIQUIDATION: Enforces Friday 21:00 forced close (Friday Gap Protection).
-# 2. GATES: Relaxed thresholds (ATR 0.7, RVol 0.8) to fix low trade count.
+# PHOENIX STRATEGY UPGRADE (2025-12-26 - MIDDLE GROUND):
+# 1. MIDDLE GROUND TUNING: ATR 0.9, RVol 0.9, KER 0.50.
+# 2. LIQUIDATION: Enforces Friday 21:00 forced close (Friday Gap Protection).
 # 3. METADATA: Passes rich metadata (Confidence, Regime) to Broker for CSV.
 # 4. SIZING: Strictly Fixed Risk (0.5%).
 # =============================================================================
@@ -98,11 +98,11 @@ class ResearchStrategy:
         # --- PHOENIX STRATEGY PARAMETERS (Refreshed from Config) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.2)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.40)
         
-        # Relaxed Entry Gates (Fix for Top Buying)
-        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 0.7)
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 0.8)
+        # Middle Ground Tuning (V1.4)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.50)
+        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 0.9)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 0.9)
         self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55)
         
         self.limit_offset = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
@@ -233,7 +233,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. PROJECT PHOENIX: LOGIC GATES (RELAXED FOR FREQUENCY)
+        # D. PROJECT PHOENIX: LOGIC GATES (TUNED MIDDLE GROUND)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
@@ -248,15 +248,15 @@ class ResearchStrategy:
         bar_range = high - low
         
         # Gate A: Range Expansion (Market is waking up)
-        # RELAXED to 0.7 * ATR via Config to catch standard moves
+        # V1.4: Tuned to 0.9 * ATR (Stable entry point)
         range_gate = bar_range > (self.range_gate_mult * atr_val)
         
         # Gate B: Volume Participation (Move is supported)
-        # RELAXED to 0.8x Average to allow flows to dip slightly
+        # V1.4: Tuned to 0.9x Average (Avoid dead zones)
         vol_gate = rvol > self.vol_gate_ratio
         
         # Gate C: Momentum Direction (Aggressor Ratio)
-        # > 0.55 = Bullish, < 0.45 = Bearish (Wider Indecision Zone removed)
+        # > 0.55 = Bullish, < 0.45 = Bearish
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
@@ -277,7 +277,7 @@ class ResearchStrategy:
                 
         # --- REGIME B: EFFICIENT TREND CONTINUATION ---
         # Logic: Efficiency (KER) + Momentum align
-        # KER Threshold relaxed to 0.40
+        # V1.4: KER Threshold raised to 0.50
         elif ker_val > self.ker_thresh:
             if is_bullish_candle:
                 proposed_action = 1
@@ -334,15 +334,15 @@ class ResearchStrategy:
             is_profitable = self.meta_labeler.predict(
                 features, 
                 proposed_action, 
-                threshold=self.params.get('meta_labeling_threshold', 0.55) # Relaxed Meta Threshold
+                threshold=self.params.get('meta_labeling_threshold', 0.55) # Middle Ground
             )
             
             if proposed_action != 0:
                 self.meta_label_events += 1
 
             # --- EXECUTION ---
-            # Relaxed ML Threshold to 0.51 via Config
-            min_prob = self.params.get('min_calibrated_probability', 0.51)
+            # V1.4: Config uses 0.55 floor for confidence
+            min_prob = self.params.get('min_calibrated_probability', 0.55)
             
             if confidence < min_prob:
                 self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob})"] += 1

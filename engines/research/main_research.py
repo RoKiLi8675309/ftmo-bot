@@ -5,11 +5,12 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-26 - REPORTING & FREQUENCY):
-# 1. VICTORY LAPS: Generates detailed reports for PROFIT/ALPHA trials to explain *why* they won.
-# 2. FULL LOGGING: Captures "Autopsy" data for all trials (Win or Loss) in the main log.
-# 3. FREQUENCY TUNING: Adjusted scoring to heavily penalize low trade counts (< 50).
-# 4. SCORING: SQN Weight 3.0 (Stability) + PnL Weight.
+# PHOENIX STRATEGY UPGRADE (2025-12-26 - MIDDLE GROUND & FULL AUDIT):
+# 1. FULL AUDIT LOGGING: Ensures EVERY trial (Win/Loss/Blown) writes a detailed
+#    Autopsy report to the main log file for analysis.
+# 2. MIDDLE GROUND TUNING: Adjusted pruning thresholds (min 25 trades) to match
+#    the new V1.4 config gates.
+# 3. SCORING: SQN Weight 3.0 (Stability) + PnL Weight + Activity Bonus.
 # =============================================================================
 import sys
 import os
@@ -118,11 +119,17 @@ class EmojiCallback:
         # 5. Log to File (for persistence)
         log.info(msg.strip())
         
-        # 6. Detailed Analysis (Victory Lap or Autopsy)
-        # We now print this for ALL non-idle trials to understand drivers
+        # 6. Detailed Analysis (Victory Lap OR Autopsy for ALL active trials)
+        # AUDIT FIX: We now print this for ALL non-idle trials to ensure full visibility.
         if 'autopsy' in attrs and trades > 0:
-            report_type = "🏁 VICTORY LAP" if pnl > 0 else "🔎 AUTOPSY"
+            if pnl > 0:
+                report_type = "🏁 VICTORY LAP"
+            else:
+                report_type = "🔎 AUTOPSY"
+                
             report_msg = f"\n{report_type} (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
+            
+            # Explicitly log to file AND console
             print(report_msg, flush=True)
             log.info(report_msg)
 
@@ -199,7 +206,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                     'drift_threshold': trial.suggest_float('drift_threshold', 0.7, 1.5)
                 },
                 
-                # Hyper Confidence for Sniper Mode (Relaxed slightly for frequency)
+                # Middle Ground Confidence (Raised floor to 0.55)
                 'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.55, 0.85)
             })
             
@@ -240,8 +247,12 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             final_score = pnl_score + (metrics['sqn'] * sqn_weight)
             
             # Constraint: Minimum Trades (Configurable)
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 50)
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 25) # Tuned to 25
             total_trades = metrics['total_trades']
+            
+            # Activity Bonus (Encourage active bots)
+            if total_trades > 50:
+                final_score += 2.0
             
             if total_trades < min_trades:
                 trial.set_user_attr("pruned", True)

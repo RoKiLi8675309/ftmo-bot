@@ -116,7 +116,7 @@ def setup_logging(component_name: str = "FTMO_Bot", log_level_override: Optional
     # Saves to logs/ftmo_bot.log (or component specific)
     log_filename = CONFIG.get('logging', {}).get('file_path', 'ftmo_bot.log')
     if component_name != "FTMO_Bot":
-        # Prefix component name if distinct
+        # Prefix component name if distinct (e.g., research_ftmo_bot.log)
         log_filename = f"{component_name.lower()}_{log_filename}"
 
     log_file_path = os.path.join(log_dir, log_filename)
@@ -126,11 +126,16 @@ def setup_logging(component_name: str = "FTMO_Bot", log_level_override: Optional
             log_file_path,
             maxBytes=CONFIG.get('logging', {}).get('max_size_mb', 10) * 1024 * 1024,
             backupCount=CONFIG.get('logging', {}).get('backup_count', 5),
-            encoding='utf-8'
+            encoding='utf-8',
+            delay=False # Ensure file is created immediately
         )
         file_handler.setLevel(file_log_level)
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
+        
+        # Explicit feedback on log location
+        print(f"📝 Log File initialized at: {os.path.abspath(log_file_path)}")
+        
     except Exception as e:
         print(f"Logging setup failed (File Handler): {e}")
 
@@ -146,7 +151,8 @@ def setup_logging(component_name: str = "FTMO_Bot", log_level_override: Optional
 
     # 5. Silence Noisy Third-Party Libraries
     # These libraries are very chatty at DEBUG/INFO levels
-    # AUDIT FIX: Added optuna to silence list because we use custom EmojiCallback
+    # AUDIT FIX: We keep Optuna silenced here because EmojiCallback handles the important logs.
+    # If we unmute Optuna, the console becomes unreadable.
     noisy_libs = [
         "optuna", 
         "stable_baselines3", 
