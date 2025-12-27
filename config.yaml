@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V1.7 (PROFITABILITY PATCH)
-# STATUS: OPTIMIZED FOR 1:2 RISK:REWARD & TREND CAPTURE
+# config.yaml – PROJECT PHOENIX V1.8 (STABILITY PATCH)
+# STATUS: TUNED FOR CONTROLLED AGGRESSION (MIDDLE GROUND)
 #
-# CRITICAL UPDATES (2025-12-26):
-# 1. POSITIVE EXPECTANCY: Adjusted SL/TP to 1.5/3.0 ATR (1:2 Ratio).
-# 2. ENTRY RELAXATION: Aggressor Threshold lowered to 0.55 to reduce "Weak Candle" rejections.
-# 3. ML UNCHAINED: Probability Threshold lowered to 0.55 to increase sample size.
-# 4. VOLATILITY TUNING: Expansion threshold lowered to 1.5 to catch early moves.
+# CRITICAL UPDATES (2025-12-27):
+# 1. STOP THE CHURN: Raised Aggressor to 0.60 to reject noise candles.
+# 2. RAISE STANDARDS: ML Probability Threshold raised to 0.60.
+# 3. SURVIVAL MODE: Base Risk reduced to 0.1% to prevent drawdown blowouts.
+# 4. FILTER NOISE: Volatility Expansion raised to 1.8 to ignore small chops.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -125,33 +125,33 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 25 # Relaxed slightly from 30 to catch developing trends
+    threshold: 25 
     
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V1.7 OPTIMIZATION) ---
+# --- PHOENIX STRATEGY PARAMETERS (V1.8 STABILIZATION) ---
 phoenix_strategy:
   # Regime A: Volatility Expansion
-  vol_expansion_threshold: 1.5  # RELAXED: Catch moves earlier (was 2.0)
+  vol_expansion_threshold: 1.8  # TIGHTENED: From 1.5 to 1.8 to filter noise
   
   # Volume Exhaustion Cap
-  max_relative_volume: 3.0      # RELAXED: Don't exit strong trends too early (was 2.2)
+  max_relative_volume: 3.0      
   
   # Regime B: Momentum Trend
   ker_trend_threshold: 0.60      
   
   # Entry Gates
-  range_gate_atr_mult: 1.0      # RELAXED: Allow standard bars (was 1.2)
-  volume_gate_ratio: 1.0        # RELAXED: Allow average volume (was 1.1)
+  range_gate_atr_mult: 1.0      
+  volume_gate_ratio: 1.0        
   
-  # CRITICAL UPDATE: Lowered to 0.55. 
-  # Previous 0.70 was rejecting valid trends as "Indecision".
-  aggressor_threshold: 0.55     # Close > 55% of High-Low is Bullish
+  # CRITICAL UPDATE: Raised to 0.60.
+  # 0.55 was letting in too much garbage. 0.60 demands clearer direction.
+  aggressor_threshold: 0.60     # Close > 60% of High-Low is Bullish
   
-  ml_confirmation_threshold: 0.55 # Syncs with online_learning
+  ml_confirmation_threshold: 0.60 # Syncs with online_learning
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -166,7 +166,8 @@ risk_management:
   sizing_method: "fixed_risk"
   
   # Risk Per Trade
-  base_risk_per_trade_percent: 0.15 # Kept conservative. We solve PnL via R:R, not sizing.
+  # REMEDIATION: Reduced to 0.1% to survive drawdowns.
+  base_risk_per_trade_percent: 0.10 
   
   max_daily_loss_pct: 0.04
   max_total_loss_pct: 0.09
@@ -176,13 +177,13 @@ risk_management:
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (1:2 RISK:REWARD)
-  stop_loss_atr_mult: 1.5       # TIGHTENED: From 2.5 to 1.5 for better R:R
-  take_profit_atr_mult: 3.0     # ADJUSTED: Target 2.0x Reward
+  stop_loss_atr_mult: 1.5       # Kept tight to maintain R:R
+  take_profit_atr_mult: 3.0     # Target 2.0x Reward
   
   # TRAILING STOP
   trailing_stop:
     enabled: true
-    activation_atr: 2.0         # Start trailing after 2.0 ATR profit
+    activation_atr: 2.0         
     step_atr: 0.5               
   
   risk_timezone: "Europe/Prague"
@@ -191,7 +192,7 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 10        # Increased limit to allow ML to work
+  max_trades_per_day: 5        
   correlation_penalty_threshold: 0.8
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
@@ -223,14 +224,14 @@ online_learning:
   
   # CONFIGURATION
   n_models: 30        
-  grace_period: 200       # FASTER LEARNING (was 250)
+  grace_period: 200       
   delta: 0.00005          
   warning_delta: 0.001    
   lambda_value: 10        
   max_features: 'log2'    
   metric: "LogLoss"       
   
-  burn_in_periods: 200    # FASTER STARTUP (was 500)
+  burn_in_periods: 200    
   
   # Volatility Gate
   volatility_gate:
@@ -250,9 +251,9 @@ online_learning:
     
   learning_horizon_sec: 300
   
-  # CRITICAL FIX: Lowered to 0.55.
-  # The model needs to take trades to learn. 0.78 was choking it.
-  min_calibrated_probability: 0.55
+  # CRITICAL UPDATE: Raised to 0.60.
+  # We need slightly more than a coin flip (0.55) to justify risk.
+  min_calibrated_probability: 0.60
 
 # --- NEWS FILTER ---
 news_filter:
