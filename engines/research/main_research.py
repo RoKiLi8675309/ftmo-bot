@@ -5,16 +5,25 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-26 - SNIPER MODE & AUDIT FIX):
-# 1. DUPLICATE LOGGING FIX: Removed explicit print() calls in EmojiCallback.
-#    Relies strictly on log.info() to prevent double console output.
-# 2. CONFIG DYNAMICS: Automatically pulls new '15 trades' threshold from Config.
-# 3. SCORING: Retained SQN Weight 3.0 (Stability) + PnL Weight + Activity Bonus.
-# 4. WORKER VISIBILITY: Explicit logging setup in worker processes ensures
-#    output reaches the main console via StreamHandler without duplication.
+# AUDIT REMEDIATION (2025-12-27 - STABILITY PATCH V2.1):
+# 1. WORKER ADJUSTMENT: Set to (Logical Cores - 4) to target ~20 workers.
+# 2. TYPING FIX: Added missing 'typing' imports (Dict, List, Any).
+# 3. ROBUSTNESS: Maintained strict single-thread env vars for math libs to
+#    prevent SegFaults when running high worker counts.
 # =============================================================================
-import sys
 import os
+import sys
+
+# --- CRITICAL STABILITY FIX: FORCE SINGLE THREADING FOR MATH LIBS ---
+# This must happen BEFORE importing numpy/pandas/river to prevent SIGSEGV
+# when running massive parallel jobs. Even with 20 workers, we must serialise
+# the internal math threads to avoid OOM/Race conditions.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import argparse
 import logging
 import pickle
@@ -58,7 +67,6 @@ log = logging.getLogger("Research")
 class EmojiCallback:
     """
     Injects FTMO-style Emojis and RICH TELEMETRY into Optuna Trial reporting.
-    AUDIT FIX: Removed explicit print() calls to prevent duplicate console output.
     """
     def __call__(self, study, trial):
         val = trial.value
@@ -114,8 +122,7 @@ class EmojiCallback:
             f"#️⃣ {trades:<4}"
         )
         
-        # 4. Log to File & Console (Standard Logging handles both now)
-        # Workers need explicit logger setup to write to file (handled in _worker_optimize_task)
+        # 4. Log to File & Console
         log.info(msg.strip())
         
         # 5. Detailed Analysis (Victory Lap OR Autopsy for ALL active trials)
@@ -126,8 +133,6 @@ class EmojiCallback:
                 report_type = "🔎 AUTOPSY"
                 
             report_msg = f"\n{report_type} (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
-            
-            # Explicitly log to file AND console via logger
             log.info(report_msg)
 
 def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
@@ -164,10 +169,11 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
     ISOLATED WORKER FUNCTION: Runs in a separate process.
     Executes Optuna Optimization for a single symbol.
     """
-    # --- AUDIT FIX: SETUP LOGGING IN WORKER ---
-    # Joblib workers do not inherit file handles. We must re-initialize logging here.
+    # Double-Ensure Single Threading in Worker
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    
     setup_logging(f"Worker_{symbol}")
-    # Re-acquire logger for this process
     log = logging.getLogger(f"Worker_{symbol}")
     
     # Silence third-party libs in worker (Warning/Error only)
@@ -290,7 +296,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
         # Cleanup
         del df
         gc.collect()
-
+        
     except Exception as e:
         log.error(f"CRITICAL WORKER ERROR ({symbol}): {e}")
         import traceback
@@ -301,6 +307,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
     Trains the Final Production Model using the Best Params found.
     Also needs logging setup for isolated execution.
     """
+    os.environ["OMP_NUM_THREADS"] = "1"
     setup_logging(f"Worker_Final_{symbol}")
     log = logging.getLogger(f"Worker_Final_{symbol}")
     
@@ -371,9 +378,11 @@ class ResearchPipeline:
         self.backtest_candles = CONFIG['data'].get('num_candles_backtest', 500000)
         
         self.db_url = CONFIG['wfo']['db_url']
-        self.total_cores = max(1, psutil.cpu_count(logical=True) - 2)
         
-        # AUDIT FIX: Removed hardware logging from __init__ to prevent worker spam.
+        # AUDIT FIX: User requested 20 workers (Logical - 4)
+        # We respect this, but ensure OMP_NUM_THREADS=1 is set globally.
+        log_cores = psutil.cpu_count(logical=True)
+        self.total_cores = max(1, log_cores - 4) if log_cores else 10
 
     def get_fresh_model(self, params: Dict[str, Any] = None) -> Any:
         if params is None:
@@ -478,8 +487,7 @@ class ResearchPipeline:
 
     def run_training(self, fresh_start: bool = False):
         log.info(f"{LogSymbols.TIME} STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
-        # MOVED: Hardware logging happens ONCE here, not in every worker via __init__
-        log.info(f"HARDWARE DETECTED: {psutil.cpu_count(logical=True)} Cores. Using {self.total_cores} workers.")
+        log.info(f"HARDWARE DETECTED: {psutil.cpu_count(logical=True)} Cores. Using {self.total_cores} workers (Configured).")
         
         for symbol in self.symbols:
             study_name = f"study_{symbol}"
@@ -510,6 +518,7 @@ class ResearchPipeline:
         
         start_time = time.time()
         
+        # AUDIT FIX: Using 'loky' backend but with restricted OMP threads
         Parallel(n_jobs=self.total_cores, backend="loky")(
             delayed(_worker_optimize_task)(*t) for t in tasks
         )
