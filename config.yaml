@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V1.9 (SNIPER GATE PATCH)
-# STATUS: TUNED FOR HIGH PRECISION & CHURN REDUCTION
+# config.yaml – PROJECT PHOENIX V2.0 (TREND HUNTER PATCH)
+# STATUS: TUNED FOR EFFICIENCY & MTF ALIGNMENT
 #
-# CRITICAL UPDATES (2025-12-27):
-# 1. KILL THE CHURN: Raised Aggressor to 0.65. Only strong closes allowed.
-# 2. DEMAND VOLUME: Raised Volume Gate to 1.2. No low-volume drifting.
-# 3. HIGH STANDARDS: ML Probability Threshold raised to 0.65.
-# 4. CAPITAL PRESERVATION: Risk kept at 0.10% to survive drawdowns.
+# REMEDIATION APPLIED (2025-12-27):
+# 1. REGIME A KILLED: Volatility Expansion entries DISABLED. No more climax chasing.
+# 2. MTF LOCK: Hard requirement for D1 Trend Alignment (Price vs EMA200).
+# 3. EFFICIENCY FOCUS: KER Threshold raised to 0.70. Only smooth trends allowed.
+# 4. EXHAUSTION FILTER: Max RVol lowered to 2.5 to avoid stop-runs.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -132,26 +132,30 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V1.9 SNIPER MODE) ---
+# --- PHOENIX STRATEGY PARAMETERS (V2.0 TREND HUNTER) ---
 phoenix_strategy:
-  # Regime A: Volatility Expansion
-  vol_expansion_threshold: 2.0  # HARDENED: Only significant expansions.
+  # --- STRUCTURAL GATES ---
+  enable_regime_a_entries: false  # KILL SWITCH: No entries on Volatility Expansion
+  require_d1_trend: true          # GOLDEN RULE: Must align with D1 EMA200
   
-  # Volume Exhaustion Cap
-  max_relative_volume: 3.0      
+  # --- FILTER THRESHOLDS ---
+  # Volume Exhaustion: Lowered to 2.5 to avoid climax buying
+  max_relative_volume: 2.5       
   
-  # Regime B: Momentum Trend
-  ker_trend_threshold: 0.60      
+  # Trend Efficiency: Raised to 0.70. Only smooth trends.
+  ker_trend_threshold: 0.70       
+  
+  # Volatility Expansion (Only used for logging now, entries disabled)
+  vol_expansion_threshold: 2.0 
   
   # Entry Gates
-  range_gate_atr_mult: 1.1      # HARDENED: Must be > 1.1x ATR (was 1.0)
-  volume_gate_ratio: 1.2        # HARDENED: Must have volume backing (was 1.0)
+  range_gate_atr_mult: 1.1      # Must be > 1.1x ATR
+  volume_gate_ratio: 1.2        # Must have volume backing
   
-  # CRITICAL UPDATE: Raised to 0.65. 
-  # This cuts out the "weak" trend candles that were causing churn.
+  # Momentum Conviction
   aggressor_threshold: 0.65     # Close > 65% of High-Low is Bullish
   
-  ml_confirmation_threshold: 0.65 # Syncs with online_learning
+  ml_confirmation_threshold: 0.70 # Raised confidence floor
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -166,7 +170,6 @@ risk_management:
   sizing_method: "fixed_risk"
   
   # Risk Per Trade
-  # Kept low to survive the learning curve.
   base_risk_per_trade_percent: 0.10 
   
   max_daily_loss_pct: 0.04
@@ -177,14 +180,14 @@ risk_management:
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (1:2 RISK:REWARD)
-  stop_loss_atr_mult: 1.5       
-  take_profit_atr_mult: 3.0     
+  stop_loss_atr_mult: 1.5        
+  take_profit_atr_mult: 3.0      
   
   # TRAILING STOP
   trailing_stop:
     enabled: true
-    activation_atr: 2.0         
-    step_atr: 0.5               
+    activation_atr: 2.0          
+    step_atr: 0.5                
   
   risk_timezone: "Europe/Prague"
   friday_liquidation_hour_server: 21 
@@ -192,7 +195,7 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 5        
+  max_trades_per_day: 5         
   correlation_penalty_threshold: 0.8
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
@@ -216,7 +219,7 @@ trading:
   
   # --- EXECUTION OPTIMIZATION ---
   limit_order_offset_pips: 0.2 
-  limit_order_ttl_seconds: 60   
+  limit_order_ttl_seconds: 60    
 
 # --- ONLINE LEARNING ---
 online_learning:
@@ -224,12 +227,12 @@ online_learning:
   
   # CONFIGURATION
   n_models: 30        
-  grace_period: 200       
+  grace_period: 200        
   delta: 0.00005          
   warning_delta: 0.001    
   lambda_value: 10        
   max_features: 'log2'    
-  metric: "LogLoss"       
+  metric: "LogLoss"        
   
   burn_in_periods: 200    
   
@@ -251,9 +254,8 @@ online_learning:
     
   learning_horizon_sec: 300
   
-  # CRITICAL UPDATE: Raised to 0.65.
-  # We require "High Confidence" signals only.
-  min_calibrated_probability: 0.65
+  # CRITICAL UPDATE: Raised to 0.70. High conviction only.
+  min_calibrated_probability: 0.70
 
 # --- NEWS FILTER ---
 news_filter:

@@ -5,12 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-27 - V1.9 SNIPER GATE PATCH):
-# 1. 1:2 R:R RATIO: Adaptive Labeler uses 1.5 ATR Risk / 3.0 ATR Reward.
-# 2. SNIPER ENTRY: Aggressor Threshold raised to 0.65. Pure trend candles only.
-# 3. VOLUME GATE: Raised to 1.2. Volume must confirm price.
-# 4. RANGE GATE: Raised to 1.1 ATR. No small bar entries.
-# 5. ML STANDARD: Probability threshold raised to 0.65. High confidence only.
+# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.0 TREND HUNTER PATCH):
+# 1. REGIME A KILLED: Volatility Expansion entries disabled to stop climax chasing.
+# 2. MTF LOCK: Hard enforcement of D1 Trend Alignment (Price vs EMA200).
+# 3. EFFICIENCY FOCUS: KER Threshold raised to 0.70.
+# 4. EXHAUSTION FILTER: Max RVol lowered to 2.5.
 # =============================================================================
 import logging
 import sys
@@ -59,7 +58,7 @@ class ResearchStrategy:
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
         
-        # V1.9: Sync Labeler Risk with 1.5 ATR Stop
+        # Sync Labeler Risk with 1.5 ATR Stop
         risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 1.5)
         
         self.labeler = AdaptiveTripleBarrier(
@@ -100,27 +99,28 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX STRATEGY PARAMETERS (Refreshed from Config V1.9) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V2.0 CONFIG) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # Exhaustion Cap (3.0) - High tolerance for trend continuations
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.0)
+        # V2.0 GATES
+        self.enable_regime_a = phx_conf.get('enable_regime_a_entries', False)
+        self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         
-        # Thresholds (Aligned with V1.9 SNIPER Config)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.60)
+        # Exhaustion Cap (Lowered to 2.5 to avoid stop-runs)
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 2.5)
         
-        # V1.9 HARDENING: Stricter Entry Gates
-        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.1)  # Was 1.0
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.2)     # Was 1.0
+        # Thresholds (V2.0 Trend Hunter)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.70)
         
-        # V1.9 CRITICAL: Raised to 0.65 to kill churn.
-        # Only candles closing in the top/bottom 35% are allowed.
+        # Entry Gates
+        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.1)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.2)
+        
+        # Momentum
         self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.65)
-        
-        # V1.9: Significant expansion only
         self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0) 
         
-        self.limit_offset = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
+        self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
         
         # Friday Liquidation
         self.friday_close_hour = CONFIG.get('risk_management', {}).get('friday_liquidation_hour_server', 21)
@@ -158,7 +158,6 @@ class ResearchStrategy:
             dt_ts = datetime.now()
 
         # --- FRIDAY LIQUIDATION CHECK (GAP PROTECTION) ---
-        # If it's Friday and past the liquidation hour, Close ALL and Return
         if dt_ts.weekday() == 4 and dt_ts.hour >= self.friday_close_hour:
             if self.symbol in broker.positions:
                 pos = broker.positions[self.symbol]
@@ -167,11 +166,11 @@ class ResearchStrategy:
             return # Block new entries
         # -------------------------------------------------
 
-        # Flow Volumes (L2 Proxies now handled by Feature Engineer if missing)
+        # Flow Volumes (L2 Proxies handled by Feature Engineer)
         buy_vol = snapshot.get_price(self.symbol, 'buy_vol')
         sell_vol = snapshot.get_price(self.symbol, 'sell_vol')
         
-        # --- RETAIL FALLBACK LOGIC (Pre-Feature Engineer) ---
+        # --- RETAIL FALLBACK LOGIC ---
         if buy_vol == 0 and sell_vol == 0:
             if self.last_price > 0:
                 if price > self.last_price:
@@ -248,7 +247,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. PROJECT PHOENIX: LOGIC GATES (V1.9 SNIPER MODE)
+        # D. PROJECT PHOENIX: LOGIC GATES (V2.0 TREND HUNTER)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
@@ -256,7 +255,6 @@ class ResearchStrategy:
         parkinson = features.get('parkinson_vol', 0.0)
         ker_val = features.get('ker', 0.5)
         aggressor = features.get('aggressor', 0.5)
-        amihud = features.get('amihud', 0.0)
         atr_val = features.get('atr', 0.0001)
         
         # --- CRITICAL FILTER 1: VOLUME EXHAUSTION ---
@@ -265,17 +263,23 @@ class ResearchStrategy:
             self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
             return # Force HOLD
             
+        # --- CRITICAL FILTER 2: MTF TREND LOCK (V2.0) ---
+        d1_ema = context_data.get('d1', {}).get('ema200', 0.0)
+        can_buy_d1 = True
+        can_sell_d1 = True
+        
+        if self.require_d1_trend and d1_ema > 0:
+            if price < d1_ema:
+                can_buy_d1 = False # Downtrend, no buys
+            elif price > d1_ema:
+                can_sell_d1 = False # Uptrend, no sells
+
         # 2. Gate Definitions
         bar_range = high - low
-        
-        # Gate A: Range Expansion (V1.9: Must be > 1.1x ATR)
         range_gate = bar_range > (self.range_gate_mult * atr_val)
-        
-        # Gate B: Volume Participation (V1.9: Must be > 1.2x Avg Volume)
         vol_gate = rvol > self.vol_gate_ratio
         
-        # Gate C: Momentum Direction (Aggressor Ratio)
-        # V1.9: > 0.65 = Bullish, < 0.35 = Bearish (SNIPER PRECISION)
+        # Momentum Direction (Aggressor Ratio)
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
@@ -285,6 +289,11 @@ class ResearchStrategy:
         # --- REGIME A: VOLATILITY EXPANSION (THE DRAGON) ---
         # Logic: Big Range + Volume + Directional Close
         if range_gate and vol_gate:
+            # V2.0: Disable entries if config says so (Anti-Climax)
+            if not self.enable_regime_a:
+                self.rejection_stats["Regime A: Disabled (Climax Protection)"] += 1
+                return
+                
             if is_bullish_candle:
                 proposed_action = 1
                 regime_label = "A (Exp-Long)"
@@ -315,6 +324,14 @@ class ResearchStrategy:
         if proposed_action == 0:
             return
 
+        # --- APPLY MTF LOCK ---
+        if proposed_action == 1 and not can_buy_d1:
+            self.rejection_stats[f"MTF Lock (Price {price:.2f} < EMA {d1_ema:.2f})"] += 1
+            return
+        if proposed_action == -1 and not can_sell_d1:
+            self.rejection_stats[f"MTF Lock (Price {price:.2f} > EMA {d1_ema:.2f})"] += 1
+            return
+
         # ---------------------------------------------------------------------
         # MEAN REVERSION FILTER (Safety)
         # Prevent "Selling the Hole" (Shorting when Price < BB Lower or RSI < 30)
@@ -323,13 +340,10 @@ class ResearchStrategy:
         rsi_val = features.get('rsi_norm', 0.5)
         
         if proposed_action == -1: # SELL
-            # bb_position < 0.0 implies Price < Lower Band
-            # rsi_norm < 0.30 implies RSI < 30
             if bb_pos < 0.0 or rsi_val < 0.30:
                 self.rejection_stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
                 return
         elif proposed_action == 1: # BUY
-            # Don't buy the top (Price > Upper Band or RSI > 70)
             if bb_pos > 1.0 or rsi_val > 0.70:
                 self.rejection_stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
                 return
@@ -359,8 +373,6 @@ class ResearchStrategy:
                 self.meta_label_events += 1
 
             # --- EXECUTION ---
-            # REMEDIATION V1.9: Defaults to 0.65 if not specified (Raised from 0.60)
-            # This ensures we only take high-conviction ML signals.
             min_prob = self.params.get('min_calibrated_probability', 0.65)
             
             if confidence < min_prob:
@@ -398,7 +410,17 @@ class ResearchStrategy:
         # D1 EMA 200
         if len(self.d1_buffer) > 0:
             arr = np.array(self.d1_buffer)
-            ema = np.mean(arr) 
+            # Standard EMA Calculation
+            if len(arr) < 200:
+                ema = np.mean(arr)
+            else:
+                # Use standard EMA formula over buffer
+                span = 200
+                alpha = 2 / (span + 1)
+                # Quick approximate EMA on buffer (last value is latest)
+                ema = arr[0]
+                for x in arr[1:]:
+                    ema = (alpha * x) + ((1 - alpha) * ema)
             ctx['d1']['ema200'] = ema
             
         # H4 RSI 14
@@ -438,7 +460,7 @@ class ResearchStrategy:
 
         # Hard Microstructure Filter (Amihud & OFI)
         amihud = features.get('amihud', 0.0)
-        if amihud > 15.0: # Relaxed illiquidity filter
+        if amihud > 15.0: 
              self.rejection_stats["High Illiquidity (Amihud)"] += 1
              # return 
 
@@ -455,7 +477,7 @@ class ResearchStrategy:
             stop_loss_price=0.0,
             account_equity=broker.equity,
             account_currency="USD",
-            win_rate=0.45, # V1.7: Adjusted expectation for 1:2 R:R
+            win_rate=0.45, 
             risk_reward_ratio=2.0
         )
 
@@ -502,7 +524,7 @@ class ResearchStrategy:
             timestamp_created=timestamp,
             stop_loss=sl_price,
             take_profit=tp_price,
-            comment=f"{trade_intent.comment}|Regime:{regime}|Limit:{self.limit_offset}p",
+            comment=f"{trade_intent.comment}|Regime:{regime}|Limit:{self.limit_order_offset_pips}p",
             # METADATA FOR CSV LOGGING
             metadata={
                 'regime': regime,

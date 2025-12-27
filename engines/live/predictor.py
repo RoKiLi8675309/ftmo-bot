@@ -7,11 +7,10 @@
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
 # PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.0 TREND HUNTER PATCH):
-# 1. MTF CONTEXT: Enforces hard alignment with D1/H4 trends.
-# 2. TREND ENTRY: Aggressor raised to 0.70. Only undeniable momentum.
-# 3. VOLUME GATE: Raised to 1.5x. Institutional participation required.
-# 4. EXHAUSTION: Relaxed to 3.5x to allow massive breakout candles.
-# 5. ML STANDARD: Probability Floor raised to 0.65.
+# 1. REGIME A KILLED: Volatility Expansion entries disabled (Climax Protection).
+# 2. MTF LOCK: Hard enforcement of D1 Trend Alignment (Price vs EMA200).
+# 3. EFFICIENCY FOCUS: KER Threshold raised to 0.70.
+# 4. EXHAUSTION FILTER: Max RVol lowered to 2.5.
 # =============================================================================
 import logging
 import pickle
@@ -108,19 +107,23 @@ class MultiAssetPredictor:
         # --- PHOENIX STRATEGY PARAMETERS (Matched to V2.0 Config) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V2.0: Relaxed Exhaustion Cap to 3.5x to allow massive breakouts
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.5)
+        # V2.0 GATES
+        self.enable_regime_a = phx_conf.get('enable_regime_a_entries', False)
+        self.require_d1_trend = phx_conf.get('require_d1_trend', True)
+        
+        # V2.0: Lowered Exhaustion Cap to 2.5x to avoid stop-runs
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 2.5)
         
         # Conviction Thresholds (V2.0 Trend Hunter)
         self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.60)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.70)
         
         # HARD GATES
-        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.2)
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.5)
+        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.1)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.2)
         
-        # V2.0 CRITICAL: Raised to 0.70. Undeniable momentum only.
-        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.70)
+        # V2.0 CRITICAL: Raised to 0.65. Undeniable momentum only.
+        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.65)
         
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
@@ -176,7 +179,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix Logic.
+        Executes the Learn-Predict Loop with Project Phoenix V2.0 Logic.
         """
         if symbol not in self.symbols: return None
         
@@ -215,16 +218,13 @@ class MultiAssetPredictor:
                 else:
                     buy_vol = bar.volume / 2.0
                     sell_vol = bar.volume / 2.0
-            else:
-                buy_vol = bar.volume / 2.0
-                sell_vol = bar.volume / 2.0
         
         self.last_close_prices[symbol] = bar.close
 
         # 1. Feature Engineering (Now digesting D1/H4 Context)
         features = fe.update(
             price=bar.close,
-            timestamp=bar.timestamp,
+            timestamp=bar.timestamp.timestamp(),
             volume=bar.volume,
             high=bar.high,
             low=bar.low,
@@ -277,7 +277,7 @@ class MultiAssetPredictor:
 
         # 3. Add CURRENT Bar as new Trade Opportunity
         current_atr = features.get('atr', 0.0)
-        labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
+        labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp())
 
         # ============================================================
         # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V2.0)
@@ -289,23 +289,35 @@ class MultiAssetPredictor:
         aggressor = features.get('aggressor', 0.5)
         amihud = features.get('amihud', 0.0)
         atr_val = features.get('atr', 0.0001)
+        parkinson = features.get('parkinson_vol', 0.0)
+        mtf_align = features.get('mtf_alignment', 0.0)
         
         # --- CRITICAL FIX 1: VOLUME EXHAUSTION FILTER ---
         if rvol > self.max_rvol_thresh:
             stats[f"Volume Climax (RVol {rvol:.2f})"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
+            
+        # --- CRITICAL FILTER 2: MTF TREND LOCK (V2.0) ---
+        d1_ema = context_data.get('d1', {}).get('ema200', 0.0) if context_data else 0.0
+        can_buy_d1 = True
+        can_sell_d1 = True
         
+        if self.require_d1_trend and d1_ema > 0:
+            if bar.close < d1_ema:
+                can_buy_d1 = False # Price below EMA, only sells allowed
+            elif bar.close > d1_ema:
+                can_sell_d1 = False # Price above EMA, only buys allowed
+
         # Gate Definitions
         bar_range = bar.high - bar.low
         
-        # Gate A: Range Expansion (V2.0: Must be > 1.2x ATR)
+        # Gate A: Range Expansion
         range_gate = bar_range > (self.range_gate_mult * atr_val)
         
-        # Gate B: Volume Participation (V2.0: Must be > 1.5x Avg Volume)
+        # Gate B: Volume Participation
         vol_gate = rvol > self.vol_gate_ratio
         
         # Gate C: Momentum Direction (Aggressor Ratio)
-        # V2.0: > 0.70 = Bullish, < 0.30 = Bearish (UNDENIABLE MOMENTUM)
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
@@ -314,6 +326,11 @@ class MultiAssetPredictor:
         
         # --- REGIME A: VOLATILITY EXPANSION (THE DRAGON) ---
         if range_gate and vol_gate:
+            # V2.0: Disable entries if config says so (Anti-Climax)
+            if not self.enable_regime_a:
+                stats["Regime A: Disabled (Climax Protection)"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": "Regime A Disabled"})
+
             if is_bullish_candle:
                 proposed_action = 1
                 regime_label = "A (Exp-Long)"
@@ -342,6 +359,14 @@ class MultiAssetPredictor:
 
         if proposed_action == 0:
             return Signal(symbol, "HOLD", 0.0, {"reason": "No Trigger"})
+
+        # --- APPLY MTF LOCK ---
+        if proposed_action == 1 and not can_buy_d1:
+            stats[f"MTF Lock (Price < D1 EMA)"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "MTF Lock"})
+        if proposed_action == -1 and not can_sell_d1:
+            stats[f"MTF Lock (Price > D1 EMA)"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "MTF Lock"})
 
         # ---------------------------------------------------------------------
         # MEAN REVERSION FILTER (Safety Check)
@@ -378,13 +403,8 @@ class MultiAssetPredictor:
         )
 
         # --- DECISION ---
-        current_ker = features.get('ker', 1.0)
-        volatility = features.get('volatility', 0.001)
-        parkinson = features.get('parkinson_vol', 0.0)
-        mtf_align = features.get('mtf_alignment', 0.0)
-        
-        # V2.0: Defaults to 0.65 if not specified (Raised from 0.60)
-        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.65)
+        # V2.0: Defaults to 0.70 if not specified (Raised from 0.65)
+        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.70)
 
         # Safety Check: If ML thinks probability is terrible (< min_prob), skip.
         if confidence < min_prob:
@@ -406,9 +426,9 @@ class MultiAssetPredictor:
                 
                 return Signal(symbol, action_str, confidence, {
                     "meta_ok": True, 
-                    "volatility": volatility, 
+                    "volatility": features.get('volatility', 0.001), 
                     "atr": current_atr, 
-                    "ker": current_ker, 
+                    "ker": ker_val, 
                     "parkinson_vol": parkinson, 
                     "rvol": rvol,
                     "amihud": amihud,
