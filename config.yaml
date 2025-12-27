@@ -1,12 +1,12 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V1.8 (STABILITY PATCH)
-# STATUS: TUNED FOR CONTROLLED AGGRESSION (MIDDLE GROUND)
+# config.yaml – PROJECT PHOENIX V1.9 (SNIPER GATE PATCH)
+# STATUS: TUNED FOR HIGH PRECISION & CHURN REDUCTION
 #
 # CRITICAL UPDATES (2025-12-27):
-# 1. STOP THE CHURN: Raised Aggressor to 0.60 to reject noise candles.
-# 2. RAISE STANDARDS: ML Probability Threshold raised to 0.60.
-# 3. SURVIVAL MODE: Base Risk reduced to 0.1% to prevent drawdown blowouts.
-# 4. FILTER NOISE: Volatility Expansion raised to 1.8 to ignore small chops.
+# 1. KILL THE CHURN: Raised Aggressor to 0.65. Only strong closes allowed.
+# 2. DEMAND VOLUME: Raised Volume Gate to 1.2. No low-volume drifting.
+# 3. HIGH STANDARDS: ML Probability Threshold raised to 0.65.
+# 4. CAPITAL PRESERVATION: Risk kept at 0.10% to survive drawdowns.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -132,10 +132,10 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V1.8 STABILIZATION) ---
+# --- PHOENIX STRATEGY PARAMETERS (V1.9 SNIPER MODE) ---
 phoenix_strategy:
   # Regime A: Volatility Expansion
-  vol_expansion_threshold: 1.8  # TIGHTENED: From 1.5 to 1.8 to filter noise
+  vol_expansion_threshold: 2.0  # HARDENED: Only significant expansions.
   
   # Volume Exhaustion Cap
   max_relative_volume: 3.0      
@@ -144,14 +144,14 @@ phoenix_strategy:
   ker_trend_threshold: 0.60      
   
   # Entry Gates
-  range_gate_atr_mult: 1.0      
-  volume_gate_ratio: 1.0        
+  range_gate_atr_mult: 1.1      # HARDENED: Must be > 1.1x ATR (was 1.0)
+  volume_gate_ratio: 1.2        # HARDENED: Must have volume backing (was 1.0)
   
-  # CRITICAL UPDATE: Raised to 0.60.
-  # 0.55 was letting in too much garbage. 0.60 demands clearer direction.
-  aggressor_threshold: 0.60     # Close > 60% of High-Low is Bullish
+  # CRITICAL UPDATE: Raised to 0.65. 
+  # This cuts out the "weak" trend candles that were causing churn.
+  aggressor_threshold: 0.65     # Close > 65% of High-Low is Bullish
   
-  ml_confirmation_threshold: 0.60 # Syncs with online_learning
+  ml_confirmation_threshold: 0.65 # Syncs with online_learning
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -166,7 +166,7 @@ risk_management:
   sizing_method: "fixed_risk"
   
   # Risk Per Trade
-  # REMEDIATION: Reduced to 0.1% to survive drawdowns.
+  # Kept low to survive the learning curve.
   base_risk_per_trade_percent: 0.10 
   
   max_daily_loss_pct: 0.04
@@ -177,8 +177,8 @@ risk_management:
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (1:2 RISK:REWARD)
-  stop_loss_atr_mult: 1.5       # Kept tight to maintain R:R
-  take_profit_atr_mult: 3.0     # Target 2.0x Reward
+  stop_loss_atr_mult: 1.5       
+  take_profit_atr_mult: 3.0     
   
   # TRAILING STOP
   trailing_stop:
@@ -251,9 +251,9 @@ online_learning:
     
   learning_horizon_sec: 300
   
-  # CRITICAL UPDATE: Raised to 0.60.
-  # We need slightly more than a coin flip (0.55) to justify risk.
-  min_calibrated_probability: 0.60
+  # CRITICAL UPDATE: Raised to 0.65.
+  # We require "High Confidence" signals only.
+  min_calibrated_probability: 0.65
 
 # --- NEWS FILTER ---
 news_filter:

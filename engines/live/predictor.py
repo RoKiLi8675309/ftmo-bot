@@ -6,11 +6,12 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-27 - V1.8 STABILITY PATCH):
-# 1. EXHAUSTION FILTER: RVol Cap relaxed to 3.0 to align with config.
-# 2. NOISE FILTER: Volatility Expansion raised to 1.8 to filter chop.
-# 3. CONTROLLED AGGRESSION: Aggressor raised to 0.60 to stop churning.
-# 4. ML STANDARD: Probability Floor raised to 0.60.
+# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.0 TREND HUNTER PATCH):
+# 1. MTF CONTEXT: Enforces hard alignment with D1/H4 trends.
+# 2. TREND ENTRY: Aggressor raised to 0.70. Only undeniable momentum.
+# 3. VOLUME GATE: Raised to 1.5x. Institutional participation required.
+# 4. EXHAUSTION: Relaxed to 3.5x to allow massive breakout candles.
+# 5. ML STANDARD: Probability Floor raised to 0.65.
 # =============================================================================
 import logging
 import pickle
@@ -104,22 +105,22 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (Matched to V1.8 Config) ---
+        # --- PHOENIX STRATEGY PARAMETERS (Matched to V2.0 Config) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # REMEDIATION: Exhaustion Cap (3.0)
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.0)
+        # V2.0: Relaxed Exhaustion Cap to 3.5x to allow massive breakouts
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.5)
         
-        # Conviction Thresholds (V1.8 Updates)
-        # V1.8: Tighter expansion threshold (1.8) to filter chop
-        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.8)
+        # Conviction Thresholds (V2.0 Trend Hunter)
+        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0)
         self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.60)
         
-        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.0)
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.0)
+        # HARD GATES
+        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.2)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.5)
         
-        # V1.8 CRITICAL: Raised to 0.60 to stop churning entries
-        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.60)
+        # V2.0 CRITICAL: Raised to 0.70. Undeniable momentum only.
+        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.70)
         
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
@@ -279,7 +280,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp)
 
         # ============================================================
-        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V1.8)
+        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V2.0)
         # ============================================================
         
         # Extract Core Indicators
@@ -297,14 +298,14 @@ class MultiAssetPredictor:
         # Gate Definitions
         bar_range = bar.high - bar.low
         
-        # Gate A: Range Expansion (Relaxed 1.0)
+        # Gate A: Range Expansion (V2.0: Must be > 1.2x ATR)
         range_gate = bar_range > (self.range_gate_mult * atr_val)
         
-        # Gate B: Volume Participation (Relaxed 1.0)
+        # Gate B: Volume Participation (V2.0: Must be > 1.5x Avg Volume)
         vol_gate = rvol > self.vol_gate_ratio
         
         # Gate C: Momentum Direction (Aggressor Ratio)
-        # V1.8: > 0.60 = Bullish, < 0.40 = Bearish (TIGHTER vs V1.7)
+        # V2.0: > 0.70 = Bullish, < 0.30 = Bearish (UNDENIABLE MOMENTUM)
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
@@ -382,8 +383,8 @@ class MultiAssetPredictor:
         parkinson = features.get('parkinson_vol', 0.0)
         mtf_align = features.get('mtf_alignment', 0.0)
         
-        # V1.8: Defaults to 0.60 if not specified (Raised from 0.55)
-        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.60)
+        # V2.0: Defaults to 0.65 if not specified (Raised from 0.60)
+        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.65)
 
         # Safety Check: If ML thinks probability is terrible (< min_prob), skip.
         if confidence < min_prob:
