@@ -5,11 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-26 - REMEDIATION PATCH):
-# 1. EXHAUSTION FILTER: Blocks entries if RVol > max_relative_volume (2.2).
-# 2. CONVICTION GATES: Raised thresholds for Range, RVol, and Aggressor.
-# 3. STOP LOSS: Widened to 2.5 ATR to survive low-volatility noise.
-# 4. ML FILTER: Enforces stricter probability threshold (0.78).
+# PHOENIX STRATEGY UPGRADE (2025-12-26 - V1.7 PROFITABILITY PATCH):
+# 1. 1:2 R:R RATIO: Adaptive Labeler now uses 1.5 ATR Risk / 3.0 ATR Reward (via Config).
+# 2. RELAXED GATES: Lowered Aggressor (0.55), Range (1.0), and Vol (1.0) thresholds.
+# 3. EXHAUSTION FILTER: Relaxed RVol cap to 3.0 to capture strong trends.
+# 4. ML UNCHAINED: Probability threshold lowered to 0.55 to increase trade frequency.
 # =============================================================================
 import logging
 import sys
@@ -57,9 +57,13 @@ class ResearchStrategy:
         
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
+        
+        # CRITICAL V1.7 UPDATE: Sync Labeler Risk with new 1.5 ATR Stop
+        risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 1.5)
+        
         self.labeler = AdaptiveTripleBarrier(
             horizon_ticks=tbm_conf.get('horizon_minutes', 60),
-            risk_mult=CONFIG['risk_management']['stop_loss_atr_mult'], # Uses Config (2.5)
+            risk_mult=risk_mult_conf, 
             reward_mult=tbm_conf.get('barrier_width', 1.5),
             drift_threshold=tbm_conf.get('drift_threshold', 1.2)
         )
@@ -73,7 +77,7 @@ class ResearchStrategy:
         self.calibrator_sell = ProbabilityCalibrator(window=2000)
         
         # 5. Warm-up State
-        self.burn_in_limit = params.get('burn_in_periods', 500) 
+        self.burn_in_limit = params.get('burn_in_periods', 200) # Faster V1.7 Startup
         self.burn_in_counter = 0
         self.burn_in_complete = False
         
@@ -95,18 +99,18 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX STRATEGY PARAMETERS (Refreshed from Config) ---
+        # --- PHOENIX STRATEGY PARAMETERS (Refreshed from Config V1.7) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # REMEDIATION: Load the new Exhaustion Cap
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 2.2)
+        # REMEDIATION: Relaxed Exhaustion Cap (3.0)
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.0)
         
-        # Thresholds (Aligned with V1.6 Config)
+        # Thresholds (Aligned with V1.7 Config)
         self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.60)
-        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.2)
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.1)
-        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.60)
-        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0)
+        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.0) # Relaxed
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.0)     # Relaxed
+        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55) # Lowered to 0.55
+        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.5) # Lowered to 1.5
         
         self.limit_offset = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
         
@@ -236,7 +240,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. PROJECT PHOENIX: LOGIC GATES (REMEDIATION MODE)
+        # D. PROJECT PHOENIX: LOGIC GATES (V1.7 OPTIMIZATION)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
@@ -247,8 +251,9 @@ class ResearchStrategy:
         amihud = features.get('amihud', 0.0)
         atr_val = features.get('atr', 0.0001)
         
-        # --- CRITICAL FIX 1: VOLUME EXHAUSTION FILTER ---
+        # --- CRITICAL FILTER 1: VOLUME EXHAUSTION ---
         # Rejects Volume Climaxes (Panic Selling / Blow-off Tops)
+        # V1.7: Threshold relaxed to 3.0 to avoid early exits
         if rvol > self.max_rvol_thresh:
             self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
             return # Force HOLD
@@ -256,14 +261,14 @@ class ResearchStrategy:
         # 2. Gate Definitions
         bar_range = high - low
         
-        # Gate A: Range Expansion (Market is waking up)
+        # Gate A: Range Expansion (Relaxed 1.0)
         range_gate = bar_range > (self.range_gate_mult * atr_val)
         
-        # Gate B: Volume Participation (Move is supported)
+        # Gate B: Volume Participation (Relaxed 1.0)
         vol_gate = rvol > self.vol_gate_ratio
         
         # Gate C: Momentum Direction (Aggressor Ratio)
-        # Stricter > 0.60 = Bullish, < 0.40 = Bearish
+        # V1.7: > 0.55 = Bullish, < 0.45 = Bearish
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
@@ -271,7 +276,7 @@ class ResearchStrategy:
         regime_label = "C (Noise)"
         
         # --- REGIME A: VOLATILITY EXPANSION (THE DRAGON) ---
-        # Logic: Big Range + High Volume + Directional Close
+        # Logic: Big Range + Volume + Directional Close
         if range_gate and vol_gate:
             if is_bullish_candle:
                 proposed_action = 1
@@ -347,8 +352,8 @@ class ResearchStrategy:
                 self.meta_label_events += 1
 
             # --- EXECUTION ---
-            # REMEDIATION: Using STRICT 0.78 probability from Params/Config
-            min_prob = self.params.get('min_calibrated_probability', 0.78)
+            # REMEDIATION V1.7: Defaults to 0.55 if not specified (Lowered from 0.78)
+            min_prob = self.params.get('min_calibrated_probability', 0.55)
             
             if confidence < min_prob:
                 self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob})"] += 1
@@ -442,7 +447,7 @@ class ResearchStrategy:
             stop_loss_price=0.0,
             account_equity=broker.equity,
             account_currency="USD",
-            win_rate=0.55,
+            win_rate=0.45, # V1.7: Adjusted expectation for 1:2 R:R
             risk_reward_ratio=2.0
         )
 
