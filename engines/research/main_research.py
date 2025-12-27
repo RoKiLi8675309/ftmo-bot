@@ -12,6 +12,7 @@
 #    the new V1.4 config gates.
 # 3. SCORING: SQN Weight 3.0 (Stability) + PnL Weight + Activity Bonus.
 # 4. ARCHITECTURE FIX: Explicit logging setup in worker processes.
+# 5. CONSOLE CLEANUP: Moved hardware detection logs to main process only.
 # =============================================================================
 import sys
 import os
@@ -378,7 +379,8 @@ class ResearchPipeline:
         self.db_url = CONFIG['wfo']['db_url']
         self.total_cores = max(1, psutil.cpu_count(logical=True) - 2)
         
-        log.info(f"HARDWARE DETECTED: {psutil.cpu_count(logical=True)} Cores. Using {self.total_cores} workers.")
+        # AUDIT FIX: Removed hardware logging here to prevent worker spam.
+        # It is now logged once in run_training.
 
     def get_fresh_model(self, params: Dict[str, Any] = None) -> Any:
         if params is None:
@@ -483,6 +485,7 @@ class ResearchPipeline:
 
     def run_training(self, fresh_start: bool = False):
         log.info(f"{LogSymbols.TIME} STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
+        log.info(f"HARDWARE DETECTED: {psutil.cpu_count(logical=True)} Cores. Using {self.total_cores} workers.")
         
         for symbol in self.symbols:
             study_name = f"study_{symbol}"

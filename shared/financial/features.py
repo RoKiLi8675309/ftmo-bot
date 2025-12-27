@@ -10,6 +10,7 @@
 # 2. VOLATILITY: Added High-Low Range Volatility (Parkinson) for expansion detection.
 # 3. LIQUIDITY: Added Amihud Illiquidity Proxy (Return / DollarVolume).
 # 4. MOMENTUM: Added Aggressor Ratio (Close vs Range) and Relative Volume (Duration Intensity).
+# 5. AUDIT FIX: Silenced HMM Convergence Warnings to clean up console output.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -379,10 +380,12 @@ class RegimeDetector:
                 elif hasattr(self.model, 'startprob_'):
                     self.model.init_params = ""
 
+                # --- AUDIT FIX: SILENCE HMM WARNINGS ---
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
+                        warnings.simplefilter("ignore") # Ignore all warnings during fit
                         self.model.fit(data)
+                # --------------------------------------
                 
                 if self.model.monitor_.converged:
                     variances = np.array([np.mean(np.diag(c)) for c in self.model.covars_])
@@ -909,7 +912,7 @@ class OnlineFeatureEngineer:
             'vol_ratio': vol_ratio,
             'volatility_log': math.log(volatility_val + 1e-9),
             'micro_ofi': micro_ofi_z,
-            'ofi_simple': ofi_simple,        
+            'ofi_simple': ofi_simple,         
             'efficiency_ratio': er_val,
             'cum_ofi': cum_ofi,
             'ofi_trend': ofi_trend,

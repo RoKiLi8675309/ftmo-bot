@@ -5,6 +5,9 @@
 # DEPENDENCIES: shared.core.config
 # DESCRIPTION: Central logging configuration. Defines Emojis and Filters.
 # CRITICAL: Python 3.9 Compatible. Unmutes Optuna for Research Transparency.
+# AUDIT REMEDIATION:
+#   - CLEANUP: Removed initialization print statement to reduce console spam.
+#   - SILENCE: Added 'hmmlearn' to noisy_libs to suppress convergence warnings.
 # =============================================================================
 
 import logging
@@ -133,8 +136,8 @@ def setup_logging(component_name: str = "FTMO_Bot", log_level_override: Optional
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
         
-        # Explicit feedback on log location (AUDIT FIX: Issue 1)
-        print(f"📝 Log File initialized at: {os.path.abspath(log_file_path)}")
+        # AUDIT FIX: Removed print statement to clean up console output
+        # print(f"📝 Log File initialized at: {os.path.abspath(log_file_path)}")
         
     except Exception as e:
         print(f"Logging setup failed (File Handler): {e}")
@@ -151,8 +154,7 @@ def setup_logging(component_name: str = "FTMO_Bot", log_level_override: Optional
 
     # 5. Silence Noisy Third-Party Libraries
     # These libraries are very chatty at DEBUG/INFO levels
-    # AUDIT FIX: We keep Optuna silenced here because EmojiCallback handles the important logs.
-    # If we unmute Optuna, the console becomes unreadable.
+    # AUDIT FIX: Added 'hmmlearn' to suppress convergence warnings
     noisy_libs = [
         "optuna", 
         "stable_baselines3", 
@@ -165,7 +167,8 @@ def setup_logging(component_name: str = "FTMO_Bot", log_level_override: Optional
         "asyncio",
         "faker",
         "PIL",
-        "websockets"
+        "websockets",
+        "hmmlearn" 
     ]
     
     for lib in noisy_libs:
