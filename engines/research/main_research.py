@@ -5,19 +5,18 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (2025-12-27 - STABILITY PATCH V2.1):
-# 1. WORKER ADJUSTMENT: Set to (Logical Cores - 4) to target ~20 workers.
-# 2. TYPING FIX: Added missing 'typing' imports (Dict, List, Any).
-# 3. ROBUSTNESS: Maintained strict single-thread env vars for math libs to
-#    prevent SegFaults when running high worker counts.
+# AUDIT REMEDIATION (2025-12-27 - DATA FIDELITY PATCH):
+# 1. FIDELITY FIX: Forced Backtest to use 'train_candles' (4M) instead of
+#    'backtest_candles' (200k). This ensures Volume Bar alignment.
+# 2. WORKER SAFETY: Kept 20 workers + Single Threading.
+# 3. TYPING: Preserved all imports.
 # =============================================================================
 import os
 import sys
 
 # --- CRITICAL STABILITY FIX: FORCE SINGLE THREADING FOR MATH LIBS ---
 # This must happen BEFORE importing numpy/pandas/river to prevent SIGSEGV
-# when running massive parallel jobs. Even with 20 workers, we must serialise
-# the internal math threads to avoid OOM/Race conditions.
+# when running massive parallel jobs.
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -379,8 +378,7 @@ class ResearchPipeline:
         
         self.db_url = CONFIG['wfo']['db_url']
         
-        # AUDIT FIX: User requested 20 workers (Logical - 4)
-        # We respect this, but ensure OMP_NUM_THREADS=1 is set globally.
+        # AUDIT FIX: Use (Logical - 4) for worker count
         log_cores = psutil.cpu_count(logical=True)
         self.total_cores = max(1, log_cores - 4) if log_cores else 10
 
@@ -552,7 +550,10 @@ class ResearchPipeline:
 
     def _run_backtest_symbol(self, symbol: str) -> List[Dict]:
         try:
-            df = process_data_into_bars(symbol, n_ticks=self.backtest_candles)
+            # --- CRITICAL DATA ALIGNMENT FIX ---
+            # Use self.train_candles (High Fidelity) instead of self.backtest_candles
+            # to ensure Volume Bars are identical to training phase.
+            df = process_data_into_bars(symbol, n_ticks=self.train_candles)
             if df.empty: return []
 
             model_path = self.models_dir / f"river_pipeline_{symbol}.pkl"
