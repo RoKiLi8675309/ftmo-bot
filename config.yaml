@@ -1,16 +1,16 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V3.0 (IRON GATE)
-# STATUS: CONFIGURATION UPDATE FOR PROFITABILITY
+# config.yaml – PROJECT PHOENIX V3.1 (ALPHA HUNTER)
+# STATUS: CONFIGURATION UPDATE FOR ALPHA GENERATION
 #
-# DIAGNOSIS (2025-12-28 - OVER-TRADING ANALYSIS):
-# 1. OVER-TRADING: 200+ trades per trial indicates filters are too loose.
-# 2. CHOP RISK: Regime B (Continuation) is firing on low-efficiency chop.
-# 3. FIX: Tighten KER for Regime B, Enforce H4 Alignment, Extend TP.
+# DIAGNOSIS (2025-12-28 - STAGNATION ANALYSIS):
+# 1. PREMATURE STOP-OUTS: 1.5 ATR SL is too tight for current volatility.
+# 2. MISSED ENTRIES: Aggressor 0.65 is rejecting viable trend candles.
+# 3. PROFIT LEAK: Trailing activation at 2.0 is too slow; profits evaporate.
 #
-# FIX (V3.0):
-# 1. KER: Raised to 0.40. Trends must be efficient.
-# 2. TP: Extended to 4.0 ATR to capture fat tails.
-# 3. CONFIDENCE: maintained at 0.60.
+# FIX (V3.1):
+# 1. SL: Widened to 2.0 ATR. Let the trade breathe.
+# 2. TRAILING: Tightened activation to 1.5 ATR to lock in wins.
+# 3. AGGRESSOR: Lowered to 0.60 to capture more valid signals.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -129,26 +129,25 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 20    # RE-ENABLED: Filter out dead markets
+    threshold: 20    # Keep ADX enabled
     
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V3.0 IRON GATE) ---
+# --- PHOENIX STRATEGY PARAMETERS (V3.1 ALPHA HUNTER) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true   
   require_d1_trend: true          
-  require_h4_alignment: true      # NEW: Check H4 RSI
+  require_h4_alignment: true      
   
-  # --- FILTER THRESHOLDS (V3.0 TIGHTENED) ---
+  # --- FILTER THRESHOLDS ---
   # Volume Exhaustion
   max_relative_volume: 3.5        
   
-  # Trend Efficiency (Raised to 0.40)
-  # FIX: Choppy markets kill Win Rate. Demand 40% efficiency.
+  # Trend Efficiency (Maintained at 0.40)
   ker_trend_threshold: 0.40       
   
   # Volatility Expansion
@@ -160,8 +159,9 @@ phoenix_strategy:
   # Volume Gate (Maintained at 1.5)
   volume_gate_ratio: 1.5          
   
-  # Momentum Conviction (Maintained at 0.65)
-  aggressor_threshold: 0.65       
+  # Momentum Conviction (Lowered to 0.60)
+  # FIX: Capture more signals
+  aggressor_threshold: 0.60       
   
   # ML Confidence (0.60)
   ml_confirmation_threshold: 0.60 
@@ -188,14 +188,16 @@ risk_management:
   max_lot_size: 10.0            
   min_lot_size: 0.01
   
-  # PROJECT PHOENIX EXIT LOGIC (1:4 RISK:REWARD)
-  stop_loss_atr_mult: 1.5       
-  take_profit_atr_mult: 4.0       # EXTENDED TARGET
+  # PROJECT PHOENIX EXIT LOGIC (1:2 RISK:REWARD BASE)
+  # FIX: Widened Stop to 2.0 ATR to survive noise
+  stop_loss_atr_mult: 2.0       
+  take_profit_atr_mult: 4.0       
   
-  # TRAILING STOP
+  # TRAILING STOP (AGGRESSIVE LOCKING)
+  # FIX: Activate sooner to bank Alpha
   trailing_stop:
     enabled: true
-    activation_atr: 2.0         
+    activation_atr: 1.5         
     step_atr: 0.5               
   
   risk_timezone: "Europe/Prague"

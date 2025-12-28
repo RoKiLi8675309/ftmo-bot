@@ -10,6 +10,8 @@
 # 2. VOLATILITY GATE: Live enforcement of ATR > Spread Ratio.
 # 3. AUTO-DETECT: Retrieves real account size from Redis for accurate sizing.
 # 4. DATA FIX: Extracts 'bid_vol'/'ask_vol' and computes 'price' from quotes.
+# 5. ALPHA: Handles 'pyramid' flag for Aggressive Pyramiding execution.
+# 6. CONTEXT BRIDGE: Now correctly passes D1/H4/Positions to Predictor.
 # =============================================================================
 import logging
 import time
@@ -19,7 +21,7 @@ import signal
 import sys
 from datetime import datetime
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 # Third-Party NLP (Guarded)
 try:
@@ -118,6 +120,9 @@ class LiveTradingEngine:
         self.last_corr_update = time.time()
         self.latest_prices = {}
         self.liquidation_triggered_map = {sym: False for sym in CONFIG['trading']['symbols']}
+        
+        # --- CONTEXT CACHE (D1/H4 from Windows) ---
+        self.latest_context = defaultdict(dict) # {symbol: {'d1': {}, 'h4': {}}}
 
         # --- AUDIT FIX: Volatility Gate Config ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
@@ -159,10 +164,33 @@ class LiveTradingEngine:
                 logger.error(f"News Fetch Error: {e}")
                 time.sleep(60)
 
+    def _get_open_positions_from_redis(self) -> Dict[str, Dict]:
+        """
+        Fetches the current open positions synced by Windows Producer.
+        Returns format compatible with Predictor: {symbol: {entry_price: ...}}
+        """
+        magic = CONFIG['trading']['magic_number']
+        key = f"{CONFIG['redis']['position_state_key_prefix']}:{magic}"
+        
+        try:
+            data = self.stream_mgr.r.get(key)
+            if not data: return {}
+            
+            pos_list = json.loads(data)
+            pos_map = {}
+            for p in pos_list:
+                sym = p.get('symbol')
+                if sym:
+                    pos_map[sym] = p
+            return pos_map
+        except Exception:
+            return {}
+
     def process_tick(self, tick_data: dict):
         """
         Handles a single raw tick from Redis.
         Extracts L2 Data (bid_vol/ask_vol) if available.
+        Extracts Context Data (D1/H4) if available.
         """
         try:
             symbol = tick_data.get('symbol')
@@ -191,6 +219,19 @@ class LiveTradingEngine:
 
             # Update Price Cache for Risk Manager
             self.latest_prices[symbol] = price
+            
+            # --- CONTEXT EXTRACTION (FIX) ---
+            # Store latest D1/H4 data for use in on_bar_complete
+            if 'ctx_d1' in tick_data:
+                try:
+                    self.latest_context[symbol]['d1'] = json.loads(tick_data['ctx_d1'])
+                except: pass
+            
+            if 'ctx_h4' in tick_data:
+                try:
+                    self.latest_context[symbol]['h4'] = json.loads(tick_data['ctx_h4'])
+                except: pass
+            # --------------------------------
 
             # 1. Feed Aggregator with L2 Data
             # AUDIT FIX: Passing external_buy_vol/sell_vol to Aggregator
@@ -224,13 +265,24 @@ class LiveTradingEngine:
         except Exception as e:
             logger.error(f"Portfolio Update Error: {e}")
         
-        # 2. Prepare Context (Sentiment Injection)
+        # 2. Prepare Context (Sentiment + MT5 Data + Positions)
+        # --- CRITICAL FIX: AGGREGATE ALL CONTEXT ---
         current_sentiment = self.global_sentiment.get('GLOBAL', 0.0)
         
+        mt5_context = self.latest_context.get(bar.symbol, {})
+        open_positions = self._get_open_positions_from_redis()
+        
+        context_data = {
+            'd1': mt5_context.get('d1', {}),
+            'h4': mt5_context.get('h4', {}),
+            'sentiment': current_sentiment,
+            'positions': open_positions  # Pass positions for Pyramiding Check
+        }
+        # -------------------------------------------
+        
         # 3. Get Signal
-        # Note: The Predictor's internal FeatureEngineer will use defaults (0.0) 
-        # if we don't explicitly pass sentiment, but the architecture supports it.
-        signal = self.predictor.process_bar(bar.symbol, bar)
+        # Predictor now has visibility into Trends (D1/H4) and Existing Trades (Pyramiding)
+        signal = self.predictor.process_bar(bar.symbol, bar, context_data=context_data)
         
         if not signal: return
 
@@ -327,6 +379,25 @@ class LiveTradingEngine:
             return
 
         trade_intent.action = signal.action
+
+        # --- ALPHA GENERATOR: AGGRESSIVE PYRAMIDING EXECUTION ---
+        # Check if Predictor flagged this as a Pyramid trade
+        is_pyramid = signal.meta_data.get('pyramid', False)
+        
+        if is_pyramid:
+            # Scale In Logic: Half Size
+            original_volume = trade_intent.volume
+            trade_intent.volume = round(original_volume * 0.5, 2)
+            
+            # Ensure we respect min lot size
+            min_lot = CONFIG['risk_management'].get('min_lot_size', 0.01)
+            if trade_intent.volume < min_lot:
+                trade_intent.volume = min_lot
+            
+            # Tag the trade for audit
+            trade_intent.comment += "|PYRAMID"
+            logger.info(f"⚡ PYRAMID EXECUTION: Scaling In {trade_intent.volume} lots (Base: {original_volume})")
+        # --------------------------------------------------------
 
         # 7. Dispatch
         self.dispatcher.send_order(trade_intent, risk_usd)

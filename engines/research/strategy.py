@@ -5,11 +5,12 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-28 - V3.0 IRON GATE):
-# 1. PHILOSOPHY: "Iron Gate" - Filter out the noise.
-# 2. FIX: H4 RSI Alignment Required (>50 for Long, <50 for Short).
-# 3. FIX: KER Raised to 0.40 for Regime B.
-# 4. FIX: ADX Filter Enabled (>20) to kill dead markets.
+# PHOENIX STRATEGY UPGRADE (2025-12-28 - V3.1 ALPHA HUNTER):
+# 1. PHILOSOPHY: "Alpha Hunter" - Capture volatility, let winners run.
+# 2. FIX: Aggressor Threshold lowered to 0.60 to capture more signals.
+# 3. FIX: Stop Loss widened to 2.0 ATR (via Risk Config).
+# 4. FIX: Trailing Stop tightened to 1.5 ATR (via Risk Config).
+# 5. ALPHA: Aggressive Pyramiding (Scale-in winners > 2 ATR).
 # =============================================================================
 import logging
 import sys
@@ -58,8 +59,8 @@ class ResearchStrategy:
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
         
-        # Sync Labeler Risk with Config (V3.0 uses 1.5 ATR Stop)
-        risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 1.5)
+        # Sync Labeler Risk with Config (V3.1 uses 2.0 ATR Stop)
+        risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 2.0)
         
         self.labeler = AdaptiveTripleBarrier(
             horizon_ticks=tbm_conf.get('horizon_minutes', 60),
@@ -99,10 +100,10 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX STRATEGY PARAMETERS (V3.0 IRON GATE CONFIG) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V3.1 ALPHA HUNTER CONFIG) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V3.0 GATES
+        # V3.1 GATES
         self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         self.require_h4_alignment = phx_conf.get('require_h4_alignment', True)
@@ -110,15 +111,15 @@ class ResearchStrategy:
         # Safety Cap
         self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.5)
         
-        # Thresholds (V3.0: TIGHTENED)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.40) # Raised to 0.40
-        self.adx_threshold = CONFIG['features']['adx'].get('threshold', 20) # Enabled at 20
+        # Thresholds (V3.1: ALPHA MODE)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.40) # Kept at 0.40
+        self.adx_threshold = CONFIG['features']['adx'].get('threshold', 20) 
         
         # Volume Gate
         self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.5)
         
-        # Momentum (V2.8: 0.65)
-        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.65)
+        # Momentum (V3.1: LOWERED to 0.60)
+        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.60)
         self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0) 
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
@@ -249,7 +250,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. PROJECT PHOENIX: LOGIC GATES (V3.0 IRON GATE)
+        # D. PROJECT PHOENIX: LOGIC GATES (V3.1 ALPHA HUNTER)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
@@ -277,11 +278,11 @@ class ResearchStrategy:
         h4_bear = h4_rsi < 50
         
         # Gate Definitions
-        # V3.0: 1.5x Avg Volume (Standard Institutional Flow)
+        # V3.1: 1.5x Avg Volume (Standard Institutional Flow)
         vol_gate = rvol > self.vol_gate_ratio
         
         # Momentum Direction (Aggressor Ratio)
-        # V2.8: 0.65 Threshold
+        # V3.1: 0.60 Threshold (Relaxed from 0.65)
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
@@ -293,7 +294,7 @@ class ResearchStrategy:
         if self.enable_regime_a:
             # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
             if d1_trend_up and is_bullish_candle and vol_gate:
-                # Require Efficiency (V3.0: KER > 0.40) - Tightened again to stop chop
+                # Require Efficiency (V3.1: KER > 0.40)
                 if ker_val > self.ker_thresh:
                     proposed_action = 1
                     regime_label = "A (Mom-Long)"
@@ -486,14 +487,59 @@ class ResearchStrategy:
              self.rejection_stats["High Illiquidity (Amihud)"] += 1
              # return 
 
-        # Position Sizing
-        # FIXED: Access broker.positions property
-        if self.symbol in broker.positions: return
-        
         volatility = features.get('volatility', 0.001)
         current_atr = features.get('atr', 0.001)
         current_ker = features.get('ker', 1.0) 
 
+        # --- ALPHA GENERATOR: AGGRESSIVE PYRAMIDING ---
+        if self.symbol in broker.positions:
+            existing_trade = broker.positions[self.symbol]
+            
+            # 1. Calc Floating Profit in ATRs
+            profit_atr = 0.0
+            if existing_trade.action == "BUY":
+                profit_atr = (price - existing_trade.entry_price) / current_atr
+            else:
+                profit_atr = (existing_trade.entry_price - price) / current_atr
+                
+            # 2. Threshold (e.g., 2.0 ATRs)
+            # Only add if we haven't already added (simple check: comment)
+            if profit_atr > 2.0 and "Pyramid" not in existing_trade.comment:
+                # 3. Add to position (Scale In)
+                new_qty = existing_trade.quantity * 0.5
+                
+                # Risk Management: Move STOP LOSS of first trade to Entry (Break Even)
+                existing_trade.stop_loss = existing_trade.entry_price
+                
+                # Submit New Order
+                sl_dist = 2.0 * current_atr # Wide stop for new leg
+                tp_dist = 4.0 * current_atr # Extended target
+                
+                sl_price = price - sl_dist if action == "BUY" else price + sl_dist
+                tp_price = price + tp_dist if action == "BUY" else price - tp_dist
+                side = 1 if action == "BUY" else -1
+                
+                order = BacktestOrder(
+                    symbol=self.symbol,
+                    side=side,
+                    quantity=new_qty,
+                    timestamp_created=timestamp,
+                    stop_loss=sl_price,
+                    take_profit=tp_price,
+                    comment=f"Pyramid|Regime:{regime}",
+                    metadata={
+                        'regime': regime,
+                        'confidence': float(confidence),
+                        'pyramid': True
+                    }
+                )
+                broker.submit_order(order)
+                return 
+            else:
+                # Already have a position and not adding -> Hold
+                return
+        
+        # --- STANDARD ENTRY LOGIC ---
         ctx = TradeContext(
             symbol=self.symbol,
             price=price,
