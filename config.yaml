@@ -160,7 +160,7 @@ phoenix_strategy:
   volume_gate_ratio: 1.5          
   
   # Momentum Conviction (Lowered to 0.60)
-  # FIX: Capture more signals
+  # FIX: Capture more signals, even if slightly messy
   aggressor_threshold: 0.60       
   
   # ML Confidence (0.60)
@@ -189,12 +189,12 @@ risk_management:
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (1:2 RISK:REWARD BASE)
-  # FIX: Widened Stop to 2.0 ATR to survive noise
+  # FIX: Widened Stop to 2.0 ATR to survive noise (Was 1.5)
   stop_loss_atr_mult: 2.0       
   take_profit_atr_mult: 4.0       
   
   # TRAILING STOP (AGGRESSIVE LOCKING)
-  # FIX: Activate sooner to bank Alpha
+  # FIX: Activate sooner (1.5 ATR) to bank Alpha from choppy winners
   trailing_stop:
     enabled: true
     activation_atr: 1.5         

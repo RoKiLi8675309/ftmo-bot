@@ -126,6 +126,12 @@ class ResearchStrategy:
         
         # Friday Liquidation
         self.friday_close_hour = CONFIG.get('risk_management', {}).get('friday_liquidation_hour_server', 21)
+        
+        # --- V3.1 TRAILING STOP LOGIC ---
+        ts_conf = CONFIG.get('risk_management', {}).get('trailing_stop', {})
+        self.use_trailing_stop = ts_conf.get('enabled', True)
+        self.ts_activation_atr = ts_conf.get('activation_atr', 1.5)
+        self.ts_step_atr = ts_conf.get('step_atr', 0.5)
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
@@ -161,7 +167,6 @@ class ResearchStrategy:
 
         # --- FRIDAY LIQUIDATION CHECK (GAP PROTECTION) ---
         if dt_ts.weekday() == 4 and dt_ts.hour >= self.friday_close_hour:
-            # FIXED: Access broker.positions property (Dict[str, BacktestOrder])
             if self.symbol in broker.positions:
                 pos = broker.positions[self.symbol]
                 broker._close_partial_position(pos, pos.quantity, price, dt_ts, "Friday Liquidation")
@@ -265,8 +270,8 @@ class ResearchStrategy:
         # --- CRITICAL FILTER 1: VOLUME EXHAUSTION FILTER ---
         if rvol > self.max_rvol_thresh:
             self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
-            return # Force HOLD
-            
+            # return # Keep logic flowing for management, but block entry
+        
         # --- CRITICAL FILTER 2: MTF TREND LOCK ---
         d1_ema = context_data.get('d1', {}).get('ema200', 0.0)
         d1_trend_up = (price > d1_ema) if d1_ema > 0 else True
@@ -289,6 +294,12 @@ class ResearchStrategy:
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
         
+        # --- ALPHA HUNTER V3.1: MANAGE EXISTING TRADES (TRAILING STOP) ---
+        # Implement Active Trailing Stop Management before checking new entries
+        if self.symbol in broker.positions and self.use_trailing_stop:
+            pos = broker.positions[self.symbol]
+            self._manage_trailing_stop(pos, price, current_atr)
+
         # --- REGIME A: MOMENTUM IGNITION (Unified Flow) ---
         # Re-enabled logic for catching moves that are not perfect "trends" yet
         if self.enable_regime_a:
@@ -410,6 +421,49 @@ class ResearchStrategy:
         except Exception as e:
             if self.debug_mode: logger.error(f"Strategy Error: {e}")
             pass
+
+    def _manage_trailing_stop(self, pos: BacktestOrder, current_price: float, current_atr: float):
+        """
+        V3.1 ALPHA HUNTER TRAILING STOP LOGIC
+        Tightens SL if profit exceeds 1.5 ATR (ts_activation_atr).
+        Follows by 0.5 ATR (ts_step_atr) or fixed distance.
+        """
+        if not pos.is_active: return
+        
+        profit_pips = 0.0
+        if pos.action == "BUY":
+            profit_pips = (current_price - pos.entry_price)
+        else:
+            profit_pips = (pos.entry_price - current_price)
+            
+        # Convert profit to ATR units
+        if current_atr <= 0: return
+        profit_atr = profit_pips / current_atr
+        
+        # Check Activation (1.5 ATR)
+        if profit_atr > self.ts_activation_atr:
+            # New SL Distance: We want to lock in profit.
+            # Strategy: Trail at 1.0 ATR distance once activated
+            trail_dist = 1.0 * current_atr
+            
+            new_sl = 0.0
+            if pos.action == "BUY":
+                potential_sl = current_price - trail_dist
+                # Only move up
+                if potential_sl > pos.stop_loss:
+                    new_sl = potential_sl
+            else:
+                potential_sl = current_price + trail_dist
+                # Only move down
+                if pos.stop_loss == 0 or potential_sl < pos.stop_loss:
+                    new_sl = potential_sl
+            
+            if new_sl != 0.0:
+                pos.stop_loss = new_sl
+                if "Trailing" not in pos.comment:
+                    pos.comment += "|Trailing"
+                    if self.debug_mode: 
+                        logger.info(f"⚡ {self.symbol} Trailing Stop Triggered: {profit_atr:.2f} ATR Profit")
 
     def _simulate_mtf_context(self, price: float, dt: datetime) -> Dict[str, Any]:
         """
