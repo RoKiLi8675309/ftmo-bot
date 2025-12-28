@@ -5,11 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.6 DISCIPLINED FLOW):
-# 1. PHILOSOPHY: "Disciplined Flow" - Remove the chop, keep the flow.
-# 2. VOLATILITY CAP: Tightened to 3.0 (was 3.5). News spikes are now filtered.
-# 3. CONVICTION: Aggressor raised to 0.60. We demand directional dominance.
-# 4. EFFICIENCY: KER raised to 0.35. Sawtooth price action is rejected.
+# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.8 IRONCLAD):
+# 1. PHILOSOPHY: "Ironclad" - No Volume, No Trade. Period.
+# 2. CRITICAL FIX: Regime B (Trend Continuation) now requires Volume Gate > 2.0.
+# 3. EFFICIENCY: KER raised to 0.50. 50% of price movement must be directional.
+# 4. CONFIDENCE: ML Threshold raised to 0.70.
 # =============================================================================
 import logging
 import sys
@@ -99,25 +99,26 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX STRATEGY PARAMETERS (V2.6 DISCIPLINED FLOW CONFIG) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V2.8 IRONCLAD CONFIG) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V2.6 GATES
+        # V2.8 GATES
         self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         
-        # Safety Cap (V2.6: 3.0 - Tightened from 3.5)
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.0)
+        # Safety Cap (V2.8: 3.5)
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.5)
         
-        # Thresholds (V2.6: Tightened)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.35) # Was 0.30
+        # Thresholds (V2.8: EXTREME)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.50) # Raised from 0.35/0.40
         self.adx_threshold = CONFIG['features']['adx'].get('threshold', 0)
         
         # Pullback/Gate settings
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.0)
+        # CRITICAL FIX: Volume Gate Ratio (2.0)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 2.0)
         
-        # Momentum (V2.6: Raised to 0.60)
-        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.60) # Was 0.55
+        # Momentum (V2.8: 0.65)
+        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.65)
         self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0) 
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
@@ -247,7 +248,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. PROJECT PHOENIX: LOGIC GATES (V2.6 DISCIPLINED FLOW)
+        # D. PROJECT PHOENIX: LOGIC GATES (V2.8 IRONCLAD)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
@@ -259,7 +260,6 @@ class ResearchStrategy:
         mtf_align = features.get('mtf_alignment', 0.0)
         
         # --- CRITICAL FILTER 1: VOLUME EXHAUSTION FILTER ---
-        # V2.6 Cap: 3.0 (Tightened from 3.5 to filter news spikes)
         if rvol > self.max_rvol_thresh:
             self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
             return # Force HOLD
@@ -269,15 +269,12 @@ class ResearchStrategy:
         d1_trend_up = (price > d1_ema) if d1_ema > 0 else True
         d1_trend_down = (price < d1_ema) if d1_ema > 0 else True
         
-        # --- NOTE: ADX HARD FILTER REMOVED IN V2.5/V2.6 ---
-        # We allow the ML model to decide if the trend is strong enough.
-
         # Gate Definitions
+        # V2.8 FREQUENCY KILLER: Must be > 2.0x Avg Volume
         vol_gate = rvol > self.vol_gate_ratio
         
         # Momentum Direction (Aggressor Ratio)
-        # V2.6: 0.60 Threshold (Raised from 0.55)
-        # We require stronger conviction. Bulls must own the top 40% of the candle.
+        # V2.8: 0.65 Threshold
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
@@ -287,9 +284,9 @@ class ResearchStrategy:
         # --- REGIME A: MOMENTUM IGNITION (Unified Flow) ---
         # Re-enabled logic for catching moves that are not perfect "trends" yet
         if self.enable_regime_a:
-            # Check for Flow Alignment: D1 Trend + Micro Structure
+            # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
             if d1_trend_up and is_bullish_candle and vol_gate:
-                # Require minimal efficiency (V2.6: KER > 0.35)
+                # Require Efficiency (V2.8: KER > 0.50)
                 if ker_val > self.ker_thresh:
                     proposed_action = 1
                     regime_label = "A (Mom-Long)"
@@ -302,10 +299,16 @@ class ResearchStrategy:
                     regime_label = "A (Mom-Short)"
                 else:
                     self.rejection_stats["Regime A: Low Efficiency"] += 1
+
+            # Diagnostic for Volume Gate Failure
+            elif (d1_trend_up and is_bullish_candle) or (d1_trend_down and is_bearish_candle):
+                if not vol_gate:
+                    self.rejection_stats[f"Volume Gate Fail (RVol {rvol:.2f} < {self.vol_gate_ratio})"] += 1
                 
         # --- REGIME B: EFFICIENT TREND CONTINUATION ---
         # Logic: Efficiency (KER) + Momentum + D1 Align
-        if proposed_action == 0 and ker_val > self.ker_thresh:
+        # CRITICAL FIX V2.8: ADDED 'and vol_gate' to prevent low volume chop trades.
+        if proposed_action == 0 and ker_val > self.ker_thresh and vol_gate:
             if is_bullish_candle and d1_trend_up:
                 proposed_action = 1
                 regime_label = "B (Trend-Long)"
@@ -370,7 +373,8 @@ class ResearchStrategy:
                 self.meta_label_events += 1
 
             # --- EXECUTION ---
-            min_prob = self.params.get('min_calibrated_probability', 0.60)
+            # V2.8: Defaults to 0.70 (Raised from 0.60)
+            min_prob = self.params.get('min_calibrated_probability', 0.70)
             
             if confidence < min_prob:
                 self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob})"] += 1

@@ -6,11 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.6 DISCIPLINED FLOW):
-# 1. PHILOSOPHY: "Disciplined Flow" - Remove the chop, keep the flow.
-# 2. VOLATILITY CAP: Tightened to 3.0 (was 3.5). News spikes are now filtered.
-# 3. CONVICTION: Aggressor raised to 0.60. We demand directional dominance.
-# 4. EFFICIENCY: KER raised to 0.35. Sawtooth price action is rejected.
+# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.8 IRONCLAD):
+# 1. PHILOSOPHY: "Ironclad" - No Volume, No Trade. Period.
+# 2. CRITICAL FIX: Regime B (Trend Continuation) now requires Volume Gate > 2.0.
+# 3. EFFICIENCY: KER raised to 0.50. 50% of price movement must be directional.
+# 4. CONFIDENCE: ML Threshold raised to 0.70.
 # =============================================================================
 import logging
 import pickle
@@ -104,26 +104,27 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V2.6 DISCIPLINED FLOW CONFIG) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V2.8 IRONCLAD CONFIG) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V2.6 GATES
+        # V2.8 GATES
         self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         
-        # Safety Cap (V2.6: 3.0 - Tightened from 3.5)
-        # Prevents chasing news spikes that usually reverse.
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.0)
+        # Safety Cap (V2.8: 3.5 - Slight loosen to capture massive events, but strict lower bound)
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.5)
         
-        # Thresholds (V2.6: Tightened)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.35) # Was 0.30
+        # Thresholds (V2.8: EXTREME)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.50) # Raised to 0.50
         self.adx_threshold = CONFIG['features']['adx'].get('threshold', 0) # Disabled
         
         # Pullback/Gate settings
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.0)
+        # CRITICAL FIX: Volume Gate Ratio (2.0)
+        # We ignore standard volume. Only 2x+ flows trigger trades.
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 2.0) 
         
-        # Momentum (V2.6: Raised to 0.60)
-        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.60) # Was 0.55
+        # Momentum (V2.8: 0.65)
+        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.65) 
         self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0) 
         
         # Fallback Tracking
@@ -180,7 +181,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V2.6 Logic (Disciplined Flow).
+        Executes the Learn-Predict Loop with Project Phoenix V2.8 Logic (Ironclad).
         """
         if symbol not in self.symbols: return None
         
@@ -281,7 +282,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp())
 
         # ============================================================
-        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V2.6 DISCIPLINED FLOW)
+        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V2.8 IRONCLAD)
         # ============================================================
         
         # Extract Core Indicators
@@ -295,7 +296,6 @@ class MultiAssetPredictor:
         rsi_val = features.get('rsi_norm', 0.5) * 100.0
         
         # --- CRITICAL FILTER 1: VOLUME EXHAUSTION FILTER ---
-        # V2.6 Cap: 3.0 (Tightened from 3.5 to filter news spikes)
         if rvol > self.max_rvol_thresh:
             stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
@@ -305,15 +305,12 @@ class MultiAssetPredictor:
         d1_trend_up = (bar.close > d1_ema) if d1_ema > 0 else True
         d1_trend_down = (bar.close < d1_ema) if d1_ema > 0 else True
         
-        # --- NOTE: ADX HARD FILTER REMOVED IN V2.5/V2.6 ---
-        # We allow the ML model to decide if the trend is strong enough.
-
         # Gate Definitions
+        # V2.8 FREQUENCY KILLER: Must be > 2.0x Avg Volume
         vol_gate = rvol > self.vol_gate_ratio
         
         # Momentum Direction (Aggressor Ratio)
-        # V2.6: 0.60 Threshold (Raised from 0.55)
-        # We require stronger conviction. Bulls must own the top 40% of the candle.
+        # V2.8: 0.65 Threshold
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
@@ -323,9 +320,9 @@ class MultiAssetPredictor:
         # --- REGIME A: MOMENTUM IGNITION (Unified Flow) ---
         # Re-enabled logic for catching moves that are not perfect "trends" yet
         if self.enable_regime_a:
-            # Check for Flow Alignment: D1 Trend + Micro Structure
+            # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
             if d1_trend_up and is_bullish_candle and vol_gate:
-                # Require minimal efficiency (V2.6: KER > 0.35)
+                # Require Efficiency (V2.8: KER > 0.50)
                 if ker_val > self.ker_thresh:
                     proposed_action = 1
                     regime_label = "A (Mom-Long)"
@@ -338,10 +335,16 @@ class MultiAssetPredictor:
                     regime_label = "A (Mom-Short)"
                 else:
                     stats["Regime A: Low Efficiency"] += 1
+            
+            # Diagnostic for Volume Gate Failure
+            elif (d1_trend_up and is_bullish_candle) or (d1_trend_down and is_bearish_candle):
+                if not vol_gate:
+                    stats[f"Volume Gate Fail (RVol {rvol:.2f} < {self.vol_gate_ratio})"] += 1
                 
         # --- REGIME B: EFFICIENT TREND CONTINUATION ---
         # Logic: Efficiency (KER) + Momentum + D1 Align
-        if proposed_action == 0 and ker_val > self.ker_thresh:
+        # CRITICAL FIX V2.8: ADDED 'and vol_gate' to prevent low volume chop trades.
+        if proposed_action == 0 and ker_val > self.ker_thresh and vol_gate:
             if is_bullish_candle and d1_trend_up:
                 proposed_action = 1
                 regime_label = "B (Trend-Long)"
@@ -399,8 +402,8 @@ class MultiAssetPredictor:
         )
 
         # --- DECISION ---
-        # V2.6: Defaults to 0.60
-        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.60)
+        # V2.8: Defaults to 0.70 (Raised from 0.60)
+        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.70)
 
         # Safety Check: If ML thinks probability is terrible (< min_prob), skip.
         if confidence < min_prob:

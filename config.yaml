@@ -1,13 +1,16 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V2.6 (DISCIPLINED FLOW)
-# STATUS: ACTIVE - TIGHTENED FILTERS
+# config.yaml – PROJECT PHOENIX V2.8 (IRONCLAD)
+# STATUS: CRITICAL PATCH - SEALING THE LEAK
 #
-# UPDATES (2025-12-27 - V2.6):
-# 1. FORENSIC DIAGNOSIS: V2.5 was too loose (150+ trades, 33% WR).
-# 2. ANTI-CLIMAX: RVol Cap lowered to 3.0 (was 3.5). Stop chasing news spikes.
-# 3. CONVICTION: Aggressor raised to 0.60 (was 0.55). Bulls must hold the top 40%.
-# 4. EFFICIENCY: KER raised to 0.35 (was 0.30). Filter out pure sawtooth chop.
-# 5. RISK: Maintained at 0.25% defensive sizing.
+# DIAGNOSIS (2025-12-27 - V2.7 FAIL):
+# 1. THE REGIME B LEAK: 'Trend Continuation' entries were bypassing the Volume Gate.
+#    Result: 200+ trades taken at RVol 1.14 despite Gate being set to 1.5.
+# 2. ML HALLUCINATION: Avg Conf 0.80+ on losing trades. Model needs a higher bar.
+#
+# FIX (V2.8):
+# 1. GATE RATIO: Raised to 2.0. We demand double the average volume.
+# 2. EFFICIENCY: KER raised to 0.50. 50% of price movement must be directional.
+# 3. CONFIDENCE: ML Threshold raised to 0.70.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -133,30 +136,35 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V2.6 DISCIPLINED FLOW) ---
+# --- PHOENIX STRATEGY PARAMETERS (V2.8 IRONCLAD) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true   # Momentum Ignition enabled.
-  require_d1_trend: true          # GOLDEN RULE: Must align with D1 EMA200
+  enable_regime_a_entries: true   
+  require_d1_trend: true          
   
-  # --- FILTER THRESHOLDS (V2.6 TIGHTENED) ---
-  # Volume Exhaustion (Lowered to 3.0)
-  max_relative_volume: 3.0        # V2.6: Stop chasing news spikes. 
+  # --- FILTER THRESHOLDS (V2.8 EXTREME) ---
+  # Volume Exhaustion
+  max_relative_volume: 3.5        
   
-  # Trend Efficiency (Raised to 0.35)
-  ker_trend_threshold: 0.35       # V2.6: Filter pure chop, demand minor trend structure.
+  # Trend Efficiency (Raised to 0.50)
+  # CRITICAL: If less than half the move is directional, it's noise.
+  ker_trend_threshold: 0.50       
   
   # Volatility Expansion
   vol_expansion_threshold: 2.0 
   
-  # Entry Gates (Standard)
+  # Entry Gates
   range_gate_atr_mult: 1.0        
-  volume_gate_ratio: 1.0          
   
-  # Momentum Conviction (Raised to 0.60)
-  aggressor_threshold: 0.60       # V2.6: Demand directional strength. Close > 60% of Range.
+  # Volume Gate (CRITICAL FIX)
+  # Raised to 2.0. We demand 2x Average Volume to even look at a trade.
+  # This MUST be applied to Regime B in code.
+  volume_gate_ratio: 2.0          
   
-  ml_confirmation_threshold: 0.60 
+  # Momentum Conviction (Maintained at 0.65)
+  aggressor_threshold: 0.65       
+  
+  ml_confirmation_threshold: 0.70 
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -171,12 +179,11 @@ risk_management:
   sizing_method: "fixed_risk"
   
   # Risk Per Trade (SURVIVAL MODE)
-  # 0.25% per trade. High frequency requires low risk.
   base_risk_per_trade_percent: 0.25 
   
   max_daily_loss_pct: 0.04
   max_total_loss_pct: 0.09
-  max_risk_percent: 0.5         # Cap single trade risk (hard ceiling)
+  max_risk_percent: 0.5         
   max_leverage: 30.0
   max_lot_size: 10.0            
   min_lot_size: 0.01
@@ -197,19 +204,19 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 30        # Increased for higher frequency (Adaptive Flow)
+  max_trades_per_day: 30        
   correlation_penalty_threshold: 0.8
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
   min_stop_loss_pips: 3.0
 
-# --- TRADING PORTFOLIO (AUTOCORRELATED PAIRS) ---
+# --- TRADING PORTFOLIO ---
 trading:
   symbols:
-    - "GBPJPY"  # The Dragon
-    - "EURUSD"  # Liquidity King
-    - "USDJPY"  # Trend Runner
-    - "AUDUSD"  # Commodity Proxy
+    - "GBPJPY"  
+    - "EURUSD"  
+    - "USDJPY"  
+    - "AUDUSD"  
   
   auxiliary_symbols:
     - "GBPUSD"
@@ -256,8 +263,8 @@ online_learning:
     
   learning_horizon_sec: 300
   
-  # High Confidence Only
-  min_calibrated_probability: 0.60
+  # High Confidence Only (Raised to 0.70)
+  min_calibrated_probability: 0.70
 
 # --- NEWS FILTER ---
 news_filter:
