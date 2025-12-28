@@ -1,13 +1,13 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V2.5 (ADAPTIVE FLOW)
-# STATUS: AGGRESSIVE RECOVERY - TRUST THE MODEL
+# config.yaml – PROJECT PHOENIX V2.6 (DISCIPLINED FLOW)
+# STATUS: ACTIVE - TIGHTENED FILTERS
 #
-# UPDATES (2025-12-27 - V2.5):
-# 1. REGIME A REVIVED: Momentum Ignition entries ENABLED to capture the 5,000+ missed signals.
-# 2. VOLATILITY CAP: Loosened to 3.5 (was 2.0). We need to trade the volatility, not hide from it.
-# 3. EFFICIENCY: KER lowered to 0.30 (was 0.60). Accepting noisy/choppy trends.
-# 4. ADX: Disabled (Threshold 0). Removing lag to enter moves earlier.
-# 5. RISK: Kept at 0.25% to survive the increased frequency.
+# UPDATES (2025-12-27 - V2.6):
+# 1. FORENSIC DIAGNOSIS: V2.5 was too loose (150+ trades, 33% WR).
+# 2. ANTI-CLIMAX: RVol Cap lowered to 3.0 (was 3.5). Stop chasing news spikes.
+# 3. CONVICTION: Aggressor raised to 0.60 (was 0.55). Bulls must hold the top 40%.
+# 4. EFFICIENCY: KER raised to 0.35 (was 0.30). Filter out pure sawtooth chop.
+# 5. RISK: Maintained at 0.25% defensive sizing.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -126,25 +126,25 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 0    # DISABLED (V2.5) - Remove lag
+    threshold: 0    # DISABLED - Remove lag
     
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V2.5 ADAPTIVE FLOW) ---
+# --- PHOENIX STRATEGY PARAMETERS (V2.6 DISCIPLINED FLOW) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true   # REVIVED: Momentum Ignition enabled.
+  enable_regime_a_entries: true   # Momentum Ignition enabled.
   require_d1_trend: true          # GOLDEN RULE: Must align with D1 EMA200
   
-  # --- FILTER THRESHOLDS (LOOSENED) ---
-  # Volume Exhaustion (Raised to 3.5)
-  max_relative_volume: 3.5        # Allow news spikes and strong momentum.
+  # --- FILTER THRESHOLDS (V2.6 TIGHTENED) ---
+  # Volume Exhaustion (Lowered to 3.0)
+  max_relative_volume: 3.0        # V2.6: Stop chasing news spikes. 
   
-  # Trend Efficiency (Lowered to 0.30)
-  ker_trend_threshold: 0.30       # Accept noisy/choppy trends.
+  # Trend Efficiency (Raised to 0.35)
+  ker_trend_threshold: 0.35       # V2.6: Filter pure chop, demand minor trend structure.
   
   # Volatility Expansion
   vol_expansion_threshold: 2.0 
@@ -153,8 +153,8 @@ phoenix_strategy:
   range_gate_atr_mult: 1.0        
   volume_gate_ratio: 1.0          
   
-  # Momentum Conviction (Lowered)
-  aggressor_threshold: 0.55       # Close > 55% of High-Low. Lower conviction required.
+  # Momentum Conviction (Raised to 0.60)
+  aggressor_threshold: 0.60       # V2.6: Demand directional strength. Close > 60% of Range.
   
   ml_confirmation_threshold: 0.60 
   
