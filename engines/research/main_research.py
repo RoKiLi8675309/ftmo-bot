@@ -5,9 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (2025-12-27 - V2.2 UNLEASHED PATCH):
-# 1. OPTIMIZATION: Widened 'min_calibrated_probability' to 0.55-0.85.
-#    This allows the model to accept trades with >55% confidence (profitable at 2:1 RR).
+# AUDIT REMEDIATION (2025-12-27 - V2.3 CONTROLLED AGGRESSION):
+# 1. OPTIMIZATION: Raised 'min_calibrated_probability' floor to 0.60.
+#    This stops the model from learning to "gamble" on 55% probabilities
+#    during high volatility regimes.
 # 2. FIDELITY: Maintains Volume Bar alignment using 'train_candles'.
 # 3. SAFETY: Enforces single-threading for stability.
 # =============================================================================
@@ -215,9 +216,9 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                     'drift_threshold': trial.suggest_float('drift_threshold', 0.7, 1.5)
                 },
                 
-                # High Conviction Threshold (Relaxed to 0.55 per V2.2)
-                # Previously 0.60-0.85, now 0.55-0.85 to capture profitable trades
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.55, 0.85)
+                # High Conviction Threshold (Raised to 0.60 per V2.3)
+                # Forces optimizer to find strong signals, not 55% coin flips
+                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.60, 0.85)
             })
             
             # Instantiate Pipeline locally

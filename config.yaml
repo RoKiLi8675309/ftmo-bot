@@ -1,15 +1,13 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V2.2 (UNLEASHED)
-# STATUS: GATES RELAXED FOR HIGHER FREQUENCY & VOLATILITY CAPTURE
+# config.yaml – PROJECT PHOENIX V2.3 (CONTROLLED AGGRESSION)
+# STATUS: "GOLDILOCKS" TUNING - BALANCING REGIME A CAPTURE WITH SURVIVAL
 #
-# UPDATES (2025-12-27 - V2.2):
-# 1. REGIME A ENABLED: Volatility Expansion entries are now ACTIVE.
-# 2. GATES OPENED:
-#    - KER Threshold: Lowered to 0.40 (Accepts noisy trends).
-#    - Aggressor: Lowered to 0.55 (Accepts moderate conviction).
-#    - Range Gate: Lowered to 0.9x ATR (Accepts standard expansion).
-# 3. JPY TUNING: Max RVol raised to 4.0 to stop filtering valid JPY spikes.
-# 4. SAFETY: D1 Trend Lock remains the primary safety net.
+# UPDATES (2025-12-27 - V2.3):
+# 1. VOLUME CAP: Tightened to 3.0 (was 4.0) to filter Blow-Off Tops.
+# 2. EFFICIENCY: KER raised to 0.50 (was 0.40) to reject pure chop.
+# 3. MOMENTUM: Aggressor raised to 0.60 (was 0.55) for directional conviction.
+# 4. SAFETY: D1 Trend Lock remains active.
+# 5. ML FLOOR: Raised to 0.60 probability to prevent gambling behavior.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -135,30 +133,30 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V2.2 UNLEASHED) ---
+# --- PHOENIX STRATEGY PARAMETERS (V2.3 CONTROLLED AGGRESSION) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true   # UNLEASHED: Allow Volatility Expansion entries (The Dragon)
+  enable_regime_a_entries: true   # Keep Regime A (The Dragon) enabled to catch breakouts
   require_d1_trend: true          # GOLDEN RULE: Must align with D1 EMA200 (Primary Safety Net)
   
-  # --- FILTER THRESHOLDS ---
-  # Volume Exhaustion (Raised for JPY Spikes)
-  max_relative_volume: 4.0        # Was 2.5. Allows aggressive liquidity grabs.
+  # --- FILTER THRESHOLDS (THE FIX) ---
+  # Volume Exhaustion (Tightened from 4.0 to 3.0)
+  max_relative_volume: 3.0        # Filter out 4-sigma blow-off tops/climaxes.
   
-  # Trend Efficiency (Lowered for Real-World Noise)
-  ker_trend_threshold: 0.40       # Was 0.70. Allows "noisy" trends (common in Forex).
+  # Trend Efficiency (Restored from 0.40 to 0.50)
+  ker_trend_threshold: 0.50       # Demand at least moderate trend efficiency (not pure noise).
   
   # Volatility Expansion
   vol_expansion_threshold: 2.0 
   
-  # Entry Gates (RELAXED V2.2)
-  range_gate_atr_mult: 0.9      # Was 1.0. Catches standard expansion candles.
-  volume_gate_ratio: 1.2        # Must have volume backing
+  # Entry Gates (V2.3 Standard)
+  range_gate_atr_mult: 1.0        # Slight tightening from 0.9 to ensure real expansion.
+  volume_gate_ratio: 1.2          # Must have volume backing
   
-  # Momentum Conviction (RELAXED V2.2)
-  aggressor_threshold: 0.55     # Was 0.60. Close > 55% of High-Low is Bullish.
+  # Momentum Conviction (Restored from 0.55 to 0.60)
+  aggressor_threshold: 0.60       # Close > 60% of High-Low. No dojis/indecision candles.
   
-  ml_confirmation_threshold: 0.60 # Lowered base threshold (let MetaLabeler decide)
+  ml_confirmation_threshold: 0.60 # Raised base confidence requirement
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -172,15 +170,14 @@ risk_management:
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # Risk Per Trade (SCALED UP FOR PASSING)
-  # 0.50% per trade. If Equity = $100k, Risk = $500.
+  # Risk Per Trade
   base_risk_per_trade_percent: 0.50 
   
   max_daily_loss_pct: 0.04
   max_total_loss_pct: 0.09
   max_risk_percent: 1.0         # Cap single trade risk (hard ceiling)
   max_leverage: 30.0
-  max_lot_size: 10.0            # Increased max lot to accommodate 0.5% risk
+  max_lot_size: 10.0            
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (1:2 RISK:REWARD)
@@ -199,7 +196,7 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 20        # Increased for higher frequency
+  max_trades_per_day: 20        
   correlation_penalty_threshold: 0.8
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
@@ -258,8 +255,8 @@ online_learning:
     
   learning_horizon_sec: 300
   
-  # High Confidence Only
-  min_calibrated_probability: 0.70
+  # High Confidence Only (Raised floor to 0.60)
+  min_calibrated_probability: 0.60
 
 # --- NEWS FILTER ---
 news_filter:
