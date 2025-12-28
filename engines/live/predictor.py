@@ -6,11 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.3 THE ARCHER PATCH):
-# 1. REGIME A PIVOT: Replaced Volatility Expansion with "Trend Pullback" logic.
-# 2. RSI GATES: Added RSI < 45 (Long) and RSI > 55 (Short) checks for entry.
-# 3. SAFETY: Tightened RVol Cap to 3.0 to prevent climax chasing.
-# 4. CONVICTION: Aggressor Threshold restored to 0.60.
+# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.4 IRONCLAD TREND PATCH):
+# 1. KILL SWITCH: Regime A (Volatility) Disabled. Pure Trend Following only.
+# 2. VOLATILITY CAP: Tightened to 2.0 to reject all climactic moves.
+# 3. EFFICIENCY: KER > 0.60 required (Smooth trends only).
+# 4. ADX: Hard filter ADX > 25 required.
 # =============================================================================
 import logging
 import pickle
@@ -104,20 +104,21 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V2.3 THE ARCHER CONFIG) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V2.4 IRONCLAD CONFIG) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V2.3 GATES
-        self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
+        # V2.4 GATES
+        self.enable_regime_a = phx_conf.get('enable_regime_a_entries', False)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         
-        # Safety Cap (V2.3: 3.0)
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.0)
+        # Safety Cap (V2.4: 2.0)
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 2.0)
         
         # Thresholds
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.50)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.60)
+        self.adx_threshold = CONFIG['features']['adx'].get('threshold', 25)
         
-        # "The Archer" Pullback Settings
+        # "The Archer" Pullback Settings (Legacy for V2.4, mostly disabled)
         self.pullback_rsi_long = phx_conf.get('pullback_rsi_long', 45)
         self.pullback_rsi_short = phx_conf.get('pullback_rsi_short', 55)
         self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.0)
@@ -180,7 +181,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V2.3 Logic (The Archer).
+        Executes the Learn-Predict Loop with Project Phoenix V2.4 Logic (Ironclad Trend).
         """
         if symbol not in self.symbols: return None
         
@@ -281,7 +282,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp())
 
         # ============================================================
-        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V2.3 THE ARCHER)
+        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V2.4 IRONCLAD)
         # ============================================================
         
         # Extract Core Indicators
@@ -292,12 +293,13 @@ class MultiAssetPredictor:
         atr_val = features.get('atr', 0.0001)
         parkinson = features.get('parkinson_vol', 0.0)
         mtf_align = features.get('mtf_alignment', 0.0)
+        adx_val = features.get('adx', 0.0)
         rsi_val = features.get('rsi_norm', 0.5) * 100.0
         
-        # --- CRITICAL FIX 1: VOLUME EXHAUSTION FILTER ---
-        # V2.3 Cap: 3.0 (Strict anti-climax)
+        # --- CRITICAL FILTER 1: VOLUME EXHAUSTION FILTER ---
+        # V2.4 Cap: 2.0 (Strict anti-climax)
         if rvol > self.max_rvol_thresh:
-            stats[f"Volume Climax (RVol {rvol:.2f})"] += 1
+            stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
             
         # --- CRITICAL FILTER 2: MTF TREND LOCK ---
@@ -305,40 +307,33 @@ class MultiAssetPredictor:
         d1_trend_up = (bar.close > d1_ema) if d1_ema > 0 else True
         d1_trend_down = (bar.close < d1_ema) if d1_ema > 0 else True
         
-        # Gate Definitions
-        vol_gate = rvol > self.vol_gate_ratio
-        
+        # --- CRITICAL FILTER 3: ADX TREND STRENGTH ---
+        # V2.4 Requirement: ADX > 25
+        if adx_val < self.adx_threshold:
+            stats[f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "Weak ADX"})
+
         # Momentum Direction (Aggressor Ratio)
-        # V2.3: 0.60 Threshold (Conviction)
+        # V2.4: 0.60 Threshold (Conviction)
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
         
-        # --- REGIME A: "THE ARCHER" (TREND PULLBACK) ---
-        # Logic: D1 Trend + RSI Dip + Reversal Candle
+        # --- REGIME A: VOLATILITY/PULLBACK (DISABLED IN V2.4) ---
         if self.enable_regime_a:
-            if d1_trend_up and is_bullish_candle and rsi_val < self.pullback_rsi_long:
-                if vol_gate:
-                    proposed_action = 1
-                    regime_label = "A (Pullback-Long)"
-                else:
-                    stats["Regime A: Low Vol on Turn"] += 1
-            
-            elif d1_trend_down and is_bearish_candle and rsi_val > self.pullback_rsi_short:
-                if vol_gate:
-                    proposed_action = -1
-                    regime_label = "A (Pullback-Short)"
-                else:
-                    stats["Regime A: Low Vol on Turn"] += 1
-            
-            # If no signal found yet, log why if close
-            elif (d1_trend_up and rsi_val < self.pullback_rsi_long) or (d1_trend_down and rsi_val > self.pullback_rsi_short):
-                stats["Regime A: Indecision Candle"] += 1
-                
-        # --- REGIME B: EFFICIENT TREND CONTINUATION ---
-        # Logic: Efficiency (KER) + Momentum align
+            # Logic commented out as per V2.4 Spec
+            pass
+        else:
+            # We track "Regime A" type conditions just for stats, but do not act
+            range_gate = (bar.high - bar.low) > (self.range_gate_mult * atr_val)
+            vol_gate = rvol > self.vol_gate_ratio
+            if range_gate and vol_gate:
+                stats["Regime A: Disabled (Climax Protection)"] += 1
+        
+        # --- REGIME B: EFFICIENT TREND CONTINUATION (IRONCLAD) ---
+        # Logic: Efficiency (KER) + Momentum + D1 Align + ADX
         if proposed_action == 0 and ker_val > self.ker_thresh:
             if is_bullish_candle and d1_trend_up:
                 proposed_action = 1
@@ -347,12 +342,12 @@ class MultiAssetPredictor:
                 proposed_action = -1
                 regime_label = "B (Trend-Short)"
             else:
-                stats["Regime B: Weak Candle"] += 1
+                stats["Regime B: Weak Candle / Counter Trend"] += 1
         
         # --- REGIME C: NOISE ---
         if proposed_action == 0:
             regime_label = "C (Noise)"
-            stats[f"Noise (KER {ker_val:.2f} | RSI {rsi_val:.1f})"] += 1
+            stats[f"Noise (KER {ker_val:.2f})"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Regime C (Noise)"})
 
         # --- FINAL MTF SAFETY CHECK ---
@@ -397,7 +392,7 @@ class MultiAssetPredictor:
         )
 
         # --- DECISION ---
-        # V2.3: Defaults to 0.60
+        # V2.4: Defaults to 0.60
         min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.60)
 
         # Safety Check: If ML thinks probability is terrible (< min_prob), skip.
@@ -414,6 +409,7 @@ class MultiAssetPredictor:
                 if rvol > 1.2: imp_feats.append('High_Volume')
                 if parkinson > 0.002: imp_feats.append('High_Parkinson')
                 if mtf_align == 1.0: imp_feats.append('MTF_Aligned')
+                if adx_val > 30: imp_feats.append('Strong_ADX')
                 
                 for f in imp_feats:
                     self.feature_importance_counter[symbol][f] += 1

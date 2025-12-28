@@ -1,17 +1,13 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V2.3 (THE ARCHER)
-# STATUS: STRATEGIC PIVOT - TREND PULLBACK LOGIC
+# config.yaml – PROJECT PHOENIX V2.4 (IRONCLAD TREND)
+# STATUS: DEFENSIVE CONFIGURATION - VOLATILITY AVOIDANCE
 #
-# UPDATES (2025-12-27 - V2.3):
-# 1. REGIME A PIVOT: Replaced "Breakout" logic with "Pullback" (The Archer).
-#    - Buy Dips in Uptrends / Sell Rallies in Downtrends.
-# 2. NEW PARAMS:
-#    - pullback_rsi_long: 45 (Buy when RSI dips below 45 in Uptrend).
-#    - pullback_rsi_short: 55 (Sell when RSI spikes above 55 in Downtrend).
-# 3. GATES TUNED:
-#    - Aggressor: 0.60 (Requires conviction on the turn).
-#    - Volume Cap: 3.0 (Safety against news spikes).
-# 4. SAFETY: D1 Trend Lock is MANDATORY for this strategy.
+# UPDATES (2025-12-27 - V2.4):
+# 1. KILL SWITCH: Regime A (Volatility/Pullback) DISABLED. It was the source of ruin.
+# 2. VOLATILITY CAP: Tightened to 2.0 (was 3.0). Rejecting all high-volatility events.
+# 3. EFFICIENCY: KER raised to 0.60 (was 0.50). Demanding smooth trends only.
+# 4. RISK: Slashed to 0.25% (was 0.50%). Survival is priority #1.
+# 5. ADX: Enforced > 25 to confirm trend strength.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -137,31 +133,28 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V2.3 THE ARCHER) ---
+# --- PHOENIX STRATEGY PARAMETERS (V2.4 IRONCLAD) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true   # NOW REFERS TO PULLBACK ENTRIES
+  enable_regime_a_entries: false  # KILL SWITCH: No Volatility/Pullback entries. Pure Trend only.
   require_d1_trend: true          # GOLDEN RULE: Must align with D1 EMA200
   
-  # --- FILTER THRESHOLDS ---
-  # Volume Exhaustion (Safety Cap)
-  max_relative_volume: 3.0        # Reject 3-sigma volume spikes (Climax protection)
+  # --- FILTER THRESHOLDS (THE DEFENSE) ---
+  # Volume Exhaustion (Tightened to 2.0)
+  max_relative_volume: 2.0        # Reject ALL loud moves. Trade quiet trends.
   
-  # Trend Efficiency (Moderate)
-  ker_trend_threshold: 0.50       # Filter out total chop
+  # Trend Efficiency (Tightened to 0.60)
+  ker_trend_threshold: 0.60       # Require smooth, efficient price action.
   
-  # Volatility Expansion (For Regime B mostly now)
+  # Volatility Expansion
   vol_expansion_threshold: 2.0 
   
-  # --- "THE ARCHER" PULLBACK SETTINGS ---
-  # Replaces Range Gate. We look for RSI dips within trend.
-  pullback_rsi_long: 45           # Buy dip if RSI < 45 in Uptrend
-  pullback_rsi_short: 55          # Sell rip if RSI > 55 in Downtrend
+  # Entry Gates (V2.4 Standard)
+  range_gate_atr_mult: 1.0        
+  volume_gate_ratio: 1.0          
   
-  volume_gate_ratio: 1.0          # Just need average volume to confirm turn
-  
-  # Momentum Conviction (The Release)
-  aggressor_threshold: 0.60       # Close > 60% of High-Low. Must be a "turn" candle.
+  # Momentum Conviction (Standard)
+  aggressor_threshold: 0.60       # Close > 60% of High-Low.
   
   ml_confirmation_threshold: 0.60 
   
@@ -177,12 +170,13 @@ risk_management:
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # Risk Per Trade (Standard Sniper Sizing)
-  base_risk_per_trade_percent: 0.50 
+  # Risk Per Trade (SLASHED FOR SURVIVAL)
+  # 0.25% per trade. Survival > Aggression.
+  base_risk_per_trade_percent: 0.25 
   
   max_daily_loss_pct: 0.04
   max_total_loss_pct: 0.09
-  max_risk_percent: 1.0         
+  max_risk_percent: 0.5         # Cap single trade risk (hard ceiling)
   max_leverage: 30.0
   max_lot_size: 10.0            
   min_lot_size: 0.01
@@ -203,7 +197,7 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 20        
+  max_trades_per_day: 15        # Reduced to reflect "Ironclad" selectivity
   correlation_penalty_threshold: 0.8
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0

@@ -5,11 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.3 THE ARCHER PATCH):
-# 1. REGIME A PIVOT: Replaced Volatility Expansion with "Trend Pullback" logic.
-# 2. RSI GATES: Added RSI < 45 (Long) and RSI > 55 (Short) checks for entry.
-# 3. SAFETY: Tightened RVol Cap to 3.0 to prevent climax chasing.
-# 4. CONVICTION: Aggressor Threshold restored to 0.60.
+# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.4 IRONCLAD TREND PATCH):
+# 1. KILL SWITCH: Regime A (Volatility) Disabled. Pure Trend Following only.
+# 2. VOLATILITY CAP: Tightened to 2.0 to reject all climactic moves.
+# 3. EFFICIENCY: KER > 0.60 required (Smooth trends only).
+# 4. ADX: Hard filter ADX > 25 required.
 # =============================================================================
 import logging
 import sys
@@ -99,20 +99,21 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX STRATEGY PARAMETERS (V2.3 THE ARCHER CONFIG) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V2.4 IRONCLAD CONFIG) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V2.3 GATES
-        self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
+        # V2.4 GATES
+        self.enable_regime_a = phx_conf.get('enable_regime_a_entries', False)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         
-        # Safety Cap (V2.3: 3.0)
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.0)
+        # Safety Cap (V2.4: 2.0)
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 2.0)
         
         # Thresholds
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.50)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.60)
+        self.adx_threshold = CONFIG['features']['adx'].get('threshold', 25)
         
-        # "The Archer" Pullback Settings
+        # "The Archer" Pullback Settings (Legacy/Disabled for V2.4)
         self.pullback_rsi_long = phx_conf.get('pullback_rsi_long', 45)
         self.pullback_rsi_short = phx_conf.get('pullback_rsi_short', 55)
         self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.0)
@@ -248,7 +249,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. PROJECT PHOENIX: LOGIC GATES (V2.3 THE ARCHER)
+        # D. PROJECT PHOENIX: LOGIC GATES (V2.4 IRONCLAD)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
@@ -257,9 +258,10 @@ class ResearchStrategy:
         aggressor = features.get('aggressor', 0.5)
         atr_val = features.get('atr', 0.0001)
         rsi_val = features.get('rsi_norm', 0.5) * 100.0
+        adx_val = features.get('adx', 0.0)
         
         # --- CRITICAL FILTER 1: VOLUME EXHAUSTION ---
-        # V2.3 Cap: 3.0 (Strict anti-climax)
+        # V2.4 Cap: 2.0 (Strict anti-climax)
         if rvol > self.max_rvol_thresh:
             self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
             return # Force HOLD
@@ -269,40 +271,35 @@ class ResearchStrategy:
         d1_trend_up = (price > d1_ema) if d1_ema > 0 else True
         d1_trend_down = (price < d1_ema) if d1_ema > 0 else True
         
+        # --- CRITICAL FILTER 3: ADX TREND STRENGTH ---
+        # V2.4 Requirement: ADX > 25
+        if adx_val < self.adx_threshold:
+            self.rejection_stats[f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
+            return # Force HOLD
+
         # Gate Definitions
         vol_gate = rvol > self.vol_gate_ratio
         
         # Momentum Direction (Aggressor Ratio)
-        # V2.3: 0.60 Threshold (Conviction)
+        # V2.4: 0.60 Threshold (Conviction)
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
         
-        # --- REGIME A: "THE ARCHER" (TREND PULLBACK) ---
-        # Logic: D1 Trend + RSI Dip + Reversal Candle
+        # --- REGIME A: VOLATILITY/PULLBACK (DISABLED IN V2.4) ---
         if self.enable_regime_a:
-            if d1_trend_up and is_bullish_candle and rsi_val < self.pullback_rsi_long:
-                if vol_gate:
-                    proposed_action = 1
-                    regime_label = "A (Pullback-Long)"
-                else:
-                    self.rejection_stats["Regime A: Low Vol on Turn"] += 1
-            
-            elif d1_trend_down and is_bearish_candle and rsi_val > self.pullback_rsi_short:
-                if vol_gate:
-                    proposed_action = -1
-                    regime_label = "A (Pullback-Short)"
-                else:
-                    self.rejection_stats["Regime A: Low Vol on Turn"] += 1
-            
-            # If no signal found yet, log why if close
-            elif (d1_trend_up and rsi_val < self.pullback_rsi_long) or (d1_trend_down and rsi_val > self.pullback_rsi_short):
-                self.rejection_stats["Regime A: Indecision Candle"] += 1
+            # Logic commented out as per V2.4 Spec
+            pass
+        else:
+            # Stats tracking only
+            range_gate = (high - low) > (1.0 * atr_val)
+            if range_gate and vol_gate:
+                self.rejection_stats["Regime A: Disabled (Climax Protection)"] += 1
                 
-        # --- REGIME B: EFFICIENT TREND CONTINUATION ---
-        # Logic: Efficiency (KER) + Momentum align
+        # --- REGIME B: EFFICIENT TREND CONTINUATION (IRONCLAD) ---
+        # Logic: Efficiency (KER) + Momentum + D1 Align + ADX
         if proposed_action == 0 and ker_val > self.ker_thresh:
             if is_bullish_candle and d1_trend_up:
                 proposed_action = 1
@@ -316,7 +313,7 @@ class ResearchStrategy:
         # --- REGIME C: NOISE / CHOP ---
         if proposed_action == 0:
             if regime_label == "C (Noise)":
-                self.rejection_stats[f"Noise (KER {ker_val:.2f} | RSI {rsi_val:.1f})"] += 1
+                self.rejection_stats[f"Noise (KER {ker_val:.2f})"] += 1
             return # Explicit HOLD
 
         # --- FINAL MTF SAFETY CHECK ---
@@ -332,7 +329,7 @@ class ResearchStrategy:
         # Prevent "Selling the Hole" (Shorting when Price < BB Lower or RSI < 30)
         # ---------------------------------------------------------------------
         bb_pos = features.get('bb_position', 0.5)
-        # Re-using RSI safety check just in case, though Regime A handles it
+        
         if proposed_action == -1: # SELL
             if bb_pos < 0.0 or rsi_val < 30:
                 self.rejection_stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
