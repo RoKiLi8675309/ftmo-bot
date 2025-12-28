@@ -5,12 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (2025-12-27 - V2.3 CONTROLLED AGGRESSION):
-# 1. OPTIMIZATION: Raised 'min_calibrated_probability' floor to 0.60.
-#    This stops the model from learning to "gamble" on 55% probabilities
-#    during high volatility regimes.
-# 2. FIDELITY: Maintains Volume Bar alignment using 'train_candles'.
-# 3. SAFETY: Enforces single-threading for stability.
+# AUDIT REMEDIATION (2025-12-28 - V2.9 COMPATIBILITY FIX):
+# 1. COMPATIBILITY: Fixed BacktestBroker instantiation to use 'initial_balance'.
+# 2. STABILITY: Enforces single-threading for heavy math libs.
+# 3. REPORTING: Ensures financial stats are correctly aggregated.
 # =============================================================================
 import os
 import sys
@@ -223,7 +221,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             # Instantiate Pipeline locally
             pipeline_inst = ResearchPipeline()
-            broker = BacktestBroker(starting_cash=CONFIG['env']['initial_balance'])
+            # FIX: Use 'initial_balance' matching backtester.py
+            broker = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
             model = pipeline_inst.get_fresh_model(params)
             strategy = ResearchStrategy(model, symbol, params)
             
@@ -238,7 +237,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 if broker.is_blown: break
             
             # --- RICH METRICS EXTRACTION ---
-            metrics = pipeline_inst.calculate_performance_metrics(broker.trade_log, broker.starting_cash)
+            metrics = pipeline_inst.calculate_performance_metrics(broker.trade_log, broker.initial_balance)
             
             # Pass metrics to Callback
             trial.set_user_attr("pnl", metrics['total_pnl'])
@@ -272,7 +271,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
 
             # AGGRESSIVE PENALTY for Negative PnL
             if metrics['total_pnl'] < 0:
-                 loss_ratio = abs(metrics['total_pnl']) / broker.starting_cash
+                 loss_ratio = abs(metrics['total_pnl']) / broker.initial_balance
                  penalty_factor = 1000.0 * loss_ratio 
                  final_score -= penalty_factor
                 
@@ -338,7 +337,8 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         
         pipeline_inst = ResearchPipeline()
         model = pipeline_inst.get_fresh_model(final_params)
-        broker = BacktestBroker(starting_cash=CONFIG['env']['initial_balance'])
+        # FIX: Use 'initial_balance' matching backtester.py
+        broker = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
         strategy = ResearchStrategy(model, symbol, final_params)
 
         for index, row in df.iterrows():
@@ -584,7 +584,8 @@ class ResearchPipeline:
                     strategy.calibrator_buy = cals['buy']
                     strategy.calibrator_sell = cals['sell']
             
-            broker = BacktestBroker(starting_cash=CONFIG['env']['initial_balance'])
+            # FIX: Use 'initial_balance' matching backtester.py
+            broker = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
             
             for index, row in df.iterrows():
                 snapshot = MarketSnapshot(timestamp=index, data=row)

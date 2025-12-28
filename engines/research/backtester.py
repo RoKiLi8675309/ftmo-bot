@@ -10,6 +10,8 @@
 # 1. ADDED: Full financial reporting (Max DD%, Sharpe, Sortino, CAGR).
 # 2. ADDED: Detailed Drawdown tracking for FTMO compliance checks.
 # 3. ADDED: Expectancy and SQN calculations.
+# 4. FIXED: Added 'submit_order' method for compatibility with ResearchStrategy.
+# 5. FIXED: Added 'positions' property for compatibility with ResearchStrategy.
 # =============================================================================
 from __future__ import annotations
 import pandas as pd
@@ -55,21 +57,38 @@ class MarketSnapshot:
             return 0.0
         except Exception:
             return 0.0
+            
+    def get_high(self, symbol: str) -> float:
+        return self.get_price(symbol, 'high')
+        
+    def get_low(self, symbol: str) -> float:
+        return self.get_price(symbol, 'low')
+
+    def to_price_dict(self) -> Dict[str, float]:
+        """Returns a dictionary of {symbol: close_price}."""
+        res = {}
+        for col in self.data.index:
+            if "_close" in col:
+                sym = col.replace("_close", "")
+                res[sym] = float(self.data[col])
+        return res
 
 @dataclass
 class BacktestOrder:
     symbol: str
-    action: str  # "BUY" or "SELL"
-    lots: float
-    entry_price: float
-    sl: float
-    tp: float
-    ticket: int
-    entry_time: datetime
+    side: int # 1 for BUY, -1 for SELL
+    quantity: float
+    entry_price: float = 0.0
+    stop_loss: float = 0.0
+    take_profit: float = 0.0
+    ticket: int = 0
+    timestamp_created: datetime = field(default_factory=datetime.now)
     magic: int = 123456
     comment: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
     
     # Validation flags
+    action: str = "" # "BUY" or "SELL" derived from side
     is_active: bool = True
     close_time: Optional[datetime] = None
     close_price: float = 0.0
@@ -82,6 +101,10 @@ class BacktestOrder:
     # Metrics
     max_favorable_excursion: float = 0.0
     max_adverse_excursion: float = 0.0
+    
+    def __post_init__(self):
+        if not self.action:
+            self.action = "BUY" if self.side == 1 else "SELL"
 
 class BacktestBroker:
     """
@@ -101,13 +124,29 @@ class BacktestBroker:
         
         self.equity_curve: List[Tuple[datetime, float]] = []
         self.orders_history: List[Dict] = []
+        self.trade_log: List[Dict] = [] # For reporting
         
         self.ticket_counter = 1
         self.last_snapshot: Optional[MarketSnapshot] = None
         self.last_price_map: Dict[str, float] = {}
+        
+        # State Flags
+        self.is_blown = False
 
         # Pre-populate price map to prevent initial warnings
         self._inject_aux_data()
+
+    @property
+    def positions(self) -> Dict[str, BacktestOrder]:
+        """
+        COMPATIBILITY LAYER: Exposes open positions as a dictionary {symbol: trade}.
+        This fixes the AttributeError in ResearchStrategy.
+        Assumes one trade per symbol (Hedging disabled in this view).
+        """
+        pos_map = {}
+        for p in self.open_positions:
+            pos_map[p.symbol] = p
+        return pos_map
 
     def _inject_aux_data(self):
         """
@@ -143,6 +182,10 @@ class BacktestBroker:
         if "AUD" in s: return 0.65
         return 1.0
 
+    def process_pending(self, snapshot: MarketSnapshot):
+        """ Alias for process_snapshot to match Live Engine nomenclature if needed """
+        self.process_snapshot(snapshot)
+
     def process_snapshot(self, snapshot: MarketSnapshot):
         """
         Updates the state of the broker based on a new market tick/bar.
@@ -151,10 +194,13 @@ class BacktestBroker:
         self.last_snapshot = snapshot
         
         # 1. Update Price Map for Risk Calc
+        # Handle both flat structure (Symbol_Close) and multi-index
         for col in snapshot.data.index:
             if "_close" in col:
                 sym = col.replace("_close", "")
                 self.last_price_map[sym] = float(snapshot.data[col])
+            elif "_" not in col and len(col) == 6: # Assumption: Pure symbol name index
+                 self.last_price_map[col] = float(snapshot.data[col])
 
         # 2. Check Open Positions
         active_positions = []
@@ -182,39 +228,53 @@ class BacktestBroker:
             exit_reason = ""
             close_price = 0.0
 
+            # High/Low checks for more realistic backtesting (Hit SL/TP within bar)
+            bar_high = snapshot.get_high(trade.symbol)
+            bar_low = snapshot.get_low(trade.symbol)
+            
+            # If High/Low unavailable, use Close
+            if bar_high == 0: bar_high = current_price
+            if bar_low == 0: bar_low = current_price
+
             if trade.action == "BUY":
-                if trade.sl > 0 and current_price <= trade.sl:
+                # Check SL (Low)
+                if trade.stop_loss > 0 and bar_low <= trade.stop_loss:
                     closed = True
                     exit_reason = "SL_HIT"
-                    close_price = trade.sl
-                elif trade.tp > 0 and current_price >= trade.tp:
+                    close_price = trade.stop_loss
+                # Check TP (High)
+                elif trade.take_profit > 0 and bar_high >= trade.take_profit:
                     closed = True
                     exit_reason = "TP_HIT"
-                    close_price = trade.tp
+                    close_price = trade.take_profit
             elif trade.action == "SELL":
-                if trade.sl > 0 and current_price >= trade.sl:
+                # Check SL (High)
+                if trade.stop_loss > 0 and bar_high >= trade.stop_loss:
                     closed = True
                     exit_reason = "SL_HIT"
-                    close_price = trade.sl
-                elif trade.tp > 0 and current_price <= trade.tp:
+                    close_price = trade.stop_loss
+                # Check TP (Low)
+                elif trade.take_profit > 0 and bar_low <= trade.take_profit:
                     closed = True
                     exit_reason = "TP_HIT"
-                    close_price = trade.tp
+                    close_price = trade.take_profit
 
             if closed:
                 self._finalize_trade(trade, close_price, snapshot.timestamp, exit_reason)
             else:
                 # Update Floating PnL
-                # Standard Lot = 100,000 units
-                raw_pnl = (current_price - trade.entry_price) * (trade.lots * 100000)
+                # Standard Lot = 100,000 units (Project assumption)
+                contract_size = 100000
+                raw_pnl = (current_price - trade.entry_price) * (trade.quantity * contract_size)
                 if trade.action == "SELL": raw_pnl = -raw_pnl
                 
                 # Convert to Account Currency (USD)
                 rate = self._get_simulation_conversion_rate(trade.symbol, current_price)
                 
-                # Commission Simulation ($3.50 per lot per side = $7 RT)
+                # Commission Simulation ($5.00 per lot per side = $10 RT)
+                # Matches config: commission_per_lot_rt
                 # Being conservative for backtest
-                comm_drag = trade.lots * 7.0 
+                comm_drag = trade.quantity * 10.0 
                 
                 floating_pnl += (raw_pnl * rate) - comm_drag
                 active_positions.append(trade)
@@ -224,50 +284,55 @@ class BacktestBroker:
         # 3. Update Equity
         self.equity = self.balance + floating_pnl
         self.equity_curve.append((snapshot.timestamp, self.equity))
+        
+        # 4. Margin Call / Blowout Check
+        if self.equity < (self.initial_balance * 0.90): # 10% Max Drawdown Hard Limit
+             self.is_blown = True
 
-    def place_limit_order(self, symbol: str, action: str, lots: float, 
-                         price: float, sl: float, tp: float, comment: str = "") -> Optional[int]:
+    def submit_order(self, order: BacktestOrder) -> Optional[int]:
         """
-        Simulates placing a trade. For backtesting, we assume immediate fill 
-        if price is within range, or simply fill at 'price' (Close of bar).
+        Public API called by ResearchStrategy.
         """
-        if lots <= 0: return None
+        if order.quantity <= 0: return None
+        
+        # Assign Ticket
+        order.ticket = self.ticket_counter
+        self.ticket_counter += 1
+        
+        # Simulate Fill (Market Order Logic for simplicity in Research)
+        # In a real engine, we'd use Limit, but for Strategy Dev, we assume 'Close' is the fill.
+        
+        # Ensure Entry Price is set
+        if order.entry_price <= 0:
+             # Try to get from last snapshot
+             if self.last_snapshot:
+                 order.entry_price = self.last_snapshot.get_price(order.symbol)
         
         # Basic Spread Simulation (Slippage)
         # BUY: Ask = Price + Spread/2
         # SELL: Bid = Price - Spread/2
         # We simulate 1 pip slippage/spread cost on entry
-        pip = 0.01 if "JPY" in symbol else 0.0001
+        pip = 0.01 if "JPY" in order.symbol else 0.0001
         slippage = 1.0 * pip
         
-        fill_price = price + slippage if action == "BUY" else price - slippage
+        order.entry_price = order.entry_price + slippage if order.action == "BUY" else order.entry_price - slippage
         
-        # Calculate Commission ($7.00 per round turn lot)
-        commission = lots * 7.0
-        
-        # Deduct commission immediately from Balance (to mimic raw spread/comm impact)
-        # Actually, in MT5 commission is usually deducted at open or close. 
-        # We'll deduct from Net PnL on close for simplicity in Balance, 
-        # but Equity will reflect it via Floating PnL logic.
-        
-        ticket = self.ticket_counter
-        self.ticket_counter += 1
-        
-        order = BacktestOrder(
-            symbol=symbol,
-            action=action,
-            lots=round(lots, 2),
-            entry_price=fill_price,
-            sl=sl,
-            tp=tp,
-            ticket=ticket,
-            entry_time=self.last_snapshot.timestamp if self.last_snapshot else datetime.now(),
-            comment=comment,
-            commission=commission
-        )
+        # Calculate Commission
+        order.commission = order.quantity * 7.0
         
         self.open_positions.append(order)
-        return ticket
+        return order.ticket
+
+    def get_position(self, symbol: str) -> Optional[BacktestOrder]:
+        """Returns the first active position for a symbol (Hedging disabled for this check)."""
+        for p in self.open_positions:
+            if p.symbol == symbol:
+                return p
+        return None
+
+    def _close_partial_position(self, trade: BacktestOrder, qty: float, price: float, time: datetime, reason: str):
+        """Simulates a partial or full close."""
+        self._finalize_trade(trade, price, time, reason)
 
     def _finalize_trade(self, trade: BacktestOrder, close_price: float, close_time: datetime, reason: str):
         """
@@ -277,7 +342,7 @@ class BacktestBroker:
         raw_diff = (close_price - trade.entry_price)
         if trade.action == "SELL": raw_diff = -raw_diff
         
-        raw_profit = raw_diff * (trade.lots * 100000)
+        raw_profit = raw_diff * (trade.quantity * 100000)
         
         # 2. Convert to USD
         rate = self._get_simulation_conversion_rate(trade.symbol, close_price)
@@ -298,6 +363,27 @@ class BacktestBroker:
         trade.exit_reason = reason
         
         self.closed_positions.append(trade)
+        
+        # 6. Log to Trade Log (For DataFrame construction)
+        self.trade_log.append({
+            'Entry_Time': trade.timestamp_created,
+            'Exit_Time': close_time,
+            'Symbol': trade.symbol,
+            'Action': trade.action,
+            'Size': trade.quantity,
+            'Entry_Price': trade.entry_price,
+            'Exit_Price': close_price,
+            'Gross_PnL': gross_pnl,
+            'Commission': trade.commission,
+            'Net_PnL': net_pnl,
+            'Status': "CLOSED",
+            'Comment': reason,
+            'MFE_Pips': trade.max_favorable_excursion,
+            'MAE_Pips': trade.max_adverse_excursion,
+            'Duration_Min': (close_time - trade.timestamp_created).total_seconds() / 60,
+            'Regime': trade.metadata.get('regime', 'Unknown'),
+            'Confidence': trade.metadata.get('confidence', 0.0)
+        })
         
         # Log it
         symbol_icon = "🟢" if net_pnl > 0 else "🔴"
