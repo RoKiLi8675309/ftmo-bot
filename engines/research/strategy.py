@@ -5,11 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.8 IRONCLAD):
-# 1. PHILOSOPHY: "Ironclad" - No Volume, No Trade. Period.
-# 2. CRITICAL FIX: Regime B (Trend Continuation) now requires Volume Gate > 2.0.
-# 3. EFFICIENCY: KER raised to 0.50. 50% of price movement must be directional.
-# 4. CONFIDENCE: ML Threshold raised to 0.70.
+# PHOENIX STRATEGY UPGRADE (2025-12-28 - V2.9 PIVOT):
+# 1. PHILOSOPHY: "Controlled Aggression" - Lower barriers to entry.
+# 2. FIX: Volume Gate lowered to 1.5 to capture institutional flow.
+# 3. FIX: KER lowered to 0.25 to tolerate choppy volume bars.
+# 4. FIX: Confidence lowered to 0.60 to increase sample size.
 # =============================================================================
 import logging
 import sys
@@ -99,23 +99,25 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX STRATEGY PARAMETERS (V2.8 IRONCLAD CONFIG) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V2.9 PIVOT CONFIG) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
+        strat_params = CONFIG.get('strategy_parameters', {}) # New section
         
-        # V2.8 GATES
+        # V2.9 GATES
         self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         
-        # Safety Cap (V2.8: 3.5)
+        # Safety Cap
         self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.5)
         
-        # Thresholds (V2.8: EXTREME)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.50) # Raised from 0.35/0.40
+        # Thresholds (V2.9: RELAXED)
+        # Prefer new strategy_parameters section, fallback to phoenix_strategy
+        self.ker_thresh = strat_params.get('min_efficiency', phx_conf.get('ker_trend_threshold', 0.25))
         self.adx_threshold = CONFIG['features']['adx'].get('threshold', 0)
         
-        # Pullback/Gate settings
-        # CRITICAL FIX: Volume Gate Ratio (2.0)
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 2.0)
+        # Volume Gate
+        # Prefer new strategy_parameters section, fallback to phoenix_strategy
+        self.vol_gate_ratio = strat_params.get('min_volume_gate', phx_conf.get('volume_gate_ratio', 1.5))
         
         # Momentum (V2.8: 0.65)
         self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.65)
@@ -248,7 +250,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. PROJECT PHOENIX: LOGIC GATES (V2.8 IRONCLAD)
+        # D. PROJECT PHOENIX: LOGIC GATES (V2.9 PIVOT)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
@@ -270,7 +272,7 @@ class ResearchStrategy:
         d1_trend_down = (price < d1_ema) if d1_ema > 0 else True
         
         # Gate Definitions
-        # V2.8 FREQUENCY KILLER: Must be > 2.0x Avg Volume
+        # V2.9: 1.5x Avg Volume (Relaxed)
         vol_gate = rvol > self.vol_gate_ratio
         
         # Momentum Direction (Aggressor Ratio)
@@ -286,19 +288,19 @@ class ResearchStrategy:
         if self.enable_regime_a:
             # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
             if d1_trend_up and is_bullish_candle and vol_gate:
-                # Require Efficiency (V2.8: KER > 0.50)
+                # Require Efficiency (V2.9: KER > 0.25 - Relaxed)
                 if ker_val > self.ker_thresh:
                     proposed_action = 1
                     regime_label = "A (Mom-Long)"
                 else:
-                    self.rejection_stats["Regime A: Low Efficiency"] += 1
+                    self.rejection_stats[f"Regime A: Low Efficiency (<{self.ker_thresh})"] += 1
             
             elif d1_trend_down and is_bearish_candle and vol_gate:
                 if ker_val > self.ker_thresh:
                     proposed_action = -1
                     regime_label = "A (Mom-Short)"
                 else:
-                    self.rejection_stats["Regime A: Low Efficiency"] += 1
+                    self.rejection_stats[f"Regime A: Low Efficiency (<{self.ker_thresh})"] += 1
 
             # Diagnostic for Volume Gate Failure
             elif (d1_trend_up and is_bullish_candle) or (d1_trend_down and is_bearish_candle):
@@ -373,8 +375,8 @@ class ResearchStrategy:
                 self.meta_label_events += 1
 
             # --- EXECUTION ---
-            # V2.8: Defaults to 0.70 (Raised from 0.60)
-            min_prob = self.params.get('min_calibrated_probability', 0.70)
+            # V2.9: Defaults to 0.60 (Lowered from 0.70)
+            min_prob = self.params.get('min_calibrated_probability', 0.60)
             
             if confidence < min_prob:
                 self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob})"] += 1

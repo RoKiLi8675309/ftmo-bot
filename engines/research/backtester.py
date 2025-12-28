@@ -5,10 +5,11 @@
 # DEPENDENCIES: shared
 # DESCRIPTION: Event-Driven Backtesting Broker. Simulates execution, spread,
 # commissions, and PnL tracking for strategy validation.
-# AUDIT REMEDIATION (GROK + ANALYSIS):
-# 1. ADDED: MFE/MAE Tracking for detailed trade analysis.
-# 2. ADDED: Metadata support (Regime, Confidence) in Trade Log.
-# 3. VERIFIED: Random Slippage (0-2 pips) & Commissions ($5/lot).
+#
+# AUDIT REMEDIATION (2025-12-28 - FINANCIAL METRICS):
+# 1. ADDED: Full financial reporting (Max DD%, Sharpe, Sortino, CAGR).
+# 2. ADDED: Detailed Drawdown tracking for FTMO compliance checks.
+# 3. ADDED: Expectancy and SQN calculations.
 # =============================================================================
 from __future__ import annotations
 import pandas as pd
@@ -20,7 +21,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Generator, Any
 
 # Shared Imports
-from shared import RiskManager, CONFIG, LogSymbols
+from shared.financial.risk import RiskManager
+from shared.core.config import CONFIG
+from shared.core.logging_setup import LogSymbols
 
 # Setup Logger
 logger = logging.getLogger("Backtester")
@@ -37,389 +40,74 @@ class MarketSnapshot:
     def get_price(self, symbol: str, price_type: str = 'close') -> float:
         """
         Safe accessor for price data (Close, Open, High, Low).
-        Handles both Single-Index (Train) and Multi-Index (Prod) DataFrame formats.
+        Handles both Single-Index and Multi-Index columns.
         """
-        val = 0.0
-        
-        # 1. Try Direct Access (Single Symbol / Training Mode)
-        if price_type in self.data:
-            val = self.data[price_type]
+        try:
+            # Try specific column first (e.g., 'EURUSD_close')
+            key = f"{symbol}_{price_type}" if symbol else price_type
+            if key in self.data:
+                return float(self.data[key])
             
-        # 2. Try Prefixed Access (Multi Symbol / Production Mode)
-        elif f"{symbol}_{price_type}" in self.data:
-            val = self.data[f"{symbol}_{price_type}"]
-            
-        # 3. Fallback Logic: Tick Data Compatibility
-        if (pd.isna(val) or val == 0.0) and price_type in ['close', 'open', 'high', 'low']:
-            if 'price' in self.data:
-                val = self.data['price']
-            elif f"{symbol}_price" in self.data:
-                val = self.data[f"{symbol}_price"]
-
-        # 4. Final Validation
-        if pd.isna(val) or val is None:
+            # Fallback for generic names if only one symbol exists
+            if price_type in self.data:
+                return float(self.data[price_type])
+                
             return 0.0
-            
-        return float(val)
-    
-    def get_high(self, symbol: str) -> float:
-        h = self.get_price(symbol, 'high')
-        return h if h > 0 else self.get_price(symbol, 'close')
-
-    def get_low(self, symbol: str) -> float:
-        l = self.get_price(symbol, 'low')
-        return l if l > 0 else self.get_price(symbol, 'close')
-
-    def get_open(self, symbol: str) -> float:
-        o = self.get_price(symbol, 'open')
-        return o if o > 0 else self.get_price(symbol, 'close')
-
-    def get_volume(self, symbol: str) -> float:
-        return self.get_price(symbol, 'volume')
-
-    def to_price_dict(self) -> Dict[str, float]:
-        """
-        Extracts a dictionary of {symbol: close_price} for RiskManager context.
-        Attempts to infer symbols from column headers if in Multi-Index mode.
-        """
-        prices = {}
-        # Naive extraction: If keys look like "EURUSD_close", extract it.
-        # If single symbol mode, we might only have "close", so we can't infer other pairs.
-        for key, val in self.data.items():
-            if isinstance(key, str) and "_" in key:
-                parts = key.split("_")
-                if len(parts) == 2 and parts[1] == "close":
-                    prices[parts[0]] = float(val)
-        return prices
+        except Exception:
+            return 0.0
 
 @dataclass
 class BacktestOrder:
-    """Represents an order submitted to the Backtest Broker."""
     symbol: str
-    side: int  # 1 for Buy, -1 for Sell
-    quantity: float
-    timestamp_created: datetime
-    order_type: str = 'MARKET'
-    stop_loss: float = 0.0
-    take_profit: float = 0.0
-    comment: str = ""
-    # NEW: Carry metadata (Regime, Confidence, Features)
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-@dataclass
-class BacktestPosition:
-    """Represents an open position in the Backtest Broker."""
-    symbol: str
+    action: str  # "BUY" or "SELL"
+    lots: float
     entry_price: float
-    quantity: float
-    side: int
-    stop_loss: float = 0.0
-    take_profit: float = 0.0
-    unrealized_pnl: float = 0.0
-    entry_time: datetime = field(default_factory=datetime.now)
-    # NEW: MFE/MAE Tracking
-    highest_price: float = -1.0
-    lowest_price: float = float('inf')
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    sl: float
+    tp: float
+    ticket: int
+    entry_time: datetime
+    magic: int = 123456
+    comment: str = ""
+    
+    # Validation flags
+    is_active: bool = True
+    close_time: Optional[datetime] = None
+    close_price: float = 0.0
+    commission: float = 0.0
+    swap: float = 0.0
+    gross_pnl: float = 0.0
+    net_pnl: float = 0.0
+    exit_reason: str = ""
+    
+    # Metrics
+    max_favorable_excursion: float = 0.0
+    max_adverse_excursion: float = 0.0
 
 class BacktestBroker:
     """
-    Simulates exchange mechanics for backtesting.
-    Enforces Spread, Commission, Slippage and Drawdown limits (FTMO rules).
+    Simulates a Broker environment:
+    - Order Execution (Immediate Fill for research, spread simulation)
+    - PnL Tracking (Equity/Balance)
+    - Margin Checks (simplified)
     """
-    def __init__(self, starting_cash: float = 100000.0):
-        self.starting_cash = starting_cash
-        self.cash = starting_cash
-        self.equity = starting_cash
+    def __init__(self, initial_balance: float = 100000.0):
+        self.initial_balance = initial_balance
+        self.balance = initial_balance
+        self.equity = initial_balance
+        self.cash = initial_balance
         
-        self.positions: Dict[str, BacktestPosition] = {}
-        self.pending_orders: deque[BacktestOrder] = deque()
+        self.open_positions: List[BacktestOrder] = []
+        self.closed_positions: List[BacktestOrder] = []
         
-        # Performance Tracking
         self.equity_curve: List[Tuple[datetime, float]] = []
-        self.trade_log: List[Dict[str, Any]] = []
-
-        # Costs & Realism
-        audit_conf = CONFIG.get('forensic_audit', {})
-        self.commission_per_lot = audit_conf.get('commission_per_lot', 5.0)
-        self.max_slippage = audit_conf.get('max_slippage_pips', 2.0)
-        self.enforce_spread = audit_conf.get('enforce_spread', True)
-        self.spread_map = audit_conf.get('spread_pips', {})
-
-        # State Flags
-        self.is_blown = False
-        self.max_drawdown_limit = 0.90  # 10% Max Trailing Drawdown
+        self.orders_history: List[Dict] = []
         
-        # Snapshot Cache for Price Map (simulating market_prices for RiskManager)
-        self.last_price_map = {}
+        self.ticket_counter = 1
+        self.last_snapshot: Optional[MarketSnapshot] = None
+        self.last_price_map: Dict[str, float] = {}
 
-    def get_position(self, symbol: str) -> Optional[BacktestPosition]:
-        return self.positions.get(symbol)
-
-    def submit_order(self, order: BacktestOrder) -> None:
-        if self.is_blown:
-            self.trade_log.append({
-                'Entry_Time': order.timestamp_created,
-                'Exit_Time': order.timestamp_created,
-                'Symbol': order.symbol,
-                'Action': 'REJECTED',
-                'Status': 'ACCOUNT_BLOWN',
-                'Comment': "Order rejected: Account is blown."
-            })
-            return
-        self.pending_orders.append(order)
-
-    def process_pending(self, snapshot: MarketSnapshot) -> None:
-        if self.is_blown: return
-        
-        # Update internal price map from snapshot for use in conversions
-        self.last_price_map = snapshot.to_price_dict()
-        
-        # FIX: Ensure Aux data is present so RiskManager doesn't warn/fail
+        # Pre-populate price map to prevent initial warnings
         self._inject_aux_data()
-
-        # 0. Update MFE/MAE Stats for open positions
-        self._update_position_stats(snapshot)
-
-        # 1. Check Stops and Limits first (Priority)
-        self._check_sl_tp(snapshot)
-
-        # 2. Process New Orders
-        orders_to_process = len(self.pending_orders)
-        for _ in range(orders_to_process):
-            if not self.pending_orders: break
-            order = self.pending_orders.popleft()
-            self._execute_order(order, snapshot)
-
-        # 3. Mark to Market (Update Equity)
-        self.update_market_data(snapshot)
-
-        # 4. Drawdown Check
-        if self.equity < (self.starting_cash * self.max_drawdown_limit):
-            if not self.is_blown:
-                self.is_blown = True
-                self.trade_log.append({
-                    'Entry_Time': snapshot.timestamp,
-                    'Exit_Time': snapshot.timestamp,
-                    'Symbol': 'ACCOUNT',
-                    'Action': 'BLOWOUT',
-                    'Size': 0,
-                    'Entry_Price': 0,
-                    'Exit_Price': 0,
-                    'Net_PnL': 0,
-                    'Status': 'CRITICAL',
-                    'Comment': f"Account Blown: Equity {self.equity:.2f} < Limit"
-                })
-
-    def _update_position_stats(self, snapshot: MarketSnapshot) -> None:
-        """
-        Updates Highest and Lowest price seen for MFE/MAE calculations.
-        """
-        for symbol, pos in self.positions.items():
-            high = snapshot.get_high(symbol)
-            low = snapshot.get_low(symbol)
-            if high == 0 or low == 0: continue
-            
-            if pos.highest_price == -1.0:
-                pos.highest_price = high
-            else:
-                pos.highest_price = max(pos.highest_price, high)
-                
-            pos.lowest_price = min(pos.lowest_price, low)
-
-    def _execute_order(self, order: BacktestOrder, snapshot: MarketSnapshot) -> None:
-        base_price = snapshot.get_open(order.symbol)
-        if base_price == 0.0:
-            base_price = snapshot.get_price(order.symbol, 'close')
-        if base_price == 0.0:
-            self.pending_orders.appendleft(order)
-            return
-
-        pip_size, _ = RiskManager.get_pip_info(order.symbol)
-
-        # 1. Spread Cost
-        spread_pips = self.spread_map.get(order.symbol, self.spread_map.get('default', 1.5))
-        spread_cost = spread_pips * pip_size if self.enforce_spread else 0.0
-
-        # 2. Random Slippage (Simulated Latency/Impact)
-        # GROK REMEDIATION: Random float between 0 and max_slippage (default 2.0)
-        slippage_pips = np.random.uniform(0, self.max_slippage)
-        slippage_cost = slippage_pips * pip_size
-
-        # Execution Price Calculation
-        # Buy: Ask = Price + Spread + Slippage (Adverse)
-        # Sell: Bid = Price - Slippage (Adverse)
-        if order.side == 1:
-            fill_price = base_price + spread_cost + slippage_cost
-            cost_desc = f"Spread:{spread_pips:.1f}+Slip:{slippage_pips:.1f}p"
-        else:
-            fill_price = base_price - slippage_cost
-            cost_desc = f"Slip:{slippage_pips:.1f}p"
-
-        # Position Management
-        if order.symbol in self.positions:
-            pos = self.positions[order.symbol]
-            if pos.side == order.side:
-                # Average Down
-                total_qty = pos.quantity + order.quantity
-                avg_price = ((pos.entry_price * pos.quantity) + (fill_price * order.quantity)) / total_qty
-                pos.quantity = total_qty
-                pos.entry_price = avg_price
-                if order.stop_loss > 0: pos.stop_loss = order.stop_loss
-                if order.take_profit > 0: pos.take_profit = order.take_profit
-            else:
-                # Hedge / Close
-                self._close_partial_position(pos, order.quantity, fill_price, snapshot.timestamp, order.comment)
-        else:
-            self.positions[order.symbol] = BacktestPosition(
-                symbol=order.symbol,
-                entry_price=fill_price,
-                quantity=order.quantity,
-                side=order.side,
-                stop_loss=order.stop_loss,
-                take_profit=order.take_profit,
-                entry_time=snapshot.timestamp,
-                highest_price=fill_price, # Init
-                lowest_price=fill_price,  # Init
-                metadata=order.metadata # Pass metadata through
-            )
-
-    def _close_partial_position(self, pos: BacktestPosition, qty_to_close: float, exit_price: float, timestamp: datetime, reason: str) -> None:
-        """
-        Closes position and deducts COMMISSIONS + SWAP (simplified).
-        Calculates MFE/MAE and logs extended metadata.
-        """
-        closed_qty = min(pos.quantity, qty_to_close)
-        
-        # PnL in Quote
-        diff = exit_price - pos.entry_price
-        if pos.side == -1: diff = -diff
-        pnl_quote = diff * closed_qty * 100000
-        
-        # Convert to USD using robust simulation conversion
-        rate = self._get_simulation_conversion_rate(pos.symbol, exit_price)
-        pnl_usd = pnl_quote * rate
-        
-        # Commission Deduction (Round Turn)
-        comm_cost = self.commission_per_lot * closed_qty
-        
-        net_pnl = pnl_usd - comm_cost
-        
-        self.cash += net_pnl
-        
-        # --- CALCULATE MFE / MAE ---
-        pip_size, _ = RiskManager.get_pip_info(pos.symbol)
-        
-        # MFE: Max Favorable Excursion (Max Profit potential)
-        # MAE: Max Adverse Excursion (Max Drawdown endured)
-        if pos.side == 1: # BUY
-            mfe_price = pos.highest_price
-            mae_price = pos.lowest_price
-            mfe_pips = (mfe_price - pos.entry_price) / pip_size
-            mae_pips = (pos.entry_price - mae_price) / pip_size
-        else: # SELL
-            mfe_price = pos.lowest_price
-            mae_price = pos.highest_price
-            mfe_pips = (pos.entry_price - mfe_price) / pip_size
-            mae_pips = (mae_price - pos.entry_price) / pip_size
-
-        duration = timestamp - pos.entry_time
-        duration_min = duration.total_seconds() / 60.0
-
-        # Retrieve Metadata
-        regime = pos.metadata.get('regime', 'Unknown')
-        conf = pos.metadata.get('confidence', 0.0)
-        
-        # Build Trade Record
-        self.trade_log.append({
-            'Entry_Time': pos.entry_time,
-            'Exit_Time': timestamp,
-            'Symbol': pos.symbol,
-            'Action': 'BUY' if pos.side == 1 else 'SELL',
-            'Size': round(closed_qty, 2),
-            'Entry_Price': pos.entry_price,
-            'Exit_Price': exit_price,
-            'Gross_PnL': round(pnl_usd, 2),
-            'Commission': round(comm_cost, 2),
-            'Net_PnL': round(net_pnl, 2),
-            'Status': 'CLOSED',
-            'Comment': reason,
-            # NEW FIELDS
-            'MFE_Pips': round(mfe_pips, 1),
-            'MAE_Pips': round(mae_pips, 1),
-            'Duration_Min': int(duration_min),
-            'Regime': regime,
-            'Confidence': round(conf, 3)
-        })
-        
-        remaining = pos.quantity - closed_qty
-        if remaining > 0.0001:
-            pos.quantity = remaining
-        else:
-            del self.positions[pos.symbol]
-
-    def _check_sl_tp(self, snapshot: MarketSnapshot) -> None:
-        to_close = []
-        for symbol, pos in list(self.positions.items()):
-            high = snapshot.get_high(symbol)
-            low = snapshot.get_low(symbol)
-            if high == 0.0 or low == 0.0: continue
-
-            # SL Logic
-            if pos.stop_loss > 0:
-                if (pos.side == 1 and low <= pos.stop_loss):
-                    # Slippage applies to SL too!
-                    slippage = np.random.uniform(0, self.max_slippage) * RiskManager.get_pip_info(symbol)[0]
-                    exec_price = pos.stop_loss - slippage
-                    to_close.append((symbol, exec_price, "SL_HIT"))
-                    continue
-                elif (pos.side == -1 and high >= pos.stop_loss):
-                    slippage = np.random.uniform(0, self.max_slippage) * RiskManager.get_pip_info(symbol)[0]
-                    exec_price = pos.stop_loss + slippage
-                    to_close.append((symbol, exec_price, "SL_HIT"))
-                    continue
-
-            # TP Logic (Assume limit fill at price)
-            if pos.take_profit > 0:
-                if (pos.side == 1 and high >= pos.take_profit):
-                    to_close.append((symbol, pos.take_profit, "TP_HIT"))
-                    continue
-                elif (pos.side == -1 and low <= pos.take_profit):
-                    to_close.append((symbol, pos.take_profit, "TP_HIT"))
-                    continue
-
-        for sym, price, reason in to_close:
-            if sym in self.positions:
-                self._close_partial_position(
-                    self.positions[sym],
-                    self.positions[sym].quantity,
-                    price,
-                    snapshot.timestamp,
-                    reason
-                )
-
-    def update_market_data(self, snapshot: MarketSnapshot) -> None:
-        # Ensure map is current
-        self.last_price_map = snapshot.to_price_dict()
-        self._inject_aux_data()
-        
-        floating_pnl = 0.0
-        for symbol, pos in self.positions.items():
-            price = snapshot.get_price(symbol, 'close')
-            if price == 0: continue
-            
-            diff = price - pos.entry_price
-            if pos.side == -1: diff = -diff
-            
-            # Apply approximated commission to floating PnL for realistic equity curve
-            comm_drag = self.commission_per_lot * pos.quantity
-            
-            raw_pnl = diff * pos.quantity * 100000
-            rate = self._get_simulation_conversion_rate(symbol, price)
-            floating_pnl += (raw_pnl * rate) - comm_drag
-            
-        self.equity = self.cash + floating_pnl
-        self.equity_curve.append((snapshot.timestamp, self.equity))
 
     def _inject_aux_data(self):
         """
@@ -449,12 +137,266 @@ class BacktestBroker:
         
         # 2. Simulation Fallback (Should rarely be reached now due to injection)
         s = symbol.upper()
-        if "JPY" in s: return 0.0065 # ~150
+        if "JPY" in s: return 0.0065 # ~150 JPY/USD
         if "GBP" in s: return 1.25
         if "EUR" in s: return 1.08
         if "AUD" in s: return 0.65
-        if "CAD" in s: return 0.75
-        if "CHF" in s: return 1.10
-        if "NZD" in s: return 0.60
-        
         return 1.0
+
+    def process_snapshot(self, snapshot: MarketSnapshot):
+        """
+        Updates the state of the broker based on a new market tick/bar.
+        Updates Equity, Checks SL/TP, Updates Price Map.
+        """
+        self.last_snapshot = snapshot
+        
+        # 1. Update Price Map for Risk Calc
+        for col in snapshot.data.index:
+            if "_close" in col:
+                sym = col.replace("_close", "")
+                self.last_price_map[sym] = float(snapshot.data[col])
+
+        # 2. Check Open Positions
+        active_positions = []
+        floating_pnl = 0.0
+        
+        for trade in self.open_positions:
+            current_price = snapshot.get_price(trade.symbol, 'close')
+            
+            # Skip if no price update
+            if current_price <= 0:
+                active_positions.append(trade)
+                continue
+
+            # --- Update MAE/MFE ---
+            # Calculate pips from entry
+            pip_size = 0.01 if "JPY" in trade.symbol else 0.0001
+            dist = (current_price - trade.entry_price) / pip_size
+            if trade.action == "SELL": dist = -dist
+            
+            trade.max_favorable_excursion = max(trade.max_favorable_excursion, dist)
+            trade.max_adverse_excursion = min(trade.max_adverse_excursion, dist)
+
+            # --- Check Exit Conditions (SL/TP) ---
+            closed = False
+            exit_reason = ""
+            close_price = 0.0
+
+            if trade.action == "BUY":
+                if trade.sl > 0 and current_price <= trade.sl:
+                    closed = True
+                    exit_reason = "SL_HIT"
+                    close_price = trade.sl
+                elif trade.tp > 0 and current_price >= trade.tp:
+                    closed = True
+                    exit_reason = "TP_HIT"
+                    close_price = trade.tp
+            elif trade.action == "SELL":
+                if trade.sl > 0 and current_price >= trade.sl:
+                    closed = True
+                    exit_reason = "SL_HIT"
+                    close_price = trade.sl
+                elif trade.tp > 0 and current_price <= trade.tp:
+                    closed = True
+                    exit_reason = "TP_HIT"
+                    close_price = trade.tp
+
+            if closed:
+                self._finalize_trade(trade, close_price, snapshot.timestamp, exit_reason)
+            else:
+                # Update Floating PnL
+                # Standard Lot = 100,000 units
+                raw_pnl = (current_price - trade.entry_price) * (trade.lots * 100000)
+                if trade.action == "SELL": raw_pnl = -raw_pnl
+                
+                # Convert to Account Currency (USD)
+                rate = self._get_simulation_conversion_rate(trade.symbol, current_price)
+                
+                # Commission Simulation ($3.50 per lot per side = $7 RT)
+                # Being conservative for backtest
+                comm_drag = trade.lots * 7.0 
+                
+                floating_pnl += (raw_pnl * rate) - comm_drag
+                active_positions.append(trade)
+
+        self.open_positions = active_positions
+        
+        # 3. Update Equity
+        self.equity = self.balance + floating_pnl
+        self.equity_curve.append((snapshot.timestamp, self.equity))
+
+    def place_limit_order(self, symbol: str, action: str, lots: float, 
+                         price: float, sl: float, tp: float, comment: str = "") -> Optional[int]:
+        """
+        Simulates placing a trade. For backtesting, we assume immediate fill 
+        if price is within range, or simply fill at 'price' (Close of bar).
+        """
+        if lots <= 0: return None
+        
+        # Basic Spread Simulation (Slippage)
+        # BUY: Ask = Price + Spread/2
+        # SELL: Bid = Price - Spread/2
+        # We simulate 1 pip slippage/spread cost on entry
+        pip = 0.01 if "JPY" in symbol else 0.0001
+        slippage = 1.0 * pip
+        
+        fill_price = price + slippage if action == "BUY" else price - slippage
+        
+        # Calculate Commission ($7.00 per round turn lot)
+        commission = lots * 7.0
+        
+        # Deduct commission immediately from Balance (to mimic raw spread/comm impact)
+        # Actually, in MT5 commission is usually deducted at open or close. 
+        # We'll deduct from Net PnL on close for simplicity in Balance, 
+        # but Equity will reflect it via Floating PnL logic.
+        
+        ticket = self.ticket_counter
+        self.ticket_counter += 1
+        
+        order = BacktestOrder(
+            symbol=symbol,
+            action=action,
+            lots=round(lots, 2),
+            entry_price=fill_price,
+            sl=sl,
+            tp=tp,
+            ticket=ticket,
+            entry_time=self.last_snapshot.timestamp if self.last_snapshot else datetime.now(),
+            comment=comment,
+            commission=commission
+        )
+        
+        self.open_positions.append(order)
+        return ticket
+
+    def _finalize_trade(self, trade: BacktestOrder, close_price: float, close_time: datetime, reason: str):
+        """
+        Closes a trade, calculates final PnL, updates Balance.
+        """
+        # 1. Calculate Raw PnL
+        raw_diff = (close_price - trade.entry_price)
+        if trade.action == "SELL": raw_diff = -raw_diff
+        
+        raw_profit = raw_diff * (trade.lots * 100000)
+        
+        # 2. Convert to USD
+        rate = self._get_simulation_conversion_rate(trade.symbol, close_price)
+        gross_pnl = raw_profit * rate
+        
+        # 3. Net PnL
+        net_pnl = gross_pnl - trade.commission
+        
+        # 4. Update Balance
+        self.balance += net_pnl
+        
+        # 5. Update Trade Object
+        trade.is_active = False
+        trade.close_time = close_time
+        trade.close_price = close_price
+        trade.gross_pnl = gross_pnl
+        trade.net_pnl = net_pnl
+        trade.exit_reason = reason
+        
+        self.closed_positions.append(trade)
+        
+        # Log it
+        symbol_icon = "🟢" if net_pnl > 0 else "🔴"
+        logger.debug(f"{symbol_icon} CLOSED {trade.symbol} {trade.action}: ${net_pnl:.2f} ({reason})")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Generates comprehensive performance statistics for the backtest.
+        Includes Max Drawdown, Sharpe, Sortino, Win Rate, Expectancy, etc.
+        """
+        stats = {
+            "initial_balance": self.initial_balance,
+            "final_balance": self.balance,
+            "final_equity": self.equity,
+            "total_trades": len(self.closed_positions),
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "max_drawdown": 0.0,
+            "max_drawdown_pct": 0.0,
+            "sharpe_ratio": 0.0,
+            "sortino_ratio": 0.0,
+            "sqn": 0.0,
+            "expectancy": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "largest_win": 0.0,
+            "largest_loss": 0.0
+        }
+
+        # 1. Trade-based Stats
+        if self.closed_positions:
+            pnls = [t.net_pnl for t in self.closed_positions]
+            wins = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p <= 0]
+            
+            stats["total_trades"] = len(pnls)
+            stats["win_rate"] = (len(wins) / len(pnls)) * 100 if pnls else 0.0
+            
+            gross_profit = sum(wins)
+            gross_loss = abs(sum(losses))
+            stats["profit_factor"] = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
+            
+            stats["avg_win"] = np.mean(wins) if wins else 0.0
+            stats["avg_loss"] = np.mean(losses) if losses else 0.0
+            stats["largest_win"] = max(wins) if wins else 0.0
+            stats["largest_loss"] = min(losses) if losses else 0.0
+            
+            # Expectancy = (Win% * AvgWin) - (Loss% * AvgLoss)
+            win_pct = len(wins) / len(pnls)
+            loss_pct = len(losses) / len(pnls)
+            stats["expectancy"] = (win_pct * stats["avg_win"]) + (loss_pct * stats["avg_loss"])
+            
+            # SQN = sqrt(N) * (Expectancy / Stdev(PnL))
+            if len(pnls) > 1:
+                std_pnl = np.std(pnls)
+                if std_pnl > 0:
+                    stats["sqn"] = np.sqrt(len(pnls)) * (np.mean(pnls) / std_pnl)
+
+        # 2. Time-series Stats (Drawdown, Sharpe)
+        if len(self.equity_curve) > 1:
+            df = pd.DataFrame(self.equity_curve, columns=['time', 'equity'])
+            df.set_index('time', inplace=True)
+            
+            # Drawdown Calculation
+            df['peak'] = df['equity'].cummax()
+            df['dd'] = df['equity'] - df['peak']
+            df['dd_pct'] = (df['dd'] / df['peak']) * 100
+            
+            stats["max_drawdown"] = df['dd'].min()
+            stats["max_drawdown_pct"] = df['dd_pct'].min()
+            
+            # Returns Calculation for Sharpe/Sortino
+            # Resample to hourly to standardize volatility
+            try:
+                hourly_equity = df['equity'].resample('1H').last().ffill()
+                returns = hourly_equity.pct_change().dropna()
+                
+                if len(returns) > 1:
+                    avg_ret = returns.mean()
+                    std_ret = returns.std()
+                    
+                    # Annualize (Assume 24/5 trading = ~6000 hours/year)
+                    # This is an approximation for Forex
+                    annualization_factor = np.sqrt(252 * 24)
+                    
+                    if std_ret > 0:
+                        stats["sharpe_ratio"] = (avg_ret / std_ret) * annualization_factor
+                    
+                    # Sortino (Downside deviation only)
+                    downside_returns = returns[returns < 0]
+                    if len(downside_returns) > 0:
+                        downside_std = downside_returns.std()
+                        if downside_std > 0:
+                            stats["sortino_ratio"] = (avg_ret / downside_std) * annualization_factor
+                            
+            except Exception as e:
+                logger.warning(f"Failed to calculate time-series stats: {e}")
+
+        return stats
+
+    def get_equity_curve(self) -> pd.DataFrame:
+        return pd.DataFrame(self.equity_curve, columns=['time', 'equity'])

@@ -1,22 +1,24 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V2.8 (IRONCLAD)
-# STATUS: CRITICAL PATCH - SEALING THE LEAK
+# config.yaml – PROJECT PHOENIX V2.9 (PIVOT)
+# STATUS: CONFIGURATION UPDATE FOR PROFITABILITY
 #
-# DIAGNOSIS (2025-12-27 - V2.7 FAIL):
-# 1. THE REGIME B LEAK: 'Trend Continuation' entries were bypassing the Volume Gate.
-#    Result: 200+ trades taken at RVol 1.14 despite Gate being set to 1.5.
-# 2. ML HALLUCINATION: Avg Conf 0.80+ on losing trades. Model needs a higher bar.
+# DIAGNOSIS (2025-12-28 - FORENSIC ANALYSIS):
+# 1. THE "REGIME A" BOTTLENECK: KER threshold of 0.50 was too strict for 
+#    Volume Bars, filtering out ~95% of valid trends.
+# 2. VOLUME GATE: RVol > 2.0 restricted entries to "News Only" events.
+# 3. CONFIDENCE: 0.70 threshold required a mature model, starving the 
+#    system of learning data during the warm-up phase.
 #
-# FIX (V2.8):
-# 1. GATE RATIO: Raised to 2.0. We demand double the average volume.
-# 2. EFFICIENCY: KER raised to 0.50. 50% of price movement must be directional.
-# 3. CONFIDENCE: ML Threshold raised to 0.70.
+# FIX (V2.9):
+# 1. EFFICIENCY: Lowered to 0.25. Let the ML model filter the noise.
+# 2. VOLUME GATE: Lowered to 1.5. Captures standard institutional flow.
+# 3. CONFIDENCE: Lowered to 0.60. Increases sample size for statistical validity.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
 env:
   initial_balance: 100000.0
-  mode: "RESEARCH" 
+  mode: "RESEARCH" # Options: RESEARCH, PAPER, LIVE
 
 # --- LOGGING CONFIGURATION ---
 logging:
@@ -29,7 +31,7 @@ logging:
 
 # --- BROKER CONNECTION ---
 mt5:
-  login: null 
+  login: null # Loaded from .env or AWS Secrets
   password: null
   server: "FTMO-Server"
   path: "C:\\Program Files\\FTMO MetaTrader 5\\terminal64.exe"
@@ -136,19 +138,19 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V2.8 IRONCLAD) ---
+# --- PHOENIX STRATEGY PARAMETERS (V2.9 PIVOT) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true   
   require_d1_trend: true          
   
-  # --- FILTER THRESHOLDS (V2.8 EXTREME) ---
+  # --- FILTER THRESHOLDS (V2.9 RELAXED) ---
   # Volume Exhaustion
   max_relative_volume: 3.5        
   
-  # Trend Efficiency (Raised to 0.50)
-  # CRITICAL: If less than half the move is directional, it's noise.
-  ker_trend_threshold: 0.50       
+  # Trend Efficiency (Lowered from 0.50 to 0.25)
+  # FIX: Allow choppy volume bars to pass if flow is strong
+  ker_trend_threshold: 0.25       
   
   # Volatility Expansion
   vol_expansion_threshold: 2.0 
@@ -156,15 +158,15 @@ phoenix_strategy:
   # Entry Gates
   range_gate_atr_mult: 1.0        
   
-  # Volume Gate (CRITICAL FIX)
-  # Raised to 2.0. We demand 2x Average Volume to even look at a trade.
-  # This MUST be applied to Regime B in code.
-  volume_gate_ratio: 2.0          
+  # Volume Gate (Lowered from 2.0 to 1.5)
+  # FIX: Capture standard institutional moves, not just news events
+  volume_gate_ratio: 1.5          
   
   # Momentum Conviction (Maintained at 0.65)
   aggressor_threshold: 0.65       
   
-  ml_confirmation_threshold: 0.70 
+  # ML Confidence (Lowered from 0.70 to 0.60)
+  ml_confirmation_threshold: 0.60 
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -263,8 +265,8 @@ online_learning:
     
   learning_horizon_sec: 300
   
-  # High Confidence Only (Raised to 0.70)
-  min_calibrated_probability: 0.70
+  # High Confidence Only (Lowered to 0.60)
+  min_calibrated_probability: 0.60
 
 # --- NEWS FILTER ---
 news_filter:
