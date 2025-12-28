@@ -1,19 +1,16 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V3.2 (INCLUSIVE GRINDER)
-# STATUS: HYPOTHESIS TEST - FILTER STARVATION
+# config.yaml – PROJECT PHOENIX V3.1 (ALPHA HUNTER)
+# STATUS: CONFIGURATION UPDATE FOR ALPHA GENERATION
 #
-# DIAGNOSIS (2025-12-28 - AUDUSD RETENTION):
-# 1. ISSUE: AUDUSD is failing KER > 0.40 checks (4500+ rejections).
-#    The ML model is 'starved' of data and cannot learn the symbol's personality.
-# 2. HYPOTHESIS: AUDUSD is a "Grinder" (Low Efficiency Trend). 
-#    It needs a lower KER barrier to participate.
-# 3. PROTECTION: To prevent over-trading the noise (Trial 13 bleed), we
-#    raise the ML Confidence threshold and ADX floor.
+# DIAGNOSIS (2025-12-28 - STAGNATION ANALYSIS):
+# 1. PREMATURE STOP-OUTS: 1.5 ATR SL is too tight for current volatility.
+# 2. MISSED ENTRIES: Aggressor 0.65 is rejecting viable trend candles.
+# 3. PROFIT LEAK: Trailing activation at 2.0 is too slow; profits evaporate.
 #
-# FIX (V3.2):
-# 1. KER: Lowered to 0.30 (Was 0.40) -> Allow "messy" trends.
-# 2. ADX: Raised to 25 (Was 20) -> Ensure macro trend strength.
-# 3. ML: Raised Confidence to 0.65 -> Quality over Quantity.
+# FIX (V3.1):
+# 1. SL: Widened to 2.0 ATR. Let the trade breathe.
+# 2. TRAILING: Tightened activation to 1.5 ATR to lock in wins.
+# 3. AGGRESSOR: Lowered to 0.60 to capture more valid signals.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -132,14 +129,14 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 25    # AUDIT FIX: Raised to 25 to filter chop (was 20)
+    threshold: 20    # Keep ADX enabled
     
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V3.2 INCLUSIVE) ---
+# --- PHOENIX STRATEGY PARAMETERS (V3.1 ALPHA HUNTER) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true   
@@ -148,11 +145,10 @@ phoenix_strategy:
   
   # --- FILTER THRESHOLDS ---
   # Volume Exhaustion
-  max_relative_volume: 3.5        
+  max_relative_volume: 4.0        
   
-  # Trend Efficiency
-  # AUDIT FIX: Lowered to 0.30 to unblock AUDUSD "Grind" trends
-  ker_trend_threshold: 0.30       
+  # Trend Efficiency (Maintained at 0.40)
+  ker_trend_threshold: 0.40       
   
   # Volatility Expansion
   vol_expansion_threshold: 2.0 
@@ -163,11 +159,12 @@ phoenix_strategy:
   # Volume Gate (Maintained at 1.5)
   volume_gate_ratio: 1.5          
   
-  # Momentum Conviction
+  # Momentum Conviction (Lowered to 0.60)
+  # FIX: Capture more signals, even if slightly messy
   aggressor_threshold: 0.60       
   
-  # ML Confidence (Raised to 0.65 to counter lower KER)
-  ml_confirmation_threshold: 0.65 
+  # ML Confidence (0.60)
+  ml_confirmation_threshold: 0.60 
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -192,11 +189,12 @@ risk_management:
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (1:2 RISK:REWARD BASE)
-  # FIX: Widened Stop to 2.0 ATR to survive noise
+  # FIX: Widened Stop to 2.0 ATR to survive noise (Was 1.5)
   stop_loss_atr_mult: 2.0       
   take_profit_atr_mult: 4.0       
   
   # TRAILING STOP (AGGRESSIVE LOCKING)
+  # FIX: Activate sooner (1.5 ATR) to bank Alpha from choppy winners
   trailing_stop:
     enabled: true
     activation_atr: 1.5         
@@ -220,7 +218,7 @@ trading:
     - "GBPJPY"  
     - "EURUSD"  
     - "USDJPY"  
-    - "AUDUSD" # RETAINED per instructions
+    - "AUDUSD"  
   
   auxiliary_symbols:
     - "GBPUSD"
@@ -267,9 +265,8 @@ online_learning:
     
   learning_horizon_sec: 300
   
-  # High Confidence Only (Raised to 0.65)
-  # This filters the noise introduced by lowering KER
-  min_calibrated_probability: 0.65
+  # High Confidence Only (0.60)
+  min_calibrated_probability: 0.60
 
 # --- NEWS FILTER ---
 news_filter:
