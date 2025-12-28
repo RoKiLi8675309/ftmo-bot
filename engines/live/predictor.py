@@ -6,11 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-28 - V2.9 PIVOT):
-# 1. PHILOSOPHY: "Controlled Aggression" - Lower barriers to entry.
-# 2. FIX: Volume Gate lowered to 1.5 to capture institutional flow.
-# 3. FIX: KER lowered to 0.25 to tolerate choppy volume bars.
-# 4. FIX: Confidence lowered to 0.60 to increase sample size.
+# PHOENIX STRATEGY UPGRADE (2025-12-28 - V3.0 IRON GATE):
+# 1. PHILOSOPHY: "Iron Gate" - Filter out the noise.
+# 2. FIX: H4 RSI Alignment Required (>50 for Long, <50 for Short).
+# 3. FIX: KER Raised to 0.40 for Regime B.
+# 4. FIX: ADX Filter Enabled (>20) to kill dead markets.
 # =============================================================================
 import logging
 import pickle
@@ -104,26 +104,23 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V2.9 PIVOT CONFIG) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V3.0 IRON GATE CONFIG) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        strat_params = CONFIG.get('strategy_parameters', {}) # New V2.9 Section
         
-        # V2.9 GATES
+        # V3.0 GATES
         self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
+        self.require_h4_alignment = phx_conf.get('require_h4_alignment', True)
         
         # Safety Cap
         self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.5)
         
-        # Thresholds (V2.9: RELAXED)
-        # Prefer new strategy_parameters section, fallback to phoenix_strategy
-        self.ker_thresh = strat_params.get('min_efficiency', phx_conf.get('ker_trend_threshold', 0.25))
-        self.adx_threshold = CONFIG['features']['adx'].get('threshold', 0) # Disabled
+        # Thresholds (V3.0: TIGHTENED)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.40) # Raised to 0.40
+        self.adx_threshold = CONFIG['features']['adx'].get('threshold', 20) # Enabled
         
-        # Pullback/Gate settings
-        # CRITICAL FIX: Volume Gate Ratio (1.5)
-        # Prefer new strategy_parameters section, fallback to phoenix_strategy
-        self.vol_gate_ratio = strat_params.get('min_volume_gate', phx_conf.get('volume_gate_ratio', 1.5))
+        # Volume Gate
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.5)
         
         # Momentum (V2.8: 0.65)
         self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.65) 
@@ -183,7 +180,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V2.9 Logic (Controlled Aggression).
+        Executes the Learn-Predict Loop with Project Phoenix V3.0 Logic (Iron Gate).
         """
         if symbol not in self.symbols: return None
         
@@ -284,7 +281,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp())
 
         # ============================================================
-        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V2.9 PIVOT)
+        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V3.0 IRON GATE)
         # ============================================================
         
         # Extract Core Indicators
@@ -296,6 +293,7 @@ class MultiAssetPredictor:
         parkinson = features.get('parkinson_vol', 0.0)
         mtf_align = features.get('mtf_alignment', 0.0)
         rsi_val = features.get('rsi_norm', 0.5) * 100.0
+        adx_val = features.get('adx', 0.0)
         
         # --- CRITICAL FILTER 1: VOLUME EXHAUSTION FILTER ---
         if rvol > self.max_rvol_thresh:
@@ -307,8 +305,13 @@ class MultiAssetPredictor:
         d1_trend_up = (bar.close > d1_ema) if d1_ema > 0 else True
         d1_trend_down = (bar.close < d1_ema) if d1_ema > 0 else True
         
+        # --- NEW: H4 RSI ALIGNMENT (V3.0) ---
+        h4_rsi = context_data.get('h4', {}).get('rsi', 50.0) if context_data else 50.0
+        h4_bull = h4_rsi > 50
+        h4_bear = h4_rsi < 50
+        
         # Gate Definitions
-        # V2.9: 1.5x Avg Volume (Relaxed)
+        # V3.0: 1.5x Avg Volume (Relaxed)
         vol_gate = rvol > self.vol_gate_ratio
         
         # Momentum Direction (Aggressor Ratio)
@@ -324,7 +327,7 @@ class MultiAssetPredictor:
         if self.enable_regime_a:
             # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
             if d1_trend_up and is_bullish_candle and vol_gate:
-                # Require Efficiency (V2.9: KER > 0.25 - Relaxed)
+                # Require Efficiency (V3.0: KER > 0.40) - Tightened
                 if ker_val > self.ker_thresh:
                     proposed_action = 1
                     regime_label = "A (Mom-Long)"
@@ -344,17 +347,30 @@ class MultiAssetPredictor:
                     stats[f"Volume Gate Fail (RVol {rvol:.2f} < {self.vol_gate_ratio})"] += 1
                 
         # --- REGIME B: EFFICIENT TREND CONTINUATION ---
-        # Logic: Efficiency (KER) + Momentum + D1 Align
-        # CRITICAL FIX V2.8: ADDED 'and vol_gate' to prevent low volume chop trades.
+        # Logic: Efficiency (KER) + Momentum + D1 Align + ADX check
+        # V3.0: Added H4 RSI Alignment & ADX Check
+        
+        # 1. ADX Filter: Market must be trending
+        is_trending = adx_val > self.adx_threshold
+        
         if proposed_action == 0 and ker_val > self.ker_thresh and vol_gate:
-            if is_bullish_candle and d1_trend_up:
-                proposed_action = 1
-                regime_label = "B (Trend-Long)"
-            elif is_bearish_candle and d1_trend_down:
-                proposed_action = -1
-                regime_label = "B (Trend-Short)"
+            if not is_trending:
+                stats[f"Regime B: Low ADX ({adx_val:.1f} < {self.adx_threshold})"] += 1
             else:
-                stats["Regime B: Weak Candle / Counter Trend"] += 1
+                if is_bullish_candle and d1_trend_up:
+                    if self.require_h4_alignment and not h4_bull:
+                        stats["Regime B: H4 RSI Mismatch (Long)"] += 1
+                    else:
+                        proposed_action = 1
+                        regime_label = "B (Trend-Long)"
+                elif is_bearish_candle and d1_trend_down:
+                    if self.require_h4_alignment and not h4_bear:
+                        stats["Regime B: H4 RSI Mismatch (Short)"] += 1
+                    else:
+                        proposed_action = -1
+                        regime_label = "B (Trend-Short)"
+                else:
+                    stats["Regime B: Weak Candle / Counter Trend"] += 1
         
         # --- REGIME C: NOISE ---
         if proposed_action == 0:

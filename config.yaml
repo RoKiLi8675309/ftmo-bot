@@ -1,18 +1,16 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V2.9 (PIVOT)
+# config.yaml – PROJECT PHOENIX V3.0 (IRON GATE)
 # STATUS: CONFIGURATION UPDATE FOR PROFITABILITY
 #
-# DIAGNOSIS (2025-12-28 - FORENSIC ANALYSIS):
-# 1. THE "REGIME A" BOTTLENECK: KER threshold of 0.50 was too strict for 
-#    Volume Bars, filtering out ~95% of valid trends.
-# 2. VOLUME GATE: RVol > 2.0 restricted entries to "News Only" events.
-# 3. CONFIDENCE: 0.70 threshold required a mature model, starving the 
-#    system of learning data during the warm-up phase.
+# DIAGNOSIS (2025-12-28 - OVER-TRADING ANALYSIS):
+# 1. OVER-TRADING: 200+ trades per trial indicates filters are too loose.
+# 2. CHOP RISK: Regime B (Continuation) is firing on low-efficiency chop.
+# 3. FIX: Tighten KER for Regime B, Enforce H4 Alignment, Extend TP.
 #
-# FIX (V2.9):
-# 1. EFFICIENCY: Lowered to 0.25. Let the ML model filter the noise.
-# 2. VOLUME GATE: Lowered to 1.5. Captures standard institutional flow.
-# 3. CONFIDENCE: Lowered to 0.60. Increases sample size for statistical validity.
+# FIX (V3.0):
+# 1. KER: Raised to 0.40. Trends must be efficient.
+# 2. TP: Extended to 4.0 ATR to capture fat tails.
+# 3. CONFIDENCE: maintained at 0.60.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -131,26 +129,27 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 0    # DISABLED - Remove lag
+    threshold: 20    # RE-ENABLED: Filter out dead markets
     
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V2.9 PIVOT) ---
+# --- PHOENIX STRATEGY PARAMETERS (V3.0 IRON GATE) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true   
   require_d1_trend: true          
+  require_h4_alignment: true      # NEW: Check H4 RSI
   
-  # --- FILTER THRESHOLDS (V2.9 RELAXED) ---
+  # --- FILTER THRESHOLDS (V3.0 TIGHTENED) ---
   # Volume Exhaustion
   max_relative_volume: 3.5        
   
-  # Trend Efficiency (Lowered from 0.50 to 0.25)
-  # FIX: Allow choppy volume bars to pass if flow is strong
-  ker_trend_threshold: 0.25       
+  # Trend Efficiency (Raised to 0.40)
+  # FIX: Choppy markets kill Win Rate. Demand 40% efficiency.
+  ker_trend_threshold: 0.40       
   
   # Volatility Expansion
   vol_expansion_threshold: 2.0 
@@ -158,14 +157,13 @@ phoenix_strategy:
   # Entry Gates
   range_gate_atr_mult: 1.0        
   
-  # Volume Gate (Lowered from 2.0 to 1.5)
-  # FIX: Capture standard institutional moves, not just news events
+  # Volume Gate (Maintained at 1.5)
   volume_gate_ratio: 1.5          
   
   # Momentum Conviction (Maintained at 0.65)
   aggressor_threshold: 0.65       
   
-  # ML Confidence (Lowered from 0.70 to 0.60)
+  # ML Confidence (0.60)
   ml_confirmation_threshold: 0.60 
   
   # Microstructure Filters (Proxies)
@@ -190,9 +188,9 @@ risk_management:
   max_lot_size: 10.0            
   min_lot_size: 0.01
   
-  # PROJECT PHOENIX EXIT LOGIC (1:2 RISK:REWARD)
+  # PROJECT PHOENIX EXIT LOGIC (1:4 RISK:REWARD)
   stop_loss_atr_mult: 1.5       
-  take_profit_atr_mult: 3.0       
+  take_profit_atr_mult: 4.0       # EXTENDED TARGET
   
   # TRAILING STOP
   trailing_stop:
@@ -265,7 +263,7 @@ online_learning:
     
   learning_horizon_sec: 300
   
-  # High Confidence Only (Lowered to 0.60)
+  # High Confidence Only (0.60)
   min_calibrated_probability: 0.60
 
 # --- NEWS FILTER ---
