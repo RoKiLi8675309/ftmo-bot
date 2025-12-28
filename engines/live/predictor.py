@@ -6,11 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.0 TREND HUNTER PATCH):
-# 1. REGIME A KILLED: Volatility Expansion entries disabled (Climax Protection).
-# 2. MTF LOCK: Hard enforcement of D1 Trend Alignment (Price vs EMA200).
-# 3. EFFICIENCY FOCUS: KER Threshold raised to 0.70.
-# 4. EXHAUSTION FILTER: Max RVol lowered to 2.5.
+# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.3 THE ARCHER PATCH):
+# 1. REGIME A PIVOT: Replaced Volatility Expansion with "Trend Pullback" logic.
+# 2. RSI GATES: Added RSI < 45 (Long) and RSI > 55 (Short) checks for entry.
+# 3. SAFETY: Tightened RVol Cap to 3.0 to prevent climax chasing.
+# 4. CONVICTION: Aggressor Threshold restored to 0.60.
 # =============================================================================
 import logging
 import pickle
@@ -104,26 +104,27 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (Matched to V2.0 Config) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V2.3 THE ARCHER CONFIG) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V2.0 GATES
-        self.enable_regime_a = phx_conf.get('enable_regime_a_entries', False)
+        # V2.3 GATES
+        self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         
-        # V2.0: Lowered Exhaustion Cap to 2.5x to avoid stop-runs
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 2.5)
+        # Safety Cap (V2.3: 3.0)
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.0)
         
-        # Conviction Thresholds (V2.0 Trend Hunter)
-        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.70)
+        # Thresholds
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.50)
         
-        # HARD GATES
-        self.range_gate_mult = phx_conf.get('range_gate_atr_mult', 1.1)
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.2)
+        # "The Archer" Pullback Settings
+        self.pullback_rsi_long = phx_conf.get('pullback_rsi_long', 45)
+        self.pullback_rsi_short = phx_conf.get('pullback_rsi_short', 55)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.0)
         
-        # V2.0 CRITICAL: Raised to 0.65. Undeniable momentum only.
-        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.65)
+        # Momentum
+        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.60)
+        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0) 
         
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
@@ -179,7 +180,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V2.0 Logic.
+        Executes the Learn-Predict Loop with Project Phoenix V2.3 Logic (The Archer).
         """
         if symbol not in self.symbols: return None
         
@@ -280,7 +281,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp())
 
         # ============================================================
-        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V2.0)
+        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V2.3 THE ARCHER)
         # ============================================================
         
         # Extract Core Indicators
@@ -291,80 +292,74 @@ class MultiAssetPredictor:
         atr_val = features.get('atr', 0.0001)
         parkinson = features.get('parkinson_vol', 0.0)
         mtf_align = features.get('mtf_alignment', 0.0)
+        rsi_val = features.get('rsi_norm', 0.5) * 100.0
         
         # --- CRITICAL FIX 1: VOLUME EXHAUSTION FILTER ---
+        # V2.3 Cap: 3.0 (Strict anti-climax)
         if rvol > self.max_rvol_thresh:
             stats[f"Volume Climax (RVol {rvol:.2f})"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
             
-        # --- CRITICAL FILTER 2: MTF TREND LOCK (V2.0) ---
+        # --- CRITICAL FILTER 2: MTF TREND LOCK ---
         d1_ema = context_data.get('d1', {}).get('ema200', 0.0) if context_data else 0.0
-        can_buy_d1 = True
-        can_sell_d1 = True
+        d1_trend_up = (bar.close > d1_ema) if d1_ema > 0 else True
+        d1_trend_down = (bar.close < d1_ema) if d1_ema > 0 else True
         
-        if self.require_d1_trend and d1_ema > 0:
-            if bar.close < d1_ema:
-                can_buy_d1 = False # Price below EMA, only sells allowed
-            elif bar.close > d1_ema:
-                can_sell_d1 = False # Price above EMA, only buys allowed
-
         # Gate Definitions
-        bar_range = bar.high - bar.low
-        
-        # Gate A: Range Expansion
-        range_gate = bar_range > (self.range_gate_mult * atr_val)
-        
-        # Gate B: Volume Participation
         vol_gate = rvol > self.vol_gate_ratio
         
-        # Gate C: Momentum Direction (Aggressor Ratio)
+        # Momentum Direction (Aggressor Ratio)
+        # V2.3: 0.60 Threshold (Conviction)
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
         
-        # --- REGIME A: VOLATILITY EXPANSION (THE DRAGON) ---
-        if range_gate and vol_gate:
-            # V2.0: Disable entries if config says so (Anti-Climax)
-            if not self.enable_regime_a:
-                stats["Regime A: Disabled (Climax Protection)"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "Regime A Disabled"})
-
-            if is_bullish_candle:
-                proposed_action = 1
-                regime_label = "A (Exp-Long)"
-            elif is_bearish_candle:
-                proposed_action = -1
-                regime_label = "A (Exp-Short)"
-            else:
+        # --- REGIME A: "THE ARCHER" (TREND PULLBACK) ---
+        # Logic: D1 Trend + RSI Dip + Reversal Candle
+        if self.enable_regime_a:
+            if d1_trend_up and is_bullish_candle and rsi_val < self.pullback_rsi_long:
+                if vol_gate:
+                    proposed_action = 1
+                    regime_label = "A (Pullback-Long)"
+                else:
+                    stats["Regime A: Low Vol on Turn"] += 1
+            
+            elif d1_trend_down and is_bearish_candle and rsi_val > self.pullback_rsi_short:
+                if vol_gate:
+                    proposed_action = -1
+                    regime_label = "A (Pullback-Short)"
+                else:
+                    stats["Regime A: Low Vol on Turn"] += 1
+            
+            # If no signal found yet, log why if close
+            elif (d1_trend_up and rsi_val < self.pullback_rsi_long) or (d1_trend_down and rsi_val > self.pullback_rsi_short):
                 stats["Regime A: Indecision Candle"] += 1
                 
         # --- REGIME B: EFFICIENT TREND CONTINUATION ---
-        elif ker_val > self.ker_thresh:
-            if is_bullish_candle:
+        # Logic: Efficiency (KER) + Momentum align
+        if proposed_action == 0 and ker_val > self.ker_thresh:
+            if is_bullish_candle and d1_trend_up:
                 proposed_action = 1
                 regime_label = "B (Trend-Long)"
-            elif is_bearish_candle:
+            elif is_bearish_candle and d1_trend_down:
                 proposed_action = -1
                 regime_label = "B (Trend-Short)"
             else:
                 stats["Regime B: Weak Candle"] += 1
         
         # --- REGIME C: NOISE ---
-        else:
+        if proposed_action == 0:
             regime_label = "C (Noise)"
-            stats[f"Noise (KER {ker_val:.2f} | RVol {rvol:.2f})"] += 1
+            stats[f"Noise (KER {ker_val:.2f} | RSI {rsi_val:.1f})"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Regime C (Noise)"})
 
-        if proposed_action == 0:
-            return Signal(symbol, "HOLD", 0.0, {"reason": "No Trigger"})
-
-        # --- APPLY MTF LOCK ---
-        if proposed_action == 1 and not can_buy_d1:
+        # --- FINAL MTF SAFETY CHECK ---
+        if proposed_action == 1 and not d1_trend_up and self.require_d1_trend:
             stats[f"MTF Lock (Price < D1 EMA)"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "MTF Lock"})
-        if proposed_action == -1 and not can_sell_d1:
+        if proposed_action == -1 and not d1_trend_down and self.require_d1_trend:
             stats[f"MTF Lock (Price > D1 EMA)"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "MTF Lock"})
 
@@ -373,14 +368,13 @@ class MultiAssetPredictor:
         # Prevent "Selling the Hole" (Shorting when Price < BB Lower or RSI < 30)
         # ---------------------------------------------------------------------
         bb_pos = features.get('bb_position', 0.5)
-        rsi_val = features.get('rsi_norm', 0.5)
         
         if proposed_action == -1: # SELL
-            if bb_pos < 0.0 or rsi_val < 0.30:
+            if bb_pos < 0.0 or rsi_val < 30:
                 stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "Mean Rev Filter"})
         elif proposed_action == 1: # BUY
-            if bb_pos > 1.0 or rsi_val > 0.70:
+            if bb_pos > 1.0 or rsi_val > 70:
                 stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "Mean Rev Filter"})
         # ---------------------------------------------------------------------
@@ -403,8 +397,8 @@ class MultiAssetPredictor:
         )
 
         # --- DECISION ---
-        # V2.0: Defaults to 0.70 if not specified (Raised from 0.65)
-        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.70)
+        # V2.3: Defaults to 0.60
+        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.60)
 
         # Safety Check: If ML thinks probability is terrible (< min_prob), skip.
         if confidence < min_prob:

@@ -1,13 +1,17 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V2.3 (CONTROLLED AGGRESSION)
-# STATUS: "GOLDILOCKS" TUNING - BALANCING REGIME A CAPTURE WITH SURVIVAL
+# config.yaml – PROJECT PHOENIX V2.3 (THE ARCHER)
+# STATUS: STRATEGIC PIVOT - TREND PULLBACK LOGIC
 #
 # UPDATES (2025-12-27 - V2.3):
-# 1. VOLUME CAP: Tightened to 3.0 (was 4.0) to filter Blow-Off Tops.
-# 2. EFFICIENCY: KER raised to 0.50 (was 0.40) to reject pure chop.
-# 3. MOMENTUM: Aggressor raised to 0.60 (was 0.55) for directional conviction.
-# 4. SAFETY: D1 Trend Lock remains active.
-# 5. ML FLOOR: Raised to 0.60 probability to prevent gambling behavior.
+# 1. REGIME A PIVOT: Replaced "Breakout" logic with "Pullback" (The Archer).
+#    - Buy Dips in Uptrends / Sell Rallies in Downtrends.
+# 2. NEW PARAMS:
+#    - pullback_rsi_long: 45 (Buy when RSI dips below 45 in Uptrend).
+#    - pullback_rsi_short: 55 (Sell when RSI spikes above 55 in Downtrend).
+# 3. GATES TUNED:
+#    - Aggressor: 0.60 (Requires conviction on the turn).
+#    - Volume Cap: 3.0 (Safety against news spikes).
+# 4. SAFETY: D1 Trend Lock is MANDATORY for this strategy.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -133,30 +137,33 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V2.3 CONTROLLED AGGRESSION) ---
+# --- PHOENIX STRATEGY PARAMETERS (V2.3 THE ARCHER) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true   # Keep Regime A (The Dragon) enabled to catch breakouts
-  require_d1_trend: true          # GOLDEN RULE: Must align with D1 EMA200 (Primary Safety Net)
+  enable_regime_a_entries: true   # NOW REFERS TO PULLBACK ENTRIES
+  require_d1_trend: true          # GOLDEN RULE: Must align with D1 EMA200
   
-  # --- FILTER THRESHOLDS (THE FIX) ---
-  # Volume Exhaustion (Tightened from 4.0 to 3.0)
-  max_relative_volume: 3.0        # Filter out 4-sigma blow-off tops/climaxes.
+  # --- FILTER THRESHOLDS ---
+  # Volume Exhaustion (Safety Cap)
+  max_relative_volume: 3.0        # Reject 3-sigma volume spikes (Climax protection)
   
-  # Trend Efficiency (Restored from 0.40 to 0.50)
-  ker_trend_threshold: 0.50       # Demand at least moderate trend efficiency (not pure noise).
+  # Trend Efficiency (Moderate)
+  ker_trend_threshold: 0.50       # Filter out total chop
   
-  # Volatility Expansion
+  # Volatility Expansion (For Regime B mostly now)
   vol_expansion_threshold: 2.0 
   
-  # Entry Gates (V2.3 Standard)
-  range_gate_atr_mult: 1.0        # Slight tightening from 0.9 to ensure real expansion.
-  volume_gate_ratio: 1.2          # Must have volume backing
+  # --- "THE ARCHER" PULLBACK SETTINGS ---
+  # Replaces Range Gate. We look for RSI dips within trend.
+  pullback_rsi_long: 45           # Buy dip if RSI < 45 in Uptrend
+  pullback_rsi_short: 55          # Sell rip if RSI > 55 in Downtrend
   
-  # Momentum Conviction (Restored from 0.55 to 0.60)
-  aggressor_threshold: 0.60       # Close > 60% of High-Low. No dojis/indecision candles.
+  volume_gate_ratio: 1.0          # Just need average volume to confirm turn
   
-  ml_confirmation_threshold: 0.60 # Raised base confidence requirement
+  # Momentum Conviction (The Release)
+  aggressor_threshold: 0.60       # Close > 60% of High-Low. Must be a "turn" candle.
+  
+  ml_confirmation_threshold: 0.60 
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -170,12 +177,12 @@ risk_management:
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # Risk Per Trade
+  # Risk Per Trade (Standard Sniper Sizing)
   base_risk_per_trade_percent: 0.50 
   
   max_daily_loss_pct: 0.04
   max_total_loss_pct: 0.09
-  max_risk_percent: 1.0         # Cap single trade risk (hard ceiling)
+  max_risk_percent: 1.0         
   max_leverage: 30.0
   max_lot_size: 10.0            
   min_lot_size: 0.01
@@ -255,7 +262,7 @@ online_learning:
     
   learning_horizon_sec: 300
   
-  # High Confidence Only (Raised floor to 0.60)
+  # High Confidence Only
   min_calibrated_probability: 0.60
 
 # --- NEWS FILTER ---
