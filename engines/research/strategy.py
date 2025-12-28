@@ -5,11 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.4 IRONCLAD TREND PATCH):
-# 1. KILL SWITCH: Regime A (Volatility) Disabled. Pure Trend Following only.
-# 2. VOLATILITY CAP: Tightened to 2.0 to reject all climactic moves.
-# 3. EFFICIENCY: KER > 0.60 required (Smooth trends only).
-# 4. ADX: Hard filter ADX > 25 required.
+# PHOENIX STRATEGY UPGRADE (2025-12-27 - V2.5 ADAPTIVE FLOW PATCH):
+# 1. REGIME A REVIVED: "Momentum Ignition" (Flow Alignment) Enabled.
+# 2. GATES LOOSENED: KER > 0.30, Aggressor > 0.55, RVol Cap < 3.5.
+# 3. LAG REMOVED: ADX and RSI hard filters disabled to reduce latency.
+# 4. PHILOSOPHY: Trust the ML model to filter signal quality.
 # =============================================================================
 import logging
 import sys
@@ -99,27 +99,25 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX STRATEGY PARAMETERS (V2.4 IRONCLAD CONFIG) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V2.5 ADAPTIVE FLOW CONFIG) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V2.4 GATES
-        self.enable_regime_a = phx_conf.get('enable_regime_a_entries', False)
+        # V2.5 GATES
+        self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         
-        # Safety Cap (V2.4: 2.0)
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 2.0)
+        # Safety Cap (V2.5: 3.5 - Loosened)
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.5)
         
-        # Thresholds
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.60)
+        # Thresholds (V2.5: Loosened)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.30)
         self.adx_threshold = CONFIG['features']['adx'].get('threshold', 25)
         
-        # "The Archer" Pullback Settings (Legacy/Disabled for V2.4)
-        self.pullback_rsi_long = phx_conf.get('pullback_rsi_long', 45)
-        self.pullback_rsi_short = phx_conf.get('pullback_rsi_short', 55)
+        # Pullback/Gate settings
         self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.0)
         
         # Momentum
-        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.60)
+        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55)
         self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0) 
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
@@ -249,7 +247,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. PROJECT PHOENIX: LOGIC GATES (V2.4 IRONCLAD)
+        # D. PROJECT PHOENIX: LOGIC GATES (V2.5 ADAPTIVE FLOW)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
@@ -257,11 +255,11 @@ class ResearchStrategy:
         ker_val = features.get('ker', 0.5)
         aggressor = features.get('aggressor', 0.5)
         atr_val = features.get('atr', 0.0001)
-        rsi_val = features.get('rsi_norm', 0.5) * 100.0
-        adx_val = features.get('adx', 0.0)
+        parkinson = features.get('parkinson_vol', 0.0)
+        mtf_align = features.get('mtf_alignment', 0.0)
         
-        # --- CRITICAL FILTER 1: VOLUME EXHAUSTION ---
-        # V2.4 Cap: 2.0 (Strict anti-climax)
+        # --- CRITICAL FILTER 1: VOLUME EXHAUSTION FILTER ---
+        # V2.5 Cap: 3.5 (Loosened to allow news events/momentum)
         if rvol > self.max_rvol_thresh:
             self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
             return # Force HOLD
@@ -271,35 +269,41 @@ class ResearchStrategy:
         d1_trend_up = (price > d1_ema) if d1_ema > 0 else True
         d1_trend_down = (price < d1_ema) if d1_ema > 0 else True
         
-        # --- CRITICAL FILTER 3: ADX TREND STRENGTH ---
-        # V2.4 Requirement: ADX > 25
-        if adx_val < self.adx_threshold:
-            self.rejection_stats[f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
-            return # Force HOLD
+        # --- NOTE: ADX HARD FILTER REMOVED IN V2.5 ---
+        # We allow the ML model to decide if the trend is strong enough.
 
         # Gate Definitions
         vol_gate = rvol > self.vol_gate_ratio
         
         # Momentum Direction (Aggressor Ratio)
-        # V2.4: 0.60 Threshold (Conviction)
+        # V2.5: 0.55 Threshold (Lowered for higher frequency)
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
         
-        # --- REGIME A: VOLATILITY/PULLBACK (DISABLED IN V2.4) ---
+        # --- REGIME A: MOMENTUM IGNITION (Unified Flow) ---
+        # Re-enabled logic for catching moves that are not perfect "trends" yet
         if self.enable_regime_a:
-            # Logic commented out as per V2.4 Spec
-            pass
-        else:
-            # Stats tracking only
-            range_gate = (high - low) > (1.0 * atr_val)
-            if range_gate and vol_gate:
-                self.rejection_stats["Regime A: Disabled (Climax Protection)"] += 1
+            # Check for Flow Alignment: D1 Trend + Micro Structure
+            if d1_trend_up and is_bullish_candle and vol_gate:
+                # Require minimal efficiency (not noise)
+                if ker_val > self.ker_thresh:
+                    proposed_action = 1
+                    regime_label = "A (Mom-Long)"
+                else:
+                    self.rejection_stats["Regime A: Low Efficiency"] += 1
+            
+            elif d1_trend_down and is_bearish_candle and vol_gate:
+                if ker_val > self.ker_thresh:
+                    proposed_action = -1
+                    regime_label = "A (Mom-Short)"
+                else:
+                    self.rejection_stats["Regime A: Low Efficiency"] += 1
                 
-        # --- REGIME B: EFFICIENT TREND CONTINUATION (IRONCLAD) ---
-        # Logic: Efficiency (KER) + Momentum + D1 Align + ADX
+        # --- REGIME B: EFFICIENT TREND CONTINUATION ---
+        # Logic: Efficiency (KER) + Momentum + D1 Align
         if proposed_action == 0 and ker_val > self.ker_thresh:
             if is_bullish_candle and d1_trend_up:
                 proposed_action = 1
@@ -309,11 +313,11 @@ class ResearchStrategy:
                 regime_label = "B (Trend-Short)"
             else:
                 self.rejection_stats["Regime B: Weak Candle / Counter Trend"] += 1
-                
-        # --- REGIME C: NOISE / CHOP ---
+        
+        # --- REGIME C: NOISE ---
         if proposed_action == 0:
-            if regime_label == "C (Noise)":
-                self.rejection_stats[f"Noise (KER {ker_val:.2f})"] += 1
+            regime_label = "C (Noise)"
+            self.rejection_stats[f"Noise (KER {ker_val:.2f})"] += 1
             return # Explicit HOLD
 
         # --- FINAL MTF SAFETY CHECK ---
@@ -325,10 +329,11 @@ class ResearchStrategy:
             return
 
         # ---------------------------------------------------------------------
-        # MEAN REVERSION FILTER (Safety)
+        # MEAN REVERSION FILTER (Safety Check)
         # Prevent "Selling the Hole" (Shorting when Price < BB Lower or RSI < 30)
         # ---------------------------------------------------------------------
         bb_pos = features.get('bb_position', 0.5)
+        rsi_val = features.get('rsi_norm', 0.5) * 100.0
         
         if proposed_action == -1: # SELL
             if bb_pos < 0.0 or rsi_val < 30:
@@ -534,6 +539,7 @@ class ResearchStrategy:
         imp_feats.append(regime)
         if features.get('rvol', 0) > 1.2: imp_feats.append('High_Volume')
         if features.get('parkinson_vol', 0) > 0.002: imp_feats.append('High_Parkinson')
+        if features.get('mtf_alignment', 0) == 1.0: imp_feats.append('MTF_Aligned')
         
         for f in imp_feats:
             self.feature_importance_counter[f] += 1
