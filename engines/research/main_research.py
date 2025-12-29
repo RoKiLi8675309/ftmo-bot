@@ -9,6 +9,12 @@
 # 1. REPORTING BUG FIX: Moved SQN/Sharpe calculation BEFORE the Drawdown check.
 #    - Previously, if DD > 10%, the function returned early, resulting in 0.00 stats.
 #    - Now, full stats are calculated regardless of FTMO violations.
+#
+# REPORTING UPGRADE (2025-12-29 - INSTITUTIONAL METRICS):
+# 1. FEATURE: Added comprehensive "No-Quantstats" reporting suite.
+#    - Includes: Profit Factor, Expectancy, SQN, Sharpe, Sortino, R:R Ratio.
+# 2. FEATURE: Enhanced Console Output with formatted tables.
+# 3. FEATURE: Added SQN Rating interpreter.
 # =============================================================================
 import os
 import sys
@@ -607,34 +613,94 @@ class ResearchPipeline:
             print(f"Backtest error {symbol}: {e}")
             return []
 
+    def _get_sqn_rating(self, sqn: float) -> str:
+        """Categorizes System Quality Number based on Van Tharp's scale."""
+        if sqn < 1.6: return "POOR 🛑"
+        if sqn < 2.0: return "AVERAGE ⚠️"
+        if sqn < 2.5: return "GOOD ✅"
+        if sqn < 3.0: return "EXCELLENT 🚀"
+        if sqn < 5.0: return "SUPERB 💎"
+        if sqn < 7.0: return "HOLY GRAIL? 🦄"
+        return "GOD MODE ⚡"
+
     def _generate_report(self, trade_log: List[Dict]):
         if not trade_log:
             log.info("No trades executed during backtest.")
             return
 
         df = pd.DataFrame(trade_log)
-        initial_capital = 100000.0 
+        initial_capital = CONFIG['env'].get('initial_balance', 100000.0)
         
-        total_pnl = df['Net_PnL'].sum()
-        win_rate = len(df[df['Net_PnL']>0]) / len(df)
+        # 1. Equity & Drawdown Calculations
+        df['Entry_Time'] = pd.to_datetime(df['Entry_Time'])
+        df = df.sort_values('Entry_Time')
+        df['Equity'] = initial_capital + df['Net_PnL'].cumsum()
+        df['Peak'] = df['Equity'].cummax()
+        df['Drawdown_USD'] = df['Equity'] - df['Peak']
+        df['Drawdown_Pct'] = (df['Drawdown_USD'] / df['Peak']).abs() * 100.0
         
-        log.info(f"--- BACKTEST RESULTS ---")
-        log.info(f"Total PnL: ${total_pnl:,.2f}")
-        log.info(f"Win Rate: {win_rate:.1%}")
-        log.info(f"Trades: {len(df)}")
+        # 2. Core Metrics
+        total_trades = len(df)
+        net_pnl = df['Net_PnL'].sum()
+        win_count = len(df[df['Net_PnL'] > 0])
+        loss_count = len(df[df['Net_PnL'] <= 0])
+        win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0.0
         
+        gross_profit = df[df['Net_PnL'] > 0]['Net_PnL'].sum()
+        gross_loss = abs(df[df['Net_PnL'] < 0]['Net_PnL'].sum())
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
+        
+        avg_win = df[df['Net_PnL'] > 0]['Net_PnL'].mean() if win_count > 0 else 0.0
+        avg_loss = df[df['Net_PnL'] <= 0]['Net_PnL'].mean() if loss_count > 0 else 0.0
+        rr_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else 0.0
+        
+        # Expectancy = (Win% * AvgWin) - (Loss% * AvgLoss)
+        expectancy = (win_rate/100 * avg_win) + ((1 - win_rate/100) * avg_loss)
+        
+        max_dd_pct = df['Drawdown_Pct'].max()
+        max_dd_usd = df['Drawdown_USD'].min()
+        
+        # 3. Advanced Metrics (SQN, Sharpe)
+        # SQN: sqrt(N) * (AvgTrade / StdDevTrade)
+        returns_std = df['Net_PnL'].std()
+        sqn = (math.sqrt(total_trades) * (df['Net_PnL'].mean() / returns_std)) if returns_std > 0 else 0.0
+        sqn_rating = self._get_sqn_rating(sqn)
+        
+        # Simple Sharpe (Trade-based)
+        sharpe_trade = (df['Net_PnL'].mean() / returns_std) if returns_std > 0 else 0.0
+        
+        # 4. Duration
+        avg_duration = df['Duration_Min'].mean()
+        
+        # 5. CONSOLE OUTPUT REPORT
+        log.info("="*60)
+        log.info(f"PHOENIX RESEARCH ENGINE - BACKTEST REPORT")
+        log.info("="*60)
+        log.info(f"{'Metric':<30} | {'Value':<15}")
+        log.info("-"*50)
+        log.info(f"{'Net Profit':<30} | ${net_pnl:,.2f}")
+        log.info(f"{'Initial Capital':<30} | ${initial_capital:,.2f}")
+        log.info(f"{'Return %':<30} | {(net_pnl/initial_capital)*100:.2f}%")
+        log.info(f"{'Profit Factor':<30} | {profit_factor:.2f}")
+        log.info(f"{'Win Rate':<30} | {win_rate:.2f}% ({win_count}/{total_trades})")
+        log.info("-"*50)
+        log.info(f"{'Max Drawdown':<30} | {max_dd_pct:.2f}% (${abs(max_dd_usd):,.2f})")
+        log.info(f"{'Expectancy':<30} | ${expectancy:.2f}")
+        log.info(f"{'SQN Score':<30} | {sqn:.2f} ({sqn_rating})")
+        log.info(f"{'Sharpe (Trade)':<30} | {sharpe_trade:.4f}")
+        log.info("-"*50)
+        log.info(f"{'Avg Win':<30} | ${avg_win:,.2f}")
+        log.info(f"{'Avg Loss':<30} | ${avg_loss:,.2f}")
+        log.info(f"{'Risk:Reward':<30} | 1:{rr_ratio:.2f}")
+        log.info(f"{'Avg Duration':<30} | {avg_duration:.1f} min")
+        log.info("="*60)
+
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_path = self.reports_dir / f"backtest_trades_{timestamp_str}.csv"
         df.to_csv(csv_path)
         log.info(f"{LogSymbols.DATABASE} Saved Trades to {csv_path}")
 
         try:
-            df['Entry_Time'] = pd.to_datetime(df['Entry_Time'])
-            df = df.sort_values('Entry_Time')
-            df['Equity'] = initial_capital + df['Net_PnL'].cumsum()
-            df['Peak'] = df['Equity'].cummax()
-            df['Drawdown'] = (df['Equity'] - df['Peak']) / df['Peak']
-            
             self._plot_equity_curve(df, timestamp_str)
         except Exception as e:
             log.warning(f"Could not generate plot: {e}")
@@ -650,7 +716,7 @@ class ResearchPipeline:
         )
         
         fig.add_trace(
-            go.Scatter(x=df_equity['Entry_Time'], y=df_equity['Drawdown'], mode='lines', name='Drawdown', fill='tozeroy', line=dict(color='#ff0000')),
+            go.Scatter(x=df_equity['Entry_Time'], y=df_equity['Drawdown_Pct'], mode='lines', name='Drawdown %', fill='tozeroy', line=dict(color='#ff0000')),
             row=2, col=1
         )
 

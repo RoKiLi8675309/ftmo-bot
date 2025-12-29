@@ -6,12 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-28 - V3.3 JPY DOMINATION):
-# 1. PHILOSOPHY: "Alpha Hunter" on JPY Basket.
-# 2. FIX: Aggressor Threshold lowered to 0.55 to capture more signals.
-# 3. FIX: Stop Loss widened to 2.0 ATR.
-# 4. FIX: Trailing Stop tightened to 1.2 ATR.
-# 5. DATA: Added default injections for EURJPY/AUDJPY to prevent warm-up crashes.
+# PHOENIX STRATEGY UPGRADE (2025-12-29 - V3.4 FTMO GUARDIAN):
+# 1. SYNC: Aligned Logic Gates with Research Strategy V3.4.
+# 2. FEATURE: Implemented "Alpha Hunter" Pyramiding Logic (Profit > 1.2 ATR).
+# 3. FIX: Updated thresholds (KER 0.35, Vol 1.1, Aggressor 0.55).
 # =============================================================================
 import logging
 import pickle
@@ -73,7 +71,7 @@ class MultiAssetPredictor:
         # Adaptive Triple Barrier
         tbm_conf = CONFIG['online_learning']['tbm']
         
-        # Sync Labeler Risk with Config (V3.2 uses 2.0 ATR Stop)
+        # Sync Labeler Risk with Config (V3.4 uses 2.0 ATR Stop)
         risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 2.0)
 
         self.labelers = {s: AdaptiveTripleBarrier(
@@ -109,10 +107,10 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V3.2 ALPHA HUNTER CONFIG) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V3.4 FTMO GUARDIAN) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V3.2 GATES
+        # V3.4 GATES
         self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         self.require_h4_alignment = phx_conf.get('require_h4_alignment', True)
@@ -120,14 +118,14 @@ class MultiAssetPredictor:
         # Safety Cap
         self.max_rvol_thresh = phx_conf.get('max_relative_volume', 5.0)
         
-        # Thresholds (V3.2: ALPHA MODE)
+        # Thresholds (V3.4: ALPHA MODE)
         self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.35) # Lowered to 0.35
         self.adx_threshold = CONFIG['features']['adx'].get('threshold', 18) 
         
         # Volume Gate
         self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.1)
         
-        # Momentum (V3.2: LOWERED to 0.55)
+        # Momentum (V3.4: LOWERED to 0.55)
         self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55)
         self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.5) 
         
@@ -188,7 +186,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V3.2 Logic (Alpha Hunter).
+        Executes the Learn-Predict Loop with Project Phoenix V3.4 Logic (Alpha Hunter).
         """
         if symbol not in self.symbols: return None
         
@@ -291,7 +289,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp())
 
         # ============================================================
-        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V3.2 ALPHA HUNTER)
+        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V3.4 ALPHA HUNTER)
         # ============================================================
         
         # Extract Core Indicators
@@ -321,11 +319,11 @@ class MultiAssetPredictor:
         h4_bear = h4_rsi < 50
         
         # Gate Definitions
-        # V3.2: 1.1x Avg Volume (Standard Institutional Flow)
+        # V3.4: 1.1x Avg Volume (Standard Institutional Flow)
         vol_gate = rvol > self.vol_gate_ratio
         
         # Momentum Direction (Aggressor Ratio)
-        # V3.2: 0.55 Threshold (Relaxed from 0.65)
+        # V3.4: 0.55 Threshold (Relaxed from 0.60)
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
@@ -349,7 +347,8 @@ class MultiAssetPredictor:
                 else:
                     profit_atr = (entry_price - bar.close) / current_atr
                 
-            # Pyramiding Threshold: > 1.2 ATR (V3.2 Aggressive)
+            # Pyramiding Threshold: > 1.2 ATR (V3.4 Aggressive)
+            # Signal 'pyramid' flag if winning, allowing Engine to size up
             if profit_atr > 1.2:
                 # We have a winning runner. Signal a PYRAMID trade.
                 # Returns the SIDE (BUY/SELL) but flags it as a pyramid.
@@ -366,7 +365,7 @@ class MultiAssetPredictor:
         if self.enable_regime_a:
             # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
             if d1_trend_up and is_bullish_candle and vol_gate:
-                # Require Efficiency (V3.2: KER > 0.35)
+                # Require Efficiency (V3.4: KER > 0.35)
                 if ker_val > self.ker_thresh:
                     proposed_action = 1
                     regime_label = "A (Mom-Long)"
@@ -459,7 +458,7 @@ class MultiAssetPredictor:
         )
 
         # --- DECISION ---
-        # V3.2: Defaults to 0.55 (Lowered from 0.60)
+        # V3.4: Defaults to 0.55 (Lowered from 0.60)
         min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
 
         # Safety Check: If ML thinks probability is terrible (< min_prob), skip.

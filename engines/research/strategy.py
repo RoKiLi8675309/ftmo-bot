@@ -5,12 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-28 - V3.3 JPY DOMINATION):
-# 1. PHILOSOPHY: "Alpha Hunter" on JPY Basket.
-# 2. FIX: Aggressor Threshold lowered to 0.55 to capture more signals.
-# 3. FIX: Stop Loss widened to 2.0 ATR.
-# 4. FIX: Trailing Stop tightened to 1.2 ATR.
-# 5. DATA: Added default injections for EURJPY/AUDJPY to prevent warm-up crashes.
+# PHOENIX STRATEGY UPGRADE (2025-12-29 - V3.4 FTMO GUARDIAN):
+# 1. FIX: "Correlated Suicide" bug -> Now counts JPY exposure dynamically.
+# 2. FIX: "Pyramid Trap" -> Implements Weighted Average Bundle Stop.
+# 3. LOGIC: Added 'daily_pnl_check' to simulate Session Guard in backtest.
 # =============================================================================
 import logging
 import sys
@@ -61,9 +59,9 @@ class ResearchStrategy:
         
         # Sync Labeler Risk with Config (V3.2 uses 2.0 ATR Stop)
         risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 2.0)
-        
+
         self.labeler = AdaptiveTripleBarrier(
-            horizon_ticks=tbm_conf.get('horizon_minutes', 60),
+            horizon_ticks=tbm_conf.get('horizon_minutes', 60), 
             risk_mult=risk_mult_conf, 
             reward_mult=tbm_conf.get('barrier_width', 1.5),
             drift_threshold=tbm_conf.get('drift_threshold', 1.2)
@@ -164,6 +162,12 @@ class ResearchStrategy:
         except Exception:
             timestamp = 0.0
             dt_ts = datetime.now()
+
+        # --- SIMULATED SESSION GUARD (Daily Loss Limit) ---
+        # FTMO Check: If Daily Drawdown > 4.5%, stop trading for the day
+        if self._check_daily_loss_limit(broker):
+            self.rejection_stats["Daily Loss Limit Hit"] += 1
+            return
 
         # --- FRIDAY LIQUIDATION CHECK (GAP PROTECTION) ---
         if dt_ts.weekday() == 4 and dt_ts.hour >= self.friday_close_hour:
@@ -422,11 +426,31 @@ class ResearchStrategy:
             if self.debug_mode: logger.error(f"Strategy Error: {e}")
             pass
 
+    def _check_daily_loss_limit(self, broker: BacktestBroker) -> bool:
+        """
+        Simulates SessionGuard in Backtest.
+        If Daily Drawdown > 4.5%, returns True (BLOCK TRADES).
+        """
+        try:
+            # Note: BacktestBroker is simple. We approximate daily loss.
+            # In live, this comes from Redis. Here we check floating PnL + Realized today.
+            # Simplified: Check simple Equity drawdown from High Water Mark of the DAY.
+            # Since backtester doesn't track "Daily Start", we check if Total DD > 5% as a proxy
+            # or rely on equity curve.
+            
+            # Better Proxy: Check open PnL vs Equity
+            current_dd_pct = (broker.initial_balance - broker.equity) / broker.initial_balance
+            if current_dd_pct > 0.045: # 4.5% Hard Stop
+                return True
+            return False
+        except:
+            return False
+
     def _manage_trailing_stop(self, pos: BacktestOrder, current_price: float, current_atr: float):
         """
         V3.2 ALPHA HUNTER TRAILING STOP LOGIC
-        Tightens SL if profit exceeds 1.2 ATR (ts_activation_atr).
-        Follows by 0.5 ATR (ts_step_atr) or fixed distance.
+        Tightens SL if profit exceeds 1.2 ATR.
+        Follows by 0.5 ATR step.
         """
         if not pos.is_active: return
         
@@ -442,8 +466,8 @@ class ResearchStrategy:
         
         # Check Activation (1.2 ATR - Aggressive Lock)
         if profit_atr > self.ts_activation_atr:
-            # New SL Distance: We want to lock in profit.
-            # Strategy: Trail at 1.0 ATR distance once activated
+            # New SL Distance: Trail at 1.0 ATR distance once activated
+            # This ensures we lock in ~0.2 ATR immediately
             trail_dist = 1.0 * current_atr
             
             new_sl = 0.0
@@ -462,8 +486,6 @@ class ResearchStrategy:
                 pos.stop_loss = new_sl
                 if "Trailing" not in pos.comment:
                     pos.comment += "|Trailing"
-                    if self.debug_mode: 
-                        logger.info(f"⚡ {self.symbol} Trailing Stop Triggered: {profit_atr:.2f} ATR Profit")
 
     def _simulate_mtf_context(self, price: float, dt: datetime) -> Dict[str, Any]:
         """
@@ -532,7 +554,10 @@ class ResearchStrategy:
                 self.last_price_map[sym] = price
 
     def _execute_logic(self, confidence, price, features, broker, timestamp: datetime, action_int: int, regime: str):
-        """Decides whether to enter a trade using Fixed Risk (Prop Firm Mode)."""
+        """
+        Decides whether to enter a trade using Fixed Risk (Prop Firm Mode).
+        AUDIT FIX: Now accounts for Portfolio Correlation.
+        """
         
         action = "BUY" if action_int == 1 else "SELL"
 
@@ -546,7 +571,14 @@ class ResearchStrategy:
         current_atr = features.get('atr', 0.001)
         current_ker = features.get('ker', 1.0) 
 
-        # --- ALPHA GENERATOR: AGGRESSIVE PYRAMIDING ---
+        # --- AUDIT FIX: DYNAMIC CORRELATION CHECK ---
+        # Scan broker positions to find JPY exposure
+        jpy_exposure_count = 0
+        for pos in broker.open_positions:
+            if "JPY" in pos.symbol: # Simple heuristic: if symbol contains JPY
+                jpy_exposure_count += 1
+        
+        # --- ALPHA GENERATOR: SAFER PYRAMIDING ---
         if self.symbol in broker.positions:
             existing_trade = broker.positions[self.symbol]
             
@@ -557,20 +589,41 @@ class ResearchStrategy:
             else:
                 profit_atr = (existing_trade.entry_price - price) / current_atr
                 
-            # 2. Threshold (Reduced to 1.2 ATRs for Challenge Mode)
-            # Only add if we haven't already added (simple check: comment)
+            # 2. Threshold (1.2 ATRs)
             if profit_atr > 1.2 and "Pyramid" not in existing_trade.comment:
-                # 3. Add to position (Scale In)
+                # 3. Scale In (Half Size)
                 new_qty = existing_trade.quantity * 0.5
                 
-                # Risk Management: Move STOP LOSS of first trade to Entry (Break Even)
-                existing_trade.stop_loss = existing_trade.entry_price
+                # --- AUDIT FIX: WEIGHTED AVERAGE BUNDLE STOP ---
+                # Calculate the "Bundle Entry Price"
+                total_qty = existing_trade.quantity + new_qty
+                w_sum = (existing_trade.entry_price * existing_trade.quantity) + (price * new_qty)
+                avg_entry = w_sum / total_qty
                 
-                # Submit New Order
-                sl_dist = 2.0 * current_atr # Wide stop for new leg
-                tp_dist = 4.0 * current_atr # Extended target
+                # New Stop Logic: Set SL for BOTH trades to Avg Entry +/- Buffer
+                # This ensures the entire "Bundle" is Break-Even in worst case (ignoring comms)
+                buffer = 0.05 * current_atr # Small buffer to cover spread
                 
-                sl_price = price - sl_dist if action == "BUY" else price + sl_dist
+                if action == "BUY":
+                    bundle_sl = avg_entry + buffer # Stop slightly above avg entry? No, strictly BE implies avg entry. 
+                    # Actually, to be safe, SL should be exactly avg entry or slightly in profit.
+                    # Let's target +5 pips above avg entry to cover commissions.
+                    pip_val = 0.01 if "JPY" in self.symbol else 0.0001
+                    bundle_sl = avg_entry + (5 * pip_val)
+                    
+                    # Ensure this new SL is logical (below current price)
+                    if bundle_sl >= price: bundle_sl = price - (0.5 * current_atr) # Fallback if price is too close
+                else:
+                    pip_val = 0.01 if "JPY" in self.symbol else 0.0001
+                    bundle_sl = avg_entry - (5 * pip_val)
+                    if bundle_sl <= price: bundle_sl = price + (0.5 * current_atr)
+
+                # Update Existing Trade
+                existing_trade.stop_loss = bundle_sl
+                existing_trade.comment += "|Bundled"
+                
+                # New Order Targets
+                tp_dist = 4.0 * current_atr # Extended target for runner
                 tp_price = price + tp_dist if action == "BUY" else price - tp_dist
                 side = 1 if action == "BUY" else -1
                 
@@ -579,7 +632,7 @@ class ResearchStrategy:
                     side=side,
                     quantity=new_qty,
                     timestamp_created=timestamp,
-                    stop_loss=sl_price,
+                    stop_loss=bundle_sl, # Shared SL
                     take_profit=tp_price,
                     comment=f"Pyramid|Regime:{regime}",
                     metadata={
@@ -591,8 +644,7 @@ class ResearchStrategy:
                 broker.submit_order(order)
                 return 
             else:
-                # Already have a position and not adding -> Hold
-                return
+                return # Hold
         
         # --- STANDARD ENTRY LOGIC ---
         ctx = TradeContext(
@@ -606,11 +658,12 @@ class ResearchStrategy:
         )
 
         # Calculate Size (Fixed Risk)
+        # PASS jpy_exposure_count to Risk Manager to scale down sizing
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=confidence,
             volatility=volatility,
-            active_correlations=0,
+            active_correlations=jpy_exposure_count, # CRITICAL FIX
             market_prices=self.last_price_map,
             atr=current_atr, 
             ker=current_ker,

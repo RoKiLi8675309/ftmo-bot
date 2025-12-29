@@ -1,12 +1,13 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V3.3 (JPY BASKET DOMINATION)
-# STATUS: ALPHA HUNTER + JPY CONCENTRATION
+# config.yaml – PROJECT PHOENIX V3.4 (FTMO GUARDIAN)
+# STATUS: ALPHA HUNTER + 0.5% RISK
 #
-# CHANGES (2025-12-28):
-# 1. PORTFOLIO RESTRUCTURE: Removed EURUSD/AUDUSD. Added EURJPY/AUDJPY.
-#    - Rationale: The strategy thrives on JPY volatility. We are concentrating 
-#      risk on the asset class where the edge is proven.
-# 2. RETAINED: All "Alpha Hunter" settings (1.0% Risk, Aggressive Gates).
+# CHANGES (2025-12-29):
+# 1. RISK REDUCTION: Lowered base_risk_per_trade_percent to 0.5% (was 1.0%).
+#    - Rationale: Survival is priority. 0.5% allows for 20 consecutive losses
+#      before hitting the 10% max loss limit.
+# 2. TRAILING STOP: Aligned with V3.2 Strategy (1.2 ATR Activation).
+# 3. JPY BASKET: Confirmed JPY dominance in symbol list.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -125,26 +126,26 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 18    # LOWERED from 20 to capture earlier trends
-    
+    threshold: 18    # V3.2: 18 (Sensitive Trend detection)
+  
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V3.2 CHALLENGE MODE) ---
+# --- PHOENIX STRATEGY PARAMETERS (V3.4 FTMO GUARDIAN) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true   
-  require_d1_trend: true          
-  require_h4_alignment: true      
+  enable_regime_a_entries: true    
+  require_d1_trend: true           
+  require_h4_alignment: true       
   
   # --- FILTER THRESHOLDS (LOOSENED FOR FREQUENCY) ---
   # Volume Exhaustion
   max_relative_volume: 5.0        
   
   # Trend Efficiency
-  ker_trend_threshold: 0.35       
+  ker_trend_threshold: 0.35        
   
   # Volatility Expansion
   vol_expansion_threshold: 1.5 
@@ -164,34 +165,34 @@ phoenix_strategy:
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
   vpin_threshold: 0.90
-  gate_fdi_threshold: 1.60       
+  gate_fdi_threshold: 1.60        
 
-# --- RISK MANAGEMENT (AGGRESSIVE GROWTH) ---
+# --- RISK MANAGEMENT (FTMO COMPLIANCE) ---
 risk_management:
   account_currency: "USD"
   
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # Risk Per Trade (AGGRESSIVE)
-  base_risk_per_trade_percent: 1.0 
+  # Risk Per Trade (CRITICAL: LOWERED TO 0.5%)
+  base_risk_per_trade_percent: 0.5 
   
   max_daily_loss_pct: 0.045       # 4.5% (FTMO Limit is 5%)
   max_total_loss_pct: 0.09        # 9% (FTMO Limit is 10%)
-  max_risk_percent: 2.0           # Max open risk at any time
+  max_risk_percent: 2.0           # Max open risk at any time (4 trades @ 0.5%)
   max_leverage: 30.0
   max_lot_size: 50.0              
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC
-  stop_loss_atr_mult: 2.0        
+  stop_loss_atr_mult: 2.0         
   take_profit_atr_mult: 4.0        
   
   # TRAILING STOP (AGGRESSIVE LOCKING)
   trailing_stop:
     enabled: true
-    activation_atr: 1.2           
-    step_atr: 0.5                
+    activation_atr: 1.2            
+    step_atr: 0.5                 
   
   risk_timezone: "Europe/Prague"
   friday_liquidation_hour_server: 21 
@@ -199,7 +200,7 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 50          
+  max_trades_per_day: 50           
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
@@ -210,8 +211,8 @@ trading:
   symbols:
     - "GBPJPY"  
     - "USDJPY"
-    - "EURJPY"  # Replaced EURUSD
-    - "AUDJPY"  # Replaced AUDUSD
+    - "EURJPY"  
+    - "AUDJPY"  
   
   auxiliary_symbols:
     - "GBPUSD"
@@ -224,7 +225,7 @@ trading:
   
   # --- EXECUTION OPTIMIZATION ---
   limit_order_offset_pips: 0.2 
-  limit_order_ttl_seconds: 60    
+  limit_order_ttl_seconds: 60     
 
 # --- ONLINE LEARNING ---
 online_learning:
@@ -232,7 +233,7 @@ online_learning:
   
   # CONFIGURATION
   n_models: 40        
-  grace_period: 150       
+  grace_period: 150        
   delta: 0.00005          
   warning_delta: 0.001    
   lambda_value: 10        
@@ -253,10 +254,10 @@ online_learning:
   
   tbm:
     horizon_minutes: 60
-    barrier_width: 1.5      
+    barrier_width: 1.5       
     min_profit_pips: 5.0
     drift_threshold: 1.2 
-    
+  
   learning_horizon_sec: 300
   
   # High Confidence Only
