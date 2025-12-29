@@ -1,16 +1,12 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V3.1 (ALPHA HUNTER)
-# STATUS: CONFIGURATION UPDATE FOR ALPHA GENERATION
+# config.yaml – PROJECT PHOENIX V3.3 (JPY BASKET DOMINATION)
+# STATUS: ALPHA HUNTER + JPY CONCENTRATION
 #
-# DIAGNOSIS (2025-12-28 - STAGNATION ANALYSIS):
-# 1. PREMATURE STOP-OUTS: 1.5 ATR SL is too tight for current volatility.
-# 2. MISSED ENTRIES: Aggressor 0.65 is rejecting viable trend candles.
-# 3. PROFIT LEAK: Trailing activation at 2.0 is too slow; profits evaporate.
-#
-# FIX (V3.1):
-# 1. SL: Widened to 2.0 ATR. Let the trade breathe.
-# 2. TRAILING: Tightened activation to 1.5 ATR to lock in wins.
-# 3. AGGRESSOR: Lowered to 0.60 to capture more valid signals.
+# CHANGES (2025-12-28):
+# 1. PORTFOLIO RESTRUCTURE: Removed EURUSD/AUDUSD. Added EURJPY/AUDJPY.
+#    - Rationale: The strategy thrives on JPY volatility. We are concentrating 
+#      risk on the asset class where the edge is proven.
+# 2. RETAINED: All "Alpha Hunter" settings (1.0% Risk, Aggressive Gates).
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -129,76 +125,73 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 20    # Keep ADX enabled
+    threshold: 18    # LOWERED from 20 to capture earlier trends
     
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V3.1 ALPHA HUNTER) ---
+# --- PHOENIX STRATEGY PARAMETERS (V3.2 CHALLENGE MODE) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true   
   require_d1_trend: true          
   require_h4_alignment: true      
   
-  # --- FILTER THRESHOLDS ---
+  # --- FILTER THRESHOLDS (LOOSENED FOR FREQUENCY) ---
   # Volume Exhaustion
-  max_relative_volume: 4.0        
+  max_relative_volume: 5.0        
   
-  # Trend Efficiency (Maintained at 0.40)
-  ker_trend_threshold: 0.40       
+  # Trend Efficiency
+  ker_trend_threshold: 0.35       
   
   # Volatility Expansion
-  vol_expansion_threshold: 2.0 
+  vol_expansion_threshold: 1.5 
   
   # Entry Gates
   range_gate_atr_mult: 1.0        
   
-  # Volume Gate (Maintained at 1.5)
-  volume_gate_ratio: 1.5          
+  # Volume Gate (CRITICAL CHANGE)
+  volume_gate_ratio: 1.1          
   
-  # Momentum Conviction (Lowered to 0.60)
-  # FIX: Capture more signals, even if slightly messy
-  aggressor_threshold: 0.60       
+  # Momentum Conviction
+  aggressor_threshold: 0.55        
   
-  # ML Confidence (0.60)
-  ml_confirmation_threshold: 0.60 
+  # ML Confidence
+  ml_confirmation_threshold: 0.55 
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
   vpin_threshold: 0.90
-  gate_fdi_threshold: 1.60      
+  gate_fdi_threshold: 1.60       
 
-# --- RISK MANAGEMENT ---
+# --- RISK MANAGEMENT (AGGRESSIVE GROWTH) ---
 risk_management:
   account_currency: "USD"
   
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # Risk Per Trade (SURVIVAL MODE)
-  base_risk_per_trade_percent: 0.25 
+  # Risk Per Trade (AGGRESSIVE)
+  base_risk_per_trade_percent: 1.0 
   
-  max_daily_loss_pct: 0.04
-  max_total_loss_pct: 0.09
-  max_risk_percent: 0.5         
+  max_daily_loss_pct: 0.045       # 4.5% (FTMO Limit is 5%)
+  max_total_loss_pct: 0.09        # 9% (FTMO Limit is 10%)
+  max_risk_percent: 2.0           # Max open risk at any time
   max_leverage: 30.0
-  max_lot_size: 10.0            
+  max_lot_size: 50.0              
   min_lot_size: 0.01
   
-  # PROJECT PHOENIX EXIT LOGIC (1:2 RISK:REWARD BASE)
-  # FIX: Widened Stop to 2.0 ATR to survive noise (Was 1.5)
-  stop_loss_atr_mult: 2.0       
-  take_profit_atr_mult: 4.0       
+  # PROJECT PHOENIX EXIT LOGIC
+  stop_loss_atr_mult: 2.0        
+  take_profit_atr_mult: 4.0        
   
   # TRAILING STOP (AGGRESSIVE LOCKING)
-  # FIX: Activate sooner (1.5 ATR) to bank Alpha from choppy winners
   trailing_stop:
     enabled: true
-    activation_atr: 1.5         
-    step_atr: 0.5               
+    activation_atr: 1.2           
+    step_atr: 0.5                
   
   risk_timezone: "Europe/Prague"
   friday_liquidation_hour_server: 21 
@@ -206,23 +199,24 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 30        
-  correlation_penalty_threshold: 0.8
+  max_trades_per_day: 50          
+  correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
   min_stop_loss_pips: 3.0
 
-# --- TRADING PORTFOLIO ---
+# --- TRADING PORTFOLIO (JPY BASKET) ---
 trading:
   symbols:
     - "GBPJPY"  
-    - "EURUSD"  
-    - "USDJPY"  
-    - "AUDUSD"  
+    - "USDJPY"
+    - "EURJPY"  # Replaced EURUSD
+    - "AUDJPY"  # Replaced AUDUSD
   
   auxiliary_symbols:
     - "GBPUSD"
-    - "USDCAD"
+    - "EURUSD"
+    - "AUDUSD"
     
   timeframe: "M5"
   magic_number: 621001
@@ -237,25 +231,25 @@ online_learning:
   model_type: "ARFClassifier"
   
   # CONFIGURATION
-  n_models: 30        
-  grace_period: 200        
+  n_models: 40        
+  grace_period: 150       
   delta: 0.00005          
   warning_delta: 0.001    
   lambda_value: 10        
   max_features: 'log2'    
   metric: "LogLoss"        
   
-  burn_in_periods: 200    
+  burn_in_periods: 100    
   
   # Volatility Gate
   volatility_gate:
     enabled: true
-    min_atr_spread_ratio: 1.5 
+    min_atr_spread_ratio: 1.2
   
   positive_class_weight: 2.0
   negative_class_weight: 2.0
   
-  meta_labeling_threshold: 0.55
+  meta_labeling_threshold: 0.53 
   
   tbm:
     horizon_minutes: 60
@@ -265,16 +259,16 @@ online_learning:
     
   learning_horizon_sec: 300
   
-  # High Confidence Only (0.60)
-  min_calibrated_probability: 0.60
+  # High Confidence Only
+  min_calibrated_probability: 0.55 
 
 # --- NEWS FILTER ---
 news_filter:
   enabled: true
   primary_url: "http://nfs.faireconomy.media/ff_calendar_thisweek.xml"
   backup_url: "https://www.forexfactory.com/calendar"
-  buffer_minutes_before: 30
-  buffer_minutes_after: 30
+  buffer_minutes_before: 15 
+  buffer_minutes_after: 15
   restricted_events:
     USD: ["FOMC", "NFP", "CPI", "GDP", "Rate"]
     EUR: ["ECB", "CPI", "Rate"]
@@ -288,16 +282,17 @@ forensic_audit:
   commission_per_lot: 5.0
   spread_pips:
     default: 1.5
+    GBPJPY: 2.5
+    USDJPY: 1.5
+    EURJPY: 2.0  # Added
+    AUDJPY: 2.5  # Added
     GBPUSD: 1.8
     EURUSD: 1.2
-    USDJPY: 1.5
-    AUDJPY: 2.0
-    GBPJPY: 2.5
     XAUUSD: 30.0
 
 # --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 50
+  n_trials: 100 
   train_years: 2
   test_months: 6
-  min_trades_optimization: 15
+  min_trades_optimization: 25

@@ -5,12 +5,12 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-28 - V3.1 ALPHA HUNTER):
-# 1. PHILOSOPHY: "Alpha Hunter" - Capture volatility, let winners run.
-# 2. FIX: Aggressor Threshold lowered to 0.60 to capture more signals.
-# 3. FIX: Stop Loss widened to 2.0 ATR (via Risk Config).
-# 4. FIX: Trailing Stop tightened to 1.5 ATR (via Risk Config).
-# 5. ALPHA: Aggressive Pyramiding (Scale-in winners > 2 ATR).
+# PHOENIX STRATEGY UPGRADE (2025-12-28 - V3.3 JPY DOMINATION):
+# 1. PHILOSOPHY: "Alpha Hunter" on JPY Basket.
+# 2. FIX: Aggressor Threshold lowered to 0.55 to capture more signals.
+# 3. FIX: Stop Loss widened to 2.0 ATR.
+# 4. FIX: Trailing Stop tightened to 1.2 ATR.
+# 5. DATA: Added default injections for EURJPY/AUDJPY to prevent warm-up crashes.
 # =============================================================================
 import logging
 import sys
@@ -59,7 +59,7 @@ class ResearchStrategy:
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
         
-        # Sync Labeler Risk with Config (V3.1 uses 2.0 ATR Stop)
+        # Sync Labeler Risk with Config (V3.2 uses 2.0 ATR Stop)
         risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 2.0)
         
         self.labeler = AdaptiveTripleBarrier(
@@ -100,37 +100,37 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX STRATEGY PARAMETERS (V3.1 ALPHA HUNTER CONFIG) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V3.2 ALPHA HUNTER CONFIG) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V3.1 GATES
+        # V3.2 GATES
         self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         self.require_h4_alignment = phx_conf.get('require_h4_alignment', True)
         
         # Safety Cap
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.5)
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 5.0)
         
-        # Thresholds (V3.1: ALPHA MODE)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.40) # Kept at 0.40
-        self.adx_threshold = CONFIG['features']['adx'].get('threshold', 20) 
+        # Thresholds (V3.2: ALPHA MODE)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.35) # Lowered for frequency
+        self.adx_threshold = CONFIG['features']['adx'].get('threshold', 18) 
         
         # Volume Gate
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.5)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.1)
         
-        # Momentum (V3.1: LOWERED to 0.60)
-        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.60)
-        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0) 
+        # Momentum (V3.2: LOWERED to 0.55)
+        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55)
+        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.5) 
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
         
         # Friday Liquidation
         self.friday_close_hour = CONFIG.get('risk_management', {}).get('friday_liquidation_hour_server', 21)
         
-        # --- V3.1 TRAILING STOP LOGIC ---
+        # --- V3.2 TRAILING STOP LOGIC ---
         ts_conf = CONFIG.get('risk_management', {}).get('trailing_stop', {})
         self.use_trailing_stop = ts_conf.get('enabled', True)
-        self.ts_activation_atr = ts_conf.get('activation_atr', 1.5)
+        self.ts_activation_atr = ts_conf.get('activation_atr', 1.2)
         self.ts_step_atr = ts_conf.get('step_atr', 0.5)
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
@@ -255,7 +255,7 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. PROJECT PHOENIX: LOGIC GATES (V3.1 ALPHA HUNTER)
+        # D. PROJECT PHOENIX: LOGIC GATES (V3.2 ALPHA HUNTER)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
@@ -283,18 +283,18 @@ class ResearchStrategy:
         h4_bear = h4_rsi < 50
         
         # Gate Definitions
-        # V3.1: 1.5x Avg Volume (Standard Institutional Flow)
+        # V3.2: 1.1x Avg Volume (Lowered from 1.5 to catch early moves)
         vol_gate = rvol > self.vol_gate_ratio
         
         # Momentum Direction (Aggressor Ratio)
-        # V3.1: 0.60 Threshold (Relaxed from 0.65)
+        # V3.2: 0.55 Threshold (Lowered from 0.60)
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
         
-        # --- ALPHA HUNTER V3.1: MANAGE EXISTING TRADES (TRAILING STOP) ---
+        # --- ALPHA HUNTER V3.2: MANAGE EXISTING TRADES (TRAILING STOP) ---
         # Implement Active Trailing Stop Management before checking new entries
         if self.symbol in broker.positions and self.use_trailing_stop:
             pos = broker.positions[self.symbol]
@@ -305,7 +305,7 @@ class ResearchStrategy:
         if self.enable_regime_a:
             # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
             if d1_trend_up and is_bullish_candle and vol_gate:
-                # Require Efficiency (V3.1: KER > 0.40)
+                # Require Efficiency (V3.2: KER > 0.35)
                 if ker_val > self.ker_thresh:
                     proposed_action = 1
                     regime_label = "A (Mom-Long)"
@@ -406,8 +406,8 @@ class ResearchStrategy:
                 self.meta_label_events += 1
 
             # --- EXECUTION ---
-            # V2.9: Defaults to 0.60 (Lowered from 0.70)
-            min_prob = self.params.get('min_calibrated_probability', 0.60)
+            # V3.2: Defaults to 0.55 (Lowered from 0.60)
+            min_prob = self.params.get('min_calibrated_probability', 0.55)
             
             if confidence < min_prob:
                 self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob})"] += 1
@@ -424,8 +424,8 @@ class ResearchStrategy:
 
     def _manage_trailing_stop(self, pos: BacktestOrder, current_price: float, current_atr: float):
         """
-        V3.1 ALPHA HUNTER TRAILING STOP LOGIC
-        Tightens SL if profit exceeds 1.5 ATR (ts_activation_atr).
+        V3.2 ALPHA HUNTER TRAILING STOP LOGIC
+        Tightens SL if profit exceeds 1.2 ATR (ts_activation_atr).
         Follows by 0.5 ATR (ts_step_atr) or fixed distance.
         """
         if not pos.is_active: return
@@ -440,7 +440,7 @@ class ResearchStrategy:
         if current_atr <= 0: return
         profit_atr = profit_pips / current_atr
         
-        # Check Activation (1.5 ATR)
+        # Check Activation (1.2 ATR - Aggressive Lock)
         if profit_atr > self.ts_activation_atr:
             # New SL Distance: We want to lock in profit.
             # Strategy: Trail at 1.0 ATR distance once activated
@@ -524,7 +524,8 @@ class ResearchStrategy:
         """Injects static approximations ONLY if missing."""
         defaults = {
             "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
-            "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60
+            "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
+            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0 # JPY Basket
         }
         for sym, price in defaults.items():
             if sym not in self.last_price_map:
@@ -556,9 +557,9 @@ class ResearchStrategy:
             else:
                 profit_atr = (existing_trade.entry_price - price) / current_atr
                 
-            # 2. Threshold (e.g., 2.0 ATRs)
+            # 2. Threshold (Reduced to 1.2 ATRs for Challenge Mode)
             # Only add if we haven't already added (simple check: comment)
-            if profit_atr > 2.0 and "Pyramid" not in existing_trade.comment:
+            if profit_atr > 1.2 and "Pyramid" not in existing_trade.comment:
                 # 3. Add to position (Scale In)
                 new_qty = existing_trade.quantity * 0.5
                 

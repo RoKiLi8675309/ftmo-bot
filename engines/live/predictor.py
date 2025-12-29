@@ -6,12 +6,12 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-28 - V3.1 ALPHA HUNTER):
-# 1. PHILOSOPHY: "Alpha Hunter" - Capture volatility, let winners run.
-# 2. FIX: Aggressor Threshold lowered to 0.60 to capture more signals.
-# 3. FIX: Stop Loss widened to 2.0 ATR (via Risk Config).
-# 4. FIX: Trailing Stop tightened to 1.5 ATR (via Risk Config).
-# 5. ALPHA: Aggressive Pyramiding Logic (Signal Generation with Meta-Flag).
+# PHOENIX STRATEGY UPGRADE (2025-12-28 - V3.3 JPY DOMINATION):
+# 1. PHILOSOPHY: "Alpha Hunter" on JPY Basket.
+# 2. FIX: Aggressor Threshold lowered to 0.55 to capture more signals.
+# 3. FIX: Stop Loss widened to 2.0 ATR.
+# 4. FIX: Trailing Stop tightened to 1.2 ATR.
+# 5. DATA: Added default injections for EURJPY/AUDJPY to prevent warm-up crashes.
 # =============================================================================
 import logging
 import pickle
@@ -73,14 +73,14 @@ class MultiAssetPredictor:
         # Adaptive Triple Barrier
         tbm_conf = CONFIG['online_learning']['tbm']
         
-        # Sync Labeler Risk with Config (V3.1 uses 2.0 ATR Stop)
+        # Sync Labeler Risk with Config (V3.2 uses 2.0 ATR Stop)
         risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 2.0)
 
         self.labelers = {s: AdaptiveTripleBarrier(
             horizon_ticks=tbm_conf['horizon_minutes'], 
             risk_mult=risk_mult_conf,
             reward_mult=tbm_conf['barrier_width'], 
-            drift_threshold=tbm_conf.get('drift_threshold', 1.0)
+            drift_threshold=tbm_conf.get('drift_threshold', 1.2)
         ) for s in symbols}
 
         # 2. Models (River Ensembles)
@@ -90,7 +90,7 @@ class MultiAssetPredictor:
         
         # 3. Warm-up State
         self.burn_in_counters = {s: 0 for s in symbols}
-        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 200) # Fast Startup
+        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 100) # Faster Startup (V3.2)
         
         # 4. Forensic Stats
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
@@ -105,35 +105,38 @@ class MultiAssetPredictor:
         # --- Gating Params ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.5)
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.2) # Relaxed V3.2
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V3.1 ALPHA HUNTER CONFIG) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V3.2 ALPHA HUNTER CONFIG) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V3.1 GATES
+        # V3.2 GATES
         self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         self.require_h4_alignment = phx_conf.get('require_h4_alignment', True)
         
         # Safety Cap
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.5)
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 5.0)
         
-        # Thresholds (V3.1: ALPHA MODE)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.40) # Kept at 0.40 for quality
-        self.adx_threshold = CONFIG['features']['adx'].get('threshold', 20) 
+        # Thresholds (V3.2: ALPHA MODE)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.35) # Lowered to 0.35
+        self.adx_threshold = CONFIG['features']['adx'].get('threshold', 18) 
         
         # Volume Gate
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.5)
+        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.1)
         
-        # Momentum (V3.1: LOWERED to 0.60)
-        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.60)
-        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0) 
+        # Momentum (V3.2: LOWERED to 0.55)
+        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55)
+        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.5) 
         
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
         self.last_close_prices = {s: 0.0 for s in symbols}
+
+        # Inject Default Data for JPY Basket (Prevents Risk Manager Zeros)
+        self._inject_auxiliary_data()
 
         # Initialize Models & Load State
         self._init_models()
@@ -156,7 +159,7 @@ class MultiAssetPredictor:
         for sym in self.symbols:
             # Base Classifier: ARF
             base_clf = forest.ARFClassifier(
-                n_models=conf['n_models'],
+                n_models=conf.get('n_models', 40), # V3.2 Increased Models
                 grace_period=conf['grace_period'],
                 delta=conf['delta'],
                 split_criterion='gini',
@@ -185,7 +188,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V3.1 Logic (Alpha Hunter).
+        Executes the Learn-Predict Loop with Project Phoenix V3.2 Logic (Alpha Hunter).
         """
         if symbol not in self.symbols: return None
         
@@ -202,6 +205,9 @@ class MultiAssetPredictor:
         feat_stats = self.feature_stats[symbol]
         
         self.bar_counters[symbol] += 1
+        
+        # Ensure we have a price for risk calculations (Live update)
+        self.last_close_prices[symbol] = bar.close
 
         # Extract Flows (Populated by Aggregator in shared/data.py)
         buy_vol = getattr(bar, 'buy_vol', 0.0)
@@ -213,20 +219,19 @@ class MultiAssetPredictor:
                 logger.warning(f"⚠️ {symbol}: Zero Flow Detected. Using Local Tick Rule Fallback.")
                 self.l2_missing_warned[symbol] = True
             
-            last_price = self.last_close_prices[symbol]
-            if last_price > 0:
-                if bar.close > last_price:
-                    buy_vol = bar.volume
-                    sell_vol = 0.0
-                elif bar.close < last_price:
-                    buy_vol = 0.0
-                    sell_vol = bar.volume
-                else:
-                    buy_vol = bar.volume / 2.0
-                    sell_vol = bar.volume / 2.0
+            # Use cached price from previous tick/bar if available
+            last_price = self.last_close_prices.get(symbol, bar.close) 
+            
+            if bar.close > last_price:
+                buy_vol = bar.volume
+                sell_vol = 0.0
+            elif bar.close < last_price:
+                buy_vol = 0.0
+                sell_vol = bar.volume
+            else:
+                buy_vol = bar.volume / 2.0
+                sell_vol = bar.volume / 2.0
         
-        self.last_close_prices[symbol] = bar.close
-
         # 1. Feature Engineering (Now digesting D1/H4 Context)
         features = fe.update(
             price=bar.close,
@@ -286,7 +291,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp())
 
         # ============================================================
-        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V3.1 ALPHA HUNTER)
+        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V3.2 ALPHA HUNTER)
         # ============================================================
         
         # Extract Core Indicators
@@ -316,11 +321,11 @@ class MultiAssetPredictor:
         h4_bear = h4_rsi < 50
         
         # Gate Definitions
-        # V3.1: 1.5x Avg Volume (Standard Institutional Flow)
+        # V3.2: 1.1x Avg Volume (Standard Institutional Flow)
         vol_gate = rvol > self.vol_gate_ratio
         
         # Momentum Direction (Aggressor Ratio)
-        # V3.1: 0.60 Threshold (Relaxed from 0.65)
+        # V3.2: 0.55 Threshold (Relaxed from 0.65)
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
@@ -328,41 +333,40 @@ class MultiAssetPredictor:
         regime_label = "C (Noise)"
 
         # --- ALPHA GENERATOR: AGGRESSIVE PYRAMIDING CHECK ---
-        # NOTE: This requires the 'positions' dict to be passed via context_data by the Engine.
         # Format of positions: {symbol: {action: 'BUY'/'SELL', price: float, ...}}
         existing_positions = context_data.get('positions', {}) if context_data else {}
         
         if symbol in existing_positions:
             pos = existing_positions[symbol]
-            entry_price = pos.get('entry_price', 0.0)
+            entry_price = float(pos.get('entry_price', 0.0))
             side = pos.get('type', 'BUY') # BUY or SELL
             
             # Calculate Profit in ATR
             profit_atr = 0.0
-            if side == "BUY":
-                profit_atr = (bar.close - entry_price) / current_atr
-            else:
-                profit_atr = (entry_price - bar.close) / current_atr
+            if current_atr > 0:
+                if side == "BUY":
+                    profit_atr = (bar.close - entry_price) / current_atr
+                else:
+                    profit_atr = (entry_price - bar.close) / current_atr
                 
-            # Pyramiding Threshold: > 2.0 ATR
-            if profit_atr > 2.0:
+            # Pyramiding Threshold: > 1.2 ATR (V3.2 Aggressive)
+            if profit_atr > 1.2:
                 # We have a winning runner. Signal a PYRAMID trade.
                 # Returns the SIDE (BUY/SELL) but flags it as a pyramid.
                 return Signal(symbol, side, 0.99, {
                     "meta_ok": True,
                     "regime": "Alpha Pyramid",
-                    "reason": f"Winning Trade > 2 ATR ({profit_atr:.2f})",
+                    "reason": f"Winning Trade > 1.2 ATR ({profit_atr:.2f})",
                     "volatility": features.get('volatility', 0.001),
                     "atr": current_atr,
                     "pyramid": True # Flag for Engine to handle sizing
                 })
         
         # --- REGIME A: MOMENTUM IGNITION (Unified Flow) ---
-        # Re-enabled logic for catching moves that are not perfect "trends" yet
         if self.enable_regime_a:
             # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
             if d1_trend_up and is_bullish_candle and vol_gate:
-                # Require Efficiency (V3.1: KER > 0.40)
+                # Require Efficiency (V3.2: KER > 0.35)
                 if ker_val > self.ker_thresh:
                     proposed_action = 1
                     regime_label = "A (Mom-Long)"
@@ -375,7 +379,7 @@ class MultiAssetPredictor:
                     regime_label = "A (Mom-Short)"
                 else:
                     stats[f"Regime A: Low Efficiency (<{self.ker_thresh})"] += 1
-            
+
             # Diagnostic for Volume Gate Failure
             elif (d1_trend_up and is_bullish_candle) or (d1_trend_down and is_bearish_candle):
                 if not vol_gate:
@@ -447,7 +451,7 @@ class MultiAssetPredictor:
         confidence = prob_buy if proposed_action == 1 else prob_sell
         
         # Meta Labeling
-        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.55)
+        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.53)
         is_profitable = meta_labeler.predict(
             features, 
             proposed_action, 
@@ -455,8 +459,8 @@ class MultiAssetPredictor:
         )
 
         # --- DECISION ---
-        # V2.9: Defaults to 0.60 (Lowered from 0.70)
-        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.60)
+        # V3.2: Defaults to 0.55 (Lowered from 0.60)
+        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
 
         # Safety Check: If ML thinks probability is terrible (< min_prob), skip.
         if confidence < min_prob:
@@ -501,545 +505,16 @@ class MultiAssetPredictor:
             
         return Signal(symbol, "HOLD", confidence, {})
 
-    def save_state(self):
-        """Saves models AND Feature Engineers to disk."""
-        try:
-            for sym in self.symbols:
-                with open(self.models_dir / f"river_pipeline_{sym}.pkl", "wb") as f:
-                    pickle.dump(self.models[sym], f)
-                with open(self.models_dir / f"meta_model_{sym}.pkl", "wb") as f:
-                    pickle.dump(self.meta_labelers[sym], f)
-                with open(self.models_dir / f"calibrators_{sym}.pkl", "wb") as f:
-                    pickle.dump(self.calibrators[sym], f)
-                
-                # Persist Feature Engineer State
-                with open(self.models_dir / f"feature_engineer_{sym}.pkl", "wb") as f:
-                    pickle.dump(self.feature_engineers[sym], f)
-                    
-            logger.info(f"{LogSymbols.DATABASE} Models & State Auto-Saved.")
-        except Exception as e:
-            logger.error(f"{LogSymbols.ERROR} Failed to save models: {e}")
-
-    def _load_state(self):
-        """Loads models AND Feature Engineers from disk."""
-        loaded_count = 0
-        for sym in self.symbols:
-            model_path = self.models_dir / f"river_pipeline_{sym}.pkl"
-            meta_path = self.models_dir / f"meta_model_{sym}.pkl"
-            fe_path = self.models_dir / f"feature_engineer_{sym}.pkl"
-            
-            if model_path.exists():
-                try:
-                    with open(model_path, "rb") as f: self.models[sym] = pickle.load(f)
-                    loaded_count += 1
-                except Exception: pass
-            
-            if meta_path.exists():
-                try:
-                    with open(meta_path, "rb") as f: self.meta_labelers[sym] = pickle.load(f)
-                except Exception: pass
-                # =============================================================================
-# FILENAME: engines/live/predictor.py
-# ENVIRONMENT: Linux/WSL2 (Python 3.11)
-# PATH: engines/live/predictor.py
-# DEPENDENCIES: shared, river, numpy
-# DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
-# Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
-#
-# PHOENIX STRATEGY UPGRADE (2025-12-28 - V3.1 ALPHA HUNTER):
-# 1. PHILOSOPHY: "Alpha Hunter" - Capture volatility, let winners run.
-# 2. FIX: Aggressor Threshold lowered to 0.60 to capture more signals.
-# 3. FIX: Stop Loss widened to 2.0 ATR (via Risk Config).
-# 4. FIX: Trailing Stop tightened to 1.5 ATR (via Risk Config).
-# 5. ALPHA: Aggressive Pyramiding Logic (Signal Generation with Meta-Flag).
-# =============================================================================
-import logging
-import pickle
-import os
-import json
-import time
-import math
-from collections import defaultdict, deque, Counter
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
-
-# Third-Party ML Imports
-try:
-    from river import forest, compose, preprocessing, metrics, drift, linear_model, multioutput, ensemble
-except ImportError:
-    print("CRITICAL: 'river' library not found. Install with: pip install river>=0.21.0")
-    import sys
-    sys.exit(1)
-
-# Shared Imports
-from shared import (
-    CONFIG,
-    LogSymbols,
-    OnlineFeatureEngineer,
-    AdaptiveTripleBarrier,
-    ProbabilityCalibrator,
-    VolumeBar,
-    RiskManager
-)
-
-# New Feature Import
-from shared.financial.features import MetaLabeler
-
-logger = logging.getLogger("Predictor")
-
-class Signal:
-    """
-    Represents a trading decision generated by the model.
-    """
-    def __init__(self, symbol: str, action: str, confidence: float, meta_data: Dict[str, Any]):
-        self.symbol = symbol
-        self.action = action  # "BUY", "SELL", "HOLD", "WARMUP"
-        self.confidence = confidence
-        self.meta_data = meta_data
-
-class MultiAssetPredictor:
-    """
-    Manages a dictionary of Online Models (one per symbol).
-    Performs 'Inference -> Train' loop on every Volume Bar.
-    """
-    def __init__(self, symbols: List[str]):
-        self.symbols = symbols
-        self.models_dir = Path("models")
-        self.models_dir.mkdir(exist_ok=True)
-        
-        # 1. State Containers
-        self.feature_engineers = {s: OnlineFeatureEngineer(window_size=CONFIG['features']['window_size']) for s in symbols}
-        
-        # Adaptive Triple Barrier
-        tbm_conf = CONFIG['online_learning']['tbm']
-        
-        # Sync Labeler Risk with Config (V3.1 uses 2.0 ATR Stop)
-        risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 2.0)
-
-        self.labelers = {s: AdaptiveTripleBarrier(
-            horizon_ticks=tbm_conf['horizon_minutes'], 
-            risk_mult=risk_mult_conf,
-            reward_mult=tbm_conf['barrier_width'], 
-            drift_threshold=tbm_conf.get('drift_threshold', 1.0)
-        ) for s in symbols}
-
-        # 2. Models (River Ensembles)
-        self.models = {}
-        self.meta_labelers = {}
-        self.calibrators = {}
-        
-        # 3. Warm-up State
-        self.burn_in_counters = {s: 0 for s in symbols}
-        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 200) # Fast Startup
-        
-        # 4. Forensic Stats
-        self.rejection_stats = {s: defaultdict(int) for s in symbols}
-        self.feature_stats = {s: defaultdict(float) for s in symbols}
-        self.bar_counters = {s: 0 for s in symbols}
-        self.feature_importance_counter = {s: Counter() for s in symbols}
-        
-        # 5. Architecture: Auto-Save Timer
-        self.last_save_time = time.time()
-        self.save_interval = 300 # 5 Minutes
-
-        # --- Gating Params ---
-        self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
-        self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.5)
-        
-        self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
-        
-        # --- PHOENIX STRATEGY PARAMETERS (V3.1 ALPHA HUNTER CONFIG) ---
-        phx_conf = CONFIG.get('phoenix_strategy', {})
-        
-        # V3.1 GATES
-        self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
-        self.require_d1_trend = phx_conf.get('require_d1_trend', True)
-        self.require_h4_alignment = phx_conf.get('require_h4_alignment', True)
-        
-        # Safety Cap
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 3.5)
-        
-        # Thresholds (V3.1: ALPHA MODE)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.40) # Kept at 0.40 for quality
-        self.adx_threshold = CONFIG['features']['adx'].get('threshold', 20) 
-        
-        # Volume Gate
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.5)
-        
-        # Momentum (V3.1: LOWERED to 0.60)
-        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.60)
-        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 2.0) 
-        
-        # Fallback Tracking
-        self.l2_missing_warned = {s: False for s in symbols}
-        self.last_close_prices = {s: 0.0 for s in symbols}
-
-        # Initialize Models & Load State
-        self._init_models()
-        self._load_state()
-
-    def _init_models(self):
-        """
-        Initializes the machine learning pipelines using Golden Config hyperparameters.
-        """
-        conf = CONFIG['online_learning']
-        
-        metric_map = {
-            "LogLoss": metrics.LogLoss(),
-            "F1": metrics.F1(),
-            "Accuracy": metrics.Accuracy(),
-            "ROCAUC": metrics.ROCAUC()
+    def _inject_auxiliary_data(self):
+        """Injects static approximations ONLY if missing."""
+        defaults = {
+            "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
+            "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
+            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0 # JPY Basket
         }
-        selected_metric = metric_map.get(conf.get('metric', 'LogLoss'), metrics.LogLoss())
-        
-        for sym in self.symbols:
-            # Base Classifier: ARF
-            base_clf = forest.ARFClassifier(
-                n_models=conf['n_models'],
-                grace_period=conf['grace_period'],
-                delta=conf['delta'],
-                split_criterion='gini',
-                leaf_prediction='mc',
-                max_features=conf.get('max_features', 'log2'),
-                lambda_value=conf.get('lambda_value', 10),
-                metric=selected_metric,
-                warning_detector=drift.ADWIN(delta=conf.get('warning_delta', 0.001)),
-                drift_detector=drift.ADWIN(delta=conf['delta'])
-            )
-            
-            # Ensemble Wrapper (Bagging)
-            self.models[sym] = compose.Pipeline(
-                preprocessing.StandardScaler(),
-                ensemble.ADWINBaggingClassifier(
-                    model=base_clf,
-                    n_models=5, 
-                    seed=42
-                )
-            )
-            
-            # Meta Model & Calibrator
-            self.meta_labelers[sym] = MetaLabeler()
-            self.calibrators[sym] = ProbabilityCalibrator()
-
-    def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
-        """
-        Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V3.1 Logic (Alpha Hunter).
-        """
-        if symbol not in self.symbols: return None
-        
-        # --- AUTO SAVE CHECK ---
-        if time.time() - self.last_save_time > self.save_interval:
-            self.save_state()
-            self.last_save_time = time.time()
-
-        fe = self.feature_engineers[symbol]
-        labeler = self.labelers[symbol]
-        model = self.models[symbol]
-        meta_labeler = self.meta_labelers[symbol]
-        stats = self.rejection_stats[symbol]
-        feat_stats = self.feature_stats[symbol]
-        
-        self.bar_counters[symbol] += 1
-
-        # Extract Flows (Populated by Aggregator in shared/data.py)
-        buy_vol = getattr(bar, 'buy_vol', 0.0)
-        sell_vol = getattr(bar, 'sell_vol', 0.0)
-        
-        # --- RETAIL FALLBACK (PARITY WITH RESEARCH) ---
-        if buy_vol == 0 and sell_vol == 0:
-            if not self.l2_missing_warned[symbol]:
-                logger.warning(f"⚠️ {symbol}: Zero Flow Detected. Using Local Tick Rule Fallback.")
-                self.l2_missing_warned[symbol] = True
-            
-            last_price = self.last_close_prices[symbol]
-            if last_price > 0:
-                if bar.close > last_price:
-                    buy_vol = bar.volume
-                    sell_vol = 0.0
-                elif bar.close < last_price:
-                    buy_vol = 0.0
-                    sell_vol = bar.volume
-                else:
-                    buy_vol = bar.volume / 2.0
-                    sell_vol = bar.volume / 2.0
-        
-        self.last_close_prices[symbol] = bar.close
-
-        # 1. Feature Engineering (Now digesting D1/H4 Context)
-        features = fe.update(
-            price=bar.close,
-            timestamp=bar.timestamp.timestamp(),
-            volume=bar.volume,
-            high=bar.high,
-            low=bar.low,
-            buy_vol=buy_vol,
-            sell_vol=sell_vol,
-            context_data=context_data # Pass D1/H4 data
-        )
-        
-        if features is None: return None
-        
-        # Update Feature Stats (Rolling Average for Monitoring)
-        alpha = 0.01
-        feat_stats['avg_ker'] = (1 - alpha) * feat_stats.get('avg_ker', 0.5) + alpha * features.get('ker', 0.5)
-        feat_stats['avg_rvol'] = (1 - alpha) * feat_stats.get('avg_rvol', 1.0) + alpha * features.get('rvol', 1.0)
-        feat_stats['avg_park'] = (1 - alpha) * feat_stats.get('avg_park', 0.0) + alpha * features.get('parkinson_vol', 0.0)
-        
-        # --- WARM-UP GATE ---
-        if self.burn_in_counters[symbol] < self.burn_in_limit:
-            self.burn_in_counters[symbol] += 1
-            remaining = self.burn_in_limit - self.burn_in_counters[symbol]
-            if remaining % 50 == 0:
-                logger.info(f"🔥 {symbol} Warm-up: {self.burn_in_counters[symbol]}/{self.burn_in_limit}")
-            return Signal(symbol, "WARMUP", 0.0, {"remaining": remaining})
-
-        # 2. Delayed Training (Label Resolution)
-        resolved_labels = labeler.resolve_labels(bar.high, bar.low)
-        
-        if resolved_labels:
-            for (stored_feats, outcome_label, realized_ret) in resolved_labels:
-                w_pos = CONFIG['online_learning'].get('positive_class_weight', 2.0)
-                w_neg = CONFIG['online_learning'].get('negative_class_weight', 2.0)
-                
-                base_weight = w_pos if outcome_label != 0 else w_neg
-                
-                # Scale by Profit Magnitude (Log Scale)
-                ret_scalar = math.log1p(abs(realized_ret) * 100.0)
-                ret_scalar = max(0.5, min(ret_scalar, 5.0))
-                final_weight = base_weight * ret_scalar
-                
-                # Train Primary Model
-                model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
-                
-                # Double Learn for Positive outcomes (Reinforcement)
-                if outcome_label != 0:
-                     model.learn_one(stored_feats, outcome_label, sample_weight=final_weight * 1.5)
-
-                # Update Meta-Labeler
-                if outcome_label != 0:
-                    meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
-
-        # 3. Add CURRENT Bar as new Trade Opportunity
-        current_atr = features.get('atr', 0.0)
-        labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp())
-
-        # ============================================================
-        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V3.1 ALPHA HUNTER)
-        # ============================================================
-        
-        # Extract Core Indicators
-        rvol = features.get('rvol', 1.0)
-        ker_val = features.get('ker', 0.5)
-        aggressor = features.get('aggressor', 0.5)
-        amihud = features.get('amihud', 0.0)
-        atr_val = features.get('atr', 0.0001)
-        parkinson = features.get('parkinson_vol', 0.0)
-        mtf_align = features.get('mtf_alignment', 0.0)
-        rsi_val = features.get('rsi_norm', 0.5) * 100.0
-        adx_val = features.get('adx', 0.0)
-        
-        # --- CRITICAL FILTER 1: VOLUME EXHAUSTION FILTER ---
-        if rvol > self.max_rvol_thresh:
-            stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
-            
-        # --- CRITICAL FILTER 2: MTF TREND LOCK ---
-        d1_ema = context_data.get('d1', {}).get('ema200', 0.0) if context_data else 0.0
-        d1_trend_up = (bar.close > d1_ema) if d1_ema > 0 else True
-        d1_trend_down = (bar.close < d1_ema) if d1_ema > 0 else True
-        
-        # --- NEW: H4 RSI ALIGNMENT (V3.0) ---
-        h4_rsi = context_data.get('h4', {}).get('rsi', 50.0) if context_data else 50.0
-        h4_bull = h4_rsi > 50
-        h4_bear = h4_rsi < 50
-        
-        # Gate Definitions
-        # V3.1: 1.5x Avg Volume (Standard Institutional Flow)
-        vol_gate = rvol > self.vol_gate_ratio
-        
-        # Momentum Direction (Aggressor Ratio)
-        # V3.1: 0.60 Threshold (Relaxed from 0.65)
-        is_bullish_candle = aggressor > self.aggressor_thresh
-        is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
-        
-        proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
-        regime_label = "C (Noise)"
-
-        # --- ALPHA GENERATOR: AGGRESSIVE PYRAMIDING CHECK ---
-        # NOTE: This requires the 'positions' dict to be passed via context_data by the Engine.
-        # Format of positions: {symbol: {action: 'BUY'/'SELL', price: float, ...}}
-        existing_positions = context_data.get('positions', {}) if context_data else {}
-        
-        if symbol in existing_positions:
-            pos = existing_positions[symbol]
-            entry_price = pos.get('entry_price', 0.0)
-            side = pos.get('type', 'BUY') # BUY or SELL
-            
-            # Calculate Profit in ATR
-            profit_atr = 0.0
-            if side == "BUY":
-                profit_atr = (bar.close - entry_price) / current_atr
-            else:
-                profit_atr = (entry_price - bar.close) / current_atr
-                
-            # Pyramiding Threshold: > 2.0 ATR
-            if profit_atr > 2.0:
-                # We have a winning runner. Signal a PYRAMID trade.
-                # Returns the SIDE (BUY/SELL) but flags it as a pyramid.
-                return Signal(symbol, side, 0.99, {
-                    "meta_ok": True,
-                    "regime": "Alpha Pyramid",
-                    "reason": f"Winning Trade > 2 ATR ({profit_atr:.2f})",
-                    "volatility": features.get('volatility', 0.001),
-                    "atr": current_atr,
-                    "pyramid": True # Flag for Engine to handle sizing
-                })
-        
-        # --- REGIME A: MOMENTUM IGNITION (Unified Flow) ---
-        # Re-enabled logic for catching moves that are not perfect "trends" yet
-        if self.enable_regime_a:
-            # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
-            if d1_trend_up and is_bullish_candle and vol_gate:
-                # Require Efficiency (V3.1: KER > 0.40)
-                if ker_val > self.ker_thresh:
-                    proposed_action = 1
-                    regime_label = "A (Mom-Long)"
-                else:
-                    stats[f"Regime A: Low Efficiency (<{self.ker_thresh})"] += 1
-            
-            elif d1_trend_down and is_bearish_candle and vol_gate:
-                if ker_val > self.ker_thresh:
-                    proposed_action = -1
-                    regime_label = "A (Mom-Short)"
-                else:
-                    stats[f"Regime A: Low Efficiency (<{self.ker_thresh})"] += 1
-            
-            # Diagnostic for Volume Gate Failure
-            elif (d1_trend_up and is_bullish_candle) or (d1_trend_down and is_bearish_candle):
-                if not vol_gate:
-                    stats[f"Volume Gate Fail (RVol {rvol:.2f} < {self.vol_gate_ratio})"] += 1
-                
-        # --- REGIME B: EFFICIENT TREND CONTINUATION ---
-        # Logic: Efficiency (KER) + Momentum + D1 Align + ADX check
-        # V3.0: Added H4 RSI Alignment & ADX Check
-        
-        # 1. ADX Filter: Market must be trending
-        is_trending = adx_val > self.adx_threshold
-        
-        if proposed_action == 0 and ker_val > self.ker_thresh and vol_gate:
-            if not is_trending:
-                stats[f"Regime B: Low ADX ({adx_val:.1f} < {self.adx_threshold})"] += 1
-            else:
-                if is_bullish_candle and d1_trend_up:
-                    if self.require_h4_alignment and not h4_bull:
-                        stats["Regime B: H4 RSI Mismatch (Long)"] += 1
-                    else:
-                        proposed_action = 1
-                        regime_label = "B (Trend-Long)"
-                elif is_bearish_candle and d1_trend_down:
-                    if self.require_h4_alignment and not h4_bear:
-                        stats["Regime B: H4 RSI Mismatch (Short)"] += 1
-                    else:
-                        proposed_action = -1
-                        regime_label = "B (Trend-Short)"
-                else:
-                    stats["Regime B: Weak Candle / Counter Trend"] += 1
-        
-        # --- REGIME C: NOISE ---
-        if proposed_action == 0:
-            regime_label = "C (Noise)"
-            stats[f"Noise (KER {ker_val:.2f})"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "Regime C (Noise)"})
-
-        # --- FINAL MTF SAFETY CHECK ---
-        if proposed_action == 1 and not d1_trend_up and self.require_d1_trend:
-            stats[f"MTF Lock (Price < D1 EMA)"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "MTF Lock"})
-        if proposed_action == -1 and not d1_trend_down and self.require_d1_trend:
-            stats[f"MTF Lock (Price > D1 EMA)"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "MTF Lock"})
-
-        # ---------------------------------------------------------------------
-        # MEAN REVERSION FILTER (Safety Check)
-        # Prevent "Selling the Hole" (Shorting when Price < BB Lower or RSI < 30)
-        # ---------------------------------------------------------------------
-        bb_pos = features.get('bb_position', 0.5)
-        
-        if proposed_action == -1: # SELL
-            if bb_pos < 0.0 or rsi_val < 30:
-                stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "Mean Rev Filter"})
-        elif proposed_action == 1: # BUY
-            if bb_pos > 1.0 or rsi_val > 70:
-                stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "Mean Rev Filter"})
-        # ---------------------------------------------------------------------
-
-        # 5. ML Confirmation & Execution
-        
-        # Primary Prediction (Used for Confidence/Sizing only)
-        pred_proba = model.predict_proba_one(features)
-        prob_buy = pred_proba.get(1, 0.0)
-        prob_sell = pred_proba.get(-1, 0.0)
-        
-        confidence = prob_buy if proposed_action == 1 else prob_sell
-        
-        # Meta Labeling
-        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.55)
-        is_profitable = meta_labeler.predict(
-            features, 
-            proposed_action, 
-            threshold=meta_threshold
-        )
-
-        # --- DECISION ---
-        # V2.9: Defaults to 0.60 (Lowered from 0.70)
-        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.60)
-
-        # Safety Check: If ML thinks probability is terrible (< min_prob), skip.
-        if confidence < min_prob:
-            stats["ML Disagreement"] += 1
-            return Signal(symbol, "HOLD", confidence, {"reason": "ML Disagreement"})
-
-        if is_profitable:
-                action_str = "BUY" if proposed_action == 1 else "SELL"
-                
-                # FEATURE IMPORTANCE TRACKING
-                imp_feats = []
-                imp_feats.append(regime_label)
-                if rvol > 1.2: imp_feats.append('High_Volume')
-                if parkinson > 0.002: imp_feats.append('High_Parkinson')
-                if mtf_align == 1.0: imp_feats.append('MTF_Aligned')
-                
-                for f in imp_feats:
-                    self.feature_importance_counter[symbol][f] += 1
-                
-                return Signal(symbol, action_str, confidence, {
-                    "meta_ok": True, 
-                    "volatility": features.get('volatility', 0.001), 
-                    "atr": current_atr, 
-                    "ker": ker_val, 
-                    "parkinson_vol": parkinson, 
-                    "rvol": rvol,
-                    "amihud": amihud,
-                    "regime": regime_label,
-                    "mtf_align": mtf_align,
-                    "drivers": imp_feats
-                })
-        else:
-            stats['Meta Rejected'] += 1
-            return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
-
-        # Periodic Stats Logging
-        if self.bar_counters[symbol] % 250 == 0:
-            top_drivers = self.feature_importance_counter[symbol].most_common(3)
-            logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} RVol:{feat_stats['avg_rvol']:.2f} Regimes:{top_drivers}")
-            logger.info(f"🔍 {symbol} Rejections: {dict(stats)}")
-            stats.clear()
-            
-        return Signal(symbol, "HOLD", confidence, {})
+        for sym, price in defaults.items():
+            if sym not in self.last_close_prices or self.last_close_prices[sym] == 0:
+                self.last_close_prices[sym] = price
 
     def save_state(self):
         """Saves models AND Feature Engineers to disk."""
@@ -1079,14 +554,6 @@ class MultiAssetPredictor:
                     with open(meta_path, "rb") as f: self.meta_labelers[sym] = pickle.load(f)
                 except Exception: pass
                 
-            if fe_path.exists():
-                try:
-                    with open(fe_path, "rb") as f: self.feature_engineers[sym] = pickle.load(f)
-                    logger.info(f"Loaded Feature State for {sym}")
-                except Exception: pass
-                
-        if loaded_count > 0:
-            logger.info(f"{LogSymbols.SUCCESS} Loaded {loaded_count} existing models.")
             if fe_path.exists():
                 try:
                     with open(fe_path, "rb") as f: self.feature_engineers[sym] = pickle.load(f)
