@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (2025-12-28 - V2.9 COMPATIBILITY FIX):
-# 1. COMPATIBILITY: Fixed BacktestBroker instantiation to use 'initial_balance'.
-# 2. STABILITY: Enforces single-threading for heavy math libs.
-# 3. REPORTING: Ensures financial stats are correctly aggregated.
+# AUDIT REMEDIATION (2025-12-28 - REPORTING FIX):
+# 1. REPORTING BUG FIX: Moved SQN/Sharpe calculation BEFORE the Drawdown check.
+#    - Previously, if DD > 10%, the function returned early, resulting in 0.00 stats.
+#    - Now, full stats are calculated regardless of FTMO violations.
 # =============================================================================
 import os
 import sys
@@ -214,8 +214,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                     'drift_threshold': trial.suggest_float('drift_threshold', 0.7, 1.5)
                 },
                 
-                # High Conviction Threshold (Raised to 0.60 per V2.3)
-                # Forces optimizer to find strong signals, not 55% coin flips
+                # High Conviction Threshold
                 'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.60, 0.85)
             })
             
@@ -257,7 +256,6 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             final_score = pnl_score + (metrics['sqn'] * sqn_weight)
             
             # Constraint: Minimum Trades (Configurable)
-            # V1.5: Config uses 15 (Reduced to allow high quality trades)
             min_trades = CONFIG['wfo'].get('min_trades_optimization', 15) 
             total_trades = metrics['total_trades']
             
@@ -279,6 +277,11 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 trial.set_user_attr("blown", True)
                 return -1000.0 
             
+            # Check FTMO Hard Limit (10%) for Scoring penalty, but return score
+            if metrics['max_dd_pct'] > 0.10:
+                # Heavy penalty but allow stats to be recorded
+                final_score -= 5000.0 
+
             return final_score
 
         # 3. Connect to Shared Study
@@ -422,6 +425,11 @@ class ResearchPipeline:
         )
 
     def calculate_performance_metrics(self, trade_log: List[Dict], initial_capital=100000.0) -> Dict[str, float]:
+        """
+        Calculates Trade Metrics from the log.
+        AUDIT FIX: Calculates SQN/Sharpe BEFORE checking FTMO violation
+        to ensure data visibility even if the trial failed.
+        """
         metrics = {
             'score': -10.0,
             'total_pnl': 0.0,
@@ -465,14 +473,8 @@ class ResearchPipeline:
         max_dd_val = df['drawdown'].min()
         metrics['max_dd_pct'] = abs(max_dd_val / initial_capital)
 
-        # Fail Conditions
-        if metrics['max_dd_pct'] > 0.10: 
-            metrics['score'] = -100.0
-            return metrics
-        
+        # Volatility Based Metrics (Moved UP to ensure they are calculated)
         avg_ret = df['Net_PnL'].mean()
-        
-        # Volatility Based Metrics
         pnl_std = df['Net_PnL'].std() if len(df) > 1 else 1.0
         downside_std = losers['Net_PnL'].std() if len(losers) > 1 else 1.0
         
@@ -482,6 +484,12 @@ class ResearchPipeline:
         # SQN
         if len(df) > 1 and pnl_std > 1e-9:
             metrics['sqn'] = math.sqrt(len(df)) * (avg_ret / pnl_std)
+
+        # Fail Conditions (Applied LAST so we keep the stats)
+        # Note: We rely on the penalty in the objective function rather than wiping the score here
+        # to ensure the callback prints valid stats.
+        if metrics['max_dd_pct'] > 0.10: 
+            metrics['score'] = -100.0
         
         return metrics
 
