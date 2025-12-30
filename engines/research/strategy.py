@@ -6,10 +6,9 @@
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
 # PHOENIX STRATEGY UPGRADE (2025-12-30 - V3.5 RISK FIRST):
-# 1. REMOVED: "Alpha Hunter" Pyramiding (Confirmed to degrade R:R).
-# 2. ADDED: Break-Even Trigger. Moves SL to Entry + 2 Pips @ 1.5R Profit.
-#    (Ensures commissions are covered to prevent net loss on reversal).
-# 3. LOGIC: Strict separation of Trade Management and Entry Logic.
+# 1. FIXED: Timestamp Type Error (Float vs Datetime in BacktestOrder).
+# 2. REMOVED: "Alpha Hunter" Pyramiding (Confirmed to degrade R:R).
+# 3. ADDED: Break-Even Trigger. Moves SL to Entry + 2 Pips @ 1.5R Profit.
 # =============================================================================
 import logging
 import sys
@@ -415,7 +414,9 @@ class ResearchStrategy:
                 return
 
             if is_profitable:
-                self._execute_entry(confidence, price, features, broker, timestamp, proposed_action, regime_label)
+                # CRITICAL FIX: Pass the datetime object (dt_ts) to _execute_entry
+                # This ensures BacktestOrder gets the correct type for timestamps.
+                self._execute_entry(confidence, price, features, broker, dt_ts, proposed_action, regime_label)
             else:
                 self.rejection_stats['Meta-Labeler Reject'] += 1
 
@@ -442,7 +443,7 @@ class ResearchStrategy:
         
         # --- 1. BREAK-EVEN TRIGGER ---
         # Logic: If we haven't moved SL yet (or it's worse than entry), calculate initial Risk.
-        # If Profit > 1.5 * Risk, Lock it with commission buffer.
+        # If Profit > 1.5 * Risk, Lock it.
         
         # Determine Current Risk Distance (from Entry to SL)
         # If we are BUY, Risk is Entry - SL. If SELL, Risk is SL - Entry.
@@ -499,9 +500,11 @@ class ResearchStrategy:
                         pos.stop_loss = potential_sl
                         if "Trail" not in pos.comment: pos.comment += "|Trail"
 
-    def _execute_entry(self, confidence, price, features, broker, timestamp, action_int, regime):
+    def _execute_entry(self, confidence, price, features, broker, dt_timestamp, action_int, regime):
         """
         Executes the trade entry logic with Fixed Risk.
+        Args:
+            dt_timestamp: The current market time as a datetime object (Required by BacktestOrder).
         """
         action = "BUY" if action_int == 1 else "SELL"
         
@@ -567,7 +570,7 @@ class ResearchStrategy:
             symbol=self.symbol,
             side=side,
             quantity=qty,
-            timestamp_created=timestamp,
+            timestamp_created=dt_timestamp, # CORRECT: Passing datetime object
             stop_loss=sl_price,
             take_profit=tp_price,
             comment=f"{trade_intent.comment}|Regime:{regime}|Limit:{self.limit_order_offset_pips}p",
@@ -594,7 +597,7 @@ class ResearchStrategy:
             self.feature_importance_counter[f] += 1
 
         self.trade_events.append({
-            'time': timestamp,
+            'time': dt_timestamp.timestamp(), # Store float for consistent stats/plotting
             'action': action,
             'price': price,
             'conf': confidence,
