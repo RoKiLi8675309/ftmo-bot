@@ -6,9 +6,9 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-29 - V3.4 FTMO GUARDIAN):
-# 1. SYNC: Aligned Logic Gates with Research Strategy V3.4.
-# 2. FEATURE: Implemented "Alpha Hunter" Pyramiding Logic (Profit > 1.2 ATR).
+# PHOENIX STRATEGY UPGRADE (2025-12-30 - V3.5 RISK FIRST):
+# 1. SYNC: Aligned Logic Gates with Research Strategy V3.5 (No Pyramiding).
+# 2. REMOVED: "Alpha Hunter" Pyramiding Logic (Degrades R:R).
 # 3. FIX: Updated thresholds (KER 0.35, Vol 1.1, Aggressor 0.55).
 # =============================================================================
 import logging
@@ -71,7 +71,7 @@ class MultiAssetPredictor:
         # Adaptive Triple Barrier
         tbm_conf = CONFIG['online_learning']['tbm']
         
-        # Sync Labeler Risk with Config (V3.4 uses 2.0 ATR Stop)
+        # Sync Labeler Risk with Config (V3.5 uses 2.0 ATR Stop)
         risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 2.0)
 
         self.labelers = {s: AdaptiveTripleBarrier(
@@ -88,7 +88,7 @@ class MultiAssetPredictor:
         
         # 3. Warm-up State
         self.burn_in_counters = {s: 0 for s in symbols}
-        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 100) # Faster Startup (V3.2)
+        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 100) # Faster Startup
         
         # 4. Forensic Stats
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
@@ -103,14 +103,14 @@ class MultiAssetPredictor:
         # --- Gating Params ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.2) # Relaxed V3.2
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.2)
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V3.4 FTMO GUARDIAN) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V3.5 FTMO GUARDIAN) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V3.4 GATES
+        # V3.5 GATES
         self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         self.require_h4_alignment = phx_conf.get('require_h4_alignment', True)
@@ -118,14 +118,14 @@ class MultiAssetPredictor:
         # Safety Cap
         self.max_rvol_thresh = phx_conf.get('max_relative_volume', 5.0)
         
-        # Thresholds (V3.4: ALPHA MODE)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.35) # Lowered to 0.35
+        # Thresholds (V3.5: RISK FIRST)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.35)
         self.adx_threshold = CONFIG['features']['adx'].get('threshold', 18) 
         
         # Volume Gate
         self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.1)
         
-        # Momentum (V3.4: LOWERED to 0.55)
+        # Momentum (V3.5: 0.55)
         self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55)
         self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.5) 
         
@@ -157,7 +157,7 @@ class MultiAssetPredictor:
         for sym in self.symbols:
             # Base Classifier: ARF
             base_clf = forest.ARFClassifier(
-                n_models=conf.get('n_models', 40), # V3.2 Increased Models
+                n_models=conf.get('n_models', 40),
                 grace_period=conf['grace_period'],
                 delta=conf['delta'],
                 split_criterion='gini',
@@ -186,7 +186,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V3.4 Logic (Alpha Hunter).
+        Executes the Learn-Predict Loop with Project Phoenix V3.5 Logic (Risk First).
         """
         if symbol not in self.symbols: return None
         
@@ -289,7 +289,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp())
 
         # ============================================================
-        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V3.4 ALPHA HUNTER)
+        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V3.5 RISK FIRST)
         # ============================================================
         
         # Extract Core Indicators
@@ -319,53 +319,26 @@ class MultiAssetPredictor:
         h4_bear = h4_rsi < 50
         
         # Gate Definitions
-        # V3.4: 1.1x Avg Volume (Standard Institutional Flow)
+        # V3.5: 1.1x Avg Volume
         vol_gate = rvol > self.vol_gate_ratio
         
         # Momentum Direction (Aggressor Ratio)
-        # V3.4: 0.55 Threshold (Relaxed from 0.60)
+        # V3.5: 0.55 Threshold
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
 
-        # --- ALPHA GENERATOR: AGGRESSIVE PYRAMIDING CHECK ---
-        # Format of positions: {symbol: {action: 'BUY'/'SELL', price: float, ...}}
-        existing_positions = context_data.get('positions', {}) if context_data else {}
-        
-        if symbol in existing_positions:
-            pos = existing_positions[symbol]
-            entry_price = float(pos.get('entry_price', 0.0))
-            side = pos.get('type', 'BUY') # BUY or SELL
-            
-            # Calculate Profit in ATR
-            profit_atr = 0.0
-            if current_atr > 0:
-                if side == "BUY":
-                    profit_atr = (bar.close - entry_price) / current_atr
-                else:
-                    profit_atr = (entry_price - bar.close) / current_atr
-                
-            # Pyramiding Threshold: > 1.2 ATR (V3.4 Aggressive)
-            # Signal 'pyramid' flag if winning, allowing Engine to size up
-            if profit_atr > 1.2:
-                # We have a winning runner. Signal a PYRAMID trade.
-                # Returns the SIDE (BUY/SELL) but flags it as a pyramid.
-                return Signal(symbol, side, 0.99, {
-                    "meta_ok": True,
-                    "regime": "Alpha Pyramid",
-                    "reason": f"Winning Trade > 1.2 ATR ({profit_atr:.2f})",
-                    "volatility": features.get('volatility', 0.001),
-                    "atr": current_atr,
-                    "pyramid": True # Flag for Engine to handle sizing
-                })
+        # --- ALPHA GENERATOR: AGGRESSIVE PYRAMIDING REMOVED ---
+        # The V3.5 strategy focuses on risk management.
+        # We rely on the Engine's Trailing Stop and Break-Even triggers instead.
         
         # --- REGIME A: MOMENTUM IGNITION (Unified Flow) ---
         if self.enable_regime_a:
             # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
             if d1_trend_up and is_bullish_candle and vol_gate:
-                # Require Efficiency (V3.4: KER > 0.35)
+                # Require Efficiency (V3.5: KER > 0.35)
                 if ker_val > self.ker_thresh:
                     proposed_action = 1
                     regime_label = "A (Mom-Long)"
@@ -458,7 +431,7 @@ class MultiAssetPredictor:
         )
 
         # --- DECISION ---
-        # V3.4: Defaults to 0.55 (Lowered from 0.60)
+        # V3.5: Defaults to 0.55
         min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
 
         # Safety Check: If ML thinks probability is terrible (< min_prob), skip.

@@ -5,23 +5,16 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (2025-12-28 - REPORTING FIX):
-# 1. REPORTING BUG FIX: Moved SQN/Sharpe calculation BEFORE the Drawdown check.
-#    - Previously, if DD > 10%, the function returned early, resulting in 0.00 stats.
-#    - Now, full stats are calculated regardless of FTMO violations.
-#
-# REPORTING UPGRADE (2025-12-29 - INSTITUTIONAL METRICS):
-# 1. FEATURE: Added comprehensive "No-Quantstats" reporting suite.
-#    - Includes: Profit Factor, Expectancy, SQN, Sharpe, Sortino, R:R Ratio.
-# 2. FEATURE: Enhanced Console Output with formatted tables.
-# 3. FEATURE: Added SQN Rating interpreter.
+# AUDIT REMEDIATION (2025-12-30 - FINANCIAL METRICS & REPORTING):
+# 1. FIX: Replaced Trade-based Sharpe with Time-Weighted Sharpe (Hourly).
+# 2. FEATURE: Added 'Total Trades' and 'Expectancy' to the primary report table.
+# 3. FIX: Corrected Sortino Ratio calculation to use downside deviation of returns.
+# 4. REPORTING: Enhanced console output with clearer columns and definitions.
 # =============================================================================
 import os
 import sys
 
 # --- CRITICAL STABILITY FIX: FORCE SINGLE THREADING FOR MATH LIBS ---
-# This must happen BEFORE importing numpy/pandas/river to prevent SIGSEGV
-# when running massive parallel jobs.
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -49,7 +42,7 @@ from typing import Dict, Any, List, Tuple, Optional
 from joblib import Parallel, delayed
 from river import compose, preprocessing, forest, metrics, ensemble, drift
 
-# Ensure project root is in sys.path to resolve 'shared' and 'engines' modules
+# Ensure project root is in sys.path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "../../"))
 if project_root not in sys.path:
@@ -433,10 +426,9 @@ class ResearchPipeline:
     def calculate_performance_metrics(self, trade_log: List[Dict], initial_capital=100000.0) -> Dict[str, float]:
         """
         Calculates Trade Metrics from the log.
-        AUDIT FIX: Calculates SQN/Sharpe BEFORE checking FTMO violation
-        to ensure data visibility even if the trial failed.
+        AUDIT FIX: Uses Time-Weighted Sharpe (Hourly Returns) for accuracy.
         """
-        metrics = {
+        metrics_out = {
             'score': -10.0,
             'total_pnl': 0.0,
             'max_dd_pct': 0.0,
@@ -451,53 +443,96 @@ class ResearchPipeline:
         }
         
         if not trade_log:
-            return metrics
+            return metrics_out
             
         df = pd.DataFrame(trade_log)
         
-        # Basic Stats
+        # 1. Sort & Cleanup
+        df['Entry_Time'] = pd.to_datetime(df['Entry_Time'])
+        df['Exit_Time'] = pd.to_datetime(df['Exit_Time'])
+        df = df.sort_values('Entry_Time')
+        
+        # 2. Basic Trade Stats
         total_pnl = df['Net_PnL'].sum()
-        metrics['total_pnl'] = total_pnl
-        metrics['total_trades'] = len(df)
+        metrics_out['total_pnl'] = total_pnl
+        metrics_out['total_trades'] = len(df)
         
         winners = df[df['Net_PnL'] > 0]
         losers = df[df['Net_PnL'] <= 0]
-        metrics['win_rate'] = len(winners) / len(df) if len(df) > 0 else 0.0
+        metrics_out['win_rate'] = len(winners) / len(df) if len(df) > 0 else 0.0
         
-        metrics['avg_win'] = winners['Net_PnL'].mean() if not winners.empty else 0.0
-        metrics['avg_loss'] = losers['Net_PnL'].mean() if not losers.empty else 0.0
+        metrics_out['avg_win'] = winners['Net_PnL'].mean() if not winners.empty else 0.0
+        metrics_out['avg_loss'] = losers['Net_PnL'].mean() if not losers.empty else 0.0
 
         # Profit Factor
         gross_profit = winners['Net_PnL'].sum()
         gross_loss = abs(losers['Net_PnL'].sum())
-        metrics['profit_factor'] = gross_profit / gross_loss if gross_loss > 0 else 0.0
+        metrics_out['profit_factor'] = gross_profit / gross_loss if gross_loss > 0 else 0.0
 
-        # Drawdown
-        df['equity'] = initial_capital + df['Net_PnL'].cumsum()
-        df['peak'] = df['equity'].cummax()
-        df['drawdown'] = df['equity'] - df['peak']
-        max_dd_val = df['drawdown'].min()
-        metrics['max_dd_pct'] = abs(max_dd_val / initial_capital)
+        # 3. Time-Series Equity Curve (Hourly Resampling for Sharpe/Sortino)
+        # We need an equity curve to calculate Drawdown and Time-Weighted returns.
+        # Construct equity curve from trade exits.
+        equity_df = pd.DataFrame({'time': df['Exit_Time'], 'pnl': df['Net_PnL']})
+        equity_df.set_index('time', inplace=True)
+        
+        # Resample to Hourly to capture volatility correctly
+        hourly_pnl = equity_df['pnl'].resample('1H').sum().fillna(0)
+        
+        # Reconstruct Equity Curve
+        hourly_equity = initial_capital + hourly_pnl.cumsum()
+        
+        # 4. Drawdown Calculation (High Water Mark)
+        peak = hourly_equity.cummax()
+        drawdown = hourly_equity - peak
+        drawdown_pct = (drawdown / peak).abs()
+        max_dd_pct = drawdown_pct.max()
+        metrics_out['max_dd_pct'] = max_dd_pct if not pd.isna(max_dd_pct) else 0.0
 
-        # Volatility Based Metrics (Moved UP to ensure they are calculated)
-        avg_ret = df['Net_PnL'].mean()
-        pnl_std = df['Net_PnL'].std() if len(df) > 1 else 1.0
-        downside_std = losers['Net_PnL'].std() if len(losers) > 1 else 1.0
+        # 5. Financial Metrics (Sharpe & Sortino)
+        # Calculate Returns: (Equity_t - Equity_t-1) / Equity_t-1
+        hourly_returns = hourly_equity.pct_change().dropna()
         
-        metrics['sharpe'] = avg_ret / (pnl_std + 1e-9)
-        metrics['sortino'] = avg_ret / (downside_std + 1e-9)
-        
-        # SQN
-        if len(df) > 1 and pnl_std > 1e-9:
-            metrics['sqn'] = math.sqrt(len(df)) * (avg_ret / pnl_std)
+        if len(hourly_returns) > 1:
+            avg_ret = hourly_returns.mean()
+            std_ret = hourly_returns.std()
+            
+            # Annualization: Forex trades 24/5 approx ~6240 hours/year (260 * 24)
+            # Crypto/24-7 would be 8760. We'll use 6000 as a safe conservative proxy for active trading hours.
+            annual_factor = np.sqrt(252 * 24) 
+            
+            if std_ret > 1e-9:
+                metrics_out['sharpe'] = (avg_ret / std_ret) * annual_factor
+            
+            # Sortino: Downside deviation
+            downside_returns = hourly_returns[hourly_returns < 0]
+            downside_std = downside_returns.std()
+            
+            if downside_std > 1e-9:
+                metrics_out['sortino'] = (avg_ret / downside_std) * annual_factor
+
+        # 6. SQN (System Quality Number) - Trade Based
+        # SQN = sqrt(N) * (Expectancy / StdDev(PnL))
+        if len(df) > 1:
+            pnl_std = df['Net_PnL'].std()
+            avg_trade = df['Net_PnL'].mean()
+            if pnl_std > 1e-9:
+                metrics_out['sqn'] = math.sqrt(len(df)) * (avg_trade / pnl_std)
 
         # Fail Conditions (Applied LAST so we keep the stats)
-        # Note: We rely on the penalty in the objective function rather than wiping the score here
-        # to ensure the callback prints valid stats.
-        if metrics['max_dd_pct'] > 0.10: 
-            metrics['score'] = -100.0
+        if metrics_out['max_dd_pct'] > 0.10: 
+            metrics_out['score'] = -100.0
         
-        return metrics
+        return metrics_out
+
+    def _get_sqn_rating(self, sqn: float) -> str:
+        """Categorizes System Quality Number based on Van Tharp's scale."""
+        if sqn < 1.6: return "POOR 🛑"
+        if sqn < 2.0: return "AVERAGE ⚠️"
+        if sqn < 2.5: return "GOOD ✅"
+        if sqn < 3.0: return "EXCELLENT 🚀"
+        if sqn < 5.0: return "SUPERB 💎"
+        if sqn < 7.0: return "HOLY GRAIL? 🦄"
+        return "GOD MODE ⚡"
 
     def run_training(self, fresh_start: bool = False):
         log.info(f"{LogSymbols.TIME} STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
@@ -543,7 +578,7 @@ class ResearchPipeline:
         
         Parallel(n_jobs=len(self.symbols), backend="loky")(
             delayed(_worker_finalize_task)(
-                sym,
+                sym, 
                 self.train_candles,
                 self.db_url,
                 self.models_dir
@@ -613,16 +648,6 @@ class ResearchPipeline:
             print(f"Backtest error {symbol}: {e}")
             return []
 
-    def _get_sqn_rating(self, sqn: float) -> str:
-        """Categorizes System Quality Number based on Van Tharp's scale."""
-        if sqn < 1.6: return "POOR 🛑"
-        if sqn < 2.0: return "AVERAGE ⚠️"
-        if sqn < 2.5: return "GOOD ✅"
-        if sqn < 3.0: return "EXCELLENT 🚀"
-        if sqn < 5.0: return "SUPERB 💎"
-        if sqn < 7.0: return "HOLY GRAIL? 🦄"
-        return "GOD MODE ⚡"
-
     def _generate_report(self, trade_log: List[Dict]):
         if not trade_log:
             log.info("No trades executed during backtest.")
@@ -654,20 +679,26 @@ class ResearchPipeline:
         avg_loss = df[df['Net_PnL'] <= 0]['Net_PnL'].mean() if loss_count > 0 else 0.0
         rr_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else 0.0
         
-        # Expectancy = (Win% * AvgWin) - (Loss% * AvgLoss)
+        # Expectancy
         expectancy = (win_rate/100 * avg_win) + ((1 - win_rate/100) * avg_loss)
         
         max_dd_pct = df['Drawdown_Pct'].max()
         max_dd_usd = df['Drawdown_USD'].min()
         
         # 3. Advanced Metrics (SQN, Sharpe)
-        # SQN: sqrt(N) * (AvgTrade / StdDevTrade)
+        # Re-using the robust calculation from calculate_performance_metrics
+        # Construct hourly equity curve for Sharpe
+        equity_series = pd.Series(df['Net_PnL'].values, index=pd.to_datetime(df['Exit_Time'])).resample('1H').sum().fillna(0)
+        hourly_equity = initial_capital + equity_series.cumsum()
+        hourly_ret = hourly_equity.pct_change().dropna()
+        
+        sharpe = 0.0
+        if hourly_ret.std() > 1e-9:
+            sharpe = (hourly_ret.mean() / hourly_ret.std()) * np.sqrt(252 * 24)
+
         returns_std = df['Net_PnL'].std()
         sqn = (math.sqrt(total_trades) * (df['Net_PnL'].mean() / returns_std)) if returns_std > 0 else 0.0
         sqn_rating = self._get_sqn_rating(sqn)
-        
-        # Simple Sharpe (Trade-based)
-        sharpe_trade = (df['Net_PnL'].mean() / returns_std) if returns_std > 0 else 0.0
         
         # 4. Duration
         avg_duration = df['Duration_Min'].mean()
@@ -683,11 +714,12 @@ class ResearchPipeline:
         log.info(f"{'Return %':<30} | {(net_pnl/initial_capital)*100:.2f}%")
         log.info(f"{'Profit Factor':<30} | {profit_factor:.2f}")
         log.info(f"{'Win Rate':<30} | {win_rate:.2f}% ({win_count}/{total_trades})")
+        log.info(f"{'Total Trades':<30} | {total_trades}")
         log.info("-"*50)
         log.info(f"{'Max Drawdown':<30} | {max_dd_pct:.2f}% (${abs(max_dd_usd):,.2f})")
         log.info(f"{'Expectancy':<30} | ${expectancy:.2f}")
         log.info(f"{'SQN Score':<30} | {sqn:.2f} ({sqn_rating})")
-        log.info(f"{'Sharpe (Trade)':<30} | {sharpe_trade:.4f}")
+        log.info(f"{'Sharpe (Hourly)':<30} | {sharpe:.4f}")
         log.info("-"*50)
         log.info(f"{'Avg Win':<30} | ${avg_win:,.2f}")
         log.info(f"{'Avg Loss':<30} | ${avg_loss:,.2f}")

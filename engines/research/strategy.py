@@ -5,10 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-29 - V3.4 FTMO GUARDIAN):
-# 1. FIX: "Correlated Suicide" bug -> Now counts JPY exposure dynamically.
-# 2. FIX: "Pyramid Trap" -> Implements Weighted Average Bundle Stop.
-# 3. LOGIC: Added 'daily_pnl_check' to simulate Session Guard in backtest.
+# PHOENIX STRATEGY UPGRADE (2025-12-30 - V3.5 RISK FIRST):
+# 1. REMOVED: "Alpha Hunter" Pyramiding (Confirmed to degrade R:R).
+# 2. ADDED: Break-Even Trigger. Moves SL to Entry + 2 Pips @ 1.5R Profit.
+#    (Ensures commissions are covered to prevent net loss on reversal).
+# 3. LOGIC: Strict separation of Trade Management and Entry Logic.
 # =============================================================================
 import logging
 import sys
@@ -98,10 +99,10 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX STRATEGY PARAMETERS (V3.2 ALPHA HUNTER CONFIG) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V3.5 RISK FIRST CONFIG) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V3.2 GATES
+        # Gates
         self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         self.require_h4_alignment = phx_conf.get('require_h4_alignment', True)
@@ -109,27 +110,28 @@ class ResearchStrategy:
         # Safety Cap
         self.max_rvol_thresh = phx_conf.get('max_relative_volume', 5.0)
         
-        # Thresholds (V3.2: ALPHA MODE)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.35) # Lowered for frequency
+        # Thresholds
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.35)
         self.adx_threshold = CONFIG['features']['adx'].get('threshold', 18) 
         
         # Volume Gate
         self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.1)
         
-        # Momentum (V3.2: LOWERED to 0.55)
+        # Momentum
         self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55)
-        self.vol_exp_thresh = phx_conf.get('vol_expansion_threshold', 1.5) 
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
         
         # Friday Liquidation
         self.friday_close_hour = CONFIG.get('risk_management', {}).get('friday_liquidation_hour_server', 21)
         
-        # --- V3.2 TRAILING STOP LOGIC ---
+        # --- TRAILING STOP & BREAK EVEN LOGIC ---
         ts_conf = CONFIG.get('risk_management', {}).get('trailing_stop', {})
         self.use_trailing_stop = ts_conf.get('enabled', True)
         self.ts_activation_atr = ts_conf.get('activation_atr', 1.2)
-        self.ts_step_atr = ts_conf.get('step_atr', 0.5)
+        
+        # Break Even Settings
+        self.be_activation_risk_mult = 1.5  # Move to BE when profit > 1.5R
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
@@ -164,7 +166,6 @@ class ResearchStrategy:
             dt_ts = datetime.now()
 
         # --- SIMULATED SESSION GUARD (Daily Loss Limit) ---
-        # FTMO Check: If Daily Drawdown > 4.5%, stop trading for the day
         if self._check_daily_loss_limit(broker):
             self.rejection_stats["Daily Loss Limit Hit"] += 1
             return
@@ -259,7 +260,20 @@ class ResearchStrategy:
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
         # ============================================================
-        # D. PROJECT PHOENIX: LOGIC GATES (V3.2 ALPHA HUNTER)
+        # D. PROJECT PHOENIX: ACTIVE TRADE MANAGEMENT
+        # ============================================================
+        
+        # Manage Open Positions (Break-Even & Trailing Stop)
+        # Replaced Pyramiding with Defensive Logic
+        if self.symbol in broker.positions:
+            pos = broker.positions[self.symbol]
+            self._manage_active_trade(pos, price, current_atr)
+            
+            # Enforce "1 Trade Per Symbol" rule (Pyramiding Removed)
+            return 
+
+        # ============================================================
+        # E. ENTRY LOGIC GATES
         # ============================================================
         
         # 1. Extract Phoenix Indicators
@@ -274,7 +288,7 @@ class ResearchStrategy:
         # --- CRITICAL FILTER 1: VOLUME EXHAUSTION FILTER ---
         if rvol > self.max_rvol_thresh:
             self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
-            # return # Keep logic flowing for management, but block entry
+            # return # Keep logic flowing for stats, but entry will be blocked
         
         # --- CRITICAL FILTER 2: MTF TREND LOCK ---
         d1_ema = context_data.get('d1', {}).get('ema200', 0.0)
@@ -287,29 +301,19 @@ class ResearchStrategy:
         h4_bear = h4_rsi < 50
         
         # Gate Definitions
-        # V3.2: 1.1x Avg Volume (Lowered from 1.5 to catch early moves)
         vol_gate = rvol > self.vol_gate_ratio
         
         # Momentum Direction (Aggressor Ratio)
-        # V3.2: 0.55 Threshold (Lowered from 0.60)
         is_bullish_candle = aggressor > self.aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
         
-        # --- ALPHA HUNTER V3.2: MANAGE EXISTING TRADES (TRAILING STOP) ---
-        # Implement Active Trailing Stop Management before checking new entries
-        if self.symbol in broker.positions and self.use_trailing_stop:
-            pos = broker.positions[self.symbol]
-            self._manage_trailing_stop(pos, price, current_atr)
-
-        # --- REGIME A: MOMENTUM IGNITION (Unified Flow) ---
-        # Re-enabled logic for catching moves that are not perfect "trends" yet
+        # --- REGIME A: MOMENTUM IGNITION ---
         if self.enable_regime_a:
             # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
             if d1_trend_up and is_bullish_candle and vol_gate:
-                # Require Efficiency (V3.2: KER > 0.35)
                 if ker_val > self.ker_thresh:
                     proposed_action = 1
                     regime_label = "A (Mom-Long)"
@@ -329,10 +333,6 @@ class ResearchStrategy:
                     self.rejection_stats[f"Volume Gate Fail (RVol {rvol:.2f} < {self.vol_gate_ratio})"] += 1
                 
         # --- REGIME B: EFFICIENT TREND CONTINUATION ---
-        # Logic: Efficiency (KER) + Momentum + D1 Align + ADX check
-        # V3.0: Added H4 RSI Alignment & ADX Check
-        
-        # 1. ADX Filter: Market must be trending
         is_trending = adx_val > self.adx_threshold
         
         if proposed_action == 0 and ker_val > self.ker_thresh and vol_gate:
@@ -371,7 +371,6 @@ class ResearchStrategy:
 
         # ---------------------------------------------------------------------
         # MEAN REVERSION FILTER (Safety Check)
-        # Prevent "Selling the Hole" (Shorting when Price < BB Lower or RSI < 30)
         # ---------------------------------------------------------------------
         bb_pos = features.get('bb_position', 0.5)
         rsi_val = features.get('rsi_norm', 0.5) * 100.0
@@ -384,10 +383,9 @@ class ResearchStrategy:
             if bb_pos > 1.0 or rsi_val > 70:
                 self.rejection_stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
                 return
-        # ---------------------------------------------------------------------
 
         # ============================================================
-        # E. ML CONFIRMATION & EXECUTION
+        # F. ML CONFIRMATION & EXECUTION
         # ============================================================
         
         try:
@@ -410,7 +408,6 @@ class ResearchStrategy:
                 self.meta_label_events += 1
 
             # --- EXECUTION ---
-            # V3.2: Defaults to 0.55 (Lowered from 0.60)
             min_prob = self.params.get('min_calibrated_probability', 0.55)
             
             if confidence < min_prob:
@@ -418,7 +415,7 @@ class ResearchStrategy:
                 return
 
             if is_profitable:
-                self._execute_logic(confidence, price, features, broker, dt_ts, proposed_action, regime_label)
+                self._execute_entry(confidence, price, features, broker, timestamp, proposed_action, regime_label)
             else:
                 self.rejection_stats['Meta-Labeler Reject'] += 1
 
@@ -426,227 +423,96 @@ class ResearchStrategy:
             if self.debug_mode: logger.error(f"Strategy Error: {e}")
             pass
 
-    def _check_daily_loss_limit(self, broker: BacktestBroker) -> bool:
+    def _manage_active_trade(self, pos: BacktestOrder, current_price: float, current_atr: float):
         """
-        Simulates SessionGuard in Backtest.
-        If Daily Drawdown > 4.5%, returns True (BLOCK TRADES).
-        """
-        try:
-            # Note: BacktestBroker is simple. We approximate daily loss.
-            # In live, this comes from Redis. Here we check floating PnL + Realized today.
-            # Simplified: Check simple Equity drawdown from High Water Mark of the DAY.
-            # Since backtester doesn't track "Daily Start", we check if Total DD > 5% as a proxy
-            # or rely on equity curve.
-            
-            # Better Proxy: Check open PnL vs Equity
-            current_dd_pct = (broker.initial_balance - broker.equity) / broker.initial_balance
-            if current_dd_pct > 0.045: # 4.5% Hard Stop
-                return True
-            return False
-        except:
-            return False
-
-    def _manage_trailing_stop(self, pos: BacktestOrder, current_price: float, current_atr: float):
-        """
-        V3.2 ALPHA HUNTER TRAILING STOP LOGIC
-        Tightens SL if profit exceeds 1.2 ATR.
-        Follows by 0.5 ATR step.
+        V3.5 DEFENSIVE MANAGEMENT:
+        1. Break-Even Trigger: If Profit > 1.5R, move SL to Entry + Buffer.
+           Buffer ensures commission/swap is covered.
+        2. Trailing Stop: If Profit > 1.2 ATR, trail by 1.0 ATR.
         """
         if not pos.is_active: return
-        
-        profit_pips = 0.0
-        if pos.action == "BUY":
-            profit_pips = (current_price - pos.entry_price)
-        else:
-            profit_pips = (pos.entry_price - current_price)
-            
-        # Convert profit to ATR units
         if current_atr <= 0: return
-        profit_atr = profit_pips / current_atr
+
+        # Directions
+        is_buy = (pos.action == "BUY")
         
-        # Check Activation (1.2 ATR - Aggressive Lock)
-        if profit_atr > self.ts_activation_atr:
-            # New SL Distance: Trail at 1.0 ATR distance once activated
-            # This ensures we lock in ~0.2 ATR immediately
-            trail_dist = 1.0 * current_atr
-            
-            new_sl = 0.0
-            if pos.action == "BUY":
-                potential_sl = current_price - trail_dist
-                # Only move up
-                if potential_sl > pos.stop_loss:
-                    new_sl = potential_sl
-            else:
-                potential_sl = current_price + trail_dist
-                # Only move down
-                if pos.stop_loss == 0 or potential_sl < pos.stop_loss:
-                    new_sl = potential_sl
-            
-            if new_sl != 0.0:
-                pos.stop_loss = new_sl
-                if "Trailing" not in pos.comment:
-                    pos.comment += "|Trailing"
-
-    def _simulate_mtf_context(self, price: float, dt: datetime) -> Dict[str, Any]:
-        """
-        Approximates D1 and H4 context from the M5 stream for Backtesting.
-        """
-        # H4 Approximation (Every 48 M5 bars)
-        h4_idx = (dt.day * 6) + (dt.hour // 4)
-        if h4_idx != self.last_h4_idx:
-            self.h4_buffer.append(price)
-            self.last_h4_idx = h4_idx
-            
-        # D1 Approximation (Every day)
-        d1_idx = dt.toordinal()
-        if d1_idx != self.last_d1_idx:
-            self.d1_buffer.append(price)
-            self.last_d1_idx = d1_idx
-            
-        # Calculate Context
-        ctx = {'d1': {}, 'h4': {}}
+        # Calculate Floating Profit in Pips/Dollars equivalent distance
+        # We calculate "Distance" from entry
+        dist_from_entry = (current_price - pos.entry_price) if is_buy else (pos.entry_price - current_price)
         
-        # D1 EMA 200
-        if len(self.d1_buffer) > 0:
-            arr = np.array(self.d1_buffer)
-            # Standard EMA Calculation
-            if len(arr) < 200:
-                ema = np.mean(arr)
-            else:
-                # Use standard EMA formula over buffer
-                span = 200
-                alpha = 2 / (span + 1)
-                # Quick approximate EMA on buffer (last value is latest)
-                ema = arr[0]
-                for x in arr[1:]:
-                    ema = (alpha * x) + ((1 - alpha) * ema)
-            ctx['d1']['ema200'] = ema
-            
-        # H4 RSI 14
-        if len(self.h4_buffer) > 14:
-            arr = np.array(self.h4_buffer)
-            changes = np.diff(arr)
-            gains = changes[changes > 0]
-            losses = -changes[changes < 0]
-            avg_gain = np.mean(gains[-14:]) if len(gains) > 0 else 0
-            avg_loss = np.mean(losses[-14:]) if len(losses) > 0 else 0
-            
-            if avg_loss == 0:
-                rsi = 100.0
-            else:
-                rs = avg_gain / avg_loss
-                rsi = 100 - (100 / (1 + rs))
-            ctx['h4']['rsi'] = rsi
-        else:
-            ctx['h4']['rsi'] = 50.0
-            
-        return ctx
-
-    def _inject_auxiliary_data(self):
-        """Injects static approximations ONLY if missing."""
-        defaults = {
-            "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
-            "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
-            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0 # JPY Basket
-        }
-        for sym, price in defaults.items():
-            if sym not in self.last_price_map:
-                self.last_price_map[sym] = price
-
-    def _execute_logic(self, confidence, price, features, broker, timestamp: datetime, action_int: int, regime: str):
-        """
-        Decides whether to enter a trade using Fixed Risk (Prop Firm Mode).
-        AUDIT FIX: Now accounts for Portfolio Correlation.
-        """
+        # --- 1. BREAK-EVEN TRIGGER ---
+        # Logic: If we haven't moved SL yet (or it's worse than entry), calculate initial Risk.
+        # If Profit > 1.5 * Risk, Lock it with commission buffer.
         
-        action = "BUY" if action_int == 1 else "SELL"
-
-        # Hard Microstructure Filter (Amihud & OFI)
-        amihud = features.get('amihud', 0.0)
-        if amihud > 15.0: 
-             self.rejection_stats["High Illiquidity (Amihud)"] += 1
-             # return 
-
-        volatility = features.get('volatility', 0.001)
-        current_atr = features.get('atr', 0.001)
-        current_ker = features.get('ker', 1.0) 
-
-        # --- AUDIT FIX: DYNAMIC CORRELATION CHECK ---
-        # Scan broker positions to find JPY exposure
-        jpy_exposure_count = 0
-        for pos in broker.open_positions:
-            if "JPY" in pos.symbol: # Simple heuristic: if symbol contains JPY
-                jpy_exposure_count += 1
+        # Determine Current Risk Distance (from Entry to SL)
+        # If we are BUY, Risk is Entry - SL. If SELL, Risk is SL - Entry.
+        current_sl_dist = (pos.entry_price - pos.stop_loss) if is_buy else (pos.stop_loss - pos.entry_price)
         
-        # --- ALPHA GENERATOR: SAFER PYRAMIDING ---
-        if self.symbol in broker.positions:
-            existing_trade = broker.positions[self.symbol]
+        # Only trigger BE if we are actually risking money (SL is "below" entry for buy, "above" for sell)
+        if current_sl_dist > 0:
+            risk_r = current_sl_dist
             
-            # 1. Calc Floating Profit in ATRs
-            profit_atr = 0.0
-            if existing_trade.action == "BUY":
-                profit_atr = (price - existing_trade.entry_price) / current_atr
-            else:
-                profit_atr = (existing_trade.entry_price - price) / current_atr
+            # Check if Profit > 1.5R
+            if dist_from_entry > (1.5 * risk_r):
+                # Calculate Safe Buffer to cover Commissions/Swaps
+                # Assumption: ~2 Pips covers $7/lot comms + spread on most majors/crosses
+                # JPY pairs use 0.01 pip size, others 0.0001
+                is_jpy = "JPY" in self.symbol
+                pip_size = 0.01 if is_jpy else 0.0001
+                cover_buffer = 2.0 * pip_size
                 
-            # 2. Threshold (1.2 ATRs)
-            if profit_atr > 1.2 and "Pyramid" not in existing_trade.comment:
-                # 3. Scale In (Half Size)
-                new_qty = existing_trade.quantity * 0.5
+                # Set New SL: Entry +/- Buffer
+                new_sl = pos.entry_price + cover_buffer if is_buy else pos.entry_price - cover_buffer
                 
-                # --- AUDIT FIX: WEIGHTED AVERAGE BUNDLE STOP ---
-                # Calculate the "Bundle Entry Price"
-                total_qty = existing_trade.quantity + new_qty
-                w_sum = (existing_trade.entry_price * existing_trade.quantity) + (price * new_qty)
-                avg_entry = w_sum / total_qty
+                # Double check we aren't moving SL backwards
+                update_needed = False
+                if is_buy and new_sl > pos.stop_loss:
+                    update_needed = True
+                elif not is_buy and (pos.stop_loss == 0 or new_sl < pos.stop_loss):
+                    update_needed = True
                 
-                # New Stop Logic: Set SL for BOTH trades to Avg Entry +/- Buffer
-                # This ensures the entire "Bundle" is Break-Even in worst case (ignoring comms)
-                buffer = 0.05 * current_atr # Small buffer to cover spread
+                if update_needed:
+                    pos.stop_loss = new_sl
+                    if "BE" not in pos.comment:
+                        pos.comment += "|BE"
+                    # Return early to let the new stop settle before trailing logic applies
+                    return 
+
+        # --- 2. TRAILING STOP (V3.2 Logic) ---
+        if self.use_trailing_stop:
+            profit_atr = dist_from_entry / current_atr
+            
+            if profit_atr > self.ts_activation_atr:
+                # Trail distance
+                trail_dist = 1.0 * current_atr
                 
-                if action == "BUY":
-                    bundle_sl = avg_entry + buffer # Stop slightly above avg entry? No, strictly BE implies avg entry. 
-                    # Actually, to be safe, SL should be exactly avg entry or slightly in profit.
-                    # Let's target +5 pips above avg entry to cover commissions.
-                    pip_val = 0.01 if "JPY" in self.symbol else 0.0001
-                    bundle_sl = avg_entry + (5 * pip_val)
-                    
-                    # Ensure this new SL is logical (below current price)
-                    if bundle_sl >= price: bundle_sl = price - (0.5 * current_atr) # Fallback if price is too close
+                if is_buy:
+                    potential_sl = current_price - trail_dist
+                    # Only move up
+                    if potential_sl > pos.stop_loss:
+                        pos.stop_loss = potential_sl
+                        if "Trail" not in pos.comment: pos.comment += "|Trail"
                 else:
-                    pip_val = 0.01 if "JPY" in self.symbol else 0.0001
-                    bundle_sl = avg_entry - (5 * pip_val)
-                    if bundle_sl <= price: bundle_sl = price + (0.5 * current_atr)
+                    potential_sl = current_price + trail_dist
+                    # Only move down (SL price decreases for sell)
+                    if pos.stop_loss == 0 or potential_sl < pos.stop_loss:
+                        pos.stop_loss = potential_sl
+                        if "Trail" not in pos.comment: pos.comment += "|Trail"
 
-                # Update Existing Trade
-                existing_trade.stop_loss = bundle_sl
-                existing_trade.comment += "|Bundled"
-                
-                # New Order Targets
-                tp_dist = 4.0 * current_atr # Extended target for runner
-                tp_price = price + tp_dist if action == "BUY" else price - tp_dist
-                side = 1 if action == "BUY" else -1
-                
-                order = BacktestOrder(
-                    symbol=self.symbol,
-                    side=side,
-                    quantity=new_qty,
-                    timestamp_created=timestamp,
-                    stop_loss=bundle_sl, # Shared SL
-                    take_profit=tp_price,
-                    comment=f"Pyramid|Regime:{regime}",
-                    metadata={
-                        'regime': regime,
-                        'confidence': float(confidence),
-                        'pyramid': True
-                    }
-                )
-                broker.submit_order(order)
-                return 
-            else:
-                return # Hold
+    def _execute_entry(self, confidence, price, features, broker, timestamp, action_int, regime):
+        """
+        Executes the trade entry logic with Fixed Risk.
+        """
+        action = "BUY" if action_int == 1 else "SELL"
         
-        # --- STANDARD ENTRY LOGIC ---
+        # --- AUDIT FIX: DYNAMIC CORRELATION CHECK ---
+        # Scan broker positions to find JPY exposure (or relevant basket)
+        exposure_count = 0
+        quote_currency = self.symbol[-3:] # e.g. "JPY" from "USDJPY"
+        for pos in broker.open_positions:
+            if quote_currency in pos.symbol: 
+                exposure_count += 1
+        
         ctx = TradeContext(
             symbol=self.symbol,
             price=price,
@@ -657,13 +523,16 @@ class ResearchStrategy:
             risk_reward_ratio=2.0
         )
 
-        # Calculate Size (Fixed Risk)
-        # PASS jpy_exposure_count to Risk Manager to scale down sizing
+        # Calculate Size
+        current_atr = features.get('atr', 0.001)
+        current_ker = features.get('ker', 1.0)
+        volatility = features.get('volatility', 0.001)
+
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=confidence,
             volatility=volatility,
-            active_correlations=jpy_exposure_count, # CRITICAL FIX
+            active_correlations=exposure_count,
             market_prices=self.last_price_map,
             atr=current_atr, 
             ker=current_ker,
@@ -693,7 +562,7 @@ class ResearchStrategy:
             tp_price = price - tp_dist
             side = -1
 
-        # Submit Order with Enriched Metadata
+        # Submit Order
         order = BacktestOrder(
             symbol=self.symbol,
             side=side,
@@ -702,7 +571,6 @@ class ResearchStrategy:
             stop_loss=sl_price,
             take_profit=tp_price,
             comment=f"{trade_intent.comment}|Regime:{regime}|Limit:{self.limit_order_offset_pips}p",
-            # METADATA FOR CSV LOGGING
             metadata={
                 'regime': regime,
                 'confidence': float(confidence),
@@ -738,6 +606,83 @@ class ResearchStrategy:
             'regime': regime,
             'top_feats': imp_feats
         })
+
+    def _check_daily_loss_limit(self, broker: BacktestBroker) -> bool:
+        """
+        Simulates SessionGuard in Backtest.
+        If Daily Drawdown > 4.5%, returns True (BLOCK TRADES).
+        """
+        try:
+            # Simplified: Check total equity drawdown from Initial Balance
+            current_dd_pct = (broker.initial_balance - broker.equity) / broker.initial_balance
+            if current_dd_pct > 0.045: # 4.5% Hard Stop
+                return True
+            return False
+        except:
+            return False
+
+    def _simulate_mtf_context(self, price: float, dt: datetime) -> Dict[str, Any]:
+        """
+        Approximates D1 and H4 context from the M5 stream for Backtesting.
+        """
+        # H4 Approximation (Every 4 hours)
+        h4_idx = (dt.day * 6) + (dt.hour // 4)
+        if h4_idx != self.last_h4_idx:
+            self.h4_buffer.append(price)
+            self.last_h4_idx = h4_idx
+            
+        # D1 Approximation (Every day)
+        d1_idx = dt.toordinal()
+        if d1_idx != self.last_d1_idx:
+            self.d1_buffer.append(price)
+            self.last_d1_idx = d1_idx
+            
+        # Calculate Context
+        ctx = {'d1': {}, 'h4': {}}
+        
+        # D1 EMA 200
+        if len(self.d1_buffer) > 0:
+            arr = np.array(self.d1_buffer)
+            if len(arr) < 200:
+                ema = np.mean(arr)
+            else:
+                span = 200
+                alpha = 2 / (span + 1)
+                ema = arr[0]
+                for x in arr[1:]:
+                    ema = (alpha * x) + ((1 - alpha) * ema)
+            ctx['d1']['ema200'] = ema
+            
+        # H4 RSI 14
+        if len(self.h4_buffer) > 14:
+            arr = np.array(self.h4_buffer)
+            changes = np.diff(arr)
+            gains = changes[changes > 0]
+            losses = -changes[changes < 0]
+            avg_gain = np.mean(gains[-14:]) if len(gains) > 0 else 0
+            avg_loss = np.mean(losses[-14:]) if len(losses) > 0 else 0
+            
+            if avg_loss == 0:
+                rsi = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+            ctx['h4']['rsi'] = rsi
+        else:
+            ctx['h4']['rsi'] = 50.0
+            
+        return ctx
+
+    def _inject_auxiliary_data(self):
+        """Injects static approximations ONLY if missing."""
+        defaults = {
+            "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
+            "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
+            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0
+        }
+        for sym, price in defaults.items():
+            if sym not in self.last_price_map:
+                self.last_price_map[sym] = price
 
     def generate_autopsy(self) -> str:
         """
