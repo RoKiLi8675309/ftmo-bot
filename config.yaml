@@ -1,13 +1,13 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V3.5 (FTMO GUARDIAN)
-# STATUS: ALPHA HUNTER + 0.5% RISK + RELAXED TRAILING STOP
+# config.yaml – PROJECT PHOENIX V3.6 (R:R FIX)
+# STATUS: PROFITABILITY FOCUS + 1:2.5 TARGET RATIO
 #
-# CHANGES (2025-12-30 - FORENSIC UPDATE):
-# 1. TRAILING STOP RELAXATION: 
-#    - Activation delayed to 1.5 ATR (was 1.2) to prevent premature choking.
-#    - Trail Distance widened to 1.5 ATR (was 1.0) to survive JPY volatility tails.
-# 2. RISK MANAGEMENT: Maintained 0.5% base risk for survival.
-# 3. STRATEGY GATES: Aligned with V3.5 Risk-First logic.
+# CHANGES (2025-12-30 - RISK/REWARD OPTIMIZATION):
+# 1. TRAILING STOP OVERHAUL:
+#    - Activation delayed to 3.0 ATR (1.5x Risk). Prevents choking winners.
+#    - Trail Distance widened to 2.0 ATR (1.0x Risk). Allows volatility breathing room.
+# 2. TARGET RATIO: Increased TP to 5.0 ATR (1:2.5 Risk:Reward).
+# 3. STRATEGY GATES: Maintained V3.5 logic but aligned with higher targets.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -184,16 +184,21 @@ risk_management:
   max_lot_size: 5.0               
   min_lot_size: 0.01
   
-  # PROJECT PHOENIX EXIT LOGIC
+  # PROJECT PHOENIX EXIT LOGIC (1:2.5 RISK:REWARD TARGET)
   stop_loss_atr_mult: 2.0         
-  take_profit_atr_mult: 4.0       
+  take_profit_atr_mult: 5.0       # INCREASED from 4.0 (Target 2.5R Wins)
   
-  # TRAILING STOP (FORENSIC UPDATE: RELAXED)
+  # TRAILING STOP (R:R FIX: DELAYED ACTIVATION)
   trailing_stop:
     enabled: true
-    activation_atr: 1.5           # INCREASED from 1.2 (Let winners run)
-    distance_atr: 1.5             # INCREASED from 1.0 (Survive JPY wicks)
-    step_atr: 0.5                 # Ratchet step to reduce churn
+    # Activation: Must be > Risk (2.0 ATR). 
+    # Setting to 3.0 (1.5R) ensures we lock only after significant profit.
+    activation_atr: 3.0           # INCREASED from 1.5
+    
+    # Distance: Widen to 2.0 (1.0R). 
+    # Prevents being wicked out of winning trades.
+    distance_atr: 2.0             # INCREASED from 1.5
+    step_atr: 0.5                 
   
   risk_timezone: "Europe/Prague"
   friday_liquidation_hour_server: 21 

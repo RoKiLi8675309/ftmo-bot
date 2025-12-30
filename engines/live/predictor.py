@@ -6,9 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-30 - V3.5 FORENSIC SYNC):
-# 1. SYNC: Fully aligned with ResearchStrategy V3.5 logic.
-# 2. CONFIG: Uses new 2.0 ATR Risk Multiplier for labeling.
+# PHOENIX STRATEGY UPGRADE (2025-12-30 - V3.6 R:R ALIGNMENT):
+# 1. LABELING FIX: Forced 'reward_mult' to be > 'risk_mult'.
+#    - Old: Risk 2.0 / Reward 1.5 (Negative Expectancy Training).
+#    - New: Reward = Max(Config Barrier, Risk * 1.25).
+# 2. SYNC: Fully aligned with Strategy V3.6 Risk Parameters.
 # 3. GATES: Consistent Thresholds (KER 0.35, Vol 1.1, Aggressor 0.55).
 # =============================================================================
 import logging
@@ -71,13 +73,24 @@ class MultiAssetPredictor:
         # Adaptive Triple Barrier
         tbm_conf = CONFIG['online_learning']['tbm']
         
-        # Sync Labeler Risk with Config (V3.5 uses 2.0 ATR Stop)
+        # --- R:R ALIGNMENT FIX ---
+        # Sync Labeler Risk with Config (V3.6 uses 2.0 ATR Stop)
         risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 2.0)
+        
+        # Configured Barrier Width (likely 1.5)
+        base_reward_mult = tbm_conf['barrier_width']
+        
+        # FORCE POSITIVE RATIO: Ensure Training Target is > Risk.
+        # If Risk is 2.0, Reward must be at least 2.5 to train the model on profitable setups.
+        # We take the larger of the config barrier OR (Risk * 1.25)
+        adjusted_reward_mult = max(base_reward_mult, risk_mult_conf * 1.25)
+
+        logger.info(f"ML TRAINING ALIGNMENT: Risk={risk_mult_conf} ATR | Reward={adjusted_reward_mult} ATR")
 
         self.labelers = {s: AdaptiveTripleBarrier(
             horizon_ticks=tbm_conf['horizon_minutes'], 
             risk_mult=risk_mult_conf,
-            reward_mult=tbm_conf['barrier_width'], 
+            reward_mult=adjusted_reward_mult, 
             drift_threshold=tbm_conf.get('drift_threshold', 1.2)
         ) for s in symbols}
 

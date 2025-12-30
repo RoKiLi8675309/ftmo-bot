@@ -5,11 +5,12 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-30 - V3.5 FORENSIC FIX):
+# PHOENIX STRATEGY UPGRADE (2025-12-30 - V3.6 R:R OPTIMIZATION):
 # 1. FIXED: Timestamp Type Error (Float vs Datetime in BacktestOrder).
 # 2. REMOVED: "Alpha Hunter" Pyramiding (Confirmed to degrade R:R).
 # 3. ADDED: Break-Even Trigger. Moves SL to Entry + 2 Pips @ 1.5R Profit.
 # 4. UPDATED: Trailing Stop Logic now uses dynamic 'distance_atr' from Config.
+# 5. OPTIMIZED: Delayed Trailing Activation (3.0 ATR) to target 1:2.5 R:R.
 # =============================================================================
 import logging
 import sys
@@ -128,9 +129,9 @@ class ResearchStrategy:
         # --- TRAILING STOP & BREAK EVEN LOGIC ---
         ts_conf = CONFIG.get('risk_management', {}).get('trailing_stop', {})
         self.use_trailing_stop = ts_conf.get('enabled', True)
-        self.ts_activation_atr = ts_conf.get('activation_atr', 1.2)
-        # FORENSIC FIX: Load distance from config, default to 1.5 if missing
-        self.ts_distance_atr = ts_conf.get('distance_atr', 1.5)
+        # V3.6: Updated defaults to be safer if config is missing
+        self.ts_activation_atr = ts_conf.get('activation_atr', 3.0) 
+        self.ts_distance_atr = ts_conf.get('distance_atr', 2.0)
         
         # Break Even Settings
         self.be_activation_risk_mult = 1.5  # Move to BE when profit > 1.5R
@@ -482,12 +483,13 @@ class ResearchStrategy:
                     # Return early to let the new stop settle before trailing logic applies
                     return 
 
-        # --- 2. TRAILING STOP (V3.5 Logic) ---
+        # --- 2. TRAILING STOP (V3.6 Logic: DELAYED ACTIVATION) ---
         if self.use_trailing_stop:
             profit_atr = dist_from_entry / current_atr
             
+            # Use Configured Activation (e.g., 3.0 ATR) to prevent choking
             if profit_atr > self.ts_activation_atr:
-                # Trail distance using CONFIG value (Default 1.5)
+                # Trail distance using CONFIG value (e.g., 2.0 ATR)
                 trail_dist = self.ts_distance_atr * current_atr
                 
                 if is_buy:
