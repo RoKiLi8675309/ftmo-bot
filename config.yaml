@@ -181,7 +181,7 @@ risk_management:
   max_total_loss_pct: 0.09        # 9% (FTMO Limit is 10%)
   max_risk_percent: 2.0           # Max open risk at any time (4 trades @ 0.5%)
   max_leverage: 30.0
-  max_lot_size: 50.0              
+  max_lot_size: 5.0              
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC
@@ -200,7 +200,7 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 50           
+  max_trades_per_day: 10           
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
@@ -293,7 +293,7 @@ forensic_audit:
 
 # --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 100 
+  n_trials: 10
   train_years: 2
   test_months: 6
   min_trades_optimization: 25
