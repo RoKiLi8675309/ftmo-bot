@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-30 - V3.5 RISK FIRST):
-# 1. SYNC: Aligned Logic Gates with Research Strategy V3.5 (No Pyramiding).
-# 2. REMOVED: "Alpha Hunter" Pyramiding Logic (Degrades R:R).
-# 3. FIX: Updated thresholds (KER 0.35, Vol 1.1, Aggressor 0.55).
+# PHOENIX STRATEGY UPGRADE (2025-12-30 - V3.5 FORENSIC SYNC):
+# 1. SYNC: Fully aligned with ResearchStrategy V3.5 logic.
+# 2. CONFIG: Uses new 2.0 ATR Risk Multiplier for labeling.
+# 3. GATES: Consistent Thresholds (KER 0.35, Vol 1.1, Aggressor 0.55).
 # =============================================================================
 import logging
 import pickle
@@ -330,10 +330,6 @@ class MultiAssetPredictor:
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
 
-        # --- ALPHA GENERATOR: AGGRESSIVE PYRAMIDING REMOVED ---
-        # The V3.5 strategy focuses on risk management.
-        # We rely on the Engine's Trailing Stop and Break-Even triggers instead.
-        
         # --- REGIME A: MOMENTUM IGNITION (Unified Flow) ---
         if self.enable_regime_a:
             # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE

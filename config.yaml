@@ -1,13 +1,13 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V3.4 (FTMO GUARDIAN)
-# STATUS: ALPHA HUNTER + 0.5% RISK
+# config.yaml – PROJECT PHOENIX V3.5 (FTMO GUARDIAN)
+# STATUS: ALPHA HUNTER + 0.5% RISK + RELAXED TRAILING STOP
 #
-# CHANGES (2025-12-29):
-# 1. RISK REDUCTION: Lowered base_risk_per_trade_percent to 0.5% (was 1.0%).
-#    - Rationale: Survival is priority. 0.5% allows for 20 consecutive losses
-#      before hitting the 10% max loss limit.
-# 2. TRAILING STOP: Aligned with V3.2 Strategy (1.2 ATR Activation).
-# 3. JPY BASKET: Confirmed JPY dominance in symbol list.
+# CHANGES (2025-12-30 - FORENSIC UPDATE):
+# 1. TRAILING STOP RELAXATION: 
+#    - Activation delayed to 1.5 ATR (was 1.2) to prevent premature choking.
+#    - Trail Distance widened to 1.5 ATR (was 1.0) to survive JPY volatility tails.
+# 2. RISK MANAGEMENT: Maintained 0.5% base risk for survival.
+# 3. STRATEGY GATES: Aligned with V3.5 Risk-First logic.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -133,12 +133,12 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V3.4 FTMO GUARDIAN) ---
+# --- PHOENIX STRATEGY PARAMETERS (V3.5 FTMO GUARDIAN) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true    
-  require_d1_trend: true           
-  require_h4_alignment: true       
+  enable_regime_a_entries: true     
+  require_d1_trend: true            
+  require_h4_alignment: true        
   
   # --- FILTER THRESHOLDS (LOOSENED FOR FREQUENCY) ---
   # Volume Exhaustion
@@ -174,25 +174,26 @@ risk_management:
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # Risk Per Trade (CRITICAL: LOWERED TO 0.5%)
+  # Risk Per Trade (SURVIVAL MODE: 0.5%)
   base_risk_per_trade_percent: 0.5 
   
   max_daily_loss_pct: 0.045       # 4.5% (FTMO Limit is 5%)
   max_total_loss_pct: 0.09        # 9% (FTMO Limit is 10%)
   max_risk_percent: 2.0           # Max open risk at any time (4 trades @ 0.5%)
   max_leverage: 30.0
-  max_lot_size: 5.0              
+  max_lot_size: 5.0               
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC
   stop_loss_atr_mult: 2.0         
-  take_profit_atr_mult: 4.0        
+  take_profit_atr_mult: 4.0       
   
-  # TRAILING STOP (AGGRESSIVE LOCKING)
+  # TRAILING STOP (FORENSIC UPDATE: RELAXED)
   trailing_stop:
     enabled: true
-    activation_atr: 1.2            
-    step_atr: 0.5                 
+    activation_atr: 1.5           # INCREASED from 1.2 (Let winners run)
+    distance_atr: 1.5             # INCREASED from 1.0 (Survive JPY wicks)
+    step_atr: 0.5                 # Ratchet step to reduce churn
   
   risk_timezone: "Europe/Prague"
   friday_liquidation_hour_server: 21 
@@ -200,7 +201,7 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 10           
+  max_trades_per_day: 10            
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
@@ -225,7 +226,7 @@ trading:
   
   # --- EXECUTION OPTIMIZATION ---
   limit_order_offset_pips: 0.2 
-  limit_order_ttl_seconds: 60     
+  limit_order_ttl_seconds: 60      
 
 # --- ONLINE LEARNING ---
 online_learning:
@@ -254,7 +255,7 @@ online_learning:
   
   tbm:
     horizon_minutes: 60
-    barrier_width: 1.5       
+    barrier_width: 1.5        
     min_profit_pips: 5.0
     drift_threshold: 1.2 
   
