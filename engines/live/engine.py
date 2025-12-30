@@ -5,13 +5,14 @@
 # DEPENDENCIES: shared, engines.live.dispatcher, engines.live.predictor
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates bars, generates signals.
 #
-# AUDIT REMEDIATION (SNIPER MODE & SENTIMENT):
-# 1. FRIDAY LIQUIDATION: Forces 'CLOSE_ALL' if SessionGuard indicates weekend close.
-# 2. VOLATILITY GATE: Live enforcement of ATR > Spread Ratio.
-# 3. AUTO-DETECT: Retrieves real account size from Redis for accurate sizing.
-# 4. DATA FIX: Extracts 'bid_vol'/'ask_vol' and computes 'price' from quotes.
-# 5. ALPHA: Handles 'pyramid' flag for Aggressive Pyramiding execution.
-# 6. CONTEXT BRIDGE: Now correctly passes D1/H4/Positions to Predictor.
+# AUDIT REMEDIATION (2025-12-30 - CLOCK SYNC & FINANCIALS):
+# 1. CLOCK SKEW GUARD: Added latency check on incoming ticks. Warns if > 3s drift.
+#    (Critical for preventing "Zombie Trades" downstream in Windows Producer).
+# 2. FRIDAY LIQUIDATION: Forces 'CLOSE_ALL' if SessionGuard indicates weekend close.
+# 3. VOLATILITY GATE: Live enforcement of ATR > Spread Ratio.
+# 4. AUTO-DETECT: Retrieves real account size from Redis for accurate sizing.
+# 5. DATA FIX: Extracts 'bid_vol'/'ask_vol' and computes 'price' from quotes.
+# 6. CONTEXT BRIDGE: Correctly passes D1/H4/Positions to Predictor.
 # =============================================================================
 import logging
 import time
@@ -56,6 +57,9 @@ from engines.live.predictor import MultiAssetPredictor
 
 setup_logging("LiveEngine")
 logger = logging.getLogger("LiveEngine")
+
+# CONSTANTS
+MAX_TICK_LATENCY_SEC = 3.0  # Threshold for warning about NTP/Clock drift
 
 class LiveTradingEngine:
     """
@@ -191,11 +195,32 @@ class LiveTradingEngine:
         Handles a single raw tick from Redis.
         Extracts L2 Data (bid_vol/ask_vol) if available.
         Extracts Context Data (D1/H4) if available.
+        
+        AUDIT FIX: Checks for clock skew between Windows (Producer) and Linux (Consumer).
         """
         try:
             symbol = tick_data.get('symbol')
             if symbol not in self.aggregators: return
             
+            # --- CLOCK SKEW CHECK ---
+            # Ideally, Producer sends 'time' as unix float
+            tick_ts = float(tick_data.get('time', 0.0))
+            now_ts = time.time()
+            
+            # Note: tick_ts from MT5 is usually server time or UTC adjusted. 
+            # We assume Producer normalizes to UTC timestamp.
+            latency = now_ts - tick_ts
+            
+            # If latency is negative, Windows clock is ahead of Linux. 
+            # If large positive, Windows is lagging or network is slow.
+            if abs(latency) > MAX_TICK_LATENCY_SEC:
+                logger.warning(
+                    f"{LogSymbols.TIME} CLOCK SKEW DETECTED: {symbol} Tick Drift {latency:.2f}s "
+                    f"(Threshold: {MAX_TICK_LATENCY_SEC}s). "
+                    f"Ensure NTP sync is active on both Host (Windows) and WSL2."
+                )
+            # ------------------------
+
             # --- DATA INTEGRITY FIX ---
             # Producer sends 'bid' and 'ask'. We calculate mid-price if 'price' is missing.
             bid = float(tick_data.get('bid', 0.0))
@@ -211,7 +236,6 @@ class LiveTradingEngine:
             if price <= 0: return # Skip invalid ticks
 
             volume = float(tick_data.get('volume', 1.0))
-            timestamp = float(tick_data.get('time', time.time()))
             
             # Extract L2 Flows (New in Producer)
             bid_vol = float(tick_data.get('bid_vol', 0.0))
@@ -238,7 +262,7 @@ class LiveTradingEngine:
             bar = self.aggregators[symbol].process_tick(
                 price=price, 
                 volume=volume, 
-                timestamp=timestamp,
+                timestamp=tick_ts, # Use original tick time for bar timestamp
                 external_buy_vol=bid_vol, 
                 external_sell_vol=ask_vol
             )

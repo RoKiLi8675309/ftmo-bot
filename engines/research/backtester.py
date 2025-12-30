@@ -6,12 +6,11 @@
 # DESCRIPTION: Event-Driven Backtesting Broker. Simulates execution, spread,
 # commissions, and PnL tracking for strategy validation.
 #
-# AUDIT REMEDIATION (2025-12-28 - FINANCIAL METRICS):
-# 1. ADDED: Full financial reporting (Max DD%, Sharpe, Sortino, CAGR).
-# 2. ADDED: Detailed Drawdown tracking for FTMO compliance checks.
-# 3. ADDED: Expectancy and SQN calculations.
-# 4. FIXED: Added 'submit_order' method for compatibility with ResearchStrategy.
-# 5. FIXED: Added 'positions' property for compatibility with ResearchStrategy.
+# AUDIT REMEDIATION (2025-12-30):
+# 1. CRITICAL FIX: Removed hardcoded commissions ($7/$10). Linked to Config ($5).
+# 2. CRITICAL FIX: Removed hardcoded slippage. Linked to Config Spread Map.
+# 3. METRICS: Validated Equity Curve vs Trade Log PnL consistency.
+# 4. COMPATIBILITY: Added positions property and submit_order API.
 # =============================================================================
 from __future__ import annotations
 import pandas as pd
@@ -132,6 +131,11 @@ class BacktestBroker:
         
         # State Flags
         self.is_blown = False
+
+        # Load Configured Costs
+        self.commission_per_lot = CONFIG.get('risk_management', {}).get('commission_per_lot_rt', 5.0)
+        self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
+        self.default_spread = self.spread_map.get('default', 1.5)
 
         # Pre-populate price map to prevent initial warnings
         self._inject_aux_data()
@@ -271,10 +275,9 @@ class BacktestBroker:
                 # Convert to Account Currency (USD)
                 rate = self._get_simulation_conversion_rate(trade.symbol, current_price)
                 
-                # Commission Simulation ($5.00 per lot per side = $10 RT)
-                # Matches config: commission_per_lot_rt
-                # Being conservative for backtest
-                comm_drag = trade.quantity * 10.0 
+                # AUDIT FIX: Use Consistent Commission from Config
+                # Deduct commission from floating equity to show realistic drawdown
+                comm_drag = trade.quantity * self.commission_per_lot 
                 
                 floating_pnl += (raw_pnl * rate) - comm_drag
                 active_positions.append(trade)
@@ -299,8 +302,7 @@ class BacktestBroker:
         order.ticket = self.ticket_counter
         self.ticket_counter += 1
         
-        # Simulate Fill (Market Order Logic for simplicity in Research)
-        # In a real engine, we'd use Limit, but for Strategy Dev, we assume 'Close' is the fill.
+        # Simulate Fill (Market Order Logic)
         
         # Ensure Entry Price is set
         if order.entry_price <= 0:
@@ -308,17 +310,20 @@ class BacktestBroker:
              if self.last_snapshot:
                  order.entry_price = self.last_snapshot.get_price(order.symbol)
         
-        # Basic Spread Simulation (Slippage)
+        # AUDIT FIX: Dynamic Spread Simulation based on Symbol
         # BUY: Ask = Price + Spread/2
         # SELL: Bid = Price - Spread/2
-        # We simulate 1 pip slippage/spread cost on entry
+        # We simulate paying the FULL spread on entry for simplicity (conservative)
         pip = 0.01 if "JPY" in order.symbol else 0.0001
-        slippage = 1.0 * pip
         
-        order.entry_price = order.entry_price + slippage if order.action == "BUY" else order.entry_price - slippage
+        # Fetch spread from config or default
+        spread_pips = self.spread_map.get(order.symbol, self.default_spread)
+        slippage_cost = spread_pips * pip
         
-        # Calculate Commission
-        order.commission = order.quantity * 7.0
+        order.entry_price = order.entry_price + slippage_cost if order.action == "BUY" else order.entry_price - slippage_cost
+        
+        # AUDIT FIX: Use Configured Commission
+        order.commission = order.quantity * self.commission_per_lot
         
         self.open_positions.append(order)
         return order.ticket

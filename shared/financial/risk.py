@@ -5,11 +5,12 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# AUDIT REMEDIATION (2025-12-26 - PROP FIRM OVERHAUL):
-# 1. NEW SIZING METHOD: Strict 'fixed_risk'. Removed Kelly/VolTargeting.
+# AUDIT REMEDIATION (2025-12-30 - FORENSIC ACCURACY):
+# 1. CONVERSION INTEGRITY: Added strict logging warnings when Static Fallbacks 
+#    are triggered during Risk Calculation. Prevents silent PnL drift.
+# 2. SIZING METHOD: Strict 'fixed_risk' logic aligned with FTMO constraints.
 #    Formula: Lots = (Equity * Risk%) / (SL_Distance * PipValue).
-# 2. FRIDAY LIQUIDATION: Added SessionGuard.should_liquidate() logic.
-# 3. DRAWDOWN BRAKE: Relaxed. Only cuts risk if DD > 4%.
+# 3. FRIDAY LIQUIDATION: Added SessionGuard.should_liquidate() logic.
 # 4. KER SCALING: Clamped to [0.8, 1.0] to prevent over-penalizing.
 # =============================================================================
 from __future__ import annotations
@@ -66,6 +67,8 @@ class RiskManager:
         """
         Calculates the Quote -> USD conversion rate using LIVE market data.
         Critical for accurate risk calculation in USD.
+        
+        AUDIT FIX: Logs warning if Static Fallback is used while market_prices are expected.
         """
         s = symbol.upper()
         
@@ -84,12 +87,19 @@ class RiskManager:
             usdjpy = get_price("USDJPY")
             if usdjpy and usdjpy > 0: return 1.0 / usdjpy
             if s == "USDJPY" and price > 0: return 1.0 / price
-            return 0.0065 # Fallback ~150
+            
+            # CRITICAL AUDIT WARNING
+            if market_prices is not None:
+                logger.warning(f"⚠️ RISK MISMATCH: Missing USDJPY price for {symbol} conversion. Using static 150.0 fallback.")
+            return 0.00666 # Fallback ~150.0
         
         # GBP Pairs (Quote = GBP). Need GBP->USD (GBPUSD).
         if s.endswith("GBP"):
             gbpusd = get_price("GBPUSD")
             if gbpusd: return gbpusd
+            
+            if market_prices is not None:
+                logger.warning(f"⚠️ RISK MISMATCH: Missing GBPUSD price for {symbol}. Using static 1.25 fallback.")
             return 1.25 # Fallback
 
         # CAD Pairs (Quote = CAD). Need CAD->USD (1 / USDCAD).
@@ -97,6 +107,9 @@ class RiskManager:
             usdcad = get_price("USDCAD")
             if usdcad and usdcad > 0: return 1.0 / usdcad
             if s == "USDCAD" and price > 0: return 1.0 / price
+            
+            if market_prices is not None:
+                logger.warning(f"⚠️ RISK MISMATCH: Missing USDCAD price for {symbol}. Using static 0.75 fallback.")
             return 0.75
 
         # CHF Pairs (Quote = CHF). Need CHF->USD (1 / USDCHF).
@@ -111,6 +124,9 @@ class RiskManager:
             audusd = get_price("AUDUSD")
             if audusd: return audusd
             if s == "AUDUSD" and price > 0: return price
+            
+            if market_prices is not None:
+                logger.warning(f"⚠️ RISK MISMATCH: Missing AUDUSD price for {symbol}. Using static 0.65 fallback.")
             return 0.65
 
         # NZD Pairs
