@@ -4,8 +4,8 @@
 #
 # STRATEGY UPDATE (V7.0):
 # 1. LOGIC: Pure Trend Aggressor. No Mean Reversion.
-# 2. GATES: KER > 0.30 (Efficiency), RVOL > 2.0 (Fuel).
-# 3. RISK: 1.5 ATR Hard Stop.
+# 2. GATES: KER > 0.20 (Relaxed Efficiency), RVOL > 1.5 (Relaxed Fuel).
+# 3. RISK: 2.0 ATR Hard Stop (Survive Volatility).
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -138,10 +138,10 @@ phoenix_strategy:
   require_d1_trend: true              
   require_h4_alignment: true        
   
-  # --- FILTER THRESHOLDS ---
+  # --- FILTER THRESHOLDS (RELAXED FOR RECOVERY) ---
   max_relative_volume: 6.0        # Cap raised to allow strong breakout volume
-  ker_trend_threshold: 0.30       # HARD GATE: High Efficiency only
-  volume_gate_ratio: 2.0          # HARD GATE: Fuel Gauge must be high
+  ker_trend_threshold: 0.20       # RELAXED: 0.30 -> 0.20 to catch earlier trends
+  volume_gate_ratio: 1.5          # RELAXED: 2.0 -> 1.5 to reduce "Low Fuel" rejects
   aggressor_threshold: 0.55       # Price Action confirmation
   ml_confirmation_threshold: 0.60 
   
@@ -182,7 +182,7 @@ optimization_search_space:
   # TREND MODE: Higher R:R Targets
   tbm_barrier_width:
     min: 2.0
-    max: 4.0
+    max: 5.0 # Increased Max Reward to allow finding higher R:R
   tbm_horizon_minutes:
     min: 60
     max: 240
@@ -214,8 +214,8 @@ risk_management:
   min_lot_size: 0.01
   
   # PROJECT PHOENIX V7.0 EXIT LOGIC
-  stop_loss_atr_mult: 1.5         # STRICT HARD STOP
-  take_profit_atr_mult: 3.0       # Default Target (Overridden by Optimized TBM)
+  stop_loss_atr_mult: 2.0         # RELAXED: 1.5 -> 2.0 to survive volatility noise
+  take_profit_atr_mult: 4.0       # Adjusted to maintain 1:2 R:R Baseline
   
   # TIER 1: BREAKEVEN
   breakeven:
@@ -226,7 +226,7 @@ risk_management:
   # TIER 2: TRAILING STOP
   trailing_stop:
     enabled: true        
-    activation_atr: 2.0           
+    activation_atr: 2.5           
     distance_atr: 1.5               
     step_atr: 0.5                   
   
@@ -291,7 +291,7 @@ online_learning:
   
   tbm:
     horizon_minutes: 120      
-    barrier_width: 3.0        
+    barrier_width: 4.0        # Default Reward Target aligned with 2.0 ATR SL
     min_profit_pips: 10.0      
     drift_threshold: 1.5 
   

@@ -11,13 +11,14 @@
 #    - REGIME FILTER: KER > 0.3 (Trend Efficiency).
 #    - FUEL GAUGE: RVOL > 2.0 (Momentum injection).
 #    - TRIGGER: Order Flow Imbalance (Buy > 1.2x Sell).
-# 3. RISK: Hard Stop at 1.5 ATR.
+# 3. RISK: Dynamic ATR Stop (Configurable).
 # =============================================================================
 import logging
 import sys
 import numpy as np
 import random
 import math
+import pytz
 from collections import deque, defaultdict, Counter
 from typing import Any, Dict, Optional, List
 from datetime import datetime
@@ -61,20 +62,26 @@ class ResearchStrategy:
             window_size=params.get('window_size', 50)
         )
         
+        # --- RISK CONFIGURATION ---
+        self.risk_conf = params.get('risk_management', CONFIG.get('risk_management', {}))
+        
+        # AUDIT FIX: Load SL Multiplier from Config (Was Hardcoded 1.5)
+        self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 1.5))
+        
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
         
-        # STRICT REQUIREMENT: Risk is ATR * 1.5
-        risk_mult_conf = 1.5 
+        # Pass the configurable Risk Multiplier to the Labeler
+        risk_mult_conf = self.sl_atr_mult
         
         # Target Reward should align with Strategy (Use Optimization Param)
-        self.optimized_reward_mult = tbm_conf.get('barrier_width', 3.0)
+        self.optimized_reward_mult = float(tbm_conf.get('barrier_width', 3.0))
         
         self.labeler = AdaptiveTripleBarrier(
-            horizon_ticks=tbm_conf.get('horizon_minutes', 120), 
+            horizon_ticks=int(tbm_conf.get('horizon_minutes', 120)), 
             risk_mult=risk_mult_conf, 
             reward_mult=self.optimized_reward_mult,
-            drift_threshold=tbm_conf.get('drift_threshold', 1.5)
+            drift_threshold=float(tbm_conf.get('drift_threshold', 1.5))
         )
         
         # 3. Meta Labeler (The Gatekeeper)
@@ -113,27 +120,33 @@ class ResearchStrategy:
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
         # Gates
-        self.require_d1_trend = True # Always require D1 for Aggressor Trend
-        self.require_h4_alignment = True
+        self.require_d1_trend = phx_conf.get('require_d1_trend', True)
+        self.require_h4_alignment = phx_conf.get('require_h4_alignment', True)
         
         # Safety Cap
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 6.0) # Cap for huge spikes
+        self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 6.0)) # Cap for huge spikes
         
         # --- STRICT THRESHOLDS (FROM DOCUMENT) ---
-        self.ker_thresh = 0.30        # "Regime Filter: KER > 0.3 (Hard Gate)"
-        self.vol_gate_ratio = 2.0     # "Fuel Gauge: RVOL > 2.0 (Hard Gate)"
+        self.ker_thresh = float(phx_conf.get('ker_trend_threshold', 0.30))
+        self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 2.0))
         self.aggressor_ratio_min = 1.2 # "Buy Vol > Sell Vol * 1.2"
-        self.adx_threshold = 25.0     # Standard trend strength requirement
+        self.adx_threshold = float(phx_conf.get('adx', {}).get('threshold', 25.0))
         
         # Aggressor Ratio Feature Threshold (Price Action proxy)
-        # 0.55 implies 55% dominance, but we rely on Volume Flow Ratio primarily now.
-        self.aggressor_thresh_price = 0.55 
+        self.aggressor_thresh_price = float(phx_conf.get('aggressor_threshold', 0.55))
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
         
         # Friday Liquidation
-        self.friday_entry_cutoff = CONFIG.get('risk_management', {}).get('friday_entry_cutoff_hour', 16)
-        self.friday_close_hour = CONFIG.get('risk_management', {}).get('friday_liquidation_hour_server', 21)
+        self.friday_entry_cutoff = self.risk_conf.get('friday_entry_cutoff_hour', 16)
+        self.friday_close_hour = self.risk_conf.get('friday_liquidation_hour_server', 21)
+        
+        # Timezone Handling
+        tz_str = self.risk_conf.get('risk_timezone', 'Europe/Prague')
+        try:
+            self.server_tz = pytz.timezone(tz_str)
+        except Exception:
+            self.server_tz = pytz.timezone('Europe/Prague')
         
         # --- REC 1: Dynamic Gate Scaling State ---
         self.ker_drift_detector = drift.ADWIN(delta=0.01)
@@ -159,7 +172,8 @@ class ResearchStrategy:
         # Inject Aux Data for single-symbol tests
         self._inject_auxiliary_data()
 
-        # Robust Timestamp Extraction
+        # Robust Timestamp Extraction (Handle UTC properly)
+        dt_ts = datetime.now()
         try:
             if hasattr(snapshot.timestamp, 'timestamp'):
                 timestamp = snapshot.timestamp.timestamp()
@@ -169,7 +183,13 @@ class ResearchStrategy:
                 dt_ts = datetime.fromtimestamp(timestamp)
         except Exception:
             timestamp = 0.0
-            dt_ts = datetime.now()
+
+        # --- TIMEZONE CONVERSION (Fixes Friday Guard Spam) ---
+        # Ensure dt_ts is timezone-aware (UTC) then convert to Server Time (Prague)
+        if dt_ts.tzinfo is None:
+            dt_ts = dt_ts.replace(tzinfo=pytz.utc)
+        
+        server_time = dt_ts.astimezone(self.server_tz)
 
         # --- SIMULATED SESSION GUARD (Daily Loss Limit) ---
         if self._check_daily_loss_limit(broker):
@@ -180,16 +200,20 @@ class ResearchStrategy:
         self._update_streak_status(broker)
 
         # --- FRIDAY LOGIC: LIQUIDATION VS ENTRY GUARD ---
-        # 1. Liquidation (21:00)
-        if dt_ts.weekday() == 4 and dt_ts.hour >= self.friday_close_hour:
+        # 1. Liquidation (21:00 Server Time)
+        if server_time.weekday() == 4 and server_time.hour >= self.friday_close_hour:
             if self.symbol in broker.positions:
                 pos = broker.positions[self.symbol]
                 broker._close_partial_position(pos, pos.quantity, price, dt_ts, "Friday Liquidation")
-                if self.debug_mode: logger.info(f"🚫 {self.symbol} Liquidated for Weekend (Friday {dt_ts.hour}:00)")
+                if self.debug_mode: logger.info(f"🚫 {self.symbol} Liquidated for Weekend (Friday {server_time.hour}:00)")
             return 
 
-        # 2. Entry Guard (16:00) - Aggressive Filter
-        is_friday_afternoon = (dt_ts.weekday() == 4 and dt_ts.hour >= self.friday_entry_cutoff)
+        # 2. Entry Guard (16:00 Server Time) - Aggressive Filter
+        # Stop new entries, but do not spam the logs
+        if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
+            # Silent return to avoid polluting stats
+            # We track it internally but don't list it as a "Failure"
+            return 
         # -------------------------------------------------
 
         # Flow Volumes (L2 Proxies handled by Feature Engineer)
@@ -209,7 +233,7 @@ class ResearchStrategy:
         self.last_price = price
 
         # --- MTF CONTEXT SIMULATION ---
-        context_data = self._simulate_mtf_context(price, dt_ts)
+        context_data = self._simulate_mtf_context(price, server_time)
 
         # A. Feature Engineering
         features = self.fe.update(
@@ -256,8 +280,8 @@ class ResearchStrategy:
         if resolved_labels:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
                 # --- PROFIT WEIGHTED LEARNING ---
-                w_pos = self.params.get('positive_class_weight', 1.5)
-                w_neg = self.params.get('negative_class_weight', 1.0)
+                w_pos = float(self.params.get('positive_class_weight', 1.5))
+                w_neg = float(self.params.get('negative_class_weight', 1.0))
                 
                 base_weight = w_pos if outcome_label != 0 else w_neg
                 
@@ -298,12 +322,6 @@ class ResearchStrategy:
         if self.symbol in broker.positions:
             return 
 
-        # --- ENTRY BLOCK: FRIDAY AFTERNOON ---
-        if is_friday_afternoon:
-            self.rejection_stats["Friday Entry Guard"] += 1
-            return 
-        # -------------------------------------------------
-
         # ============================================================
         # E. ENTRY LOGIC GATES (V7.0 AGGRESSOR ONLY)
         # ============================================================
@@ -311,11 +329,10 @@ class ResearchStrategy:
         # 1. Extract Phoenix Indicators
         rvol = features.get('rvol', 1.0)
         aggressor = features.get('aggressor', 0.5)
-        mtf_align = features.get('mtf_alignment', 0.0)
         adx_val = features.get('adx', 0.0)
         
         # --- CRITICAL FILTER 1: FUEL GAUGE (HARD GATE) ---
-        # RVOL must be > 2.0 to inject momentum
+        # RVOL must be > Threshold to inject momentum
         if rvol < self.vol_gate_ratio:
             self.rejection_stats[f"Low Fuel (RVol {rvol:.2f} < {self.vol_gate_ratio})"] += 1
             return
@@ -327,7 +344,7 @@ class ResearchStrategy:
         
         # --- CRITICAL FILTER 3: EFFICIENCY GATE (HARD GATE) ---
         # Apply Dynamic Offset from ADWIN but keep hard floor
-        effective_ker_thresh = max(0.20, self.ker_thresh + self.dynamic_ker_offset)
+        effective_ker_thresh = max(0.15, self.ker_thresh + self.dynamic_ker_offset)
         
         if self.consecutive_losses > 0:
             # Soft Breaker: Require higher efficiency if losing
@@ -375,7 +392,7 @@ class ResearchStrategy:
         
         # BUY SCENARIO
         if is_bullish_flow and is_bullish_pa and h4_bull:
-            if not d1_trend_up:
+            if self.require_d1_trend and not d1_trend_up:
                 self.rejection_stats["Counter-D1 Trend"] += 1
                 return
             proposed_action = 1
@@ -383,7 +400,7 @@ class ResearchStrategy:
 
         # SELL SCENARIO
         elif is_bearish_flow and is_bearish_pa and h4_bear:
-            if not d1_trend_down:
+            if self.require_d1_trend and not d1_trend_down:
                 self.rejection_stats["Counter-D1 Trend"] += 1
                 return
             proposed_action = -1
@@ -410,14 +427,14 @@ class ResearchStrategy:
             is_profitable = self.meta_labeler.predict(
                 features, 
                 proposed_action, 
-                threshold=self.params.get('meta_labeling_threshold', 0.50)
+                threshold=float(self.params.get('meta_labeling_threshold', 0.50))
             )
             
             if proposed_action != 0:
                 self.meta_label_events += 1
 
             # --- EXECUTION WITH DYNAMIC CONFIDENCE ---
-            min_prob = self.params.get('min_calibrated_probability', 0.55)
+            min_prob = float(self.params.get('min_calibrated_probability', 0.55))
             
             if self.consecutive_losses > 0:
                 # Streak Breaker: Increase required confidence if losing
@@ -485,16 +502,12 @@ class ResearchStrategy:
             self.rejection_stats[f"Risk Zero: {trade_intent.comment}"] += 1
             return
 
-        # --- STOP LOSS ENFORCEMENT (ATR * 1.5) ---
-        # RiskManager defaults might be different, so we strictly enforce 1.5 here
-        # and adjust TP to match the ML's target R:R
-        stop_dist = current_atr * 1.5
+        # --- STOP LOSS ENFORCEMENT (DYNAMIC CONFIG) ---
+        # AUDIT FIX: Use the configured SL multiplier, not hardcoded 1.5
+        stop_dist = current_atr * self.sl_atr_mult
         trade_intent.stop_loss = stop_dist
         
         # TP based on Optimized R:R (e.g., 3.0 * ATR)
-        # Note: If ML says Reward is 3.0, TP is 3.0 * ATR.
-        # But if we fix SL at 1.5 ATR, then R:R becomes 2.0 (3.0/1.5).
-        # We must honor the 'barrier_width' (Reward Mult) as the TP distance.
         dynamic_tp_dist = current_atr * self.optimized_reward_mult
         trade_intent.take_profit = dynamic_tp_dist
         

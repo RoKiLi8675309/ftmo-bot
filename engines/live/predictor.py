@@ -9,10 +9,10 @@
 # PHOENIX STRATEGY V7.0 (AGGRESSOR BREAKOUT - LIVE):
 # 1. MEAN REVERSION PURGED: Removed Regime C.
 # 2. AGGRESSOR LOGIC ALIGNMENT:
-#    - KER > 0.3 (Hard Efficiency Gate).
-#    - RVOL > 2.0 (Hard Fuel Gate).
+#    - KER > 0.2 (Relaxed Efficiency).
+#    - RVOL > 1.5 (Relaxed Fuel).
 #    - TRIGGER: Order Flow Imbalance (Buy > 1.2x Sell) + PA Aggressor > 0.55.
-# 3. RISK: Metadata passed to Engine now assumes Aggressor constraints.
+# 3. RISK: Metadata passed to Engine now assumes Aggressor constraints (2.0 ATR).
 # =============================================================================
 import logging
 import pickle
@@ -20,6 +20,8 @@ import os
 import json
 import time
 import math
+import pytz 
+from datetime import datetime
 from collections import defaultdict, deque, Counter
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -73,10 +75,11 @@ class MultiAssetPredictor:
         
         # 2. Adaptive Triple Barrier (Per-Symbol Dynamic Configuration)
         tbm_conf = CONFIG['online_learning']['tbm']
+        risk_conf = CONFIG.get('risk_management', {})
         
-        # STRICT REQUIREMENT: Risk is ATR * 1.5 (Hardcoded override for V7.0)
-        # We set risk_mult to 1.5 for labeling consistency with execution
-        risk_mult_conf = 1.5
+        # AUDIT FIX: Load SL Multiplier from Config (Was Hardcoded 1.5)
+        # Now defaults to 2.0 per config update
+        risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 1.5))
         
         self.labelers = {}
         self.optimized_params = {} # Cache for gates
@@ -161,6 +164,13 @@ class MultiAssetPredictor:
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
         self.last_close_prices = {s: 0.0 for s in symbols}
+        
+        # Timezone for Guard
+        tz_str = risk_conf.get('risk_timezone', 'Europe/Prague')
+        try:
+            self.server_tz = pytz.timezone(tz_str)
+        except Exception:
+            self.server_tz = pytz.timezone('Europe/Prague')
 
         # --- REC 1: Dynamic Gate Scaling State ---
         # ADWIN Drift detectors for KER monitoring per symbol
@@ -360,16 +370,20 @@ class MultiAssetPredictor:
         aggressor = features.get('aggressor', 0.5)
         adx_val = features.get('adx', 0.0)
         
-        # Hard Gates
-        max_rvol_thresh = self.default_max_rvol
-        ker_thresh = 0.30
-        vol_gate_ratio = 2.0
+        # Pull Configs (Relaxed)
+        phx = CONFIG.get('phoenix_strategy', {})
+        max_rvol_thresh = float(phx.get('max_relative_volume', 6.0))
+        ker_thresh = float(phx.get('ker_trend_threshold', 0.20)) # Was 0.30
+        vol_gate_ratio = float(phx.get('volume_gate_ratio', 1.5)) # Was 2.0
         aggressor_ratio_min = 1.2
         aggressor_pa_thresh = 0.55
         
-        # --- FRIDAY GUARD ---
-        if bar.timestamp.weekday() == 4 and bar.timestamp.hour >= self.friday_entry_cutoff:
-             stats["Friday Entry Guard"] += 1
+        # --- FRIDAY GUARD (Timezone Aware) ---
+        # Convert UTC bar time to Server Time (Prague)
+        server_time = bar.timestamp.astimezone(self.server_tz)
+        
+        if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
+             # Just return HOLD, do not spam stats if it happens often
              return Signal(symbol, "HOLD", 0.0, {"reason": "Friday Entry Guard"})
 
         # --- CRITICAL FILTER 1: FUEL GAUGE (HARD GATE) ---
@@ -391,8 +405,8 @@ class MultiAssetPredictor:
             # Soft Breaker: Require cleaner trend if losing
             effective_ker_thresh += min(0.1, streak * 0.02)
         
-        # Ensure gate doesn't go below absolute safety minimum of 0.20
-        effective_ker_thresh = max(0.20, effective_ker_thresh)
+        # Ensure gate doesn't go below absolute safety minimum of 0.15
+        effective_ker_thresh = max(0.15, effective_ker_thresh)
 
         # --- CRITICAL FILTER 3: EFFICIENCY GATE ---
         ker_val = features.get('ker', 0.5)
