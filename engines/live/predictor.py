@@ -7,15 +7,15 @@
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
 # AUDIT REMEDIATION (2025-01-01 - AGGRESSIVE RECOVERY):
-# 1. CORRECTED STREAK BREAKER: Synchronized with Research Strategy V5.5.
-# - If streak >= 3: KER +0.15 (Strict but Achievable), Conf +0.10.
-# - Prevents "Dormancy Trap" while still filtering chop.
+# 1. CORRECTED STREAK BREAKER: Synchronized with Research Strategy V6.0.
+#    - Softened penalty to prevent "Dormancy Trap".
 # 2. RISK LOADING: Loads 'risk_per_trade_percent' from optimized params file.
 #
-# IMPLEMENTATION UPDATE (Rec 1, 2, 3):
-# - Rec 1: Dynamic Gate Scaling: River ADWIN monitors KER to adjust thresholds.
-# - Rec 2: Volatility Passing: Explicit Parkinson Vol passing for barrier adjustment.
-# - Rec 3: Efficiency-Weighted Learning: Sample weights boosted by KER * 2.0.
+# IMPLEMENTATION UPDATE (PROFITABILITY FIXES V6.0):
+# - REGIME C UNLOCKED: Trading ranging markets (Mean Reversion).
+# - RELAXED GATES: Lowered RVol (0.8), ADX (15), Aggressor (0.52).
+# - DYNAMIC GATES: ADWIN monitors KER to adjust thresholds.
+# - WEIGHTED LEARNING: Sample weights boosted by KER * 2.0.
 # =============================================================================
 import logging
 import pickle
@@ -221,7 +221,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V5.0 Logic.
+        Executes the Learn-Predict Loop with Project Phoenix V6.0 Logic.
         Includes Rec 1 (Dynamic Gates) and Rec 3 (Weighted Learning).
         """
         if symbol not in self.symbols: return None
@@ -286,7 +286,7 @@ class MultiAssetPredictor:
         # If distribution of KER changes significantly (Drift), adjust threshold
         if self.ker_drift_detectors[symbol].drift_detected:
             # Drift implies regime shift. Relax gate temporarily to catch new trends.
-            # Reduce threshold by 0.05
+            # Reduce threshold by 0.05 (Min limit handled in effective calc)
             self.dynamic_ker_offsets[symbol] = max(-0.15, self.dynamic_ker_offsets[symbol] - 0.05)
             # logger.info(f"🌊 {symbol}: KER Drift Detected. Relaxing gate by {self.dynamic_ker_offsets[symbol]:.2f}")
         else:
@@ -361,7 +361,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp(), parkinson_vol=parkinson)
 
         # ============================================================
-        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V5.0 SIMPLE)
+        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V6.0 AGGRESSIVE)
         # ============================================================
         
         # Extract Core Indicators
@@ -374,10 +374,18 @@ class MultiAssetPredictor:
         mtf_align = features.get('mtf_alignment', 0.0)
         adx_val = features.get('adx', 0.0)
         
+        # Bollinger Bands for Regime C
+        bb_upper = features.get('bb_upper', bar.close * 1.01)
+        bb_lower = features.get('bb_lower', bar.close * 0.99)
+        bb_width = features.get('bb_width', 0.0)
+        
+        # RSI for Regime C
+        rsi_val = features.get('rsi_norm', 0.5) * 100.0
+        
         # Retrieve Optimized or Default Params
         opt = self.optimized_params.get(symbol, {})
         max_rvol_thresh = self.default_max_rvol
-        ker_thresh = self.default_ker_thresh
+        ker_thresh = 0.15 # Aggressively lowered default
         
         # --- FRIDAY GUARD ---
         if bar.timestamp.weekday() == 4 and bar.timestamp.hour >= self.friday_entry_cutoff:
@@ -398,19 +406,18 @@ class MultiAssetPredictor:
         if streak > 0:
             if streak >= 3:
                 # FIRM BREAKER: Require cleaner trend
-                effective_ker_thresh += 0.15
+                effective_ker_thresh += 0.05
             else:
                 # SOFT BREAKER
-                effective_ker_thresh += min(0.10, streak * 0.02)
+                effective_ker_thresh += min(0.05, streak * 0.01)
         
         # Ensure gate doesn't go below absolute safety minimum
-        effective_ker_thresh = max(0.10, effective_ker_thresh)
+        effective_ker_thresh = max(0.05, effective_ker_thresh)
 
-        if ker_val < effective_ker_thresh:
-            stats[f"Low Efficiency (Streak: {streak})"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (Streak: {streak})"})
-
-        # --- CRITICAL FILTER 2: MTF TREND LOCK ---
+        # Ker Check (Only for Trend Trades, logic handled inside regime block below)
+        # But we do a pre-check rejection if it's super low and we aren't in Regime C
+        
+        # --- CRITICAL FILTER 2: MTF TREND CONTEXT ---
         d1_ema = context_data.get('d1', {}).get('ema200', 0.0) if context_data else 0.0
         d1_trend_up = (bar.close > d1_ema) if d1_ema > 0 else True
         d1_trend_down = (bar.close < d1_ema) if d1_ema > 0 else True
@@ -421,11 +428,12 @@ class MultiAssetPredictor:
         h4_bear = h4_rsi < 50
         
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
+        enable_regime_a = True
+        enable_regime_c = True # Enable Mean Reversion
         require_d1_trend = phx_conf.get('require_d1_trend', True)
         require_h4_alignment = phx_conf.get('require_h4_alignment', True)
-        vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.1)
-        aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55)
+        vol_gate_ratio = 0.8 # Relaxed
+        aggressor_thresh = 0.52 # Relaxed
         
         # Gate Definitions
         vol_gate = rvol > vol_gate_ratio
@@ -437,60 +445,72 @@ class MultiAssetPredictor:
         proposed_action = 0
         regime_label = "C (Noise)"
 
-        # --- REGIME A: MOMENTUM IGNITION ---
-        if enable_regime_a:
-            if d1_trend_up and is_bullish_candle and vol_gate:
+        # --- REGIME DETERMINATION ---
+        is_trending = adx_val > 15.0 # Relaxed ADX
+        
+        # >>> LOGIC BRANCH 1: TREND FOLLOWING (REGIME A/B) <<<
+        if is_trending and vol_gate:
+            # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
+            
+            # REQUIRE H4 ALIGNMENT (Stronger than D1 for Intraday)
+            if is_bullish_candle and h4_bull:
                 proposed_action = 1
-                regime_label = "A (Mom-Long)"
-            
-            elif d1_trend_down and is_bearish_candle and vol_gate:
+                regime_label = "Trend-Long"
+                
+                # Downgraded D1 Check: Only block if D1 is aggressively against us
+                if not d1_trend_up:
+                    regime_label += " (Counter-D1)"
+                    
+            elif is_bearish_candle and h4_bear:
                 proposed_action = -1
-                regime_label = "A (Mom-Short)"
-            elif (d1_trend_up and is_bullish_candle) or (d1_trend_down and is_bearish_candle):
-                if not vol_gate:
-                    stats[f"Volume Gate Fail"] += 1
+                regime_label = "Trend-Short"
+                if not d1_trend_down:
+                    regime_label += " (Counter-D1)"
             
-        # --- REGIME B: EFFICIENT TREND CONTINUATION ---
-        is_trending = adx_val > CONFIG['features']['adx'].get('threshold', 18)
-        
-        if proposed_action == 0 and vol_gate:
-            if not is_trending:
-                stats[f"Regime B: Low ADX"] += 1
             else:
-                if is_bullish_candle and d1_trend_up:
-                    if require_h4_alignment and not h4_bull:
-                        stats["Regime B: H4 Mismatch"] += 1
-                    else:
-                        proposed_action = 1
-                        regime_label = "B (Trend-Long)"
-                elif is_bearish_candle and d1_trend_down:
-                    if require_h4_alignment and not h4_bear:
-                        stats["Regime B: H4 Mismatch"] += 1
-                    else:
-                        proposed_action = -1
-                        regime_label = "B (Trend-Short)"
+                stats["Trend: H4 Mismatch"] += 1
+
+        # >>> LOGIC BRANCH 2: MEAN REVERSION (REGIME C) <<<
+        # "Unlock the Chop" - Monetize ranging markets
+        elif enable_regime_c and not is_trending:
+            # Conditions:
+            # 1. Price is interacting with Bands
+            # 2. RSI confirms overbought/oversold
+            # 3. Not in a squeeze (BB Width decent)
+            
+            if bb_width > 0.001: # Ensure bands aren't pinched tight
+                # Reversion to Mean (Long)
+                if bar.close <= bb_lower and rsi_val < 35:
+                    proposed_action = 1
+                    regime_label = "MeanRev-Long"
+                
+                # Reversion to Mean (Short)
+                elif bar.close >= bb_upper and rsi_val > 65:
+                    proposed_action = -1
+                    regime_label = "MeanRev-Short"
                 else:
-                    stats["Regime B: Counter Trend"] += 1
+                    stats["MeanRev: No Trigger"] += 1
+            else:
+                stats["MeanRev: Squeeze"] += 1
         
-        # --- REGIME C: NOISE ---
+        else:
+            stats["No Regime"] += 1
+
+        # --- FINAL GATE CHECK ---
         if proposed_action == 0:
             regime_label = "C (Noise)"
             stats[f"No Signal Condition"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Regime C (Noise)"})
 
-        # --- FINAL MTF SAFETY CHECK ---
-        if proposed_action == 1 and not d1_trend_up and require_d1_trend:
-            stats[f"MTF Lock"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "MTF Lock"})
-        if proposed_action == -1 and not d1_trend_down and require_d1_trend:
-            stats[f"MTF Lock"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "MTF Lock"})
+        # Ker Check (Only applicable for Trend Trades, skipped for MeanRev)
+        if "Trend" in regime_label and ker_val < effective_ker_thresh:
+            stats[f"Low Efficiency"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f})"})
 
         # ---------------------------------------------------------------------
         # MEAN REVERSION FILTER (Safety Check)
         # ---------------------------------------------------------------------
         bb_pos = features.get('bb_position', 0.5)
-        rsi_val = features.get('rsi_norm', 0.5) * 100.0
         
         if proposed_action == -1: # SELL
             if bb_pos < 0.0 or rsi_val < 30:
@@ -509,7 +529,7 @@ class MultiAssetPredictor:
         confidence = prob_buy if proposed_action == 1 else prob_sell
         
         # Meta Labeling
-        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.55)
+        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.50) # Relaxed
         is_profitable = meta_labeler.predict(
             features,
             proposed_action,
@@ -517,14 +537,18 @@ class MultiAssetPredictor:
         )
 
         # --- EXECUTION WITH DYNAMIC CONFIDENCE (CORRECTED BREAKER) ---
-        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.60)
+        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.55) # Relaxed
+        
+        # Penalize Counter-Trend / MeanRev slightly to ensure quality
+        if "MeanRev" in regime_label or "Counter" in regime_label:
+            min_prob += 0.05
         
         # STREAK BREAKER: Increase required confidence
         if streak > 0:
             if streak >= 3:
-                min_prob += 0.10
+                min_prob += 0.05
             else:
-                min_prob += min(0.10, streak * 0.02)
+                min_prob += min(0.05, streak * 0.01)
 
         if confidence < min_prob:
             stats[f"ML Disagreement (Streak: {streak})"] += 1

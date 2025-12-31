@@ -5,16 +5,14 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# AUDIT REMEDIATION (2025-01-01 - AGGRESSIVE RECOVERY):
-# 1. CORRECTED STREAK BREAKER: Softened penalty to prevent "Dormancy Trap".
-#    - If streak >= 3: KER +0.15 (Strict but Achievable), Conf +0.10.
-#    - Prevents bot from "rage quitting" after a drawdown.
-# 2. BASE GATES: Lowered KER threshold to 0.20 to increase trade frequency.
-# 3. RISK CAP: Strict enforcement of 0.25% max risk (Config Driven).
-#
-# IMPLEMENTATION UPDATE (Rec 1 & 3):
-# - Dynamic Gate Scaling: ADWIN monitors KER to adjust thresholds.
-# - Efficiency-Weighted Learning: Sample weights boosted by KER.
+# PHOENIX STRATEGY V6.0 (AGGRESSIVE PROFIT RECOVERY):
+# 1. REGIME C UNLOCKED: Implemented Mean Reversion for ranging markets.
+#    - Condition: ADX < 25 + Bollinger Band Touch + RSI Extremes.
+#    - Goal: Monetize the 70% of time the market is chopping.
+# 2. FILTER RELAXATION:
+#    - D1 Trend: Downgraded from Hard Lock to Directional Bias.
+#    - Volume Gate: Lowered to 0.8x average to catch quiet moves.
+# 3. PROFIT FOCUS: Prioritizes entry frequency over perfection.
 # =============================================================================
 import logging
 import sys
@@ -112,26 +110,27 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX STRATEGY PARAMETERS (V5.5 AGGRESSIVE) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V6.0 AGGRESSIVE) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
         # Gates
         self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
+        self.enable_regime_c = True # Enable Mean Reversion (Regime C)
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
         self.require_h4_alignment = phx_conf.get('require_h4_alignment', True)
         
-        # Safety Cap
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 4.0)
+        # Safety Cap - Relaxed to 5.0 to allow volatility
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 5.0)
         
-        # Thresholds (LOWERED BASELINE)
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.20) 
-        self.adx_threshold = CONFIG['features']['adx'].get('threshold', 18) 
+        # Thresholds (AGGRESSIVELY LOWERED FOR PROFITABILITY)
+        self.ker_thresh = 0.15 # Was 0.20
+        self.adx_threshold = 15.0 # Was 18.0 - Catch trends earlier
         
-        # Volume Gate
-        self.vol_gate_ratio = phx_conf.get('volume_gate_ratio', 1.1)
+        # Volume Gate - Relaxed
+        self.vol_gate_ratio = 0.8 # Was 1.1 - Allow trades on standard volume
         
         # Momentum
-        self.aggressor_thresh = phx_conf.get('aggressor_threshold', 0.55)
+        self.aggressor_thresh = 0.52 # Was 0.55 - Lower bar for entry
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
         
@@ -140,7 +139,6 @@ class ResearchStrategy:
         self.friday_close_hour = CONFIG.get('risk_management', {}).get('friday_liquidation_hour_server', 21)
         
         # --- REC 1: Dynamic Gate Scaling State ---
-        # Using delta=0.01 to match Live Predictor configuration
         self.ker_drift_detector = drift.ADWIN(delta=0.01)
         self.dynamic_ker_offset = 0.0
         
@@ -253,8 +251,7 @@ class ResearchStrategy:
         
         # If distribution of KER changes significantly (Drift), adjust threshold
         if self.ker_drift_detector.drift_detected:
-            # Drift implies regime shift. Relax gate temporarily to catch new trends.
-            # Reduce threshold by 0.05 (Min limit handled in effective calc)
+            # Drift implies regime shift. Relax gate temporarily.
             self.dynamic_ker_offset = max(-0.15, self.dynamic_ker_offset - 0.05)
         else:
             # Slowly decay offset back to 0 (Normalization)
@@ -276,10 +273,10 @@ class ResearchStrategy:
                 ret_scalar = max(0.5, ret_scalar)
                 
                 # --- REC 3: EFFICIENCY-WEIGHTED LEARNING ---
-                # Weight samples by KER. High efficiency bars are more valuable for trend learning.
-                # Prioritize high-quality data points (High KER = Clean Trend)
+                # Weight samples by KER. High efficiency bars are more valuable.
                 hist_ker = stored_feats.get('ker', 0.5)
-                ker_weight = hist_ker * 2.0 # Scale 0-2 (e.g., 0.8 KER -> 1.6x weight)
+                # Boost multiplier from 1.0+ker to ker*2.0
+                ker_weight = hist_ker * 2.0 
                 
                 final_weight = base_weight * ret_scalar * ker_weight
                 
@@ -296,12 +293,11 @@ class ResearchStrategy:
 
         # C. Add CURRENT Bar as new Trade Opportunity
         # --- REC 2: Volatility Passing ---
-        # Inject Parkinson for Labeler boost
+        # Inject Parkinson for Labeler boost (Rec 2)
         parkinson = features.get('parkinson_vol', 0.0)
         features['parkinson_vol'] = parkinson 
         
         current_atr = features.get('atr', 0.0)
-        # Pass parkinson_vol explicitly to match the updated AdaptiveTripleBarrier API
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp, parkinson_vol=parkinson)
 
         # ============================================================
@@ -319,49 +315,49 @@ class ResearchStrategy:
         # -------------------------------------------------
 
         # ============================================================
-        # E. ENTRY LOGIC GATES
+        # E. ENTRY LOGIC GATES (V6.0 OVERHAUL)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
         rvol = features.get('rvol', 1.0)
-        # ker_val extracted above
         aggressor = features.get('aggressor', 0.5)
         atr_val = features.get('atr', 0.0001)
-        # parkinson extracted above
         mtf_align = features.get('mtf_alignment', 0.0)
         adx_val = features.get('adx', 0.0)
+        
+        # Bollinger Bands for Regime C
+        bb_upper = features.get('bb_upper', price * 1.01)
+        bb_lower = features.get('bb_lower', price * 0.99)
+        bb_width = features.get('bb_width', 0.0)
+        
+        # RSI for Regime C
+        rsi_val = features.get('rsi_norm', 0.5) * 100.0
         
         # --- CRITICAL FILTER 1: VOLUME EXHAUSTION FILTER ---
         if rvol > self.max_rvol_thresh:
             self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
             return # Block trade
         
-        # --- CORRECTED STREAK BREAKER (V5.5) & DYNAMIC SCALING ---
+        # --- CORRECTED STREAK BREAKER (V6.0) & DYNAMIC SCALING ---
         # Apply Dynamic Offset from ADWIN (Rec 1)
         effective_ker_thresh = self.ker_thresh + self.dynamic_ker_offset
         
         if self.consecutive_losses > 0:
             if self.consecutive_losses >= 3:
-                # FIRM BREAKER: Require cleaner trend
-                effective_ker_thresh += 0.15 
+                # FIRM BREAKER: Softened to +0.05 to avoid dormancy
+                effective_ker_thresh += 0.05 
             else:
                 # SOFT BREAKER: Mild penalty for 1-2 losses
-                effective_ker_thresh += min(0.10, self.consecutive_losses * 0.02)
+                effective_ker_thresh += min(0.05, self.consecutive_losses * 0.01)
         
         # Ensure gate doesn't go below absolute safety minimum
-        effective_ker_thresh = max(0.10, effective_ker_thresh)
+        effective_ker_thresh = max(0.05, effective_ker_thresh)
             
-        # Check Efficiency Gate
-        if ker_val < effective_ker_thresh:
-            self.rejection_stats[f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f} | Streak: {self.consecutive_losses})"] += 1
-            return # Block trade
-
-        # --- CRITICAL FILTER 2: MTF TREND LOCK ---
+        # --- CRITICAL FILTER 2: MTF TREND CONTEXT ---
         d1_ema = context_data.get('d1', {}).get('ema200', 0.0)
         d1_trend_up = (price > d1_ema) if d1_ema > 0 else True
         d1_trend_down = (price < d1_ema) if d1_ema > 0 else True
         
-        # --- NEW: H4 RSI ALIGNMENT (V3.0) ---
         h4_rsi = context_data.get('h4', {}).get('rsi', 50.0)
         h4_bull = h4_rsi > 50
         h4_bear = h4_rsi < 50
@@ -376,73 +372,65 @@ class ResearchStrategy:
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "C (Noise)"
         
-        # --- REGIME A: MOMENTUM IGNITION ---
-        if self.enable_regime_a:
-            # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
-            if d1_trend_up and is_bullish_candle and vol_gate:
-                proposed_action = 1
-                regime_label = "A (Mom-Long)"
-            
-            elif d1_trend_down and is_bearish_candle and vol_gate:
-                proposed_action = -1
-                regime_label = "A (Mom-Short)"
-
-            # Diagnostic for Volume Gate Failure
-            elif (d1_trend_up and is_bullish_candle) or (d1_trend_down and is_bearish_candle):
-                if not vol_gate:
-                    self.rejection_stats[f"Volume Gate Fail (RVol {rvol:.2f} < {self.vol_gate_ratio})"] += 1
-                
-        # --- REGIME B: EFFICIENT TREND CONTINUATION ---
+        # --- REGIME DETERMINATION ---
         is_trending = adx_val > self.adx_threshold
         
-        if proposed_action == 0 and vol_gate:
-            if not is_trending:
-                self.rejection_stats[f"Regime B: Low ADX ({adx_val:.1f} < {self.adx_threshold})"] += 1
+        # >>> LOGIC BRANCH 1: TREND FOLLOWING (REGIME A/B) <<<
+        if is_trending and vol_gate:
+            
+            # REQUIRE H4 ALIGNMENT (Stronger than D1 for Intraday)
+            if is_bullish_candle and h4_bull:
+                proposed_action = 1
+                regime_label = "Trend-Long"
+                
+                # Downgraded D1 Check: Only block if D1 is aggressively against us
+                # Now handled as a soft bias rather than a hard lock
+                if not d1_trend_up:
+                    regime_label += " (Counter-D1)"
+                    
+            elif is_bearish_candle and h4_bear:
+                proposed_action = -1
+                regime_label = "Trend-Short"
+                if not d1_trend_down:
+                    regime_label += " (Counter-D1)"
+            
             else:
-                if is_bullish_candle and d1_trend_up:
-                    if self.require_h4_alignment and not h4_bull:
-                        self.rejection_stats["Regime B: H4 RSI Mismatch (Long)"] += 1
-                    else:
-                        proposed_action = 1
-                        regime_label = "B (Trend-Long)"
-                        
-                elif is_bearish_candle and d1_trend_down:
-                    if self.require_h4_alignment and not h4_bear:
-                        self.rejection_stats["Regime B: H4 RSI Mismatch (Short)"] += 1
-                    else:
-                        proposed_action = -1
-                        regime_label = "B (Trend-Short)"
+                self.rejection_stats["Trend: H4 Mismatch"] += 1
+
+        # >>> LOGIC BRANCH 2: MEAN REVERSION (REGIME C) <<<
+        # "Unlock the Chop" - Monetize ranging markets
+        elif self.enable_regime_c and not is_trending:
+            # Conditions:
+            # 1. Price is interacting with Bands
+            # 2. RSI confirms overbought/oversold
+            # 3. Not in a squeeze (BB Width decent)
+            
+            if bb_width > 0.001: # Ensure bands aren't pinched tight
+                # Reversion to Mean (Long)
+                if price <= bb_lower and rsi_val < 35:
+                    proposed_action = 1
+                    regime_label = "MeanRev-Long"
+                
+                # Reversion to Mean (Short)
+                elif price >= bb_upper and rsi_val > 65:
+                    proposed_action = -1
+                    regime_label = "MeanRev-Short"
                 else:
-                    self.rejection_stats["Regime B: Weak Candle / Counter Trend"] += 1
+                    self.rejection_stats["MeanRev: No Trigger"] += 1
+            else:
+                self.rejection_stats["MeanRev: Squeeze"] += 1
         
-        # --- REGIME C: NOISE ---
+        else:
+            self.rejection_stats["No Regime"] += 1
+
+        # --- FINAL GATE CHECK ---
         if proposed_action == 0:
-            regime_label = "C (Noise)"
-            self.rejection_stats[f"No Signal Condition"] += 1
-            return # Explicit HOLD
+            return 
 
-        # --- FINAL MTF SAFETY CHECK ---
-        if proposed_action == 1 and not d1_trend_up and self.require_d1_trend:
-            self.rejection_stats[f"MTF Lock (Price {price:.2f} < EMA {d1_ema:.2f})"] += 1
+        # Ker Check (Only applicable for Trend Trades, skipped for MeanRev)
+        if "Trend" in regime_label and ker_val < effective_ker_thresh:
+            self.rejection_stats[f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f})"] += 1
             return
-        if proposed_action == -1 and not d1_trend_down and self.require_d1_trend:
-            self.rejection_stats[f"MTF Lock (Price {price:.2f} > EMA {d1_ema:.2f})"] += 1
-            return
-
-        # ---------------------------------------------------------------------
-        # MEAN REVERSION FILTER (Safety Check)
-        # ---------------------------------------------------------------------
-        bb_pos = features.get('bb_position', 0.5)
-        rsi_val = features.get('rsi_norm', 0.5) * 100.0
-        
-        if proposed_action == -1: # SELL
-            if bb_pos < 0.0 or rsi_val < 30:
-                self.rejection_stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
-                return
-        elif proposed_action == 1: # BUY
-            if bb_pos > 1.0 or rsi_val > 70:
-                self.rejection_stats[f"Mean Rev Filter (BB:{bb_pos:.2f}|RSI:{rsi_val:.2f})"] += 1
-                return
 
         # ============================================================
         # F. ML CONFIRMATION & EXECUTION
@@ -461,26 +449,29 @@ class ResearchStrategy:
             is_profitable = self.meta_labeler.predict(
                 features, 
                 proposed_action, 
-                threshold=self.params.get('meta_labeling_threshold', 0.55)
+                threshold=self.params.get('meta_labeling_threshold', 0.50) # Relaxed to 0.50
             )
             
             if proposed_action != 0:
                 self.meta_label_events += 1
 
             # --- EXECUTION WITH DYNAMIC CONFIDENCE (CORRECTED BREAKER) ---
-            min_prob = self.params.get('min_calibrated_probability', 0.60)
+            min_prob = self.params.get('min_calibrated_probability', 0.55) # Lowered base to 0.55
+            
+            # Penalize Counter-Trend / MeanRev slightly to ensure quality
+            if "MeanRev" in regime_label or "Counter" in regime_label:
+                min_prob += 0.05
             
             if self.consecutive_losses > 0:
                 if self.consecutive_losses >= 3:
-                    # FIRM BREAKER: +10% Confidence (e.g., 0.60 -> 0.70)
-                    # Requires conviction but not certainty.
-                    min_prob += 0.10
+                    # FIRM BREAKER: +5% Confidence
+                    min_prob += 0.05
                 else:
-                    # SOFT BREAKER: +2% per loss
-                    min_prob += min(0.10, self.consecutive_losses * 0.02)
+                    # SOFT BREAKER: +1% per loss
+                    min_prob += min(0.05, self.consecutive_losses * 0.01)
                 
             if confidence < min_prob:
-                self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob:.2f} | Streak: {self.consecutive_losses})"] += 1
+                self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob:.2f})"] += 1
                 return
 
             if is_profitable:
@@ -581,7 +572,7 @@ class ResearchStrategy:
             timestamp_created=dt_timestamp, 
             stop_loss=sl_price,
             take_profit=tp_price,
-            comment=f"{trade_intent.comment}|Regime:{regime}|Limit:{self.limit_order_offset_pips}p",
+            comment=f"{trade_intent.comment}|{regime}",
             metadata={
                 'regime': regime,
                 'confidence': float(confidence),

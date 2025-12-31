@@ -10,10 +10,10 @@
 # 2. SCORING FUNCTION: Added explicit penalty for Drawdown > 5% to filter volatility.
 # 3. SAFETY: Single-threaded math ops to prevent worker deadlocks.
 #
-# IMPLEMENTATION UPDATE (Rec 5):
-# - Optuna DD Frequency Penalty: Penalizes score by -10 for every trade closed
-#   while account is in > 5% drawdown.
-# - FIX: Corrected Drawdown calculation math (Peak initialization).
+# IMPLEMENTATION UPDATE (PROFIT FOCUS V6.0):
+# - SCORING: Primary Objective is now Raw PnL (USD).
+# - INCENTIVE: Added Trade Frequency Bonus (+5 score per trade) to break pruning loops.
+# - FIX: Drawdown calculation is strictly Ratio-based (0.0-1.0) internally.
 # =============================================================================
 import os
 import sys
@@ -103,6 +103,7 @@ class EmojiCallback:
             status = "LOSS "
 
         # 2. Extract Metrics (Safe Defaults)
+        # Note: Internal DD is ratio (0.05), so multiply by 100 for display (5.0%)
         dd = attrs.get('max_dd_pct', 0.0) * 100
         wr = attrs.get('win_rate', 0.0) * 100
         pf = attrs.get('profit_factor', 0.0)
@@ -267,43 +268,37 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             # ALWAYS Generate Autopsy/Victory Lap Report for analysis
             trial.set_user_attr("autopsy", strategy.generate_autopsy())
             
-            # --- PROFIT-FIRST SCORING FUNCTION (REFINED) ---
-            # 1. Base Score = Net Profit in USD
-            base_score = metrics['total_pnl'] / 100.0
+            # --- PROFIT-FIRST SCORING FUNCTION (PROFIT & FREQUENCY) ---
             
-            # Constraint: Minimum Trades (Statistical Significance)
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 15)
-            total_trades = metrics['total_trades']
+            # 1. Base Score = Raw PnL (Maximize Dollars)
+            score = metrics['total_pnl']
             
-            if total_trades < min_trades:
+            # 2. Activity Bonus (Incentivize Trading)
+            # Add $5 score per trade to break "fear of losing" and inactivity
+            score += (metrics['total_trades'] * 5.0)
+            
+            # 3. Pruning Check (Relaxed)
+            min_trades = 10 # Lowered from 15 to allow emerging strategies
+            if metrics['total_trades'] < min_trades:
                 trial.set_user_attr("pruned", True)
-                return -1000.0 # Heavy penalty for inactivity
+                return -500.0 # Softer penalty (was -1000.0)
             
-            # Constraint: Account Blowout
+            # 4. Blowout Check
             if broker.is_blown:
                 trial.set_user_attr("blown", True)
-                return -10000.0 # Maximum penalty
+                return -5000.0
             
-            # If Profitable: Add R:R Bonus & DD Penalties
-            if metrics['total_pnl'] > 0:
-                # Add Risk:Reward as a multiplier/bonus
-                rr_bonus = metrics['risk_reward_ratio'] * 5.0
-                final_score = base_score + rr_bonus
-                
-                # --- REC 5: DD FREQUENCY PENALTY ---
-                # Penalize based on how many trades were closed while in > 5% DD.
-                # This hurts strategies that linger in deep drawdown.
-                dd_count = metrics.get('dd_events_gt_5', 0)
-                final_score -= (10.0 * dd_count)
-                
-                # Hard cap check (Legacy safety)
-                if metrics['max_dd_pct'] > 0.10:
-                    final_score -= 50.0
-                
-                return final_score
-            else:
-                # If Losing: Return pure (negative) PnL score
-                return base_score
+            # 5. Strategic Penalties (Drawdown Frequency)
+            # Penalize based on how many trades were closed while in > 5% drawdown.
+            dd_count = metrics.get('dd_events_gt_5', 0)
+            score -= (dd_count * 20.0)
+            
+            # Legacy Safety Cap (DD > 10% = Heavy Penalty)
+            # Threshold is 0.10 (Ratio)
+            if metrics['max_dd_pct'] > 0.10:
+                score -= 1000.0
+            
+            return score
 
         # 3. Connect to Shared Study
         study_name = f"study_{symbol}"
@@ -471,10 +466,13 @@ class ResearchPipeline:
             
         df = pd.DataFrame(trade_log)
         
-        # 1. Sort & Cleanup
+        # 1. Sort & Cleanup (FIX: Sort by Exit_Time for accurate Equity Curve)
         df['Entry_Time'] = pd.to_datetime(df['Entry_Time'])
         df['Exit_Time'] = pd.to_datetime(df['Exit_Time'])
-        df = df.sort_values('Entry_Time')
+        df = df.sort_values('Exit_Time') # Changed from Entry_Time
+        
+        # Ensure PnL is numeric and handle NaNs
+        df['Net_PnL'] = pd.to_numeric(df['Net_PnL'], errors='coerce').fillna(0.0)
         
         # 2. Basic Trade Stats
         total_pnl = df['Net_PnL'].sum()
@@ -511,6 +509,12 @@ class ResearchPipeline:
                 metrics_out['sqn'] = np.sqrt(len(df)) * (df['Net_PnL'].mean() / pnl_std)
 
         # 3. Time-Series Equity Curve
+        
+        # FIX: Sanity Check for Initial Capital to prevent 500% DD bugs
+        if initial_capital <= 1000:
+             log.warning(f"⚠️ SUSPICIOUS INITIAL CAPITAL: {initial_capital}. Defaulting to 100k.")
+             initial_capital = 100000.0
+
         # Calculate running equity to detect Drawdown events
         # CRITICAL FIX: Ensure Peak respects initial capital to prevent fake drawdowns on first loss
         df['Equity'] = initial_capital + df['Net_PnL'].cumsum()
@@ -520,7 +524,9 @@ class ResearchPipeline:
         df['Peak'] = df['Peak'].clip(lower=initial_capital)
         
         df['Drawdown_USD'] = df['Equity'] - df['Peak']
-        df['Drawdown_Pct'] = (df['Drawdown_USD'] / df['Peak']).abs() * 100.0
+        
+        # --- UNIT FIX: Removed * 100.0 so this is a RATIO (0.05 for 5%) ---
+        df['Drawdown_Pct'] = (df['Drawdown_USD'] / df['Peak']).abs()
         
         max_dd_pct = df['Drawdown_Pct'].max()
         metrics_out['max_dd_pct'] = max_dd_pct if not pd.isna(max_dd_pct) else 0.0
@@ -528,7 +534,7 @@ class ResearchPipeline:
         # --- REC 5: DRAWDOWN FREQUENCY ---
         # Count number of trade closures where the account was in > 5% drawdown
         # This penalizes lingering in the danger zone
-        dd_events = len(df[df['Drawdown_Pct'] > 5.0])
+        dd_events = len(df[df['Drawdown_Pct'] > 0.05])
         metrics_out['dd_events_gt_5'] = dd_events
 
         # 4. Hourly Resampling for Sharpe/Sortino
@@ -688,7 +694,9 @@ class ResearchPipeline:
         
         # 1. Equity & Drawdown Calculations
         df['Entry_Time'] = pd.to_datetime(df['Entry_Time'])
-        df = df.sort_values('Entry_Time')
+        df['Exit_Time'] = pd.to_datetime(df['Exit_Time'])
+        df = df.sort_values('Exit_Time') # Match metric calc logic
+        
         df['Equity'] = initial_capital + df['Net_PnL'].cumsum()
         
         # CRITICAL FIX for BACKTEST REPORT: ensure Peak is correctly initialized
