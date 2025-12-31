@@ -6,6 +6,7 @@
 # 1. OPTIMIZATION RANGES: Moved all hardcoded Optuna ranges here.
 # 2. RISK OPTIMIZATION: Added 'risk_per_trade_options' for WFO.
 # 3. CENTRALIZATION: All strategy thresholds are now strictly defined here.
+# 4. FINE TUNING: Expanded R:R search (1.5-5.0) and granular Risk (0.1-1.0%).
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -182,10 +183,12 @@ optimization_search_space:
     min: 0.85
     max: 0.95
   
-  # Triple Barrier Method (Labeling)
+  # Triple Barrier Method (Labeling) -> Defines Reward Target (TP)
   tbm_barrier_width:
-    min: 2.5
-    max: 4.0  # Widen to catch big moves
+    min: 1.5
+    max: 5.0
+    # Note: Optuna 'suggest_float' doesn't strictly adhere to 'step' like 'suggest_int'
+    # but we will hint it in the logic or let it explore freely within range.
   tbm_horizon_minutes:
     min: 60
     max: 180
@@ -333,9 +336,9 @@ forensic_audit:
 
 # --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 10  # Increased slightly
+  n_trials: 10  # Increased slightly to cover new search space
   train_years: 2
   test_months: 6
-  min_trades_optimization: 25
-  # --- RISK OPTIMIZATION ---
-  risk_per_trade_options: [0.25, 0.5, 0.75, 1.0]
+  min_trades_optimization: 100
+  # --- RISK OPTIMIZATION (FINE TUNED) ---
+  risk_per_trade_options: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
