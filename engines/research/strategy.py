@@ -5,12 +5,12 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# AUDIT REMEDIATION (2025-01-01 - HARD STREAK BREAKER):
-# 1. HARD STREAK BREAKER: If consecutive losses >= 3, impose SEVERE penalty.
-#    - Forces bot to "sit out" chop until conditions are near-perfect.
-#    - KER Threshold +0.40 (Requires almost straight line trend).
-#    - Confidence +0.20 (Requires 85-90% certainty).
-# 2. RISK CAP: Strict enforcement of 0.25% max risk (Config Driven).
+# AUDIT REMEDIATION (2025-01-01 - AGGRESSIVE RECOVERY):
+# 1. CORRECTED STREAK BREAKER: Softened penalty to prevent "Dormancy Trap".
+#    - If streak >= 3: KER +0.15 (Strict but Achievable), Conf +0.10.
+#    - Prevents bot from "rage quitting" after a drawdown.
+# 2. BASE GATES: Lowered KER threshold to 0.20 to increase trade frequency.
+# 3. RISK CAP: Strict enforcement of 0.25% max risk (Config Driven).
 # =============================================================================
 import logging
 import sys
@@ -105,7 +105,7 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX STRATEGY PARAMETERS (V5.0 SIMPLE) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V5.5 AGGRESSIVE) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
         # Gates
@@ -116,8 +116,8 @@ class ResearchStrategy:
         # Safety Cap
         self.max_rvol_thresh = phx_conf.get('max_relative_volume', 4.0)
         
-        # Thresholds 
-        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.35)
+        # Thresholds (LOWERED BASELINE)
+        self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.20) 
         self.adx_threshold = CONFIG['features']['adx'].get('threshold', 18) 
         
         # Volume Gate
@@ -298,15 +298,16 @@ class ResearchStrategy:
             self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
             return # Block trade
         
-        # --- HARD STREAK BREAKER (V5.3) ---
-        # If consecutive losses >= 3, apply MASSIVE penalties to stop chop trading.
+        # --- CORRECTED STREAK BREAKER (V5.5) ---
+        # The V5.3 "Hard Breaker" (+0.40 KER) was too aggressive, causing dormancy.
+        # We now use a "Firm Breaker" (+0.15 KER) that filters chop but allows strong trends.
         effective_ker_thresh = self.ker_thresh
         
         if self.consecutive_losses > 0:
             if self.consecutive_losses >= 3:
-                # HARD BREAKER: Require pristine trend efficiency (0.7+)
-                # This effectively stops trading unless the market is moving in a straight line.
-                effective_ker_thresh += 0.40 
+                # FIRM BREAKER: Require cleaner trend (e.g., 0.20 + 0.15 = 0.35)
+                # This is strict but achievable, unlike 0.70.
+                effective_ker_thresh += 0.15 
             else:
                 # SOFT BREAKER: Mild penalty for 1-2 losses
                 effective_ker_thresh += min(0.10, self.consecutive_losses * 0.02)
@@ -427,13 +428,14 @@ class ResearchStrategy:
             if proposed_action != 0:
                 self.meta_label_events += 1
 
-            # --- EXECUTION WITH DYNAMIC CONFIDENCE (HARD BREAKER) ---
+            # --- EXECUTION WITH DYNAMIC CONFIDENCE (CORRECTED BREAKER) ---
             min_prob = self.params.get('min_calibrated_probability', 0.60)
             
             if self.consecutive_losses > 0:
                 if self.consecutive_losses >= 3:
-                    # HARD BREAKER: Require 80-85% Confidence to break a nasty losing streak
-                    min_prob += 0.20
+                    # FIRM BREAKER: +10% Confidence (e.g., 0.60 -> 0.70)
+                    # Requires conviction but not certainty.
+                    min_prob += 0.10
                 else:
                     # SOFT BREAKER: +2% per loss
                     min_prob += min(0.10, self.consecutive_losses * 0.02)

@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V5.4 (SURVIVAL MODE)
+# config.yaml – PROJECT PHOENIX V5.5 (AGGRESSIVE RECOVERY)
 # STATUS: CONFIGURABLE | TARGET: 10% IN 90 DAYS
 #
 # UPDATES (2025-01-01):
-# 1. RISK CAP: HARD CAP at 0.25%. High risk (0.3%+) is banned.
-# 2. SEARCH SPACE: Widen R:R floor to 1.0 to allow higher win-rate strategies.
-# 3. GATES: Re-tightened KER to 0.30 to filter chop.
+# 1. GATES: Lowered KER to 0.20 to increase trade frequency.
+# 2. OPTIMIZATION: Reduced min_trades to 12 to stop false pruning.
+# 3. RISK: Kept strictly low (0.1-0.25%) to survive drawdowns.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -124,7 +124,7 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 20 # Increased slightly to 20 to filter weak trends
+    threshold: 18 # Lowered slightly to allow earlier entry
   
   cyclical_time: true
   session_awareness: true
@@ -140,7 +140,7 @@ phoenix_strategy:
   
   # --- FILTER THRESHOLDS ---
   max_relative_volume: 4.0        
-  ker_trend_threshold: 0.30       # Kept at 0.30 (Balanced)
+  ker_trend_threshold: 0.20       # AGGRESSIVE: Lowered from 0.30 to allow more trades
   vol_expansion_threshold: 1.5 
   range_gate_atr_mult: 1.0        
   volume_gate_ratio: 1.1          
@@ -210,7 +210,7 @@ risk_management:
   
   max_daily_loss_pct: 0.048       # 4.8% (FTMO Limit is 5% - Keep buffer)
   max_total_loss_pct: 0.098       # 9.8% (FTMO Limit is 10%)
-  max_risk_percent: 1.0           # Max open risk at any time (Lowered from 1.5)
+  max_risk_percent: 1.0           # Max open risk at any time
   max_leverage: 30.0
   max_lot_size: 50.0 
   min_lot_size: 0.01
@@ -335,8 +335,7 @@ wfo:
   n_trials: 35
   train_years: 2
   test_months: 6
-  min_trades_optimization: 25
+  min_trades_optimization: 12 # LOWERED from 25 to stop false pruning
   # --- RISK OPTIMIZATION (SURVIVAL MODE) ---
-  # CRITICAL UPDATE: Capped at 0.25% to prevent Daily Limit Breaches
-  # BANNED: 0.3, 0.4, 0.5, etc.
+  # Strict Range: 0.10% to 0.25%. High risk is BANNED.
   risk_per_trade_options: [0.10, 0.15, 0.20, 0.25]

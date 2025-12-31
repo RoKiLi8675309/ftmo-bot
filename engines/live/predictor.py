@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# AUDIT REMEDIATION (2025-01-01 - HARD STREAK BREAKER):
-# 1. HARD STREAK BREAKER: Synchronized with Research Strategy.
-#    - If streak >= 3: KER +0.40, Confidence +0.20.
-#    - If streak < 3: KER +0.02/loss, Confidence +0.02/loss.
+# AUDIT REMEDIATION (2025-01-01 - AGGRESSIVE RECOVERY):
+# 1. CORRECTED STREAK BREAKER: Synchronized with Research Strategy V5.5.
+#    - If streak >= 3: KER +0.15 (Strict but Achievable), Conf +0.10.
+#    - Prevents "Dormancy Trap" while still filtering chop.
 # 2. RISK LOADING: Loads 'risk_per_trade_percent' from optimized params file.
 # =============================================================================
 import logging
@@ -147,7 +147,8 @@ class MultiAssetPredictor:
         
         # --- PHOENIX STRATEGY PARAMETERS (DEFAULTS) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        self.default_ker_thresh = phx_conf.get('ker_trend_threshold', 0.35)
+        # Updated default to 0.20 to match Config V5.5
+        self.default_ker_thresh = phx_conf.get('ker_trend_threshold', 0.20)
         self.default_max_rvol = phx_conf.get('max_relative_volume', 4.0)
         
         # Friday Guard
@@ -349,17 +350,18 @@ class MultiAssetPredictor:
             stats[f"Volume Climax"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
             
-        # --- HARD STREAK BREAKER: DYNAMIC EFFICIENCY GATE ---
+        # --- CORRECTED STREAK BREAKER: DYNAMIC EFFICIENCY GATE ---
         # If we are in a losing streak, require higher efficiency (cleaner trends)
         streak = self.consecutive_losses[symbol]
         effective_ker_thresh = ker_thresh
         
         if streak > 0:
             if streak >= 3:
-                # HARD BREAKER: Require pristine trend efficiency (0.7+) to break a nasty streak
-                effective_ker_thresh += 0.40 
+                # FIRM BREAKER: Require cleaner trend (e.g., +0.15) to break a nasty streak
+                # This is strict but achievable, unlike the previous +0.40.
+                effective_ker_thresh += 0.15 
             else:
-                # RELAXED SOFT BREAKER: Add 0.02 per loss for 1-2 losses
+                # SOFT BREAKER: Add 0.02 per loss for 1-2 losses
                 effective_ker_thresh += min(0.10, streak * 0.02)
             
         if ker_val < effective_ker_thresh:
@@ -473,14 +475,14 @@ class MultiAssetPredictor:
             threshold=meta_threshold
         )
 
-        # --- DECISION WITH DYNAMIC CONFIDENCE (HARD BREAKER) ---
+        # --- EXECUTION WITH DYNAMIC CONFIDENCE (CORRECTED BREAKER) ---
         min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.60)
         
         # STREAK BREAKER: Increase required confidence
         if streak > 0:
             if streak >= 3:
-                # HARD BREAKER: Require high confidence (80%+)
-                min_prob += 0.20
+                # FIRM BREAKER: +10% Confidence (e.g. 0.60 -> 0.70)
+                min_prob += 0.10
             else:
                 # SOFT BREAKER: Add 0.02 per loss
                 min_prob += min(0.10, streak * 0.02)
