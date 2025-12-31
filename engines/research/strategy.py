@@ -5,12 +5,12 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-30 - V3.6 R:R OPTIMIZATION):
-# 1. FIXED: Timestamp Type Error (Float vs Datetime in BacktestOrder).
-# 2. REMOVED: "Alpha Hunter" Pyramiding (Confirmed to degrade R:R).
-# 3. ADDED: Break-Even Trigger. Moves SL to Entry + 2 Pips @ 1.5R Profit.
-# 4. UPDATED: Trailing Stop Logic now uses dynamic 'distance_atr' from Config.
-# 5. OPTIMIZED: Delayed Trailing Activation (3.0 ATR) to target 1:2.5 R:R.
+# AUDIT REMEDIATION (2025-12-31 - STREAK BREAKER & PROFIT DEFENSE):
+# 1. DYNAMIC GATES: Implemented 'Dynamic Volatility Filter'.
+#    - Increases KER threshold (Efficiency) based on consecutive losses.
+#    - Increases Confidence threshold based on consecutive losses.
+# 2. LOGIC: Forces strategy to "sit out" chop after a loss until a clean trend forms.
+# 3. OPTIMIZATION SYNC: Ensures R:R matches the new Profit-First objective.
 # =============================================================================
 import logging
 import sys
@@ -59,14 +59,18 @@ class ResearchStrategy:
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
         
-        # Sync Labeler Risk with Config (V3.2 uses 2.0 ATR Stop)
-        risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 2.0)
-
+        # Sync Labeler Risk with Config (Default 1.5 ATR for labeling)
+        risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 1.5)
+        
+        # Target Reward should align with Strategy (Use Optimization Param)
+        # We ensure the Labeler trains on the SAME target we plan to execute.
+        self.optimized_reward_mult = tbm_conf.get('barrier_width', 3.0)
+        
         self.labeler = AdaptiveTripleBarrier(
-            horizon_ticks=tbm_conf.get('horizon_minutes', 60), 
+            horizon_ticks=tbm_conf.get('horizon_minutes', 120), 
             risk_mult=risk_mult_conf, 
-            reward_mult=tbm_conf.get('barrier_width', 1.5),
-            drift_threshold=tbm_conf.get('drift_threshold', 1.2)
+            reward_mult=self.optimized_reward_mult,
+            drift_threshold=tbm_conf.get('drift_threshold', 1.5)
         )
         
         # 3. Meta Labeler (The Gatekeeper)
@@ -78,7 +82,7 @@ class ResearchStrategy:
         self.calibrator_sell = ProbabilityCalibrator(window=2000)
         
         # 5. Warm-up State
-        self.burn_in_limit = params.get('burn_in_periods', 200) # Fast Startup
+        self.burn_in_limit = params.get('burn_in_periods', 200) 
         self.burn_in_counter = 0
         self.burn_in_complete = False
         
@@ -87,6 +91,7 @@ class ResearchStrategy:
         self.last_price = 0.0
         self.last_price_map = {}
         self.bars_processed = 0
+        self.consecutive_losses = 0 # Track Streak
         
         # MTF Simulation State (for backtesting consistency)
         self.h4_buffer = deque(maxlen=200) # Store H4 closes for RSI
@@ -100,7 +105,7 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX STRATEGY PARAMETERS (V3.5 RISK FIRST CONFIG) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V5.0 SIMPLE) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
         # Gates
@@ -109,9 +114,9 @@ class ResearchStrategy:
         self.require_h4_alignment = phx_conf.get('require_h4_alignment', True)
         
         # Safety Cap
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 5.0)
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 4.0)
         
-        # Thresholds
+        # Thresholds 
         self.ker_thresh = phx_conf.get('ker_trend_threshold', 0.35)
         self.adx_threshold = CONFIG['features']['adx'].get('threshold', 18) 
         
@@ -124,17 +129,12 @@ class ResearchStrategy:
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
         
         # Friday Liquidation
+        self.friday_entry_cutoff = CONFIG.get('risk_management', {}).get('friday_entry_cutoff_hour', 16)
         self.friday_close_hour = CONFIG.get('risk_management', {}).get('friday_liquidation_hour_server', 21)
         
-        # --- TRAILING STOP & BREAK EVEN LOGIC ---
-        ts_conf = CONFIG.get('risk_management', {}).get('trailing_stop', {})
-        self.use_trailing_stop = ts_conf.get('enabled', True)
-        # V3.6: Updated defaults to be safer if config is missing
-        self.ts_activation_atr = ts_conf.get('activation_atr', 3.0) 
-        self.ts_distance_atr = ts_conf.get('distance_atr', 2.0)
-        
-        # Break Even Settings
-        self.be_activation_risk_mult = 1.5  # Move to BE when profit > 1.5R
+        # --- TRAILING STOP & BREAK EVEN LOGIC (DISABLED IN V5.0) ---
+        self.use_trailing_stop = False
+        self.use_breakeven = False
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
@@ -173,13 +173,20 @@ class ResearchStrategy:
             self.rejection_stats["Daily Loss Limit Hit"] += 1
             return
 
-        # --- FRIDAY LIQUIDATION CHECK (GAP PROTECTION) ---
+        # --- UPDATE STREAK STATUS (CRITICAL FOR FILTER) ---
+        self._update_streak_status(broker)
+
+        # --- FRIDAY LOGIC: LIQUIDATION VS ENTRY GUARD ---
+        # 1. Liquidation (21:00)
         if dt_ts.weekday() == 4 and dt_ts.hour >= self.friday_close_hour:
             if self.symbol in broker.positions:
                 pos = broker.positions[self.symbol]
                 broker._close_partial_position(pos, pos.quantity, price, dt_ts, "Friday Liquidation")
                 if self.debug_mode: logger.info(f"🚫 {self.symbol} Liquidated for Weekend (Friday {dt_ts.hour}:00)")
-            return # Block new entries
+            return 
+
+        # 2. Entry Guard (16:00) - Aggressive Filter
+        is_friday_afternoon = (dt_ts.weekday() == 4 and dt_ts.hour >= self.friday_entry_cutoff)
         # -------------------------------------------------
 
         # Flow Volumes (L2 Proxies handled by Feature Engineer)
@@ -190,14 +197,11 @@ class ResearchStrategy:
         if buy_vol == 0 and sell_vol == 0:
             if self.last_price > 0:
                 if price > self.last_price:
-                    buy_vol = volume
-                    sell_vol = 0.0
+                    buy_vol = volume; sell_vol = 0.0
                 elif price < self.last_price:
-                    buy_vol = 0.0
-                    sell_vol = volume
+                    buy_vol = 0.0; sell_vol = volume
                 else:
-                    buy_vol = volume / 2.0
-                    sell_vol = volume / 2.0
+                    buy_vol = volume / 2.0; sell_vol = volume / 2.0
         
         self.last_price = price
 
@@ -236,8 +240,8 @@ class ResearchStrategy:
         if resolved_labels:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
                 # --- PROFIT WEIGHTED LEARNING ---
-                w_pos = self.params.get('positive_class_weight', 2.0)
-                w_neg = self.params.get('negative_class_weight', 2.0)
+                w_pos = self.params.get('positive_class_weight', 1.5)
+                w_neg = self.params.get('negative_class_weight', 1.0)
                 
                 base_weight = w_pos if outcome_label != 0 else w_neg
                 
@@ -266,14 +270,15 @@ class ResearchStrategy:
         # D. PROJECT PHOENIX: ACTIVE TRADE MANAGEMENT
         # ============================================================
         
-        # Manage Open Positions (Break-Even & Trailing Stop)
-        # Replaced Pyramiding with Defensive Logic
+        # Enforce "1 Trade Per Symbol" rule (Set and Forget)
         if self.symbol in broker.positions:
-            pos = broker.positions[self.symbol]
-            self._manage_active_trade(pos, price, current_atr)
-            
-            # Enforce "1 Trade Per Symbol" rule (Pyramiding Removed)
             return 
+
+        # --- ENTRY BLOCK: FRIDAY AFTERNOON (AUDIT FIX) ---
+        if is_friday_afternoon:
+            self.rejection_stats["Friday Entry Guard"] += 1
+            return 
+        # -------------------------------------------------
 
         # ============================================================
         # E. ENTRY LOGIC GATES
@@ -291,8 +296,24 @@ class ResearchStrategy:
         # --- CRITICAL FILTER 1: VOLUME EXHAUSTION FILTER ---
         if rvol > self.max_rvol_thresh:
             self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
-            # return # Keep logic flowing for stats, but entry will be blocked
+            return # Block trade
         
+        # --- DYNAMIC VOLATILITY/EFFICIENCY FILTER (STREAK DEFENSE) ---
+        # Calculate Dynamic KER Threshold based on recent losses.
+        effective_ker_thresh = self.ker_thresh
+        
+        if self.consecutive_losses > 0:
+            # 1. Efficiency Boost: +0.05 KER per loss (Cap +0.25)
+            # This forces the bot to wait for a CLEANER trend after a loss.
+            # Base 0.35 -> 1 Loss: 0.40 -> 2 Losses: 0.45 ...
+            ker_penalty = min(0.25, self.consecutive_losses * 0.05)
+            effective_ker_thresh += ker_penalty
+            
+        # Check Efficiency Gate
+        if ker_val < effective_ker_thresh:
+            self.rejection_stats[f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f} | Streak: {self.consecutive_losses})"] += 1
+            return # Block trade
+
         # --- CRITICAL FILTER 2: MTF TREND LOCK ---
         d1_ema = context_data.get('d1', {}).get('ema200', 0.0)
         d1_trend_up = (price > d1_ema) if d1_ema > 0 else True
@@ -317,18 +338,12 @@ class ResearchStrategy:
         if self.enable_regime_a:
             # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
             if d1_trend_up and is_bullish_candle and vol_gate:
-                if ker_val > self.ker_thresh:
-                    proposed_action = 1
-                    regime_label = "A (Mom-Long)"
-                else:
-                    self.rejection_stats[f"Regime A: Low Efficiency (<{self.ker_thresh})"] += 1
+                proposed_action = 1
+                regime_label = "A (Mom-Long)"
             
             elif d1_trend_down and is_bearish_candle and vol_gate:
-                if ker_val > self.ker_thresh:
-                    proposed_action = -1
-                    regime_label = "A (Mom-Short)"
-                else:
-                    self.rejection_stats[f"Regime A: Low Efficiency (<{self.ker_thresh})"] += 1
+                proposed_action = -1
+                regime_label = "A (Mom-Short)"
 
             # Diagnostic for Volume Gate Failure
             elif (d1_trend_up and is_bullish_candle) or (d1_trend_down and is_bearish_candle):
@@ -338,7 +353,7 @@ class ResearchStrategy:
         # --- REGIME B: EFFICIENT TREND CONTINUATION ---
         is_trending = adx_val > self.adx_threshold
         
-        if proposed_action == 0 and ker_val > self.ker_thresh and vol_gate:
+        if proposed_action == 0 and vol_gate:
             if not is_trending:
                 self.rejection_stats[f"Regime B: Low ADX ({adx_val:.1f} < {self.adx_threshold})"] += 1
             else:
@@ -361,7 +376,7 @@ class ResearchStrategy:
         # --- REGIME C: NOISE ---
         if proposed_action == 0:
             regime_label = "C (Noise)"
-            self.rejection_stats[f"Noise (KER {ker_val:.2f})"] += 1
+            self.rejection_stats[f"No Signal Condition"] += 1
             return # Explicit HOLD
 
         # --- FINAL MTF SAFETY CHECK ---
@@ -410,16 +425,21 @@ class ResearchStrategy:
             if proposed_action != 0:
                 self.meta_label_events += 1
 
-            # --- EXECUTION ---
-            min_prob = self.params.get('min_calibrated_probability', 0.55)
+            # --- EXECUTION WITH DYNAMIC CONFIDENCE ---
+            min_prob = self.params.get('min_calibrated_probability', 0.60)
             
+            # STREAK BREAKER: Increase required confidence if in a losing streak
+            if self.consecutive_losses > 0:
+                # Add 0.05 to hurdle for every loss, cap at +0.15
+                streak_penalty = min(0.15, self.consecutive_losses * 0.05)
+                min_prob += streak_penalty
+                
             if confidence < min_prob:
-                self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob})"] += 1
+                self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob:.2f} | Streak: {self.consecutive_losses})"] += 1
                 return
 
             if is_profitable:
                 # CRITICAL FIX: Pass the datetime object (dt_ts) to _execute_entry
-                # This ensures BacktestOrder gets the correct type for timestamps.
                 self._execute_entry(confidence, price, features, broker, dt_ts, proposed_action, regime_label)
             else:
                 self.rejection_stats['Meta-Labeler Reject'] += 1
@@ -428,99 +448,22 @@ class ResearchStrategy:
             if self.debug_mode: logger.error(f"Strategy Error: {e}")
             pass
 
-    def _manage_active_trade(self, pos: BacktestOrder, current_price: float, current_atr: float):
-        """
-        V3.5 DEFENSIVE MANAGEMENT:
-        1. Break-Even Trigger: If Profit > 1.5R, move SL to Entry + Buffer.
-           Buffer ensures commission/swap is covered.
-        2. Trailing Stop: If Profit > Activation ATR, trail by Distance ATR.
-        """
-        if not pos.is_active: return
-        if current_atr <= 0: return
-
-        # Directions
-        is_buy = (pos.action == "BUY")
-        
-        # Calculate Floating Profit in Pips/Dollars equivalent distance
-        # We calculate "Distance" from entry
-        dist_from_entry = (current_price - pos.entry_price) if is_buy else (pos.entry_price - current_price)
-        
-        # --- 1. BREAK-EVEN TRIGGER ---
-        # Logic: If we haven't moved SL yet (or it's worse than entry), calculate initial Risk.
-        # If Profit > 1.5 * Risk, Lock it.
-        
-        # Determine Current Risk Distance (from Entry to SL)
-        # If we are BUY, Risk is Entry - SL. If SELL, Risk is SL - Entry.
-        current_sl_dist = (pos.entry_price - pos.stop_loss) if is_buy else (pos.stop_loss - pos.entry_price)
-        
-        # Only trigger BE if we are actually risking money (SL is "below" entry for buy, "above" for sell)
-        if current_sl_dist > 0:
-            risk_r = current_sl_dist
-            
-            # Check if Profit > 1.5R
-            if dist_from_entry > (1.5 * risk_r):
-                # Calculate Safe Buffer to cover Commissions/Swaps
-                # Assumption: ~2 Pips covers $7/lot comms + spread on most majors/crosses
-                # JPY pairs use 0.01 pip size, others 0.0001
-                is_jpy = "JPY" in self.symbol
-                pip_size = 0.01 if is_jpy else 0.0001
-                cover_buffer = 2.0 * pip_size
-                
-                # Set New SL: Entry +/- Buffer
-                new_sl = pos.entry_price + cover_buffer if is_buy else pos.entry_price - cover_buffer
-                
-                # Double check we aren't moving SL backwards
-                update_needed = False
-                if is_buy and new_sl > pos.stop_loss:
-                    update_needed = True
-                elif not is_buy and (pos.stop_loss == 0 or new_sl < pos.stop_loss):
-                    update_needed = True
-                
-                if update_needed:
-                    pos.stop_loss = new_sl
-                    if "BE" not in pos.comment:
-                        pos.comment += "|BE"
-                    # Return early to let the new stop settle before trailing logic applies
-                    return 
-
-        # --- 2. TRAILING STOP (V3.6 Logic: DELAYED ACTIVATION) ---
-        if self.use_trailing_stop:
-            profit_atr = dist_from_entry / current_atr
-            
-            # Use Configured Activation (e.g., 3.0 ATR) to prevent choking
-            if profit_atr > self.ts_activation_atr:
-                # Trail distance using CONFIG value (e.g., 2.0 ATR)
-                trail_dist = self.ts_distance_atr * current_atr
-                
-                if is_buy:
-                    potential_sl = current_price - trail_dist
-                    # Only move up
-                    if potential_sl > pos.stop_loss:
-                        pos.stop_loss = potential_sl
-                        if "Trail" not in pos.comment: pos.comment += "|Trail"
-                else:
-                    potential_sl = current_price + trail_dist
-                    # Only move down (SL price decreases for sell)
-                    if pos.stop_loss == 0 or potential_sl < pos.stop_loss:
-                        pos.stop_loss = potential_sl
-                        if "Trail" not in pos.comment: pos.comment += "|Trail"
-
     def _execute_entry(self, confidence, price, features, broker, dt_timestamp, action_int, regime):
         """
         Executes the trade entry logic with Fixed Risk.
-        Args:
-            dt_timestamp: The current market time as a datetime object (Required by BacktestOrder).
+        Overrides Config defaults with Optuna parameters to ensure Dynamic R:R.
         """
         action = "BUY" if action_int == 1 else "SELL"
         
         # --- AUDIT FIX: DYNAMIC CORRELATION CHECK ---
-        # Scan broker positions to find JPY exposure (or relevant basket)
         exposure_count = 0
-        quote_currency = self.symbol[-3:] # e.g. "JPY" from "USDJPY"
+        quote_currency = self.symbol[-3:] 
         for pos in broker.open_positions:
             if quote_currency in pos.symbol: 
                 exposure_count += 1
         
+        # Construct Context
+        # Note: Risk Reward passed here is informational, sizing is handled by RiskManager
         ctx = TradeContext(
             symbol=self.symbol,
             price=price,
@@ -528,10 +471,10 @@ class ResearchStrategy:
             account_equity=broker.equity,
             account_currency="USD",
             win_rate=0.45, 
-            risk_reward_ratio=2.0
+            risk_reward_ratio=self.optimized_reward_mult # Use Optimized R:R
         )
 
-        # Calculate Size
+        # Calculate Size using Risk Manager (Calculates default TP/SL from Config)
         current_atr = features.get('atr', 0.001)
         current_ker = features.get('ker', 1.0)
         volatility = features.get('volatility', 0.001)
@@ -547,14 +490,24 @@ class ResearchStrategy:
             account_size=broker.equity
         )
 
-        trade_intent.action = action
-
         if trade_intent.volume <= 0:
             self.rejection_stats[f"Risk Zero: {trade_intent.comment}"] += 1
             return
 
+        # --- OPTIMIZATION OVERRIDE (CRITICAL FOR R:R SEARCH) ---
+        # RiskManager returns Config-based TP. We must override it with
+        # the 'barrier_width' (Reward Multiplier) found by Optuna.
+        # This ensures the Strategy executes exactly what the ML model learned.
+        
+        # 1. Recalculate Dynamic TP
+        dynamic_tp_dist = current_atr * self.optimized_reward_mult
+        trade_intent.take_profit = dynamic_tp_dist
+        
+        # 2. Assign Action
+        trade_intent.action = action
+
         qty = trade_intent.volume
-        stop_dist = trade_intent.stop_loss
+        stop_dist = trade_intent.stop_loss # Keep RiskManager's SL (Fixed Risk)
         tp_dist = trade_intent.take_profit
 
         if qty < 0.01:
@@ -575,7 +528,7 @@ class ResearchStrategy:
             symbol=self.symbol,
             side=side,
             quantity=qty,
-            timestamp_created=dt_timestamp, # CORRECT: Passing datetime object
+            timestamp_created=dt_timestamp, 
             stop_loss=sl_price,
             take_profit=tp_price,
             comment=f"{trade_intent.comment}|Regime:{regime}|Limit:{self.limit_order_offset_pips}p",
@@ -585,7 +538,8 @@ class ResearchStrategy:
                 'rvol': features.get('rvol', 0),
                 'parkinson': features.get('parkinson_vol', 0),
                 'ker': current_ker,
-                'atr': current_atr
+                'atr': current_atr,
+                'optimized_rr': self.optimized_reward_mult
             }
         )
         
@@ -602,7 +556,7 @@ class ResearchStrategy:
             self.feature_importance_counter[f] += 1
 
         self.trade_events.append({
-            'time': dt_timestamp.timestamp(), # Store float for consistent stats/plotting
+            'time': dt_timestamp.timestamp(), 
             'action': action,
             'price': price,
             'conf': confidence,
@@ -618,16 +572,33 @@ class ResearchStrategy:
     def _check_daily_loss_limit(self, broker: BacktestBroker) -> bool:
         """
         Simulates SessionGuard in Backtest.
-        If Daily Drawdown > 4.5%, returns True (BLOCK TRADES).
+        If Daily Drawdown > 4.9% (Relaxed from 4.8%), returns True (BLOCK TRADES).
         """
         try:
-            # Simplified: Check total equity drawdown from Initial Balance
             current_dd_pct = (broker.initial_balance - broker.equity) / broker.initial_balance
-            if current_dd_pct > 0.045: # 4.5% Hard Stop
+            if current_dd_pct > 0.049: # V5.0: Relaxed to 4.9%
                 return True
             return False
         except:
             return False
+
+    def _update_streak_status(self, broker: BacktestBroker):
+        """
+        Updates the consecutive loss counter based on the last closed trade.
+        """
+        if not broker.closed_positions:
+            self.consecutive_losses = 0
+            return
+            
+        # Re-calc streak from history tail (stateless safe)
+        streak = 0
+        for trade in reversed(broker.closed_positions):
+            if trade.net_pnl < 0:
+                streak += 1
+            else:
+                break
+        
+        self.consecutive_losses = streak
 
     def _simulate_mtf_context(self, price: float, dt: datetime) -> Dict[str, Any]:
         """

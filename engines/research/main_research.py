@@ -5,11 +5,12 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (2025-12-30 - FINANCIAL METRICS & REPORTING):
-# 1. FIX: Replaced Trade-based Sharpe with Time-Weighted Sharpe (Hourly).
-# 2. FEATURE: Added 'Total Trades' and 'Expectancy' to the primary report table.
-# 3. FIX: Corrected Sortino Ratio calculation to use downside deviation of returns.
-# 4. REPORTING: Enhanced console output with clearer columns and definitions.
+# AUDIT REMEDIATION (2025-12-31 - PROFIT FIRST OPTIMIZATION):
+# 1. OBJECTIVE CHANGE: Prioritizes Net Profit (PnL) as the primary driver.
+# 2. SCORING FORMULA: Score = (PnL / 100.0) + (Risk_Reward * 5.0).
+#    - Strategies must be profitable to get the R:R bonus.
+#    - Losing strategies return raw negative PnL score (Huge Penalty).
+# 3. REPORTING: SQN and Sharpe Ratio explicitly included in console output.
 # =============================================================================
 import os
 import sys
@@ -73,7 +74,7 @@ class EmojiCallback:
         symbol = study.study_name.replace("study_", "")
         
         # 1. Determine Status Icon & Rank
-        sqn = attrs.get('sqn', 0.0)
+        rr = attrs.get('risk_reward_ratio', 0.0)
         trades = attrs.get('trades', 0)
         pnl = attrs.get('pnl', 0.0)
         
@@ -86,15 +87,12 @@ class EmojiCallback:
         elif trades == 0:
             icon = "💤" # No Trades
             status = "IDLE "
-        elif pnl >= 5000.0: # Aggressive Target
+        elif pnl >= 5000.0:
             icon = "🚀" # To the Moon
             status = "ALPHA"
-        elif pnl >= 500.0:
-            icon = "💎" # Solid
-            status = "PROFIT"
         elif pnl > 0.0:
-            icon = "🛡️" # Weak Profit
-            status = "WEAK "
+            icon = "🛡️" # Profit
+            status = "PROFIT"
         else:
             icon = "🔻" # Loss
             status = "LOSS "
@@ -103,19 +101,20 @@ class EmojiCallback:
         dd = attrs.get('max_dd_pct', 0.0) * 100
         wr = attrs.get('win_rate', 0.0) * 100
         pf = attrs.get('profit_factor', 0.0)
+        sqn = attrs.get('sqn', 0.0)
         sharpe = attrs.get('sharpe', 0.0)
         
         # 3. Format Output (Column Aligned)
-        # Structure: [ICON] STATUS | SYMBOL | ID | SCORE | PnL | WR | DD | PF | SQN | TRADES
+        # Structure: [ICON] STATUS | SYMBOL | ID | R:R | PnL | WR | DD | PF | SQN | SR | TRADES
         msg = (
             f"{icon} {status:<6} | {symbol:<6} | Trial {trial.number:<3} | "
-            f"🏆 Score: {val:>6.2f} | "
+            f"⚖️ R:R: {rr:>4.2f} | " 
             f"💰 PnL: ${pnl:>9,.2f} | "
             f"🎯 WR: {wr:>5.1f}% | "
             f"📉 DD: {dd:>5.2f}% | "
-            f"⚖️ PF: {pf:>4.2f} | "
-            f"🧠 SQN: {sqn:>4.2f} | "
-            f"⚡ Sharpe: {sharpe:>4.2f} | "
+            f"⚡ PF: {pf:>4.2f} | "
+            f"💎 SQN: {sqn:>4.2f} | "
+            f"📈 SR: {sharpe:>4.2f} | "
             f"#️⃣ {trades:<4}"
         )
         
@@ -207,10 +206,10 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'lambda_value': trial.suggest_int('lambda_value', 6, 15),
                 
                 'tbm': {
-                    # Barrier Width as Volatility Multiplier
-                    'barrier_width': trial.suggest_float('barrier_width', 1.5, 3.0),
-                    'horizon_minutes': trial.suggest_int('horizon_minutes', 30, 90),
-                    'drift_threshold': trial.suggest_float('drift_threshold', 0.7, 1.5)
+                    # WIDEN BARRIER to allow high R:R trades to play out
+                    'barrier_width': trial.suggest_float('barrier_width', 2.5, 4.0),
+                    'horizon_minutes': trial.suggest_int('horizon_minutes', 60, 180),
+                    'drift_threshold': trial.suggest_float('drift_threshold', 1.0, 2.0)
                 },
                 
                 # High Conviction Threshold
@@ -243,45 +242,47 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("win_rate", metrics['win_rate'])
             trial.set_user_attr("trades", metrics['total_trades'])
             trial.set_user_attr("profit_factor", metrics['profit_factor'])
+            trial.set_user_attr("risk_reward_ratio", metrics['risk_reward_ratio'])
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("sharpe", metrics['sharpe'])
             
             # ALWAYS Generate Autopsy/Victory Lap Report for analysis
             trial.set_user_attr("autopsy", strategy.generate_autopsy())
             
-            # --- SCORING: SQN DOMINANT (Weight 3.0) + PnL ---
-            pnl_score = metrics['total_pnl'] / 100.0
-            sqn_weight = 3.0 # Golden Config: High weight on stability
-            final_score = pnl_score + (metrics['sqn'] * sqn_weight)
+            # --- PROFIT-FIRST SCORING FUNCTION ---
+            # 1. Base Score = Net Profit in USD
+            # We scale it down (e.g. / 100) to make the numbers manageable alongside other metrics
+            base_score = metrics['total_pnl'] / 100.0
             
-            # Constraint: Minimum Trades (Configurable)
+            # Constraint: Minimum Trades (Statistical Significance)
             min_trades = CONFIG['wfo'].get('min_trades_optimization', 15) 
             total_trades = metrics['total_trades']
             
-            # Activity Bonus (Encourage active bots)
-            if total_trades > 50:
-                final_score += 2.0
-            
             if total_trades < min_trades:
                 trial.set_user_attr("pruned", True)
-                return -100.0 
-
-            # AGGRESSIVE PENALTY for Negative PnL
-            if metrics['total_pnl'] < 0:
-                 loss_ratio = abs(metrics['total_pnl']) / broker.initial_balance
-                 penalty_factor = 1000.0 * loss_ratio 
-                 final_score -= penalty_factor
-                
+                return -1000.0 # Heavy penalty for inactivity
+            
+            # Constraint: Account Blowout
             if broker.is_blown:
                 trial.set_user_attr("blown", True)
-                return -1000.0 
+                return -10000.0 # Maximum penalty
             
-            # Check FTMO Hard Limit (10%) for Scoring penalty, but return score
-            if metrics['max_dd_pct'] > 0.10:
-                # Heavy penalty but allow stats to be recorded
-                final_score -= 5000.0 
-
-            return final_score
+            # If Profitable: Add R:R Bonus
+            if metrics['total_pnl'] > 0:
+                # Add Risk:Reward as a multiplier/bonus
+                # E.g., R:R of 2.0 adds 10 points to the score
+                rr_bonus = metrics['risk_reward_ratio'] * 5.0
+                final_score = base_score + rr_bonus
+                
+                # Check FTMO Hard Limit (10%) for Scoring penalty
+                if metrics['max_dd_pct'] > 0.10:
+                    final_score -= 50.0 # Significant penalty but maybe still profitable
+                
+                return final_score
+            else:
+                # If Losing: Return pure (negative) PnL score
+                # This ensures we always prefer -$100 over -$500, regardless of R:R
+                return base_score
 
         # 3. Connect to Shared Study
         study_name = f"study_{symbol}"
@@ -426,10 +427,10 @@ class ResearchPipeline:
     def calculate_performance_metrics(self, trade_log: List[Dict], initial_capital=100000.0) -> Dict[str, float]:
         """
         Calculates Trade Metrics from the log.
-        AUDIT FIX: Uses Time-Weighted Sharpe (Hourly Returns) for accuracy.
+        AUDIT FIX: Computes Risk:Reward Ratio (Avg Win / Avg Loss).
         """
         metrics_out = {
-            'score': -10.0,
+            'risk_reward_ratio': 0.0,
             'total_pnl': 0.0,
             'max_dd_pct': 0.0,
             'win_rate': 0.0,
@@ -463,22 +464,34 @@ class ResearchPipeline:
         
         metrics_out['avg_win'] = winners['Net_PnL'].mean() if not winners.empty else 0.0
         metrics_out['avg_loss'] = losers['Net_PnL'].mean() if not losers.empty else 0.0
+        
+        # --- RISK REWARD CALCULATION ---
+        avg_loss_abs = abs(metrics_out['avg_loss'])
+        if avg_loss_abs > 0:
+            metrics_out['risk_reward_ratio'] = metrics_out['avg_win'] / avg_loss_abs
+        else:
+            if metrics_out['avg_win'] > 0:
+                metrics_out['risk_reward_ratio'] = 10.0 # Cap for Infinite R:R
+            else:
+                metrics_out['risk_reward_ratio'] = 0.0
+        # -------------------------------
 
         # Profit Factor
         gross_profit = winners['Net_PnL'].sum()
         gross_loss = abs(losers['Net_PnL'].sum())
         metrics_out['profit_factor'] = gross_profit / gross_loss if gross_loss > 0 else 0.0
 
+        # SQN Calculation
+        if len(df) > 1:
+            pnl_std = df['Net_PnL'].std()
+            if pnl_std > 1e-9:
+                metrics_out['sqn'] = np.sqrt(len(df)) * (df['Net_PnL'].mean() / pnl_std)
+
         # 3. Time-Series Equity Curve (Hourly Resampling for Sharpe/Sortino)
-        # We need an equity curve to calculate Drawdown and Time-Weighted returns.
-        # Construct equity curve from trade exits.
         equity_df = pd.DataFrame({'time': df['Exit_Time'], 'pnl': df['Net_PnL']})
         equity_df.set_index('time', inplace=True)
         
-        # Resample to Hourly to capture volatility correctly
         hourly_pnl = equity_df['pnl'].resample('1H').sum().fillna(0)
-        
-        # Reconstruct Equity Curve
         hourly_equity = initial_capital + hourly_pnl.cumsum()
         
         # 4. Drawdown Calculation (High Water Mark)
@@ -489,39 +502,22 @@ class ResearchPipeline:
         metrics_out['max_dd_pct'] = max_dd_pct if not pd.isna(max_dd_pct) else 0.0
 
         # 5. Financial Metrics (Sharpe & Sortino)
-        # Calculate Returns: (Equity_t - Equity_t-1) / Equity_t-1
         hourly_returns = hourly_equity.pct_change().dropna()
         
         if len(hourly_returns) > 1:
             avg_ret = hourly_returns.mean()
             std_ret = hourly_returns.std()
-            
-            # Annualization: Forex trades 24/5 approx ~6240 hours/year (260 * 24)
-            # Crypto/24-7 would be 8760. We'll use 6000 as a safe conservative proxy for active trading hours.
             annual_factor = np.sqrt(252 * 24) 
             
             if std_ret > 1e-9:
                 metrics_out['sharpe'] = (avg_ret / std_ret) * annual_factor
             
-            # Sortino: Downside deviation
             downside_returns = hourly_returns[hourly_returns < 0]
             downside_std = downside_returns.std()
             
             if downside_std > 1e-9:
                 metrics_out['sortino'] = (avg_ret / downside_std) * annual_factor
 
-        # 6. SQN (System Quality Number) - Trade Based
-        # SQN = sqrt(N) * (Expectancy / StdDev(PnL))
-        if len(df) > 1:
-            pnl_std = df['Net_PnL'].std()
-            avg_trade = df['Net_PnL'].mean()
-            if pnl_std > 1e-9:
-                metrics_out['sqn'] = math.sqrt(len(df)) * (avg_trade / pnl_std)
-
-        # Fail Conditions (Applied LAST so we keep the stats)
-        if metrics_out['max_dd_pct'] > 0.10: 
-            metrics_out['score'] = -100.0
-        
         return metrics_out
 
     def _get_sqn_rating(self, sqn: float) -> str:
@@ -536,6 +532,7 @@ class ResearchPipeline:
 
     def run_training(self, fresh_start: bool = False):
         log.info(f"{LogSymbols.TIME} STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
+        log.info(f"OBJECTIVE: MAXIMIZE PROFIT (Primary) + RISK REWARD (Secondary)")
         log.info(f"HARDWARE DETECTED: {psutil.cpu_count(logical=True)} Cores. Using {self.total_cores} workers (Configured).")
         
         for symbol in self.symbols:

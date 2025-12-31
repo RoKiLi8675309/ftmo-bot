@@ -5,14 +5,12 @@
 # DEPENDENCIES: shared, engines.live.dispatcher, engines.live.predictor
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates bars, generates signals.
 #
-# AUDIT REMEDIATION (2025-12-30 - CLOCK SYNC & FINANCIALS):
-# 1. CLOCK SKEW GUARD: Added latency check on incoming ticks. Warns if > 3s drift.
-#    (Critical for preventing "Zombie Trades" downstream in Windows Producer).
-# 2. FRIDAY LIQUIDATION: Forces 'CLOSE_ALL' if SessionGuard indicates weekend close.
-# 3. VOLATILITY GATE: Live enforcement of ATR > Spread Ratio.
-# 4. AUTO-DETECT: Retrieves real account size from Redis for accurate sizing.
-# 5. DATA FIX: Extracts 'bid_vol'/'ask_vol' and computes 'price' from quotes.
-# 6. CONTEXT BRIDGE: Correctly passes D1/H4/Positions to Predictor.
+# AUDIT REMEDIATION (2025-12-31 - OPTIMIZATION EXECUTION):
+# 1. DYNAMIC R:R EXECUTION: Now applies the 'optimized_rr' (barrier_width) 
+#    from the Predictor to override the default Config-based Take Profit.
+#    This ensures Live Trading respects the ML optimization findings.
+# 2. CLOCK SKEW GUARD: Latency checks for robust data sync.
+# 3. FRIDAY LIQUIDATION: Hard closing of positions before weekend.
 # =============================================================================
 import logging
 import time
@@ -66,9 +64,9 @@ class LiveTradingEngine:
     The Central Logic Unit for the Linux Consumer.
     1. Consumes Ticks from Redis.
     2. Aggregates Ticks into Volume Bars.
-    3. Fetches News & Calculates Sentiment (Step 4).
-    4. Feeds Bars to Predictor (Ensemble ARF).
-    5. Dispatches Orders to Windows.
+    3. Fetches News & Calculates Sentiment.
+    4. Feeds Bars to Predictor (Ensemble ARF) -> Gets Optimized R:R.
+    5. Dispatches Orders to Windows with Precise Limits.
     """
     def __init__(self):
         self.shutdown_flag = False
@@ -113,7 +111,7 @@ class LiveTradingEngine:
             lock=self.lock
         )
 
-        # 6. Sentiment Engine (Step 4)
+        # 6. Sentiment Engine
         self.global_sentiment = {} # {symbol: score} or {'GLOBAL': score}
         if NLP_AVAILABLE:
             self.news_thread = threading.Thread(target=self.fetch_news_loop, daemon=True)
@@ -128,7 +126,7 @@ class LiveTradingEngine:
         # --- CONTEXT CACHE (D1/H4 from Windows) ---
         self.latest_context = defaultdict(dict) # {symbol: {'d1': {}, 'h4': {}}}
 
-        # --- AUDIT FIX: Volatility Gate Config ---
+        # --- Volatility Gate Config ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
         self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.5)
@@ -137,31 +135,21 @@ class LiveTradingEngine:
     def fetch_news_loop(self):
         """
         Background thread to fetch news and update sentiment scores.
-        Implementation of Step 4 (Sentiment Integration).
         """
         logger.info(f"{LogSymbols.NEWS} Sentiment Analysis Thread Started.")
         while not self.shutdown_flag:
             try:
-                # 1. Fetch News (Using ForexFactory as proxy or generic financial news)
-                # In production, use specific API. Here we scrape a general page as requested.
                 url = 'https://www.forexfactory.com/news'
                 article = Article(url)
                 article.download()
                 article.parse()
                 
-                # 2. Analyze Sentiment
                 if article.text:
                     blob = TextBlob(article.text)
                     polarity = blob.sentiment.polarity
-                    
-                    # Store as GLOBAL sentiment (affects all pairs)
-                    # We could refine this by searching for "USD", "EUR" in text
                     self.global_sentiment['GLOBAL'] = polarity
-                    
-                    # Decay/Normalize
                     logger.info(f"{LogSymbols.NEWS} Market Sentiment Updated: {polarity:.3f}")
                 
-                # Sleep 5 minutes
                 time.sleep(300)
                 
             except Exception as e:
@@ -171,7 +159,6 @@ class LiveTradingEngine:
     def _get_open_positions_from_redis(self) -> Dict[str, Dict]:
         """
         Fetches the current open positions synced by Windows Producer.
-        Returns format compatible with Predictor: {symbol: {entry_price: ...}}
         """
         magic = CONFIG['trading']['magic_number']
         key = f"{CONFIG['redis']['position_state_key_prefix']}:{magic}"
@@ -193,36 +180,23 @@ class LiveTradingEngine:
     def process_tick(self, tick_data: dict):
         """
         Handles a single raw tick from Redis.
-        Extracts L2 Data (bid_vol/ask_vol) if available.
-        Extracts Context Data (D1/H4) if available.
-        
-        AUDIT FIX: Checks for clock skew between Windows (Producer) and Linux (Consumer).
         """
         try:
             symbol = tick_data.get('symbol')
             if symbol not in self.aggregators: return
             
             # --- CLOCK SKEW CHECK ---
-            # Ideally, Producer sends 'time' as unix float
             tick_ts = float(tick_data.get('time', 0.0))
             now_ts = time.time()
-            
-            # Note: tick_ts from MT5 is usually server time or UTC adjusted. 
-            # We assume Producer normalizes to UTC timestamp.
             latency = now_ts - tick_ts
             
-            # If latency is negative, Windows clock is ahead of Linux. 
-            # If large positive, Windows is lagging or network is slow.
             if abs(latency) > MAX_TICK_LATENCY_SEC:
                 logger.warning(
                     f"{LogSymbols.TIME} CLOCK SKEW DETECTED: {symbol} Tick Drift {latency:.2f}s "
-                    f"(Threshold: {MAX_TICK_LATENCY_SEC}s). "
-                    f"Ensure NTP sync is active on both Host (Windows) and WSL2."
+                    f"(Threshold: {MAX_TICK_LATENCY_SEC}s). Verify NTP sync."
                 )
-            # ------------------------
 
-            # --- DATA INTEGRITY FIX ---
-            # Producer sends 'bid' and 'ask'. We calculate mid-price if 'price' is missing.
+            # --- DATA INTEGRITY ---
             bid = float(tick_data.get('bid', 0.0))
             ask = float(tick_data.get('ask', 0.0))
             
@@ -233,36 +207,28 @@ class LiveTradingEngine:
             else:
                 price = 0.0
                 
-            if price <= 0: return # Skip invalid ticks
+            if price <= 0: return
 
             volume = float(tick_data.get('volume', 1.0))
-            
-            # Extract L2 Flows (New in Producer)
             bid_vol = float(tick_data.get('bid_vol', 0.0))
             ask_vol = float(tick_data.get('ask_vol', 0.0))
 
-            # Update Price Cache for Risk Manager
             self.latest_prices[symbol] = price
             
-            # --- CONTEXT EXTRACTION (FIX) ---
-            # Store latest D1/H4 data for use in on_bar_complete
+            # --- CONTEXT EXTRACTION ---
             if 'ctx_d1' in tick_data:
-                try:
-                    self.latest_context[symbol]['d1'] = json.loads(tick_data['ctx_d1'])
+                try: self.latest_context[symbol]['d1'] = json.loads(tick_data['ctx_d1'])
                 except: pass
             
             if 'ctx_h4' in tick_data:
-                try:
-                    self.latest_context[symbol]['h4'] = json.loads(tick_data['ctx_h4'])
+                try: self.latest_context[symbol]['h4'] = json.loads(tick_data['ctx_h4'])
                 except: pass
-            # --------------------------------
 
-            # 1. Feed Aggregator with L2 Data
-            # AUDIT FIX: Passing external_buy_vol/sell_vol to Aggregator
+            # 1. Feed Aggregator
             bar = self.aggregators[symbol].process_tick(
                 price=price, 
                 volume=volume, 
-                timestamp=tick_ts, # Use original tick time for bar timestamp
+                timestamp=tick_ts, 
                 external_buy_vol=bid_vol, 
                 external_sell_vol=ask_vol
             )
@@ -277,6 +243,7 @@ class LiveTradingEngine:
     def on_bar_complete(self, bar: VolumeBar):
         """
         Triggered when a Volume Bar is closed.
+        Executes the Prediction and Dispatch logic with Dynamic R:R.
         """
         # 1. Update Portfolio Risk State
         try:
@@ -289,10 +256,8 @@ class LiveTradingEngine:
         except Exception as e:
             logger.error(f"Portfolio Update Error: {e}")
         
-        # 2. Prepare Context (Sentiment + MT5 Data + Positions)
-        # --- CRITICAL FIX: AGGREGATE ALL CONTEXT ---
+        # 2. Prepare Context
         current_sentiment = self.global_sentiment.get('GLOBAL', 0.0)
-        
         mt5_context = self.latest_context.get(bar.symbol, {})
         open_positions = self._get_open_positions_from_redis()
         
@@ -300,39 +265,25 @@ class LiveTradingEngine:
             'd1': mt5_context.get('d1', {}),
             'h4': mt5_context.get('h4', {}),
             'sentiment': current_sentiment,
-            'positions': open_positions  # Pass positions for Pyramiding Check
+            'positions': open_positions
         }
-        # -------------------------------------------
         
         # 3. Get Signal
-        # Predictor now has visibility into Trends (D1/H4) and Existing Trades (Pyramiding)
         signal = self.predictor.process_bar(bar.symbol, bar, context_data=context_data)
         
         if not signal: return
 
-        # --- FRIDAY LIQUIDATION CHECK (GAP PROTECTION) ---
+        # --- FRIDAY LIQUIDATION CHECK ---
         if self.session_guard.should_liquidate():
             if not self.liquidation_triggered_map[bar.symbol]:
-                logger.warning(f"{LogSymbols.CLOSE} FRIDAY LIQUIDATION: Closing all {bar.symbol} trades for weekend.")
-                
-                # Send CLOSE_ALL Trade Intent
-                close_intent = Trade(
-                    symbol=bar.symbol,
-                    action="CLOSE_ALL",
-                    volume=0.0, # Irrelevant for Close All
-                    entry_price=0.0,
-                    stop_loss=0.0,
-                    take_profit=0.0,
-                    comment="Friday Liquidation"
-                )
+                logger.warning(f"{LogSymbols.CLOSE} FRIDAY LIQUIDATION: Closing all {bar.symbol} trades.")
+                close_intent = Trade(symbol=bar.symbol, action="CLOSE_ALL", volume=0.0, entry_price=0.0, stop_loss=0.0, take_profit=0.0, comment="Friday Liquidation")
                 self.dispatcher.send_order(close_intent, 0.0)
                 self.liquidation_triggered_map[bar.symbol] = True
-            return # Block new entries
+            return 
         else:
-            # Reset trigger if we are out of the liquidation window (e.g. Monday)
             if self.liquidation_triggered_map[bar.symbol]:
                 self.liquidation_triggered_map[bar.symbol] = False
-        # -------------------------------------------------
 
         # --- PHASE 2: WARM-UP GATE ---
         if signal.action == "WARMUP":
@@ -344,16 +295,15 @@ class LiveTradingEngine:
             
         logger.info(f"{LogSymbols.SIGNAL} SIGNAL: {signal.action} {bar.symbol} (Conf: {signal.confidence:.2f})")
 
-        # --- AUDIT FIX: VOLATILITY GATE ---
+        # --- VOLATILITY GATE ---
         current_atr = signal.meta_data.get('atr', 0.0)
-        
         if self.use_vol_gate:
             pip_size, _ = RiskManager.get_pip_info(bar.symbol)
             spread_pips = self.spread_map.get(bar.symbol, 1.5)
             spread_cost = spread_pips * pip_size
             
             if current_atr < (spread_cost * self.min_atr_spread_ratio):
-                logger.warning(f"{LogSymbols.LOCK} Vol Gate: {bar.symbol} Rejected. ATR {current_atr:.5f} < {self.min_atr_spread_ratio}x Spread.")
+                logger.warning(f"{LogSymbols.LOCK} Vol Gate: {bar.symbol} Rejected. Low Volatility.")
                 return
 
         # 5. Check Risk & Compliance Gates
@@ -362,21 +312,18 @@ class LiveTradingEngine:
 
         # 6. Calculate Size (Fixed Risk Mode)
         volatility = signal.meta_data.get('volatility', 0.001)
-        
         active_corrs = self.portfolio_mgr.get_correlation_count(
             bar.symbol, 
             threshold=CONFIG['risk_management']['correlation_penalty_threshold']
         )
 
-        # --- AUTO-DETECT: Retrieve Account Size from Redis ---
-        # The Windows Producer updates 'bot:account_info' and 'bot:account_size'.
-        # We fetch this to ensure sizing is based on real equity.
         try:
             cached_size = self.stream_mgr.r.get("bot:account_size")
             account_size = float(cached_size) if cached_size else self.ftmo_guard.equity
         except:
             account_size = self.ftmo_guard.equity
 
+        # Initial Context (R:R is informational here)
         ctx = TradeContext(
             symbol=bar.symbol,
             price=bar.close,
@@ -387,7 +334,7 @@ class LiveTradingEngine:
             risk_reward_ratio=2.0 
         )
 
-        # Calculate Size
+        # Get Base Trade Intent (Uses Config R:R by default)
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=signal.confidence,
@@ -395,7 +342,7 @@ class LiveTradingEngine:
             active_correlations=active_corrs,
             market_prices=self.latest_prices,
             atr=current_atr,
-            account_size=account_size # Use real account size
+            account_size=account_size
         )
 
         if trade_intent.volume <= 0:
@@ -404,24 +351,30 @@ class LiveTradingEngine:
 
         trade_intent.action = signal.action
 
-        # --- ALPHA GENERATOR: AGGRESSIVE PYRAMIDING EXECUTION ---
-        # Check if Predictor flagged this as a Pyramid trade
-        is_pyramid = signal.meta_data.get('pyramid', False)
+        # --- CRITICAL UPDATE: DYNAMIC R:R OVERRIDE ---
+        # Look for 'optimized_rr' in the signal (passed from Predictor)
+        # and override the default Take Profit.
+        optimized_rr = signal.meta_data.get('optimized_rr')
         
+        if optimized_rr and optimized_rr > 0 and current_atr > 0:
+            # Overwrite the default config-based TP
+            new_tp_dist = current_atr * optimized_rr
+            trade_intent.take_profit = new_tp_dist
+            
+            # Update comment for audit
+            trade_intent.comment += f"|OptRR:{optimized_rr:.2f}"
+            # logger.info(f"⚡ {bar.symbol}: Applying Optimized R:R {optimized_rr:.2f} (TP: {new_tp_dist:.5f})")
+        # ---------------------------------------------
+
+        # --- PYRAMIDING LOGIC ---
+        is_pyramid = signal.meta_data.get('pyramid', False)
         if is_pyramid:
-            # Scale In Logic: Half Size
             original_volume = trade_intent.volume
             trade_intent.volume = round(original_volume * 0.5, 2)
-            
-            # Ensure we respect min lot size
             min_lot = CONFIG['risk_management'].get('min_lot_size', 0.01)
-            if trade_intent.volume < min_lot:
-                trade_intent.volume = min_lot
-            
-            # Tag the trade for audit
+            if trade_intent.volume < min_lot: trade_intent.volume = min_lot
             trade_intent.comment += "|PYRAMID"
-            logger.info(f"⚡ PYRAMID EXECUTION: Scaling In {trade_intent.volume} lots (Base: {original_volume})")
-        # --------------------------------------------------------
+            logger.info(f"⚡ PYRAMID: Scaling In {trade_intent.volume} lots")
 
         # 7. Dispatch
         self.dispatcher.send_order(trade_intent, risk_usd)
@@ -430,21 +383,17 @@ class LiveTradingEngine:
         """
         Runs the gauntlet of safety checks.
         """
-        # 1. FTMO Hard Limits (CRITICAL - NEVER BYPASS)
         if not self.ftmo_guard.can_trade():
             logger.warning(f"{LogSymbols.LOCK} FTMO Guard: Trading Halted (Drawdown).")
             return False
 
-        # 2. Session Time
         if not self.session_guard.is_trading_allowed():
             return False
 
-        # 3. Penalty Box
         if self.portfolio_mgr.check_penalty_box(symbol):
             logger.warning(f"{LogSymbols.LOCK} {symbol} is in Penalty Box.")
             return False
 
-        # 4. News Blackout
         if not self.news_monitor.check_trade_permission(symbol):
              return False
 
@@ -482,7 +431,6 @@ class LiveTradingEngine:
                             self.process_tick(data)
                             self.stream_mgr.r.xack(stream_key, group, message_id)
                 
-                # Update local equity cache from Redis (pushed by Producer)
                 try:
                     cached_eq = self.stream_mgr.r.get(CONFIG['redis']['risk_keys']['current_equity'])
                     if cached_eq:

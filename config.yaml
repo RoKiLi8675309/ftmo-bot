@@ -1,13 +1,15 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V3.6 (R:R FIX)
-# STATUS: PROFITABILITY FOCUS + 1:2.5 TARGET RATIO
+# config.yaml – PROJECT PHOENIX V5.0 (BACK TO BASICS)
+# STATUS: SIMPLIFIED | TARGET: 10% IN 90 DAYS
 #
-# CHANGES (2025-12-30 - RISK/REWARD OPTIMIZATION):
-# 1. TRAILING STOP OVERHAUL:
-#    - Activation delayed to 3.0 ATR (1.5x Risk). Prevents choking winners.
-#    - Trail Distance widened to 2.0 ATR (1.0x Risk). Allows volatility breathing room.
-# 2. TARGET RATIO: Increased TP to 5.0 ATR (1:2.5 Risk:Reward).
-# 3. STRATEGY GATES: Maintained V3.5 logic but aligned with higher targets.
+# OVERHAUL (2025-12-30 - USER REQUEST):
+# 1. COMPLEXITY NUKE: Disabled Trailing Stop and Breakeven.
+#    - Pure "Set and Forget" logic.
+# 2. RISK:REWARD: Fixed at 1:2.
+#    - Stop Loss: 1.5 ATR.
+#    - Take Profit: 3.0 ATR.
+# 3. RISK SIZING: Lowered to 0.5% to prevent Daily Limit breaches.
+# 4. GATES: Relaxed slightly to allow more frequency for the 1:2 math to play out.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -26,7 +28,7 @@ logging:
 
 # --- BROKER CONNECTION ---
 mt5:
-  login: null # Loaded from .env or AWS Secrets
+  login: null 
   password: null
   server: "FTMO-Server"
   path: "C:\\Program Files\\FTMO MetaTrader 5\\terminal64.exe"
@@ -86,7 +88,7 @@ data:
   num_candles_wfo: 10000
   num_candles_backtest: 200000
 
-# --- FEATURE ENGINEERING (PROJECT PHOENIX L1 PROXIES) ---
+# --- FEATURE ENGINEERING ---
 features:
   use_causal_features: true
   n_jobs: 20
@@ -97,10 +99,10 @@ features:
   use_log_returns: true
   
   # Project Phoenix L1 Proxies
-  use_parkinson_vol: true    # High/Low Volatility
-  use_amihud_liquidity: true # Return / DollarVolume
-  use_relative_volume: true  # Vol / SMA(Vol)
-  use_aggressor_ratio: true  # Close location within High-Low
+  use_parkinson_vol: true    
+  use_amihud_liquidity: true 
+  use_relative_volume: true  
+  use_aggressor_ratio: true  
   
   # Legacy / Context
   use_regime: true
@@ -126,26 +128,26 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 18    # V3.2: 18 (Sensitive Trend detection)
+    threshold: 18 
   
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V3.5 FTMO GUARDIAN) ---
+# --- PHOENIX STRATEGY PARAMETERS (V5.0 SIMPLE) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true     
   require_d1_trend: true            
   require_h4_alignment: true        
   
-  # --- FILTER THRESHOLDS (LOOSENED FOR FREQUENCY) ---
-  # Volume Exhaustion
-  max_relative_volume: 5.0        
+  # --- FILTER THRESHOLDS ---
+  # Volume Exhaustion (Standardized)
+  max_relative_volume: 4.0        
   
-  # Trend Efficiency
-  ker_trend_threshold: 0.35        
+  # Trend Efficiency (Relaxed slightly to allow 1:2 setups to form)
+  ker_trend_threshold: 0.35       
   
   # Volatility Expansion
   vol_expansion_threshold: 1.5 
@@ -153,14 +155,14 @@ phoenix_strategy:
   # Entry Gates
   range_gate_atr_mult: 1.0        
   
-  # Volume Gate (CRITICAL CHANGE)
+  # Volume Gate (RVol > Ratio)
   volume_gate_ratio: 1.1          
   
   # Momentum Conviction
-  aggressor_threshold: 0.55        
+  aggressor_threshold: 0.55       
   
   # ML Confidence
-  ml_confirmation_threshold: 0.55 
+  ml_confirmation_threshold: 0.60 
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -174,34 +176,37 @@ risk_management:
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # Risk Per Trade (SURVIVAL MODE: 0.5%)
+  # Risk Per Trade (SAFE: 0.5%)
+  # Allows ~10 consecutive losses before hitting daily limit
   base_risk_per_trade_percent: 0.5 
   
-  max_daily_loss_pct: 0.045       # 4.5% (FTMO Limit is 5%)
-  max_total_loss_pct: 0.09        # 9% (FTMO Limit is 10%)
-  max_risk_percent: 2.0           # Max open risk at any time (4 trades @ 0.5%)
+  max_daily_loss_pct: 0.048       # 4.8% (FTMO Limit is 5% - Keep buffer)
+  max_total_loss_pct: 0.098       # 9.8% (FTMO Limit is 10%)
+  max_risk_percent: 1.5           # Max open risk at any time (3 trades @ 0.5%)
   max_leverage: 30.0
-  max_lot_size: 5.0               
+  max_lot_size: 50.0 
   min_lot_size: 0.01
   
-  # PROJECT PHOENIX EXIT LOGIC (1:2.5 RISK:REWARD TARGET)
-  stop_loss_atr_mult: 2.0         
-  take_profit_atr_mult: 5.0       # INCREASED from 4.0 (Target 2.5R Wins)
+  # PROJECT PHOENIX EXIT LOGIC (1:2 RATIO)
+  stop_loss_atr_mult: 1.5         # Standard Volatility Stop
+  take_profit_atr_mult: 3.0       # Exact 1:2 Risk:Reward
   
-  # TRAILING STOP (R:R FIX: DELAYED ACTIVATION)
+  # TIER 1: BREAKEVEN (DISABLED)
+  breakeven:
+    enabled: false       # SIMPLIFIED: Let the trade hit TP or SL
+    activation_atr: 2.0  
+    profit_pips: 2.0     
+  
+  # TIER 2: TRAILING STOP (DISABLED)
   trailing_stop:
-    enabled: true
-    # Activation: Must be > Risk (2.0 ATR). 
-    # Setting to 3.0 (1.5R) ensures we lock only after significant profit.
-    activation_atr: 3.0           # INCREASED from 1.5
-    
-    # Distance: Widen to 2.0 (1.0R). 
-    # Prevents being wicked out of winning trades.
-    distance_atr: 2.0             # INCREASED from 1.5
+    enabled: false       # SIMPLIFIED: Let the trade hit TP or SL
+    activation_atr: 2.5           
+    distance_atr: 2.0             
     step_atr: 0.5                 
   
   risk_timezone: "Europe/Prague"
-  friday_liquidation_hour_server: 21 
+  friday_entry_cutoff_hour: 16       # Stop entries at 16:00 Server Time
+  friday_liquidation_hour_server: 21 # Hard Close at 21:00 Server Time
   
   commission_per_lot_rt: 5.0
   contract_size: 100000
@@ -238,44 +243,44 @@ online_learning:
   model_type: "ARFClassifier"
   
   # CONFIGURATION
-  n_models: 40        
-  grace_period: 150        
-  delta: 0.00005          
+  n_models: 50        
+  grace_period: 200   
+  delta: 0.00001      
   warning_delta: 0.001    
   lambda_value: 10        
-  max_features: 'log2'    
+  max_features: 'sqrt'    
   metric: "LogLoss"        
   
-  burn_in_periods: 100    
+  burn_in_periods: 200    
   
   # Volatility Gate
   volatility_gate:
     enabled: true
-    min_atr_spread_ratio: 1.2
+    min_atr_spread_ratio: 1.5 
   
-  positive_class_weight: 2.0
-  negative_class_weight: 2.0
+  positive_class_weight: 1.5 
+  negative_class_weight: 1.0
   
-  meta_labeling_threshold: 0.53 
+  meta_labeling_threshold: 0.55 
   
   tbm:
-    horizon_minutes: 60
-    barrier_width: 1.5        
-    min_profit_pips: 5.0
-    drift_threshold: 1.2 
+    horizon_minutes: 120      
+    barrier_width: 2.5        # WIDENED: Train on larger moves to match new TP
+    min_profit_pips: 10.0     
+    drift_threshold: 1.5 
   
   learning_horizon_sec: 300
   
-  # High Confidence Only
-  min_calibrated_probability: 0.55 
+  # Standard Confidence
+  min_calibrated_probability: 0.60 
 
 # --- NEWS FILTER ---
 news_filter:
   enabled: true
   primary_url: "http://nfs.faireconomy.media/ff_calendar_thisweek.xml"
   backup_url: "https://www.forexfactory.com/calendar"
-  buffer_minutes_before: 15 
-  buffer_minutes_after: 15
+  buffer_minutes_before: 30 
+  buffer_minutes_after: 30
   restricted_events:
     USD: ["FOMC", "NFP", "CPI", "GDP", "Rate"]
     EUR: ["ECB", "CPI", "Rate"]
@@ -291,8 +296,8 @@ forensic_audit:
     default: 1.5
     GBPJPY: 2.5
     USDJPY: 1.5
-    EURJPY: 2.0  # Added
-    AUDJPY: 2.5  # Added
+    EURJPY: 2.0 
+    AUDJPY: 2.5 
     GBPUSD: 1.8
     EURUSD: 1.2
     XAUUSD: 30.0

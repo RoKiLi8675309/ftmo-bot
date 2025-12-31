@@ -5,13 +5,11 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# AUDIT REMEDIATION (2025-12-30 - FORENSIC ACCURACY):
-# 1. CONVERSION INTEGRITY: Added strict logging warnings when Static Fallbacks 
-#    are triggered during Risk Calculation. Prevents silent PnL drift.
-# 2. SIZING METHOD: Strict 'fixed_risk' logic aligned with FTMO constraints.
-#    Formula: Lots = (Equity * Risk%) / (SL_Distance * PipValue).
-# 3. FRIDAY LIQUIDATION: Added SessionGuard.should_liquidate() logic.
-# 4. KER SCALING: Clamped to [0.8, 1.0] to prevent over-penalizing.
+# AUDIT REMEDIATION (2025-01-02 - FRIDAY GUARD & TIERED RISK):
+# 1. FRIDAY GUARD: Added is_friday_afternoon() to separate "Stop Entries" from
+#    "Liquidation". Stops churn at 17:00, liquidates at 21:00.
+# 2. SIZING: Maintained strict fixed_risk logic.
+# 3. COMPATIBILITY: SessionGuard now accepts timestamps for Backtest accuracy.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -67,8 +65,6 @@ class RiskManager:
         """
         Calculates the Quote -> USD conversion rate using LIVE market data.
         Critical for accurate risk calculation in USD.
-        
-        AUDIT FIX: Logs warning if Static Fallback is used while market_prices are expected.
         """
         s = symbol.upper()
         
@@ -88,7 +84,6 @@ class RiskManager:
             if usdjpy and usdjpy > 0: return 1.0 / usdjpy
             if s == "USDJPY" and price > 0: return 1.0 / price
             
-            # CRITICAL AUDIT WARNING
             if market_prices is not None:
                 logger.warning(f"⚠️ RISK MISMATCH: Missing USDJPY price for {symbol} conversion. Using static 150.0 fallback.")
             return 0.00666 # Fallback ~150.0
@@ -153,7 +148,6 @@ class RiskManager:
     ) -> Tuple[Trade, float]:
         """
         Calculates position size using 'fixed_risk' logic only.
-        Kelly Criterion has been removed as requested.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -166,7 +160,6 @@ class RiskManager:
         c_size = contract_size_override if contract_size_override else risk_conf.get('contract_size', RiskManager.DEFAULT_CONTRACT_SIZE)
         
         # USE DETECTED ACCOUNT SIZE (if available), else default to Config
-        # This handles the case where backtester has varying equity
         start_equity = account_size if account_size else float(CONFIG.get('env', {}).get('initial_balance', 100000.0))
         
         # --- ADAPTIVE STOP LOSS (ATR Based) ---
@@ -177,7 +170,7 @@ class RiskManager:
         if atr and atr > 0:
             stop_dist = atr * atr_mult_sl
         else:
-            # Fallback 0.2% of price if ATR missing or zero (Widened fallback)
+            # Fallback 0.2% of price if ATR missing or zero
             stop_dist = price * 0.002 * atr_mult_sl
             
         # --- DEAD PAIR PROTECTION (SPREAD CLAMP) ---
@@ -192,38 +185,32 @@ class RiskManager:
         sl_pips = stop_dist / pip_val
 
         # --- CROSS-PAIR PIP VALUE CALCULATION ---
-        # Value of 1 Pip in USD for 1 Lot
-        # Formula: ContractSize * PipSize * ConversionRate
         conversion_rate = RiskManager.get_conversion_rate(symbol, price, market_prices)
         
         if conversion_rate <= 0:
             return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, "Conversion Error"), 0.0
             
         usd_per_pip_per_lot = c_size * pip_val * conversion_rate
-        # Risk in USD per 1 Lot trade given the calculated Stop Loss
         loss_per_lot_usd = sl_pips * usd_per_pip_per_lot
         
         lots = 0.0
         calculated_risk_usd = 0.0
         
         # --- PROP FIRM STANDARD: Risk % of Equity ---
-        risk_pct = risk_conf.get('base_risk_per_trade_percent', 0.5)
+        risk_pct = risk_conf.get('base_risk_per_trade_percent', 1.0) # Updated default to 1.0
         
         # Drawdown Brake: If in significant drawdown (>4%), reduce risk
-        # This helps survive bad streaks without blowing the account
         if balance < (start_equity * 0.96):
-            risk_pct *= 0.75 # Reduce risk by 25% (e.g., 0.5% -> 0.375%)
+            risk_pct *= 0.75 
         
         # Calculate Risk Amount in USD
         calculated_risk_usd = balance * (risk_pct / 100.0)
         
-        # KER Scaling: Minor penalty for chop, but don't kill the trade
-        # Clamp KER between 0.8 and 1.0 (Audit Requirement)
+        # KER Scaling: Clamp KER between 0.8 and 1.0
         ker_scalar = max(0.8, min(ker, 1.0))
         calculated_risk_usd *= ker_scalar
         
-        # Confidence Scaling: Boost high confidence, trim low
-        # If conf > 0.8, full size. If conf < 0.6, half size.
+        # Confidence Scaling
         conf_scalar = min(1.0, max(0.5, conf / 0.8))
         calculated_risk_usd *= conf_scalar
 
@@ -238,10 +225,10 @@ class RiskManager:
 
         # --- CONSTRAINTS & SANITIZATION ---
         min_lot = risk_conf.get('min_lot_size', 0.01)
-        max_lot = risk_conf.get('max_lot_size', 50.0) # Cap at 50 lots
+        max_lot = risk_conf.get('max_lot_size', 50.0)
         max_lev = risk_conf.get('max_leverage', 30.0)
         
-        # 1. Leverage Cap (Broker Constraint)
+        # 1. Leverage Cap
         notional_value = lots * c_size * price * conversion_rate
         if notional_value > 0:
             current_leverage = notional_value / balance
@@ -267,6 +254,118 @@ class RiskManager:
         )
         
         return trade, final_risk_usd
+
+class SessionGuard:
+    def __init__(self):
+        risk_conf = CONFIG.get('risk_management', {})
+        tz_str = risk_conf.get('risk_timezone', 'Europe/Prague')
+        try:
+            self.market_tz = pytz.timezone(tz_str)
+        except Exception:
+            self.market_tz = pytz.timezone('Europe/Prague')
+            
+        self.friday_cutoff = dt_time(19, 0) # Generic weekly cutoff
+        self.monday_start = dt_time(1, 0)
+        self.rollover_start = dt_time(23, 50)
+        self.rollover_end = dt_time(1, 15)
+        
+        # FTMO Spec: Stop entries early, Liquidate later
+        self.friday_entry_cutoff_hour = risk_conf.get('friday_entry_cutoff_hour', 17)
+        self.liquidation_hour = risk_conf.get('friday_liquidation_hour_server', 21)
+
+    def is_trading_allowed(self) -> bool:
+        """
+        General market hours check (Weekend, Rollover).
+        """
+        now_local = datetime.now(self.market_tz)
+        weekday = now_local.weekday()
+        current_time = now_local.time()
+        
+        if weekday == 5: return False # Saturday
+        if weekday == 6 and current_time < self.monday_start: return False # Sunday AM
+        if weekday == 4 and current_time > self.friday_cutoff: return False # Late Friday generic
+        
+        if current_time >= self.rollover_start or current_time <= self.rollover_end:
+            return False
+            
+        return True
+
+    def is_friday_afternoon(self, timestamp: Optional[datetime] = None) -> bool:
+        """
+        Returns True if it is Friday and past the entry cutoff hour (e.g., 17:00).
+        This differentiates "No New Entries" from "Market Closed".
+        """
+        if timestamp:
+            # Handle timezone if provided, otherwise assume aligned
+            if timestamp.tzinfo is None:
+                dt = timestamp
+            else:
+                dt = timestamp.astimezone(self.market_tz)
+        else:
+            dt = datetime.now(self.market_tz)
+            
+        if dt.weekday() == 4 and dt.hour >= self.friday_entry_cutoff_hour:
+            return True
+            
+        return False
+
+    def should_liquidate(self) -> bool:
+        """
+        Returns True if it is Friday and past the liquidation hour.
+        This forces the bot to close all trades before the weekend.
+        """
+        now_local = datetime.now(self.market_tz)
+        weekday = now_local.weekday()
+        
+        # Check if Friday (4) and hour >= liquidation hour (e.g., 21:00)
+        if weekday == 4 and now_local.hour >= self.liquidation_hour:
+            return True
+            
+        return False
+
+class FTMORiskMonitor:
+    """
+    Monitors account health against FTMO's strict drawdown limits.
+    """
+    def __init__(self, initial_balance: float, max_daily_loss_pct: float, redis_client):
+        self.initial_balance = initial_balance
+        self.max_daily_loss = initial_balance * max_daily_loss_pct
+        self.r = redis_client
+        self.starting_equity_of_day = initial_balance
+        self.equity = initial_balance
+        
+        # 10% Profit Target (FTMO Challenge Goal)
+        self.profit_target = initial_balance * 1.10
+
+    def can_trade(self) -> bool:
+        # 1. Total Drawdown Check (10% Max)
+        if self.equity < (self.initial_balance * 0.90): return False
+        
+        # 2. Daily Drawdown Check (5% Max)
+        current_daily_loss = self.starting_equity_of_day - self.equity
+        if current_daily_loss >= self.max_daily_loss: return False
+        
+        # 3. Circuit Breaker: Profit Target Reached
+        if self.equity >= self.profit_target:
+            return False
+            
+        return True
+
+    def _check_constraints(self, risk_to_add: float):
+        pass
+        
+    def check_circuit_breakers(self) -> str:
+        if self.equity < (self.initial_balance * 0.90): return "Total Drawdown Breach"
+        
+        current_daily_loss = self.starting_equity_of_day - self.equity
+        if current_daily_loss >= self.max_daily_loss: return "Daily Drawdown Breach"
+        
+        if self.equity >= self.profit_target: return "Profit Target Reached (Victory Lap)"
+        
+        return "OK"
+
+    def update_equity(self, current_equity: float):
+        self.equity = current_equity
 
 class HierarchicalRiskParity:
     """
@@ -372,93 +471,3 @@ class PortfolioRiskManager:
     def add_to_penalty_box(self, symbol: str, duration_minutes: int = 60):
         self.penalty_box[symbol] = time.time() + (duration_minutes * 60)
         logger.warning(f"🚫 {symbol} added to Penalty Box for {duration_minutes}m")
-
-class FTMORiskMonitor:
-    """
-    Monitors account health against FTMO's strict drawdown limits.
-    """
-    def __init__(self, initial_balance: float, max_daily_loss_pct: float, redis_client):
-        self.initial_balance = initial_balance
-        self.max_daily_loss = initial_balance * max_daily_loss_pct
-        self.r = redis_client
-        self.starting_equity_of_day = initial_balance
-        self.equity = initial_balance
-        
-        # 10% Profit Target (FTMO Challenge Goal)
-        self.profit_target = initial_balance * 1.10
-
-    def can_trade(self) -> bool:
-        # 1. Total Drawdown Check (10% Max)
-        if self.equity < (self.initial_balance * 0.90): return False
-        
-        # 2. Daily Drawdown Check (5% Max)
-        current_daily_loss = self.starting_equity_of_day - self.equity
-        if current_daily_loss >= self.max_daily_loss: return False
-        
-        # 3. Circuit Breaker: Profit Target Reached
-        if self.equity >= self.profit_target:
-            logger.info("🎉 PROFIT TARGET REACHED! Trading Halted to preserve pass.")
-            return False
-            
-        return True
-
-    def _check_constraints(self, risk_to_add: float):
-        pass
-        
-    def check_circuit_breakers(self) -> str:
-        if self.equity < (self.initial_balance * 0.90): return "Total Drawdown Breach"
-        
-        current_daily_loss = self.starting_equity_of_day - self.equity
-        if current_daily_loss >= self.max_daily_loss: return "Daily Drawdown Breach"
-        
-        if self.equity >= self.profit_target: return "Profit Target Reached (Victory Lap)"
-        
-        return "OK"
-
-    def update_equity(self, current_equity: float):
-        self.equity = current_equity
-
-class SessionGuard:
-    def __init__(self):
-        risk_conf = CONFIG.get('risk_management', {})
-        tz_str = risk_conf.get('risk_timezone', 'Europe/Prague')
-        try:
-            self.market_tz = pytz.timezone(tz_str)
-        except Exception:
-            self.market_tz = pytz.timezone('Europe/Prague')
-            
-        self.friday_cutoff = dt_time(19, 0)
-        self.monday_start = dt_time(1, 0)
-        self.rollover_start = dt_time(23, 50)
-        self.rollover_end = dt_time(1, 15)
-        
-        # For Liquidation (Uses Server Time usually, simplified to local/config time)
-        self.liquidation_hour = risk_conf.get('friday_liquidation_hour_server', 21)
-
-    def is_trading_allowed(self) -> bool:
-        now_local = datetime.now(self.market_tz)
-        weekday = now_local.weekday()
-        current_time = now_local.time()
-        
-        if weekday == 5: return False
-        if weekday == 6 and current_time < self.monday_start: return False
-        if weekday == 4 and current_time > self.friday_cutoff: return False
-        
-        if current_time >= self.rollover_start or current_time <= self.rollover_end:
-            return False
-            
-        return True
-
-    def should_liquidate(self) -> bool:
-        """
-        Returns True if it is Friday and past the liquidation hour.
-        This forces the bot to close all trades before the weekend.
-        """
-        now_local = datetime.now(self.market_tz)
-        weekday = now_local.weekday()
-        
-        # Check if Friday (4) and hour >= liquidation hour (e.g., 21:00)
-        if weekday == 4 and now_local.hour >= self.liquidation_hour:
-            return True
-            
-        return False

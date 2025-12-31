@@ -6,10 +6,10 @@
 # DESCRIPTION: Event-Driven Backtesting Broker. Simulates execution, spread,
 # commissions, and PnL tracking for strategy validation.
 #
-# AUDIT REMEDIATION (2025-12-30):
-# 1. CRITICAL FIX: Removed hardcoded commissions ($7/$10). Linked to Config ($5).
-# 2. CRITICAL FIX: Removed hardcoded slippage. Linked to Config Spread Map.
-# 3. METRICS: Validated Equity Curve vs Trade Log PnL consistency.
+# AUDIT REMEDIATION (2025-12-31):
+# 1. METRICS UPDATE: Added native 'risk_reward_ratio' to get_stats().
+# 2. CRITICAL FIX: Removed hardcoded commissions ($7/$10). Linked to Config ($5).
+# 3. CRITICAL FIX: Removed hardcoded slippage. Linked to Config Spread Map.
 # 4. COMPATIBILITY: Added positions property and submit_order API.
 # =============================================================================
 from __future__ import annotations
@@ -397,7 +397,7 @@ class BacktestBroker:
     def get_stats(self) -> Dict[str, Any]:
         """
         Generates comprehensive performance statistics for the backtest.
-        Includes Max Drawdown, Sharpe, Sortino, Win Rate, Expectancy, etc.
+        Includes Max Drawdown, Sharpe, Sortino, Win Rate, Expectancy, and Risk:Reward.
         """
         stats = {
             "initial_balance": self.initial_balance,
@@ -414,6 +414,7 @@ class BacktestBroker:
             "expectancy": 0.0,
             "avg_win": 0.0,
             "avg_loss": 0.0,
+            "risk_reward_ratio": 0.0, # NATIVE SUPPORT ADDED
             "largest_win": 0.0,
             "largest_loss": 0.0
         }
@@ -435,6 +436,13 @@ class BacktestBroker:
             stats["avg_loss"] = np.mean(losses) if losses else 0.0
             stats["largest_win"] = max(wins) if wins else 0.0
             stats["largest_loss"] = min(losses) if losses else 0.0
+            
+            # Risk:Reward Ratio (Avg Win / Avg Loss)
+            avg_loss_abs = abs(stats["avg_loss"])
+            if avg_loss_abs > 0:
+                stats["risk_reward_ratio"] = stats["avg_win"] / avg_loss_abs
+            else:
+                stats["risk_reward_ratio"] = 10.0 if stats["avg_win"] > 0 else 0.0
             
             # Expectancy = (Win% * AvgWin) - (Loss% * AvgLoss)
             win_pct = len(wins) / len(pnls)
