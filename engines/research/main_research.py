@@ -5,12 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (2025-12-31 - PROFIT FIRST OPTIMIZATION & CONFIG):
-# 1. OPTIMIZATION: Ranges now pulled dynamically from config.yaml.
-# 2. RISK SIZING: Optimization now includes 'risk_per_trade_percent'.
-# 3. SCORING: Score = (PnL / 100.0) + (Risk_Reward * 5.0).
-#    - Losing strategies return raw negative PnL score.
-#    - Strategies with < min_trades are pruned.
+# AUDIT REMEDIATION (2025-01-01 - ANALYSIS IMPLEMENTATION V5.3):
+# 1. OPTIMIZATION: Dynamically ingests fine-tuned R:R (1.5-3.5) and Risk (0.1-0.5%).
+# 2. SCORING FUNCTION: Added explicit penalty for Drawdown > 5% to filter volatility.
+# 3. SAFETY: Single-threaded math ops to prevent worker deadlocks.
 # =============================================================================
 import os
 import sys
@@ -103,10 +101,9 @@ class EmojiCallback:
         wr = attrs.get('win_rate', 0.0) * 100
         pf = attrs.get('profit_factor', 0.0)
         sqn = attrs.get('sqn', 0.0)
-        sharpe = attrs.get('sharpe', 0.0)
         
         # 3. Format Output (Column Aligned)
-        # Structure: [ICON] STATUS | SYMBOL | ID | RISK | R:R | PnL | WR | DD | PF | SQN | SR | TRADES
+        # Structure: [ICON] STATUS | SYMBOL | ID | RISK | R:R | PnL | WR | DD | PF | SQN | TRADES
         msg = (
             f"{icon} {status:<6} | {symbol:<6} | Trial {trial.number:<3} | "
             f"🎲 RISK: {risk_pct}% | "
@@ -219,12 +216,12 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             # --- CRITICAL: RISK OPTIMIZATION ---
             # Optimizing Risk Per Trade to find the balance between Drawdown and Profit
-            risk_options = CONFIG['wfo'].get('risk_per_trade_options', [0.25, 0.5, 0.75, 1.0])
+            # Now ingesting 0.1 - 0.5% range from Config
+            risk_options = CONFIG['wfo'].get('risk_per_trade_options', [0.25, 0.5])
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             
             # Instantiate Pipeline locally
             pipeline_inst = ResearchPipeline()
-            # FIX: Use 'initial_balance' matching backtester.py
             broker = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
             model = pipeline_inst.get_fresh_model(params)
             strategy = ResearchStrategy(model, symbol, params)
@@ -256,9 +253,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             # ALWAYS Generate Autopsy/Victory Lap Report for analysis
             trial.set_user_attr("autopsy", strategy.generate_autopsy())
             
-            # --- PROFIT-FIRST SCORING FUNCTION ---
+            # --- PROFIT-FIRST SCORING FUNCTION (REFINED) ---
             # 1. Base Score = Net Profit in USD
-            # We scale it down (e.g. / 100) to make the numbers manageable alongside other metrics
             base_score = metrics['total_pnl'] / 100.0
             
             # Constraint: Minimum Trades (Statistical Significance)
@@ -274,21 +270,24 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 trial.set_user_attr("blown", True)
                 return -10000.0 # Maximum penalty
             
-            # If Profitable: Add R:R Bonus
+            # If Profitable: Add R:R Bonus & DD Penalties
             if metrics['total_pnl'] > 0:
                 # Add Risk:Reward as a multiplier/bonus
-                # E.g., R:R of 2.0 adds 10 points to the score
                 rr_bonus = metrics['risk_reward_ratio'] * 5.0
                 final_score = base_score + rr_bonus
                 
-                # Check FTMO Hard Limit (10%) for Scoring penalty
+                # --- STRICTER DRAWDOWN PENALTY (ANALYSIS RECOMMENDATION) ---
+                # Penalize if Drawdown exceeds 5% (Daily Limit Danger Zone)
+                if metrics['max_dd_pct'] > 0.05:
+                    final_score -= 20.0 
+                
+                # Check FTMO Hard Limit (10%) for massive penalty
                 if metrics['max_dd_pct'] > 0.10:
-                    final_score -= 50.0 # Significant penalty but maybe still profitable
+                    final_score -= 50.0 
                 
                 return final_score
             else:
                 # If Losing: Return pure (negative) PnL score
-                # This ensures we always prefer -$100 over -$500, regardless of R:R
                 return base_score
 
         # 3. Connect to Shared Study
@@ -347,7 +346,6 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         
         pipeline_inst = ResearchPipeline()
         model = pipeline_inst.get_fresh_model(final_params)
-        # FIX: Use 'initial_balance' matching backtester.py
         broker = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
         strategy = ResearchStrategy(model, symbol, final_params)
 
@@ -388,7 +386,7 @@ class ResearchPipeline:
         self.train_candles = CONFIG['data'].get('num_candles_train', 4000000)
         self.backtest_candles = CONFIG['data'].get('num_candles_backtest', 500000)
         
-        self.db_url = CONFIG['wfo']['db_url']
+        self.db_url = CONFIG['wfo'].get('db_url', 'sqlite:///optuna.db') # Add default fallback
         
         # AUDIT FIX: Use (Logical - 4) for worker count
         log_cores = psutil.cpu_count(logical=True)
@@ -637,7 +635,6 @@ class ResearchPipeline:
                     strategy.calibrator_buy = cals['buy']
                     strategy.calibrator_sell = cals['sell']
             
-            # FIX: Use 'initial_balance' matching backtester.py
             broker = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
             
             for index, row in df.iterrows():

@@ -5,13 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# AUDIT REMEDIATION (2025-12-31 - RISK OPTIMIZATION & STREAK BREAKER):
-# 1. RISK OPTIMIZATION: Now accepts 'risk_per_trade_percent' from Optuna params
-#    and passes it to RiskManager to override the default 0.5%.
-# 2. DYNAMIC GATES: Implemented 'Dynamic Volatility Filter'.
-#    - Increases KER threshold (Efficiency) based on consecutive losses.
-#    - Increases Confidence threshold based on consecutive losses.
-# 3. LOGIC: Forces strategy to "sit out" chop after a loss until a clean trend forms.
+# AUDIT REMEDIATION (2025-01-01 - STREAK BREAKER RELAXATION):
+# 1. STREAK BREAKER: Relaxed penalty logic to prevent over-pruning.
+#    - KER Penalty: Reduced from 0.05/step to 0.02/step (Cap 0.10).
+#    - Conf Penalty: Reduced from 0.05/step to 0.02/step (Cap 0.10).
+# 2. RISK OPTIMIZATION: Maintained Optuna risk override logic.
 # =============================================================================
 import logging
 import sys
@@ -304,10 +302,10 @@ class ResearchStrategy:
         effective_ker_thresh = self.ker_thresh
         
         if self.consecutive_losses > 0:
-            # 1. Efficiency Boost: +0.05 KER per loss (Cap +0.25)
-            # This forces the bot to wait for a CLEANER trend after a loss.
-            # Base 0.35 -> 1 Loss: 0.40 -> 2 Losses: 0.45 ...
-            ker_penalty = min(0.25, self.consecutive_losses * 0.05)
+            # RELAXED STREAK BREAKER (2025-01-01):
+            # Reduced step from 0.05 to 0.02 to prevent "Pruned" trials.
+            # Cap reduced from 0.25 to 0.10.
+            ker_penalty = min(0.10, self.consecutive_losses * 0.02)
             effective_ker_thresh += ker_penalty
             
         # Check Efficiency Gate
@@ -431,8 +429,9 @@ class ResearchStrategy:
             
             # STREAK BREAKER: Increase required confidence if in a losing streak
             if self.consecutive_losses > 0:
-                # Add 0.05 to hurdle for every loss, cap at +0.15
-                streak_penalty = min(0.15, self.consecutive_losses * 0.05)
+                # RELAXED STREAK BREAKER (2025-01-01):
+                # Reduced step from 0.05 to 0.02. Cap at 0.10.
+                streak_penalty = min(0.10, self.consecutive_losses * 0.02)
                 min_prob += streak_penalty
                 
             if confidence < min_prob:

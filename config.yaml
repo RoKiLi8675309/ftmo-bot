@@ -1,12 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V5.1 (CENTRALIZED OPTIMIZATION)
+# config.yaml – PROJECT PHOENIX V5.3 (ANALYSIS IMPLEMENTATION)
 # STATUS: CONFIGURABLE | TARGET: 10% IN 90 DAYS
 #
-# UPDATES (2025-12-31):
-# 1. OPTIMIZATION RANGES: Moved all hardcoded Optuna ranges here.
-# 2. RISK OPTIMIZATION: Added 'risk_per_trade_options' for WFO.
-# 3. CENTRALIZATION: All strategy thresholds are now strictly defined here.
-# 4. FINE TUNING: Expanded R:R search (1.5-5.0) and granular Risk (0.1-1.0%).
+# UPDATES (2025-01-01):
+# 1. RISK CALIBRATION: Capped max risk at 0.5% based on "Drawdown Breach" analysis.
+# 2. SEARCH SPACE: Narrowed R:R to 1.5-3.5 (The "Sweet Spot").
+# 3. GATES: Relaxed KER threshold to 0.25 to prevent "Pruned" trials.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -133,7 +132,6 @@ features:
   d1_context: true
 
 # --- PHOENIX STRATEGY PARAMETERS (DEFAULTS) ---
-# These are used if no optimized model is found.
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true      
@@ -142,7 +140,7 @@ phoenix_strategy:
   
   # --- FILTER THRESHOLDS ---
   max_relative_volume: 4.0        
-  ker_trend_threshold: 0.35       
+  ker_trend_threshold: 0.25       # RELAXED from 0.30 to reduce "Pruned" trials
   vol_expansion_threshold: 1.5 
   range_gate_atr_mult: 1.0        
   volume_gate_ratio: 1.1          
@@ -155,7 +153,6 @@ phoenix_strategy:
   gate_fdi_threshold: 1.60        
 
 # --- OPTIMIZATION SEARCH SPACE (OPTUNA) ---
-# Ranges for hyperparameter tuning. Hardcoded values removed from Python.
 optimization_search_space:
   # River Model Params
   n_models:
@@ -184,11 +181,11 @@ optimization_search_space:
     max: 0.95
   
   # Triple Barrier Method (Labeling) -> Defines Reward Target (TP)
+  # NARROWED to 1.5 - 3.5 per Analysis
   tbm_barrier_width:
     min: 1.5
-    max: 5.0
-    # Note: Optuna 'suggest_float' doesn't strictly adhere to 'step' like 'suggest_int'
-    # but we will hint it in the logic or let it explore freely within range.
+    max: 3.5
+    # Note: Optimization will treat this as a continuous float within range
   tbm_horizon_minutes:
     min: 60
     max: 180
@@ -209,12 +206,12 @@ risk_management:
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # Default Risk Per Trade (Overridden by Optimization)
-  base_risk_per_trade_percent: 0.5 
+  # Default Risk Per Trade (Lowered default for safety)
+  base_risk_per_trade_percent: 0.25 
   
   max_daily_loss_pct: 0.048       # 4.8% (FTMO Limit is 5% - Keep buffer)
   max_total_loss_pct: 0.098       # 9.8% (FTMO Limit is 10%)
-  max_risk_percent: 1.5           # Max open risk at any time (3 trades @ 0.5%)
+  max_risk_percent: 1.5           # Max open risk at any time
   max_leverage: 30.0
   max_lot_size: 50.0 
   min_lot_size: 0.01
@@ -336,9 +333,11 @@ forensic_audit:
 
 # --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 10  # Increased slightly to cover new search space
+  n_trials: 20
   train_years: 2
   test_months: 6
-  min_trades_optimization: 100
-  # --- RISK OPTIMIZATION (FINE TUNED) ---
-  risk_per_trade_options: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  min_trades_optimization: 25
+  # --- RISK OPTIMIZATION (ANALYSIS APPLIED) ---
+  # Removed high risk options (0.6 - 1.0) to prevent "Drawdown Breaches"
+  # Added finer granularity in the "Sweet Spot" (0.1 - 0.5)
+  risk_per_trade_options: [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]

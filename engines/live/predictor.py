@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# AUDIT REMEDIATION (2025-12-31 - RISK OPTIMIZATION & CONFIG):
+# AUDIT REMEDIATION (2025-01-01 - STREAK BREAKER RELAXATION):
 # 1. RISK LOADING: Loads 'risk_per_trade_percent' from optimized params file.
 # 2. SIGNAL INJECTION: Passes optimized risk to Live Engine via Signal metadata.
-# 3. STREAK BREAKER: Retained logic for dynamic gate tightening.
+# 3. STREAK BREAKER: Relaxed penalty logic (0.02 step, 0.10 cap) to match Research.
 # =============================================================================
 import logging
 import pickle
@@ -354,8 +354,8 @@ class MultiAssetPredictor:
         effective_ker_thresh = ker_thresh
         
         if streak > 0:
-            # Add 0.05 per loss, cap at +0.25
-            effective_ker_thresh += min(0.25, streak * 0.05)
+            # RELAXED: Add 0.02 per loss, cap at +0.10 (Matched Strategy.py)
+            effective_ker_thresh += min(0.10, streak * 0.02)
             
         if ker_val < effective_ker_thresh:
             stats[f"Low Efficiency (Streak: {streak})"] += 1
@@ -471,9 +471,10 @@ class MultiAssetPredictor:
         # --- DECISION WITH DYNAMIC CONFIDENCE ---
         min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.60)
         
-        # STREAK BREAKER: Increase required confidence
+        # STREAK BREAKER: Increase required confidence (RELAXED)
         if streak > 0:
-            min_prob += min(0.15, streak * 0.05)
+            # Add 0.02 per loss, cap at +0.10
+            min_prob += min(0.10, streak * 0.02)
 
         if confidence < min_prob:
             stats[f"ML Disagreement (Streak: {streak})"] += 1
