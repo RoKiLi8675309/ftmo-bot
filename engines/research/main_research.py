@@ -5,7 +5,7 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (2025-12-31 - PROFIT FIRST OPTIMIZATION & CONFIGURATION):
+# AUDIT REMEDIATION (2025-12-31 - PROFIT FIRST OPTIMIZATION & CONFIG):
 # 1. OPTIMIZATION: Ranges now pulled dynamically from config.yaml.
 # 2. RISK SIZING: Optimization now includes 'risk_per_trade_percent'.
 # 3. SCORING: Score = (PnL / 100.0) + (Risk_Reward * 5.0).
@@ -109,13 +109,13 @@ class EmojiCallback:
         # Structure: [ICON] STATUS | SYMBOL | ID | RISK | R:R | PnL | WR | DD | PF | SQN | SR | TRADES
         msg = (
             f"{icon} {status:<6} | {symbol:<6} | Trial {trial.number:<3} | "
-            f"🎲 {risk_pct}% | "
-            f"⚖️ {rr:>4.2f} | " 
-            f"💰 ${pnl:>9,.2f} | "
-            f"🎯 {wr:>5.1f}% | "
-            f"📉 {dd:>5.2f}% | "
-            f"⚡ {pf:>4.2f} | "
-            f"💎 {sqn:>4.2f} | "
+            f"🎲 RISK: {risk_pct}% | "
+            f"⚖️ R:R: {rr:>4.2f} | " 
+            f"💰 PnL: ${pnl:>9,.2f} | "
+            f"🎯 WR: {wr:>5.1f}% | "
+            f"📉 DD: {dd:>5.2f}% | "
+            f"⚡ PF: {pf:>4.2f} | "
+            f"💎 SQN: {sqn:>4.2f} | "
             f"#️⃣ {trades:<4}"
         )
         
