@@ -1,15 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V5.0 (BACK TO BASICS)
-# STATUS: SIMPLIFIED | TARGET: 10% IN 90 DAYS
+# config.yaml – PROJECT PHOENIX V5.1 (CENTRALIZED OPTIMIZATION)
+# STATUS: CONFIGURABLE | TARGET: 10% IN 90 DAYS
 #
-# OVERHAUL (2025-12-30 - USER REQUEST):
-# 1. COMPLEXITY NUKE: Disabled Trailing Stop and Breakeven.
-#    - Pure "Set and Forget" logic.
-# 2. RISK:REWARD: Fixed at 1:2.
-#    - Stop Loss: 1.5 ATR.
-#    - Take Profit: 3.0 ATR.
-# 3. RISK SIZING: Lowered to 0.5% to prevent Daily Limit breaches.
-# 4. GATES: Relaxed slightly to allow more frequency for the 1:2 math to play out.
+# UPDATES (2025-12-31):
+# 1. OPTIMIZATION RANGES: Moved all hardcoded Optuna ranges here.
+# 2. RISK OPTIMIZATION: Added 'risk_per_trade_options' for WFO.
+# 3. CENTRALIZATION: All strategy thresholds are now strictly defined here.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -99,10 +95,10 @@ features:
   use_log_returns: true
   
   # Project Phoenix L1 Proxies
-  use_parkinson_vol: true    
+  use_parkinson_vol: true     
   use_amihud_liquidity: true 
-  use_relative_volume: true  
-  use_aggressor_ratio: true  
+  use_relative_volume: true   
+  use_aggressor_ratio: true   
   
   # Legacy / Context
   use_regime: true
@@ -135,39 +131,73 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V5.0 SIMPLE) ---
+# --- PHOENIX STRATEGY PARAMETERS (DEFAULTS) ---
+# These are used if no optimized model is found.
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true     
-  require_d1_trend: true            
+  enable_regime_a_entries: true      
+  require_d1_trend: true             
   require_h4_alignment: true        
   
   # --- FILTER THRESHOLDS ---
-  # Volume Exhaustion (Standardized)
   max_relative_volume: 4.0        
-  
-  # Trend Efficiency (Relaxed slightly to allow 1:2 setups to form)
   ker_trend_threshold: 0.35       
-  
-  # Volatility Expansion
   vol_expansion_threshold: 1.5 
-  
-  # Entry Gates
   range_gate_atr_mult: 1.0        
-  
-  # Volume Gate (RVol > Ratio)
   volume_gate_ratio: 1.1          
-  
-  # Momentum Conviction
-  aggressor_threshold: 0.55       
-  
-  # ML Confidence
+  aggressor_threshold: 0.55        
   ml_confirmation_threshold: 0.60 
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
   vpin_threshold: 0.90
   gate_fdi_threshold: 1.60        
+
+# --- OPTIMIZATION SEARCH SPACE (OPTUNA) ---
+# Ranges for hyperparameter tuning. Hardcoded values removed from Python.
+optimization_search_space:
+  # River Model Params
+  n_models:
+    min: 30
+    max: 50
+    step: 5
+  grace_period:
+    min: 200
+    max: 600
+    step: 50
+  delta:
+    min: 1.0e-6
+    max: 1.0e-4
+    log: true
+  lambda_value:
+    min: 6
+    max: 15
+    step: 1
+  
+  # Filters & Gates
+  entropy_threshold:
+    min: 0.85
+    max: 0.95
+  vpin_threshold:
+    min: 0.85
+    max: 0.95
+  
+  # Triple Barrier Method (Labeling)
+  tbm_barrier_width:
+    min: 2.5
+    max: 4.0  # Widen to catch big moves
+  tbm_horizon_minutes:
+    min: 60
+    max: 180
+    step: 30
+  tbm_drift_threshold:
+    min: 1.0
+    max: 2.0
+  
+  # Strategy Execution
+  min_calibrated_probability:
+    min: 0.60
+    max: 0.85
 
 # --- RISK MANAGEMENT (FTMO COMPLIANCE) ---
 risk_management:
@@ -176,8 +206,7 @@ risk_management:
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # Risk Per Trade (SAFE: 0.5%)
-  # Allows ~10 consecutive losses before hitting daily limit
+  # Default Risk Per Trade (Overridden by Optimization)
   base_risk_per_trade_percent: 0.5 
   
   max_daily_loss_pct: 0.048       # 4.8% (FTMO Limit is 5% - Keep buffer)
@@ -187,31 +216,31 @@ risk_management:
   max_lot_size: 50.0 
   min_lot_size: 0.01
   
-  # PROJECT PHOENIX EXIT LOGIC (1:2 RATIO)
+  # PROJECT PHOENIX EXIT LOGIC
   stop_loss_atr_mult: 1.5         # Standard Volatility Stop
-  take_profit_atr_mult: 3.0       # Exact 1:2 Risk:Reward
+  take_profit_atr_mult: 3.0       # Default Target (Overridden by Optimized TBM)
   
   # TIER 1: BREAKEVEN (DISABLED)
   breakeven:
-    enabled: false       # SIMPLIFIED: Let the trade hit TP or SL
+    enabled: false        
     activation_atr: 2.0  
-    profit_pips: 2.0     
+    profit_pips: 2.0      
   
   # TIER 2: TRAILING STOP (DISABLED)
   trailing_stop:
-    enabled: false       # SIMPLIFIED: Let the trade hit TP or SL
-    activation_atr: 2.5           
-    distance_atr: 2.0             
-    step_atr: 0.5                 
+    enabled: false        
+    activation_atr: 2.5            
+    distance_atr: 2.0              
+    step_atr: 0.5                  
   
   risk_timezone: "Europe/Prague"
-  friday_entry_cutoff_hour: 16       # Stop entries at 16:00 Server Time
-  friday_liquidation_hour_server: 21 # Hard Close at 21:00 Server Time
+  friday_entry_cutoff_hour: 16        # Stop entries at 16:00 Server Time
+  friday_liquidation_hour_server: 21  # Hard Close at 21:00 Server Time
   
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 10            
+  max_trades_per_day: 10             
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
@@ -244,7 +273,7 @@ online_learning:
   
   # CONFIGURATION
   n_models: 50        
-  grace_period: 200   
+  grace_period: 200    
   delta: 0.00001      
   warning_delta: 0.001    
   lambda_value: 10        
@@ -265,8 +294,8 @@ online_learning:
   
   tbm:
     horizon_minutes: 120      
-    barrier_width: 2.5        # WIDENED: Train on larger moves to match new TP
-    min_profit_pips: 10.0     
+    barrier_width: 2.5        
+    min_profit_pips: 10.0      
     drift_threshold: 1.5 
   
   learning_horizon_sec: 300
@@ -304,7 +333,9 @@ forensic_audit:
 
 # --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 10
+  n_trials: 10  # Increased slightly
   train_years: 2
   test_months: 6
   min_trades_optimization: 25
+  # --- RISK OPTIMIZATION ---
+  risk_per_trade_options: [0.25, 0.5, 0.75, 1.0]

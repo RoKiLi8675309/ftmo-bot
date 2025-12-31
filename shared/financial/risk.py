@@ -8,7 +8,7 @@
 # AUDIT REMEDIATION (2025-01-02 - FRIDAY GUARD & TIERED RISK):
 # 1. FRIDAY GUARD: Added is_friday_afternoon() to separate "Stop Entries" from
 #    "Liquidation". Stops churn at 17:00, liquidates at 21:00.
-# 2. SIZING: Maintained strict fixed_risk logic.
+# 2. SIZING: Maintained strict fixed_risk logic with Optuna Override support.
 # 3. COMPATIBILITY: SessionGuard now accepts timestamps for Backtest accuracy.
 # =============================================================================
 from __future__ import annotations
@@ -144,7 +144,8 @@ class RiskManager:
         atr: Optional[float] = None,
         account_size: Optional[float] = None, # NEW ARGUMENT for Auto-Detection
         contract_size_override: Optional[float] = None, # NEW: Allow overriding lot size
-        ker: float = 1.0 # Kaufman Efficiency Ratio input
+        ker: float = 1.0, # Kaufman Efficiency Ratio input
+        risk_percent_override: Optional[float] = None # NEW: Optimization Override
     ) -> Tuple[Trade, float]:
         """
         Calculates position size using 'fixed_risk' logic only.
@@ -197,7 +198,11 @@ class RiskManager:
         calculated_risk_usd = 0.0
         
         # --- PROP FIRM STANDARD: Risk % of Equity ---
-        risk_pct = risk_conf.get('base_risk_per_trade_percent', 1.0) # Updated default to 1.0
+        # PRIORITY: Override (Optimizer) > Config > Default 0.5%
+        if risk_percent_override is not None:
+            risk_pct = risk_percent_override
+        else:
+            risk_pct = risk_conf.get('base_risk_per_trade_percent', 0.5)
         
         # Drawdown Brake: If in significant drawdown (>4%), reduce risk
         if balance < (start_equity * 0.96):

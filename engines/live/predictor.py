@@ -6,11 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# AUDIT REMEDIATION (2025-12-31 - STREAK BREAKER & PROFIT SYNC):
-# 1. STREAK BREAKER: Implemented internal tracking of consecutive losses to 
-#    dynamically tighten KER (Efficiency) and Confidence thresholds.
-# 2. DYNAMIC GATES: Logic matches 'strategy.py' to prevent "death by chop".
-# 3. OPTIMIZATION SYNC: Loads 'best_params_{symbol}.json' for R:R targets.
+# AUDIT REMEDIATION (2025-12-31 - RISK OPTIMIZATION & CONFIG):
+# 1. RISK LOADING: Loads 'risk_per_trade_percent' from optimized params file.
+# 2. SIGNAL INJECTION: Passes optimized risk to Live Engine via Signal metadata.
+# 3. STREAK BREAKER: Retained logic for dynamic gate tightening.
 # =============================================================================
 import logging
 import pickle
@@ -83,7 +82,7 @@ class MultiAssetPredictor:
             s_horizon = tbm_conf.get('horizon_minutes', 120)
             
             # --- DYNAMIC PARAMETER LOADING ---
-            # Try to load optimized R:R from Research
+            # Try to load optimized R:R and Risk from Research
             params_path = self.models_dir / f"best_params_{s}.json"
             if params_path.exists():
                 try:
@@ -96,6 +95,12 @@ class MultiAssetPredictor:
                             s_reward = float(bp['barrier_width'])
                         if 'horizon_minutes' in bp:
                             s_horizon = int(bp['horizon_minutes'])
+                        
+                        # NEW: Load Risk Param
+                        if 'risk_per_trade_percent' in bp:
+                            # Store in dict to ensure persistence
+                            if s not in self.optimized_params: self.optimized_params[s] = {}
+                            self.optimized_params[s]['risk_per_trade_percent'] = float(bp['risk_per_trade_percent'])
                             
                     # logger.info(f"⚡ {s}: Loaded Optimized Params (TP: {s_reward} ATR)")
                 except Exception as e:
@@ -492,6 +497,7 @@ class MultiAssetPredictor:
                 
                 # Retrieve optimized R:R for metadata
                 opt_rr = self.labelers[symbol].reward_mult
+                opt_risk = self.optimized_params.get(symbol, {}).get('risk_per_trade_percent')
 
                 return Signal(symbol, action_str, confidence, {
                     "meta_ok": True, 
@@ -504,7 +510,8 @@ class MultiAssetPredictor:
                     "regime": regime_label,
                     "mtf_align": mtf_align,
                     "drivers": imp_feats,
-                    "optimized_rr": opt_rr
+                    "optimized_rr": opt_rr,
+                    "risk_percent_override": opt_risk
                 })
         else:
             stats['Meta Rejected'] += 1

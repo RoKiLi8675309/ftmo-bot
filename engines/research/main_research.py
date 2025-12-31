@@ -5,12 +5,12 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 #
-# AUDIT REMEDIATION (2025-12-31 - PROFIT FIRST OPTIMIZATION):
-# 1. OBJECTIVE CHANGE: Prioritizes Net Profit (PnL) as the primary driver.
-# 2. SCORING FORMULA: Score = (PnL / 100.0) + (Risk_Reward * 5.0).
-#    - Strategies must be profitable to get the R:R bonus.
-#    - Losing strategies return raw negative PnL score (Huge Penalty).
-# 3. REPORTING: SQN and Sharpe Ratio explicitly included in console output.
+# AUDIT REMEDIATION (2025-12-31 - PROFIT FIRST OPTIMIZATION & CONFIGURATION):
+# 1. OPTIMIZATION: Ranges now pulled dynamically from config.yaml.
+# 2. RISK SIZING: Optimization now includes 'risk_per_trade_percent'.
+# 3. SCORING: Score = (PnL / 100.0) + (Risk_Reward * 5.0).
+#    - Losing strategies return raw negative PnL score.
+#    - Strategies with < min_trades are pruned.
 # =============================================================================
 import os
 import sys
@@ -77,6 +77,7 @@ class EmojiCallback:
         rr = attrs.get('risk_reward_ratio', 0.0)
         trades = attrs.get('trades', 0)
         pnl = attrs.get('pnl', 0.0)
+        risk_pct = attrs.get('risk_pct', 0.5)
         
         if attrs.get('blown', False):
             icon = "💀" # Blown Account
@@ -105,16 +106,16 @@ class EmojiCallback:
         sharpe = attrs.get('sharpe', 0.0)
         
         # 3. Format Output (Column Aligned)
-        # Structure: [ICON] STATUS | SYMBOL | ID | R:R | PnL | WR | DD | PF | SQN | SR | TRADES
+        # Structure: [ICON] STATUS | SYMBOL | ID | RISK | R:R | PnL | WR | DD | PF | SQN | SR | TRADES
         msg = (
             f"{icon} {status:<6} | {symbol:<6} | Trial {trial.number:<3} | "
-            f"⚖️ R:R: {rr:>4.2f} | " 
-            f"💰 PnL: ${pnl:>9,.2f} | "
-            f"🎯 WR: {wr:>5.1f}% | "
-            f"📉 DD: {dd:>5.2f}% | "
-            f"⚡ PF: {pf:>4.2f} | "
-            f"💎 SQN: {sqn:>4.2f} | "
-            f"📈 SR: {sharpe:>4.2f} | "
+            f"🎲 {risk_pct}% | "
+            f"⚖️ {rr:>4.2f} | " 
+            f"💰 ${pnl:>9,.2f} | "
+            f"🎯 {wr:>5.1f}% | "
+            f"📉 {dd:>5.2f}% | "
+            f"⚡ {pf:>4.2f} | "
+            f"💎 {sqn:>4.2f} | "
             f"#️⃣ {trades:<4}"
         )
         
@@ -188,33 +189,38 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
 
         # 2. Define Objective
         def objective(trial):
-            # Define Search Space (Focused on Profitability & Exploration)
+            # Load Search Space dynamically from CONFIG (No more hardcoding)
+            space = CONFIG['optimization_search_space']
+            
+            # Base Params
             params = CONFIG['online_learning'].copy()
-            params.update({
-                'n_models': trial.suggest_int('n_models', 30, 50, step=5),
-                
-                # High Patience for Sniper Mode
-                'grace_period': trial.suggest_int('grace_period', 200, 600), 
-                'delta': trial.suggest_float('delta', 1e-6, 1e-4, log=True),
-                
-                # Strict Filter Ranges
-                'entropy_threshold': trial.suggest_float('entropy_threshold', 0.85, 0.95),
-                'vpin_threshold': trial.suggest_float('vpin_threshold', 0.85, 0.95),
-                
-                # Log2 Features for Decorrelation
-                'max_features': trial.suggest_categorical('max_features', ['log2', 'sqrt']),
-                'lambda_value': trial.suggest_int('lambda_value', 6, 15),
-                
-                'tbm': {
-                    # WIDEN BARRIER to allow high R:R trades to play out
-                    'barrier_width': trial.suggest_float('barrier_width', 2.5, 4.0),
-                    'horizon_minutes': trial.suggest_int('horizon_minutes', 60, 180),
-                    'drift_threshold': trial.suggest_float('drift_threshold', 1.0, 2.0)
-                },
-                
-                # High Conviction Threshold
-                'min_calibrated_probability': trial.suggest_float('min_calibrated_probability', 0.60, 0.85)
-            })
+            
+            # --- HYPERPARAMETER MAPPING ---
+            # River Model Params
+            params['n_models'] = trial.suggest_int('n_models', space['n_models']['min'], space['n_models']['max'], step=space['n_models']['step'])
+            params['grace_period'] = trial.suggest_int('grace_period', space['grace_period']['min'], space['grace_period']['max'], step=space['grace_period']['step'])
+            params['delta'] = trial.suggest_float('delta', float(space['delta']['min']), float(space['delta']['max']), log=space['delta'].get('log', True))
+            params['lambda_value'] = trial.suggest_int('lambda_value', space['lambda_value']['min'], space['lambda_value']['max'], step=space['lambda_value']['step'])
+            params['max_features'] = trial.suggest_categorical('max_features', ['log2', 'sqrt'])
+            
+            # Filters & Gates
+            params['entropy_threshold'] = trial.suggest_float('entropy_threshold', space['entropy_threshold']['min'], space['entropy_threshold']['max'])
+            params['vpin_threshold'] = trial.suggest_float('vpin_threshold', space['vpin_threshold']['min'], space['vpin_threshold']['max'])
+            
+            # Triple Barrier Method (Labeling)
+            params['tbm'] = {
+                'barrier_width': trial.suggest_float('barrier_width', space['tbm_barrier_width']['min'], space['tbm_barrier_width']['max']),
+                'horizon_minutes': trial.suggest_int('horizon_minutes', space['tbm_horizon_minutes']['min'], space['tbm_horizon_minutes']['max'], step=space['tbm_horizon_minutes']['step']),
+                'drift_threshold': trial.suggest_float('drift_threshold', space['tbm_drift_threshold']['min'], space['tbm_drift_threshold']['max'])
+            }
+            
+            # Strategy Execution
+            params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
+            
+            # --- CRITICAL: RISK OPTIMIZATION ---
+            # Optimizing Risk Per Trade to find the balance between Drawdown and Profit
+            risk_options = CONFIG['wfo'].get('risk_per_trade_options', [0.25, 0.5, 0.75, 1.0])
+            params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             
             # Instantiate Pipeline locally
             pipeline_inst = ResearchPipeline()
@@ -245,6 +251,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("risk_reward_ratio", metrics['risk_reward_ratio'])
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("sharpe", metrics['sharpe'])
+            trial.set_user_attr("risk_pct", params['risk_per_trade_percent'])
             
             # ALWAYS Generate Autopsy/Victory Lap Report for analysis
             trial.set_user_attr("autopsy", strategy.generate_autopsy())

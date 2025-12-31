@@ -5,12 +5,13 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# AUDIT REMEDIATION (2025-12-31 - STREAK BREAKER & PROFIT DEFENSE):
-# 1. DYNAMIC GATES: Implemented 'Dynamic Volatility Filter'.
+# AUDIT REMEDIATION (2025-12-31 - RISK OPTIMIZATION & STREAK BREAKER):
+# 1. RISK OPTIMIZATION: Now accepts 'risk_per_trade_percent' from Optuna params
+#    and passes it to RiskManager to override the default 0.5%.
+# 2. DYNAMIC GATES: Implemented 'Dynamic Volatility Filter'.
 #    - Increases KER threshold (Efficiency) based on consecutive losses.
 #    - Increases Confidence threshold based on consecutive losses.
-# 2. LOGIC: Forces strategy to "sit out" chop after a loss until a clean trend forms.
-# 3. OPTIMIZATION SYNC: Ensures R:R matches the new Profit-First objective.
+# 3. LOGIC: Forces strategy to "sit out" chop after a loss until a clean trend forms.
 # =============================================================================
 import logging
 import sys
@@ -479,6 +480,10 @@ class ResearchStrategy:
         current_ker = features.get('ker', 1.0)
         volatility = features.get('volatility', 0.001)
 
+        # --- RETRIEVE OPTIMIZED RISK PARAMETER (AUDIT FIX) ---
+        # Check self.params for 'risk_per_trade_percent' which Optuna injects
+        risk_override = self.params.get('risk_per_trade_percent')
+
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=confidence,
@@ -487,7 +492,8 @@ class ResearchStrategy:
             market_prices=self.last_price_map,
             atr=current_atr, 
             ker=current_ker,
-            account_size=broker.equity
+            account_size=broker.equity,
+            risk_percent_override=risk_override # NEW: Pass Override to Risk Manager
         )
 
         if trade_intent.volume <= 0:
