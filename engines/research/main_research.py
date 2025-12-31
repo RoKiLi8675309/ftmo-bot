@@ -13,6 +13,7 @@
 # IMPLEMENTATION UPDATE (Rec 5):
 # - Optuna DD Frequency Penalty: Penalizes score by -10 for every trade closed
 #   while account is in > 5% drawdown.
+# - FIX: Corrected Drawdown calculation math (Peak initialization).
 # =============================================================================
 import os
 import sys
@@ -229,7 +230,12 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             # Instantiate Pipeline locally
             pipeline_inst = ResearchPipeline()
-            broker = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
+            
+            # AUDIT FIX: Ensure initial_balance is explicitly set from Config or fallback
+            init_bal = CONFIG['env'].get('initial_balance', 100000.0)
+            if init_bal <= 0: init_bal = 100000.0
+            
+            broker = BacktestBroker(initial_balance=init_bal)
             model = pipeline_inst.get_fresh_model(params)
             strategy = ResearchStrategy(model, symbol, params)
             
@@ -506,8 +512,13 @@ class ResearchPipeline:
 
         # 3. Time-Series Equity Curve
         # Calculate running equity to detect Drawdown events
+        # CRITICAL FIX: Ensure Peak respects initial capital to prevent fake drawdowns on first loss
         df['Equity'] = initial_capital + df['Net_PnL'].cumsum()
+        
+        # Peak Calculation needs to consider Initial Capital as the starting high water mark
         df['Peak'] = df['Equity'].cummax()
+        df['Peak'] = df['Peak'].clip(lower=initial_capital)
+        
         df['Drawdown_USD'] = df['Equity'] - df['Peak']
         df['Drawdown_Pct'] = (df['Drawdown_USD'] / df['Peak']).abs() * 100.0
         
@@ -679,7 +690,11 @@ class ResearchPipeline:
         df['Entry_Time'] = pd.to_datetime(df['Entry_Time'])
         df = df.sort_values('Entry_Time')
         df['Equity'] = initial_capital + df['Net_PnL'].cumsum()
+        
+        # CRITICAL FIX for BACKTEST REPORT: ensure Peak is correctly initialized
         df['Peak'] = df['Equity'].cummax()
+        df['Peak'] = df['Peak'].clip(lower=initial_capital)
+        
         df['Drawdown_USD'] = df['Equity'] - df['Peak']
         df['Drawdown_Pct'] = (df['Drawdown_USD'] / df['Peak']).abs() * 100.0
         
