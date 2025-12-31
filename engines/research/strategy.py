@@ -140,6 +140,7 @@ class ResearchStrategy:
         self.friday_close_hour = CONFIG.get('risk_management', {}).get('friday_liquidation_hour_server', 21)
         
         # --- REC 1: Dynamic Gate Scaling State ---
+        # Using delta=0.01 to match Live Predictor configuration
         self.ker_drift_detector = drift.ADWIN(delta=0.01)
         self.dynamic_ker_offset = 0.0
         
@@ -252,7 +253,8 @@ class ResearchStrategy:
         
         # If distribution of KER changes significantly (Drift), adjust threshold
         if self.ker_drift_detector.drift_detected:
-            # Drift implies regime shift. Relax gate temporarily.
+            # Drift implies regime shift. Relax gate temporarily to catch new trends.
+            # Reduce threshold by 0.05 (Min limit handled in effective calc)
             self.dynamic_ker_offset = max(-0.15, self.dynamic_ker_offset - 0.05)
         else:
             # Slowly decay offset back to 0 (Normalization)
@@ -274,30 +276,33 @@ class ResearchStrategy:
                 ret_scalar = max(0.5, ret_scalar)
                 
                 # --- REC 3: EFFICIENCY-WEIGHTED LEARNING ---
-                # Weight samples by KER. High efficiency bars are more valuable.
+                # Weight samples by KER. High efficiency bars are more valuable for trend learning.
+                # Prioritize high-quality data points (High KER = Clean Trend)
                 hist_ker = stored_feats.get('ker', 0.5)
-                efficiency_scalar = 1.0 + hist_ker
+                ker_weight = hist_ker * 2.0 # Scale 0-2 (e.g., 0.8 KER -> 1.6x weight)
                 
-                final_weight = base_weight * ret_scalar * efficiency_scalar
+                final_weight = base_weight * ret_scalar * ker_weight
                 
                 # Train the model
                 self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
                 
                 # Double Learn for Positive outcomes (Reinforcement)
                 if outcome_label != 0:
-                     self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight * 1.5)
+                      self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight * 1.5)
 
                 # Train Meta Labeler
                 if outcome_label != 0:
                     self.meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
 
         # C. Add CURRENT Bar as new Trade Opportunity
-        # Inject Parkinson for Labeler boost (Rec 2)
+        # --- REC 2: Volatility Passing ---
+        # Inject Parkinson for Labeler boost
         parkinson = features.get('parkinson_vol', 0.0)
         features['parkinson_vol'] = parkinson 
         
         current_atr = features.get('atr', 0.0)
-        self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
+        # Pass parkinson_vol explicitly to match the updated AdaptiveTripleBarrier API
+        self.labeler.add_trade_opportunity(features, price, current_atr, timestamp, parkinson_vol=parkinson)
 
         # ============================================================
         # D. PROJECT PHOENIX: ACTIVE TRADE MANAGEMENT
@@ -514,7 +519,7 @@ class ResearchStrategy:
             risk_reward_ratio=self.optimized_reward_mult # Use Optimized R:R
         )
 
-        # Calculate Size using Risk Manager (Calculates default TP/SL from Config)
+        # Calculate Size using RiskManager (Calculates default TP/SL from Config)
         current_atr = features.get('atr', 0.001)
         current_ker = features.get('ker', 1.0)
         volatility = features.get('volatility', 0.001)

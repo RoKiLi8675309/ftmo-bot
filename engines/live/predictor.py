@@ -13,9 +13,9 @@
 # 2. RISK LOADING: Loads 'risk_per_trade_percent' from optimized params file.
 #
 # IMPLEMENTATION UPDATE (Rec 1, 2, 3):
-# - Dynamic Gate Scaling: River ADWIN monitors KER to adjust thresholds.
-# - Efficiency-Weighted Learning: Sample weights boosted by KER.
-# - Volatility Passing: explicit Parkinson Vol passing for barrier adjustment.
+# - Rec 1: Dynamic Gate Scaling: River ADWIN monitors KER to adjust thresholds.
+# - Rec 2: Volatility Passing: Explicit Parkinson Vol passing for barrier adjustment.
+# - Rec 3: Efficiency-Weighted Learning: Sample weights boosted by KER * 2.0.
 # =============================================================================
 import logging
 import pickle
@@ -332,11 +332,11 @@ class MultiAssetPredictor:
                 
                 # --- REC 3: EFFICIENCY-WEIGHTED LEARNING ---
                 # Weight samples by KER. High efficiency bars are more valuable for trend learning.
-                # e.g. If KER is 0.8, weight multiplier is 1 + 0.8 = 1.8
+                # Prioritize high-quality data points (High KER = Clean Trend)
                 hist_ker = stored_feats.get('ker', 0.5)
-                efficiency_scalar = 1.0 + hist_ker
+                ker_weight = hist_ker * 2.0  # Scale 0-2 (e.g., 0.8 KER -> 1.6x weight)
                 
-                final_weight = base_weight * ret_scalar * efficiency_scalar
+                final_weight = base_weight * ret_scalar * ker_weight
                 
                 # Train Primary Model
                 model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
@@ -352,13 +352,13 @@ class MultiAssetPredictor:
         # 3. Add CURRENT Bar as new Trade Opportunity
         # --- REC 2: Volatility Passing ---
         # Explicitly pass parkinson_vol to labeler for dynamic barrier sizing
-        # The actual scaling logic resides in AdaptiveTripleBarrier (updated next file)
         current_atr = features.get('atr', 0.0)
         
-        # Inject Parkinson into features passed to labeler if not already clear
+        # Inject Parkinson into features if missing (though FeatureEngineer should provide it)
         features['parkinson_vol'] = parkinson 
         
-        labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp())
+        # Pass parkinson_vol explicitly to match the updated AdaptiveTripleBarrier API
+        labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp(), parkinson_vol=parkinson)
 
         # ============================================================
         # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V5.0 SIMPLE)
@@ -562,7 +562,8 @@ class MultiAssetPredictor:
                     "mtf_align": mtf_align,
                     "drivers": imp_feats,
                     "optimized_rr": opt_rr,
-                    "risk_percent_override": opt_risk
+                    "risk_percent_override": opt_risk,
+                    "pyramid": False
                 })
         else:
             stats['Meta Rejected'] += 1

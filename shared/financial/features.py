@@ -575,7 +575,7 @@ class AdaptiveTripleBarrier:
         self.reward_mult = reward_mult
         self.drift_threshold = drift_threshold
 
-    def add_trade_opportunity(self, features: Dict[str, float], entry_price: float, current_atr: float, timestamp: float):
+    def add_trade_opportunity(self, features: Dict[str, float], entry_price: float, current_atr: float, timestamp: float, parkinson_vol: float = 0.0):
         if current_atr <= 0: current_atr = entry_price * 0.0001
         
         # Base Volatility Scaling (Standard Deviation based)
@@ -585,10 +585,11 @@ class AdaptiveTripleBarrier:
         # --- REC 2: Parkinson Volatility Boost ---
         # If range-based volatility (Parkinson) indicates expansion (> 0.002),
         # we widen barriers to prevent premature stops in volatile moves.
-        parkinson_vol = features.get('parkinson_vol', 0.0)
-        vol_boost = 0.0
+        # Use argument if provided, else fallback to features
+        p_vol = parkinson_vol if parkinson_vol > 0 else features.get('parkinson_vol', 0.0)
         
-        if parkinson_vol > 0.002:
+        vol_boost = 0.0
+        if p_vol > 0.002:
             vol_boost = 0.5 # Add 0.5x ATR room
         
         effective_risk_mult = (self.risk_mult + vol_boost) * adaptive_scalar
