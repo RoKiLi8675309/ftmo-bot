@@ -6,10 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# AUDIT REMEDIATION (2025-01-01 - STREAK BREAKER RELAXATION):
-# 1. RISK LOADING: Loads 'risk_per_trade_percent' from optimized params file.
-# 2. SIGNAL INJECTION: Passes optimized risk to Live Engine via Signal metadata.
-# 3. STREAK BREAKER: Relaxed penalty logic (0.02 step, 0.10 cap) to match Research.
+# AUDIT REMEDIATION (2025-01-01 - HARD STREAK BREAKER):
+# 1. HARD STREAK BREAKER: Synchronized with Research Strategy.
+#    - If streak >= 3: KER +0.40, Confidence +0.20.
+#    - If streak < 3: KER +0.02/loss, Confidence +0.02/loss.
+# 2. RISK LOADING: Loads 'risk_per_trade_percent' from optimized params file.
 # =============================================================================
 import logging
 import pickle
@@ -348,14 +349,18 @@ class MultiAssetPredictor:
             stats[f"Volume Climax"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
             
-        # --- STREAK BREAKER: DYNAMIC EFFICIENCY GATE ---
+        # --- HARD STREAK BREAKER: DYNAMIC EFFICIENCY GATE ---
         # If we are in a losing streak, require higher efficiency (cleaner trends)
         streak = self.consecutive_losses[symbol]
         effective_ker_thresh = ker_thresh
         
         if streak > 0:
-            # RELAXED: Add 0.02 per loss, cap at +0.10 (Matched Strategy.py)
-            effective_ker_thresh += min(0.10, streak * 0.02)
+            if streak >= 3:
+                # HARD BREAKER: Require pristine trend efficiency (0.7+) to break a nasty streak
+                effective_ker_thresh += 0.40 
+            else:
+                # RELAXED SOFT BREAKER: Add 0.02 per loss for 1-2 losses
+                effective_ker_thresh += min(0.10, streak * 0.02)
             
         if ker_val < effective_ker_thresh:
             stats[f"Low Efficiency (Streak: {streak})"] += 1
@@ -468,13 +473,17 @@ class MultiAssetPredictor:
             threshold=meta_threshold
         )
 
-        # --- DECISION WITH DYNAMIC CONFIDENCE ---
+        # --- DECISION WITH DYNAMIC CONFIDENCE (HARD BREAKER) ---
         min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.60)
         
-        # STREAK BREAKER: Increase required confidence (RELAXED)
+        # STREAK BREAKER: Increase required confidence
         if streak > 0:
-            # Add 0.02 per loss, cap at +0.10
-            min_prob += min(0.10, streak * 0.02)
+            if streak >= 3:
+                # HARD BREAKER: Require high confidence (80%+)
+                min_prob += 0.20
+            else:
+                # SOFT BREAKER: Add 0.02 per loss
+                min_prob += min(0.10, streak * 0.02)
 
         if confidence < min_prob:
             stats[f"ML Disagreement (Streak: {streak})"] += 1

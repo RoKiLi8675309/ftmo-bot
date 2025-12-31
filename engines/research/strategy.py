@@ -5,11 +5,12 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 #
-# AUDIT REMEDIATION (2025-01-01 - STREAK BREAKER RELAXATION):
-# 1. STREAK BREAKER: Relaxed penalty logic to prevent over-pruning.
-#    - KER Penalty: Reduced from 0.05/step to 0.02/step (Cap 0.10).
-#    - Conf Penalty: Reduced from 0.05/step to 0.02/step (Cap 0.10).
-# 2. RISK OPTIMIZATION: Maintained Optuna risk override logic.
+# AUDIT REMEDIATION (2025-01-01 - HARD STREAK BREAKER):
+# 1. HARD STREAK BREAKER: If consecutive losses >= 3, impose SEVERE penalty.
+#    - Forces bot to "sit out" chop until conditions are near-perfect.
+#    - KER Threshold +0.40 (Requires almost straight line trend).
+#    - Confidence +0.20 (Requires 85-90% certainty).
+# 2. RISK CAP: Strict enforcement of 0.25% max risk (Config Driven).
 # =============================================================================
 import logging
 import sys
@@ -297,16 +298,18 @@ class ResearchStrategy:
             self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
             return # Block trade
         
-        # --- DYNAMIC VOLATILITY/EFFICIENCY FILTER (STREAK DEFENSE) ---
-        # Calculate Dynamic KER Threshold based on recent losses.
+        # --- HARD STREAK BREAKER (V5.3) ---
+        # If consecutive losses >= 3, apply MASSIVE penalties to stop chop trading.
         effective_ker_thresh = self.ker_thresh
         
         if self.consecutive_losses > 0:
-            # RELAXED STREAK BREAKER (2025-01-01):
-            # Reduced step from 0.05 to 0.02 to prevent "Pruned" trials.
-            # Cap reduced from 0.25 to 0.10.
-            ker_penalty = min(0.10, self.consecutive_losses * 0.02)
-            effective_ker_thresh += ker_penalty
+            if self.consecutive_losses >= 3:
+                # HARD BREAKER: Require pristine trend efficiency (0.7+)
+                # This effectively stops trading unless the market is moving in a straight line.
+                effective_ker_thresh += 0.40 
+            else:
+                # SOFT BREAKER: Mild penalty for 1-2 losses
+                effective_ker_thresh += min(0.10, self.consecutive_losses * 0.02)
             
         # Check Efficiency Gate
         if ker_val < effective_ker_thresh:
@@ -424,15 +427,16 @@ class ResearchStrategy:
             if proposed_action != 0:
                 self.meta_label_events += 1
 
-            # --- EXECUTION WITH DYNAMIC CONFIDENCE ---
+            # --- EXECUTION WITH DYNAMIC CONFIDENCE (HARD BREAKER) ---
             min_prob = self.params.get('min_calibrated_probability', 0.60)
             
-            # STREAK BREAKER: Increase required confidence if in a losing streak
             if self.consecutive_losses > 0:
-                # RELAXED STREAK BREAKER (2025-01-01):
-                # Reduced step from 0.05 to 0.02. Cap at 0.10.
-                streak_penalty = min(0.10, self.consecutive_losses * 0.02)
-                min_prob += streak_penalty
+                if self.consecutive_losses >= 3:
+                    # HARD BREAKER: Require 80-85% Confidence to break a nasty losing streak
+                    min_prob += 0.20
+                else:
+                    # SOFT BREAKER: +2% per loss
+                    min_prob += min(0.10, self.consecutive_losses * 0.02)
                 
             if confidence < min_prob:
                 self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob:.2f} | Streak: {self.consecutive_losses})"] += 1
