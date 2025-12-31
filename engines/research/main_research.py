@@ -4,11 +4,15 @@
 # PATH: engines/research/main_research.py
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
-#
+# 
 # AUDIT REMEDIATION (2025-01-01 - ANALYSIS IMPLEMENTATION V5.3):
 # 1. OPTIMIZATION: Dynamically ingests fine-tuned R:R (1.5-3.5) and Risk (0.1-0.5%).
 # 2. SCORING FUNCTION: Added explicit penalty for Drawdown > 5% to filter volatility.
 # 3. SAFETY: Single-threaded math ops to prevent worker deadlocks.
+#
+# IMPLEMENTATION UPDATE (Rec 5):
+# - Optuna DD Frequency Penalty: Penalizes score by -10 for every trade closed
+#   while account is in > 5% drawdown.
 # =============================================================================
 import os
 import sys
@@ -60,6 +64,7 @@ setup_logging("Research")
 log = logging.getLogger("Research")
 
 # --- 1. TELEMETRY & REPORTING UTILS ---
+
 class EmojiCallback:
     """
     Injects FTMO-style Emojis and RICH TELEMETRY into Optuna Trial reporting.
@@ -101,16 +106,17 @@ class EmojiCallback:
         wr = attrs.get('win_rate', 0.0) * 100
         pf = attrs.get('profit_factor', 0.0)
         sqn = attrs.get('sqn', 0.0)
+        dd_ev = attrs.get('dd_events', 0)
         
         # 3. Format Output (Column Aligned)
         # Structure: [ICON] STATUS | SYMBOL | ID | RISK | R:R | PnL | WR | DD | PF | SQN | TRADES
         msg = (
             f"{icon} {status:<6} | {symbol:<6} | Trial {trial.number:<3} | "
             f"🎲 RISK: {risk_pct}% | "
-            f"⚖️ R:R: {rr:>4.2f} | " 
+            f"⚖️ R:R: {rr:>4.2f} | "
             f"💰 PnL: ${pnl:>9,.2f} | "
             f"🎯 WR: {wr:>5.1f}% | "
-            f"📉 DD: {dd:>5.2f}% | "
+            f"📉 DD: {dd:>5.2f}% ({dd_ev} ev) | "
             f"⚡ PF: {pf:>4.2f} | "
             f"💎 SQN: {sqn:>4.2f} | "
             f"#️⃣ {trades:<4}"
@@ -135,7 +141,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     Strictly enforcing Volume Bars eliminates "Time-Based noise".
     """
     # 1. Load Massive Amount of Ticks (To get sufficient Bars)
-    raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2) 
+    raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2)
     
     if raw_ticks.empty:
         return pd.DataFrame()
@@ -158,6 +164,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     return df_bars
 
 # --- 2. WORKER FUNCTIONS (ISOLATED PROCESSES) ---
+
 def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url: str) -> None:
     """
     ISOLATED WORKER FUNCTION: Runs in a separate process.
@@ -174,7 +181,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
     optuna.logging.set_verbosity(optuna.logging.WARN)
     
     try:
-        # 1. Load & Aggregate Data 
+        # 1. Load & Aggregate Data
         df = process_data_into_bars(symbol, n_ticks=4000000)
         
         if df.empty:
@@ -249,6 +256,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("sharpe", metrics['sharpe'])
             trial.set_user_attr("risk_pct", params['risk_per_trade_percent'])
+            trial.set_user_attr("dd_events", metrics.get('dd_events_gt_5', 0))
             
             # ALWAYS Generate Autopsy/Victory Lap Report for analysis
             trial.set_user_attr("autopsy", strategy.generate_autopsy())
@@ -258,7 +266,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             base_score = metrics['total_pnl'] / 100.0
             
             # Constraint: Minimum Trades (Statistical Significance)
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 15) 
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 15)
             total_trades = metrics['total_trades']
             
             if total_trades < min_trades:
@@ -276,14 +284,15 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 rr_bonus = metrics['risk_reward_ratio'] * 5.0
                 final_score = base_score + rr_bonus
                 
-                # --- STRICTER DRAWDOWN PENALTY (ANALYSIS RECOMMENDATION) ---
-                # Penalize if Drawdown exceeds 5% (Daily Limit Danger Zone)
-                if metrics['max_dd_pct'] > 0.05:
-                    final_score -= 20.0 
+                # --- REC 5: DD FREQUENCY PENALTY ---
+                # Penalize based on how many trades were closed while in > 5% DD.
+                # This hurts strategies that linger in deep drawdown.
+                dd_count = metrics.get('dd_events_gt_5', 0)
+                final_score -= (10.0 * dd_count)
                 
-                # Check FTMO Hard Limit (10%) for massive penalty
+                # Hard cap check (Legacy safety)
                 if metrics['max_dd_pct'] > 0.10:
-                    final_score -= 50.0 
+                    final_score -= 50.0
                 
                 return final_score
             else:
@@ -375,6 +384,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         log.error(f"CRITICAL FINALIZE ERROR ({symbol}): {e}")
 
 # --- 3. MAIN PIPELINE CLASS ---
+
 class ResearchPipeline:
     def __init__(self):
         self.symbols = CONFIG['trading']['symbols']
@@ -424,7 +434,7 @@ class ResearchPipeline:
             preprocessing.StandardScaler(),
             ensemble.ADWINBaggingClassifier(
                 model=base_clf,
-                n_models=5, 
+                n_models=5,
                 seed=42
             )
         )
@@ -433,6 +443,7 @@ class ResearchPipeline:
         """
         Calculates Trade Metrics from the log.
         AUDIT FIX: Computes Risk:Reward Ratio (Avg Win / Avg Loss).
+        IMPLEMENTATION UPDATE (Rec 5): Counts drawdown frequency events.
         """
         metrics_out = {
             'risk_reward_ratio': 0.0,
@@ -445,7 +456,8 @@ class ResearchPipeline:
             'sortino': 0.0,
             'sqn': 0.0,
             'avg_win': 0.0,
-            'avg_loss': 0.0
+            'avg_loss': 0.0,
+            'dd_events_gt_5': 0
         }
         
         if not trade_log:
@@ -492,27 +504,34 @@ class ResearchPipeline:
             if pnl_std > 1e-9:
                 metrics_out['sqn'] = np.sqrt(len(df)) * (df['Net_PnL'].mean() / pnl_std)
 
-        # 3. Time-Series Equity Curve (Hourly Resampling for Sharpe/Sortino)
+        # 3. Time-Series Equity Curve
+        # Calculate running equity to detect Drawdown events
+        df['Equity'] = initial_capital + df['Net_PnL'].cumsum()
+        df['Peak'] = df['Equity'].cummax()
+        df['Drawdown_USD'] = df['Equity'] - df['Peak']
+        df['Drawdown_Pct'] = (df['Drawdown_USD'] / df['Peak']).abs() * 100.0
+        
+        max_dd_pct = df['Drawdown_Pct'].max()
+        metrics_out['max_dd_pct'] = max_dd_pct if not pd.isna(max_dd_pct) else 0.0
+        
+        # --- REC 5: DRAWDOWN FREQUENCY ---
+        # Count number of trade closures where the account was in > 5% drawdown
+        # This penalizes lingering in the danger zone
+        dd_events = len(df[df['Drawdown_Pct'] > 5.0])
+        metrics_out['dd_events_gt_5'] = dd_events
+
+        # 4. Hourly Resampling for Sharpe/Sortino
         equity_df = pd.DataFrame({'time': df['Exit_Time'], 'pnl': df['Net_PnL']})
         equity_df.set_index('time', inplace=True)
         
         hourly_pnl = equity_df['pnl'].resample('1H').sum().fillna(0)
         hourly_equity = initial_capital + hourly_pnl.cumsum()
-        
-        # 4. Drawdown Calculation (High Water Mark)
-        peak = hourly_equity.cummax()
-        drawdown = hourly_equity - peak
-        drawdown_pct = (drawdown / peak).abs()
-        max_dd_pct = drawdown_pct.max()
-        metrics_out['max_dd_pct'] = max_dd_pct if not pd.isna(max_dd_pct) else 0.0
-
-        # 5. Financial Metrics (Sharpe & Sortino)
         hourly_returns = hourly_equity.pct_change().dropna()
         
         if len(hourly_returns) > 1:
             avg_ret = hourly_returns.mean()
             std_ret = hourly_returns.std()
-            annual_factor = np.sqrt(252 * 24) 
+            annual_factor = np.sqrt(252 * 24)
             
             if std_ret > 1e-9:
                 metrics_out['sharpe'] = (avg_ret / std_ret) * annual_factor
@@ -580,7 +599,7 @@ class ResearchPipeline:
         
         Parallel(n_jobs=len(self.symbols), backend="loky")(
             delayed(_worker_finalize_task)(
-                sym, 
+                sym,
                 self.train_candles,
                 self.db_url,
                 self.models_dir
@@ -644,7 +663,6 @@ class ResearchPipeline:
                     strategy.on_data(snapshot, broker)
             
             return broker.trade_log
-
         except Exception as e:
             print(f"Backtest error {symbol}: {e}")
             return []
@@ -732,14 +750,14 @@ class ResearchPipeline:
         csv_path = self.reports_dir / f"backtest_trades_{timestamp_str}.csv"
         df.to_csv(csv_path)
         log.info(f"{LogSymbols.DATABASE} Saved Trades to {csv_path}")
-
+        
         try:
             self._plot_equity_curve(df, timestamp_str)
         except Exception as e:
             log.warning(f"Could not generate plot: {e}")
 
     def _plot_equity_curve(self, df_equity: pd.DataFrame, timestamp_str: str):
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                             vertical_spacing=0.05, row_heights=[0.7, 0.3],
                             subplot_titles=("Equity Curve", "Drawdown"))
 

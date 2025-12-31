@@ -4,13 +4,16 @@
 # PATH: shared/financial/features.py
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
-#
+# 
 # PHOENIX STRATEGY UPGRADE (2025-12-25 - L1 PROXIES):
 # 1. CORE FEATURES: Implemented 7 Core L1 Proxies (Parkinson, Amihud, RVol, etc.).
 # 2. VOLATILITY: Added High-Low Range Volatility (Parkinson) for expansion detection.
 # 3. LIQUIDITY: Added Amihud Illiquidity Proxy (Return / DollarVolume).
 # 4. MOMENTUM: Added Aggressor Ratio (Close vs Range) and Relative Volume (Duration Intensity).
-# 5. AUDIT FIX: Hard-silenced hmmlearn loggers to ERROR level.
+#
+# IMPLEMENTATION UPDATE (Rec 2):
+# - AdaptiveTripleBarrier: Now accepts 'parkinson_vol' to boost barrier width
+#   during volatility expansion phases (> 0.002).
 # =============================================================================
 from __future__ import annotations
 import math
@@ -109,7 +112,7 @@ class RecursiveEMA:
 
     def update(self, x: float):
         if x is None or math.isnan(x) or math.isinf(x):
-            return # Skip bad values
+            return  # Skip bad values
             
         if self.value is None:
             self.value = x
@@ -228,7 +231,7 @@ class StreamingAggressorRatio:
 
 class StreamingFracDiff:
     """
-    Computes the Fractionally Differentiated value of a time series 
+    Computes the Fractionally Differentiated value of a time series
     in a streaming (online) fashion with O(1) complexity per update.
     Preserves memory (d < 1) while ensuring stationarity.
     """
@@ -338,7 +341,7 @@ class RegimeDetector:
         self.last_regime = 0
         self.model = None
         self.fit_failures = 0
-        self.fit_counter = 0 
+        self.fit_counter = 0
         
         if HMM_AVAILABLE:
             # FORCE SILENCE HMM LOGGERS
@@ -348,13 +351,13 @@ class RegimeDetector:
             
             try:
                 self.model = hmm.GaussianHMM(
-                    n_components=n_states, 
-                    covariance_type="diag", 
-                    n_iter=100, 
+                    n_components=n_states,
+                    covariance_type="diag",
+                    n_iter=100,
                     random_state=42,
-                    init_params="stmc", 
+                    init_params="stmc",
                     verbose=False,
-                    min_covar=1e-3, 
+                    min_covar=1e-3,
                     tol=1e-4
                 )
             except Exception as e:
@@ -374,21 +377,18 @@ class RegimeDetector:
         try:
             data = np.array(self.returns).reshape(-1, 1)
             should_fit = (self.fit_counter % 50 == 0) or (self.fit_counter < 200)
-
             if should_fit:
                 if np.var(data) < 1e-6 or np.isnan(data).any():
                     return self.last_regime
-
                 if self.fit_failures > 5:
                     self.model.init_params = "stmc"
                     self.fit_failures = 0
                 elif hasattr(self.model, 'startprob_'):
                     self.model.init_params = ""
-
                 # Standard Warning suppression + context capture
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     with warnings.catch_warnings():
-                        warnings.simplefilter("ignore") 
+                        warnings.simplefilter("ignore")
                         self.model.fit(data)
                 
                 if self.model.monitor_.converged:
@@ -399,13 +399,12 @@ class RegimeDetector:
                 else:
                     self.fit_failures += 1
                     self.state_map = {i: i for i in range(self.n_states)}
-
+            
             raw_state = int(self.model.predict(data[-1].reshape(1, -1))[0])
             mapped_state = self.state_map.get(raw_state, raw_state)
             
             self.last_regime = mapped_state
             return mapped_state
-
         except Exception:
             self.fit_failures += 1
             return self.last_regime
@@ -567,6 +566,7 @@ class StreamingIndicators:
         return features
 
 # --- 5. ADAPTIVE TRIPLE BARRIER ---
+
 class AdaptiveTripleBarrier:
     def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.75):
         self.buffer = deque()
@@ -578,11 +578,21 @@ class AdaptiveTripleBarrier:
     def add_trade_opportunity(self, features: Dict[str, float], entry_price: float, current_atr: float, timestamp: float):
         if current_atr <= 0: current_atr = entry_price * 0.0001
         
+        # Base Volatility Scaling (Standard Deviation based)
         volatility = features.get('volatility', 0.0)
         adaptive_scalar = 1.0 + (volatility * 100.0)
         
-        effective_risk_mult = self.risk_mult * adaptive_scalar
-        effective_reward_mult = self.reward_mult * adaptive_scalar
+        # --- REC 2: Parkinson Volatility Boost ---
+        # If range-based volatility (Parkinson) indicates expansion (> 0.002),
+        # we widen barriers to prevent premature stops in volatile moves.
+        parkinson_vol = features.get('parkinson_vol', 0.0)
+        vol_boost = 0.0
+        
+        if parkinson_vol > 0.002:
+            vol_boost = 0.5 # Add 0.5x ATR room
+        
+        effective_risk_mult = (self.risk_mult + vol_boost) * adaptive_scalar
+        effective_reward_mult = (self.reward_mult + vol_boost) * adaptive_scalar
         
         upper_barrier = entry_price + (effective_reward_mult * current_atr)
         lower_barrier = entry_price - (effective_risk_mult * current_atr)
@@ -612,7 +622,7 @@ class AdaptiveTripleBarrier:
             realized_ret = 0.0
             
             if current_high >= trade['tp']:
-                label = 1 # BUY
+                label = 1  # BUY
                 realized_ret = (trade['tp'] - trade['entry']) / trade['entry']
             elif current_low <= trade['sl']:
                 label = -1 # SELL
@@ -640,6 +650,7 @@ class AdaptiveTripleBarrier:
         return resolved
 
 # --- 6. PROBABILITY CALIBRATOR & META LABELER ---
+
 class ProbabilityCalibrator:
     def __init__(self, window: int = 1000):
         self.window = window
@@ -669,8 +680,8 @@ class MetaLabeler:
         
         if ML_AVAILABLE:
             self.model = forest.ARFClassifier(
-                n_models=10, 
-                seed=42, 
+                n_models=10,
+                seed=42,
                 metric=metrics.F1()
             )
 
@@ -719,6 +730,7 @@ class MetaLabeler:
         return clean
 
 # --- 7. ONLINE FEATURE ENGINEER (PROJECT PHOENIX UPGRADE) ---
+
 class OnlineFeatureEngineer:
     def __init__(self, window_size: int = 50):
         self.window_size = window_size
@@ -730,7 +742,7 @@ class OnlineFeatureEngineer:
         
         # Welford Scaler for Volume (Infinite Window Stationarity)
         self.welford_volume = WelfordScaler()
-        self.welford_ofi = WelfordScaler() 
+        self.welford_ofi = WelfordScaler()
         
         # Regime Indicators
         self.ker = KaufmanEfficiencyRatio(window=10)
@@ -746,7 +758,7 @@ class OnlineFeatureEngineer:
         # Microstructure & Math Engines
         self.entropy = EntropyMonitor(window=window_size)
         self.vpin = VPINMonitor(bucket_size=1000)
-        self.frac_diff = StreamingFracDiff(d=0.4, window=window_size) 
+        self.frac_diff = StreamingFracDiff(d=0.4, window=window_size)
         self.microstructure = MicrostructureAnalyzer(ema_alpha=0.1)
         self.vol_monitor = VolatilityMonitor(window=20)
         
@@ -756,9 +768,9 @@ class OnlineFeatureEngineer:
         self.vol_baseline = RecursiveEMA(alpha=0.001)
         self.ofi_ema = RecursiveEMA(alpha=CONFIG['features'].get('ofi_alpha', 0.1))
 
-    def update(self, price: float, timestamp: float, volume: float, 
-               high: Optional[float] = None, low: Optional[float] = None, 
-               buy_vol: float = 0.0, sell_vol: float = 0.0, 
+    def update(self, price: float, timestamp: float, volume: float,
+               high: Optional[float] = None, low: Optional[float] = None,
+               buy_vol: float = 0.0, sell_vol: float = 0.0,
                time_feats: Dict[str, float] = None,
                sentiment: float = 0.0,
                context_data: Dict[str, Any] = None) -> Dict[str, float]:
@@ -767,7 +779,6 @@ class OnlineFeatureEngineer:
             time_feats = {'sin_hour': 0.0, 'cos_hour': 0.0}
         if high is None: high = price
         if low is None: low = price
-
         if not math.isfinite(price) or price <= 0: return None
         if not math.isfinite(volume): volume = 0.0
 
@@ -887,7 +898,7 @@ class OnlineFeatureEngineer:
             'log_ret': ret_log,
             'volatility': volatility_val,
             'atr': current_atr,
-            'atr_pct': current_atr / price, 
+            'atr_pct': current_atr / price,
             
             # Project Phoenix L1 Proxies
             'parkinson_vol': parkinson_val,
@@ -908,15 +919,15 @@ class OnlineFeatureEngineer:
             'rsi_norm': rsi_norm,
             'macd_norm': macd_norm,
             'macd_hist_norm': tech_feats['macd_hist'] / price,
-            'adx': tech_feats.get('adx', 0.0), 
-            'bb_width': tech_feats.get('bb_width', 0.0), 
+            'adx': tech_feats.get('adx', 0.0),
+            'bb_width': tech_feats.get('bb_width', 0.0),
             'bb_position': (price - tech_feats.get('bb_lower', price)) / (tech_feats.get('bb_upper', price) - tech_feats.get('bb_lower', price)) if tech_feats.get('bb_width', 0) > 0 else 0.5,
 
             # Context / Legacy
             'vol_ratio': vol_ratio,
             'volatility_log': math.log(volatility_val + 1e-9),
             'micro_ofi': micro_ofi_z,
-            'ofi_simple': ofi_simple,         
+            'ofi_simple': ofi_simple,
             'efficiency_ratio': er_val,
             'cum_ofi': cum_ofi,
             'ofi_trend': ofi_trend,
@@ -949,6 +960,7 @@ class OnlineFeatureEngineer:
         return clean
 
 # --- 8. LEGACY MONITORS (PRESERVED) ---
+
 class StreamingTripleBarrier:
     def __init__(self, vol_multiplier: float = 2.0, barrier_len: int = 50, horizon_ticks: int = 100):
         self.vol_multiplier = vol_multiplier
@@ -1013,7 +1025,7 @@ class VPINMonitor:
         self.current_bucket_vol = 0.0
         self.current_buy_vol = 0.0
         self.current_sell_vol = 0.0
-        self.buckets = deque(maxlen=50) 
+        self.buckets = deque(maxlen=50)
         self.last_price = None
 
     def update(self, volume: float, price: float, buy_vol_input: float = 0.0, sell_vol_input: float = 0.0) -> float:
@@ -1023,6 +1035,7 @@ class VPINMonitor:
         
         b_vol = 0.0
         s_vol = 0.0
+        
         if buy_vol_input > 0 or sell_vol_input > 0:
             b_vol = buy_vol_input
             s_vol = sell_vol_input
@@ -1045,7 +1058,7 @@ class VPINMonitor:
             self.current_bucket_vol = 0.0
             self.current_buy_vol = 0.0
             self.current_sell_vol = 0.0
-        
+            
         return self.get_vpin()
 
     def get_vpin(self) -> float:
@@ -1062,7 +1075,6 @@ class IncrementalFracDiff:
     """Wrapper for StreamingFracDiff legacy compatibility."""
     def __init__(self, d: float = 0.6, window: int = 20):
         self.impl = StreamingFracDiff(d=d, window=window)
-
     def update(self, price: float) -> float:
         return self.impl.update(price)
 
@@ -1097,7 +1109,7 @@ def calculate_hurst(ts):
     y = np.log(tau)
     A = np.column_stack((x, np.ones(len(x))))
     m, c = np.linalg.lstsq(A, y)[0]
-    hurst = m * 2.0 
+    hurst = m * 2.0
     return max(0.0, min(1.0, hurst))
 
 def enrich_with_d1_data(features: Dict[str, float], d1_data: Dict[str, float], current_price: float) -> Dict[str, float]:
@@ -1105,6 +1117,7 @@ def enrich_with_d1_data(features: Dict[str, float], d1_data: Dict[str, float], c
     prev_high = d1_data.get('high', 0)
     prev_low = d1_data.get('low', 0)
     if prev_high == 0: return features
+    
     features['dist_d1_high'] = (prev_high - current_price) / current_price
     features['dist_d1_low'] = (current_price - prev_low) / current_price
     return features

@@ -8,9 +8,14 @@
 #
 # AUDIT REMEDIATION (2025-01-01 - AGGRESSIVE RECOVERY):
 # 1. CORRECTED STREAK BREAKER: Synchronized with Research Strategy V5.5.
-#    - If streak >= 3: KER +0.15 (Strict but Achievable), Conf +0.10.
-#    - Prevents "Dormancy Trap" while still filtering chop.
+# - If streak >= 3: KER +0.15 (Strict but Achievable), Conf +0.10.
+# - Prevents "Dormancy Trap" while still filtering chop.
 # 2. RISK LOADING: Loads 'risk_per_trade_percent' from optimized params file.
+#
+# IMPLEMENTATION UPDATE (Rec 1, 2, 3):
+# - Dynamic Gate Scaling: River ADWIN monitors KER to adjust thresholds.
+# - Efficiency-Weighted Learning: Sample weights boosted by KER.
+# - Volatility Passing: explicit Parkinson Vol passing for barrier adjustment.
 # =============================================================================
 import logging
 import pickle
@@ -122,7 +127,7 @@ class MultiAssetPredictor:
         
         # 4. Warm-up State
         self.burn_in_counters = {s: 0 for s in symbols}
-        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 200) 
+        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 200)
         
         # 5. Forensic Stats
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
@@ -157,6 +162,11 @@ class MultiAssetPredictor:
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
         self.last_close_prices = {s: 0.0 for s in symbols}
+
+        # --- REC 1: Dynamic Gate Scaling State ---
+        # ADWIN Drift detectors for KER monitoring per symbol
+        self.ker_drift_detectors = {s: drift.ADWIN(delta=0.01) for s in symbols}
+        self.dynamic_ker_offsets = {s: 0.0 for s in symbols}
 
         # Inject Default Data for JPY Basket (Prevents Risk Manager Zeros)
         self._inject_auxiliary_data()
@@ -199,7 +209,7 @@ class MultiAssetPredictor:
                 preprocessing.StandardScaler(),
                 ensemble.ADWINBaggingClassifier(
                     model=base_clf,
-                    n_models=5, 
+                    n_models=5,
                     seed=42
                 )
             )
@@ -212,6 +222,7 @@ class MultiAssetPredictor:
         """
         Actual entry point called by Engine.
         Executes the Learn-Predict Loop with Project Phoenix V5.0 Logic.
+        Includes Rec 1 (Dynamic Gates) and Rec 3 (Weighted Learning).
         """
         if symbol not in self.symbols: return None
         
@@ -242,7 +253,7 @@ class MultiAssetPredictor:
                 logger.warning(f"⚠️ {symbol}: Zero Flow Detected. Using Local Tick Rule Fallback.")
                 self.l2_missing_warned[symbol] = True
             
-            last_price = self.last_close_prices.get(symbol, bar.close) 
+            last_price = self.last_close_prices.get(symbol, bar.close)
             if bar.close > last_price:
                 buy_vol = bar.volume; sell_vol = 0.0
             elif bar.close < last_price:
@@ -259,11 +270,29 @@ class MultiAssetPredictor:
             low=bar.low,
             buy_vol=buy_vol,
             sell_vol=sell_vol,
-            context_data=context_data 
+            context_data=context_data
         )
         
         if features is None: return None
         
+        # Extract Key Features
+        ker_val = features.get('ker', 0.5)
+        parkinson = features.get('parkinson_vol', 0.0)
+
+        # --- REC 1: DYNAMIC GATE SCALING (Drift Detection) ---
+        # Update drift detector with current KER
+        self.ker_drift_detectors[symbol].update(ker_val)
+        
+        # If distribution of KER changes significantly (Drift), adjust threshold
+        if self.ker_drift_detectors[symbol].drift_detected:
+            # Drift implies regime shift. Relax gate temporarily to catch new trends.
+            # Reduce threshold by 0.05
+            self.dynamic_ker_offsets[symbol] = max(-0.15, self.dynamic_ker_offsets[symbol] - 0.05)
+            # logger.info(f"🌊 {symbol}: KER Drift Detected. Relaxing gate by {self.dynamic_ker_offsets[symbol]:.2f}")
+        else:
+            # Slowly decay offset back to 0 (Normalization)
+            self.dynamic_ker_offsets[symbol] = min(0.0, self.dynamic_ker_offsets[symbol] + 0.001)
+
         # Update Feature Stats
         alpha = 0.01
         feat_stats['avg_ker'] = (1 - alpha) * feat_stats.get('avg_ker', 0.5) + alpha * features.get('ker', 0.5)
@@ -281,12 +310,8 @@ class MultiAssetPredictor:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
                 
                 # --- STREAK BREAKER UPDATE ---
-                # Check if this resolved label corresponds to a trade we signaled
                 # Outcome_label: 1=Win(Target), -1=Loss(Stop), 0=Neutral
-                # Note: This is an internal proxy. Real PnL comes from Engine, but this ensures autonomy.
                 if self.active_signals[symbol]:
-                    # Simple FIFO matching for now
-                    # (In a complex system, we'd match IDs, but barriers are sequential)
                     _ = self.active_signals[symbol].popleft()
                     
                     if outcome_label == 1:
@@ -304,7 +329,14 @@ class MultiAssetPredictor:
                 # Scale by Profit Magnitude (Log Scale)
                 ret_scalar = math.log1p(abs(realized_ret) * 100.0)
                 ret_scalar = max(0.5, min(ret_scalar, 5.0))
-                final_weight = base_weight * ret_scalar
+                
+                # --- REC 3: EFFICIENCY-WEIGHTED LEARNING ---
+                # Weight samples by KER. High efficiency bars are more valuable for trend learning.
+                # e.g. If KER is 0.8, weight multiplier is 1 + 0.8 = 1.8
+                hist_ker = stored_feats.get('ker', 0.5)
+                efficiency_scalar = 1.0 + hist_ker
+                
+                final_weight = base_weight * ret_scalar * efficiency_scalar
                 
                 # Train Primary Model
                 model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
@@ -318,7 +350,14 @@ class MultiAssetPredictor:
                     meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
 
         # 3. Add CURRENT Bar as new Trade Opportunity
+        # --- REC 2: Volatility Passing ---
+        # Explicitly pass parkinson_vol to labeler for dynamic barrier sizing
+        # The actual scaling logic resides in AdaptiveTripleBarrier (updated next file)
         current_atr = features.get('atr', 0.0)
+        
+        # Inject Parkinson into features passed to labeler if not already clear
+        features['parkinson_vol'] = parkinson 
+        
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp())
 
         # ============================================================
@@ -327,11 +366,11 @@ class MultiAssetPredictor:
         
         # Extract Core Indicators
         rvol = features.get('rvol', 1.0)
-        ker_val = features.get('ker', 0.5)
+        # ker_val already extracted
         aggressor = features.get('aggressor', 0.5)
         amihud = features.get('amihud', 0.0)
         atr_val = features.get('atr', 0.0001)
-        parkinson = features.get('parkinson_vol', 0.0)
+        # parkinson already extracted
         mtf_align = features.get('mtf_alignment', 0.0)
         adx_val = features.get('adx', 0.0)
         
@@ -351,19 +390,22 @@ class MultiAssetPredictor:
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
             
         # --- CORRECTED STREAK BREAKER: DYNAMIC EFFICIENCY GATE ---
-        # If we are in a losing streak, require higher efficiency (cleaner trends)
+        # Apply Dynamic Offset from ADWIN (Rec 1)
+        effective_ker_thresh = ker_thresh + self.dynamic_ker_offsets[symbol]
+        
         streak = self.consecutive_losses[symbol]
-        effective_ker_thresh = ker_thresh
         
         if streak > 0:
             if streak >= 3:
-                # FIRM BREAKER: Require cleaner trend (e.g., +0.15) to break a nasty streak
-                # This is strict but achievable, unlike the previous +0.40.
-                effective_ker_thresh += 0.15 
+                # FIRM BREAKER: Require cleaner trend
+                effective_ker_thresh += 0.15
             else:
-                # SOFT BREAKER: Add 0.02 per loss for 1-2 losses
+                # SOFT BREAKER
                 effective_ker_thresh += min(0.10, streak * 0.02)
-            
+        
+        # Ensure gate doesn't go below absolute safety minimum
+        effective_ker_thresh = max(0.10, effective_ker_thresh)
+
         if ker_val < effective_ker_thresh:
             stats[f"Low Efficiency (Streak: {streak})"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (Streak: {streak})"})
@@ -392,7 +434,7 @@ class MultiAssetPredictor:
         is_bullish_candle = aggressor > aggressor_thresh
         is_bearish_candle = aggressor < (1.0 - aggressor_thresh)
         
-        proposed_action = 0 
+        proposed_action = 0
         regime_label = "C (Noise)"
 
         # --- REGIME A: MOMENTUM IGNITION ---
@@ -404,11 +446,10 @@ class MultiAssetPredictor:
             elif d1_trend_down and is_bearish_candle and vol_gate:
                 proposed_action = -1
                 regime_label = "A (Mom-Short)"
-
             elif (d1_trend_up and is_bullish_candle) or (d1_trend_down and is_bearish_candle):
                 if not vol_gate:
                     stats[f"Volume Gate Fail"] += 1
-                
+            
         # --- REGIME B: EFFICIENT TREND CONTINUATION ---
         is_trending = adx_val > CONFIG['features']['adx'].get('threshold', 18)
         
@@ -470,8 +511,8 @@ class MultiAssetPredictor:
         # Meta Labeling
         meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.55)
         is_profitable = meta_labeler.predict(
-            features, 
-            proposed_action, 
+            features,
+            proposed_action,
             threshold=meta_threshold
         )
 
@@ -481,10 +522,8 @@ class MultiAssetPredictor:
         # STREAK BREAKER: Increase required confidence
         if streak > 0:
             if streak >= 3:
-                # FIRM BREAKER: +10% Confidence (e.g. 0.60 -> 0.70)
                 min_prob += 0.10
             else:
-                # SOFT BREAKER: Add 0.02 per loss
                 min_prob += min(0.10, streak * 0.02)
 
         if confidence < min_prob:
@@ -495,7 +534,7 @@ class MultiAssetPredictor:
                 action_str = "BUY" if proposed_action == 1 else "SELL"
                 
                 # Register Signal for Streak Tracking
-                self.active_signals[symbol].append(action_str) 
+                self.active_signals[symbol].append(action_str)
                 
                 # FEATURE IMPORTANCE TRACKING
                 imp_feats = []
@@ -512,11 +551,11 @@ class MultiAssetPredictor:
                 opt_risk = self.optimized_params.get(symbol, {}).get('risk_per_trade_percent')
 
                 return Signal(symbol, action_str, confidence, {
-                    "meta_ok": True, 
-                    "volatility": features.get('volatility', 0.001), 
-                    "atr": current_atr, 
-                    "ker": ker_val, 
-                    "parkinson_vol": parkinson, 
+                    "meta_ok": True,
+                    "volatility": features.get('volatility', 0.001),
+                    "atr": current_atr,
+                    "ker": ker_val,
+                    "parkinson_vol": parkinson,
                     "rvol": rvol,
                     "amihud": amihud,
                     "regime": regime_label,
@@ -586,12 +625,12 @@ class MultiAssetPredictor:
                 try:
                     with open(meta_path, "rb") as f: self.meta_labelers[sym] = pickle.load(f)
                 except Exception: pass
-                
+            
             if fe_path.exists():
                 try:
                     with open(fe_path, "rb") as f: self.feature_engineers[sym] = pickle.load(f)
                     logger.info(f"Loaded Feature State for {sym}")
                 except Exception: pass
-                
+            
         if loaded_count > 0:
             logger.info(f"{LogSymbols.SUCCESS} Loaded {loaded_count} existing models.")

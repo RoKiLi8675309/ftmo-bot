@@ -4,13 +4,17 @@
 # PATH: engines/research/strategy.py
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
-#
+# 
 # AUDIT REMEDIATION (2025-01-01 - AGGRESSIVE RECOVERY):
 # 1. CORRECTED STREAK BREAKER: Softened penalty to prevent "Dormancy Trap".
 #    - If streak >= 3: KER +0.15 (Strict but Achievable), Conf +0.10.
 #    - Prevents bot from "rage quitting" after a drawdown.
 # 2. BASE GATES: Lowered KER threshold to 0.20 to increase trade frequency.
 # 3. RISK CAP: Strict enforcement of 0.25% max risk (Config Driven).
+#
+# IMPLEMENTATION UPDATE (Rec 1 & 3):
+# - Dynamic Gate Scaling: ADWIN monitors KER to adjust thresholds.
+# - Efficiency-Weighted Learning: Sample weights boosted by KER.
 # =============================================================================
 import logging
 import sys
@@ -20,6 +24,9 @@ import math
 from collections import deque, defaultdict, Counter
 from typing import Any, Dict, Optional, List
 from datetime import datetime
+
+# Third-Party Imports
+from river import drift
 
 # Shared Imports
 from shared import (
@@ -132,6 +139,10 @@ class ResearchStrategy:
         self.friday_entry_cutoff = CONFIG.get('risk_management', {}).get('friday_entry_cutoff_hour', 16)
         self.friday_close_hour = CONFIG.get('risk_management', {}).get('friday_liquidation_hour_server', 21)
         
+        # --- REC 1: Dynamic Gate Scaling State ---
+        self.ker_drift_detector = drift.ADWIN(delta=0.01)
+        self.dynamic_ker_offset = 0.0
+        
         # --- TRAILING STOP & BREAK EVEN LOGIC (DISABLED IN V5.0) ---
         self.use_trailing_stop = False
         self.use_breakeven = False
@@ -234,6 +245,19 @@ class ResearchStrategy:
 
         self.bars_processed += 1
 
+        # --- REC 1: DYNAMIC GATE SCALING (Drift Detection) ---
+        # Update drift detector with current KER
+        ker_val = features.get('ker', 0.5)
+        self.ker_drift_detector.update(ker_val)
+        
+        # If distribution of KER changes significantly (Drift), adjust threshold
+        if self.ker_drift_detector.drift_detected:
+            # Drift implies regime shift. Relax gate temporarily.
+            self.dynamic_ker_offset = max(-0.15, self.dynamic_ker_offset - 0.05)
+        else:
+            # Slowly decay offset back to 0 (Normalization)
+            self.dynamic_ker_offset = min(0.0, self.dynamic_ker_offset + 0.001)
+
         # B. Delayed Training (Label Resolution via Adaptive Barrier)
         resolved_labels = self.labeler.resolve_labels(high, low, current_close=price)
         
@@ -249,20 +273,29 @@ class ResearchStrategy:
                 ret_scalar = math.log1p(abs(realized_ret) * 100.0)
                 ret_scalar = max(0.5, ret_scalar)
                 
-                final_weight = base_weight * ret_scalar
+                # --- REC 3: EFFICIENCY-WEIGHTED LEARNING ---
+                # Weight samples by KER. High efficiency bars are more valuable.
+                hist_ker = stored_feats.get('ker', 0.5)
+                efficiency_scalar = 1.0 + hist_ker
+                
+                final_weight = base_weight * ret_scalar * efficiency_scalar
                 
                 # Train the model
                 self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
                 
                 # Double Learn for Positive outcomes (Reinforcement)
                 if outcome_label != 0:
-                     self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
+                     self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight * 1.5)
 
                 # Train Meta Labeler
                 if outcome_label != 0:
                     self.meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
 
         # C. Add CURRENT Bar as new Trade Opportunity
+        # Inject Parkinson for Labeler boost (Rec 2)
+        parkinson = features.get('parkinson_vol', 0.0)
+        features['parkinson_vol'] = parkinson 
+        
         current_atr = features.get('atr', 0.0)
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp)
 
@@ -286,10 +319,10 @@ class ResearchStrategy:
         
         # 1. Extract Phoenix Indicators
         rvol = features.get('rvol', 1.0)
-        ker_val = features.get('ker', 0.5)
+        # ker_val extracted above
         aggressor = features.get('aggressor', 0.5)
         atr_val = features.get('atr', 0.0001)
-        parkinson = features.get('parkinson_vol', 0.0)
+        # parkinson extracted above
         mtf_align = features.get('mtf_alignment', 0.0)
         adx_val = features.get('adx', 0.0)
         
@@ -298,19 +331,20 @@ class ResearchStrategy:
             self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
             return # Block trade
         
-        # --- CORRECTED STREAK BREAKER (V5.5) ---
-        # The V5.3 "Hard Breaker" (+0.40 KER) was too aggressive, causing dormancy.
-        # We now use a "Firm Breaker" (+0.15 KER) that filters chop but allows strong trends.
-        effective_ker_thresh = self.ker_thresh
+        # --- CORRECTED STREAK BREAKER (V5.5) & DYNAMIC SCALING ---
+        # Apply Dynamic Offset from ADWIN (Rec 1)
+        effective_ker_thresh = self.ker_thresh + self.dynamic_ker_offset
         
         if self.consecutive_losses > 0:
             if self.consecutive_losses >= 3:
-                # FIRM BREAKER: Require cleaner trend (e.g., 0.20 + 0.15 = 0.35)
-                # This is strict but achievable, unlike 0.70.
+                # FIRM BREAKER: Require cleaner trend
                 effective_ker_thresh += 0.15 
             else:
                 # SOFT BREAKER: Mild penalty for 1-2 losses
                 effective_ker_thresh += min(0.10, self.consecutive_losses * 0.02)
+        
+        # Ensure gate doesn't go below absolute safety minimum
+        effective_ker_thresh = max(0.10, effective_ker_thresh)
             
         # Check Efficiency Gate
         if ker_val < effective_ker_thresh:
