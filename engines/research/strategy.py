@@ -5,14 +5,13 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V6.0 (AGGRESSIVE PROFIT RECOVERY):
-# 1. REGIME C UNLOCKED: Implemented Mean Reversion for ranging markets.
-#    - Condition: ADX < 25 + Bollinger Band Touch + RSI Extremes.
-#    - Goal: Monetize the 70% of time the market is chopping.
-# 2. FILTER RELAXATION:
-#    - D1 Trend: Downgraded from Hard Lock to Directional Bias.
-#    - Volume Gate: Lowered to 0.8x average to catch quiet moves.
-# 3. PROFIT FOCUS: Prioritizes entry frequency over perfection.
+# PHOENIX STRATEGY V7.0 (AGGRESSOR BREAKOUT):
+# 1. MEAN REVERSION PURGED: Removed all Regime C logic.
+# 2. AGGRESSOR LOGIC:
+#    - REGIME FILTER: KER > 0.3 (Trend Efficiency).
+#    - FUEL GAUGE: RVOL > 2.0 (Momentum injection).
+#    - TRIGGER: Order Flow Imbalance (Buy > 1.2x Sell).
+# 3. RISK: Hard Stop at 1.5 ATR.
 # =============================================================================
 import logging
 import sys
@@ -49,6 +48,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
+    Strictly implements the Aggressor Breakout System.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -64,11 +64,10 @@ class ResearchStrategy:
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
         
-        # Sync Labeler Risk with Config (Default 1.5 ATR for labeling)
-        risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 1.5)
+        # STRICT REQUIREMENT: Risk is ATR * 1.5
+        risk_mult_conf = 1.5 
         
         # Target Reward should align with Strategy (Use Optimization Param)
-        # We ensure the Labeler trains on the SAME target we plan to execute.
         self.optimized_reward_mult = tbm_conf.get('barrier_width', 3.0)
         
         self.labeler = AdaptiveTripleBarrier(
@@ -110,27 +109,25 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX STRATEGY PARAMETERS (V6.0 AGGRESSIVE) ---
+        # --- PHOENIX V7.0 PARAMETERS (AGGRESSOR) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
         # Gates
-        self.enable_regime_a = phx_conf.get('enable_regime_a_entries', True)
-        self.enable_regime_c = True # Enable Mean Reversion (Regime C)
-        self.require_d1_trend = phx_conf.get('require_d1_trend', True)
-        self.require_h4_alignment = phx_conf.get('require_h4_alignment', True)
+        self.require_d1_trend = True # Always require D1 for Aggressor Trend
+        self.require_h4_alignment = True
         
-        # Safety Cap - Relaxed to 5.0 to allow volatility
-        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 5.0)
+        # Safety Cap
+        self.max_rvol_thresh = phx_conf.get('max_relative_volume', 6.0) # Cap for huge spikes
         
-        # Thresholds (AGGRESSIVELY LOWERED FOR PROFITABILITY)
-        self.ker_thresh = 0.15 # Was 0.20
-        self.adx_threshold = 15.0 # Was 18.0 - Catch trends earlier
+        # --- STRICT THRESHOLDS (FROM DOCUMENT) ---
+        self.ker_thresh = 0.30        # "Regime Filter: KER > 0.3 (Hard Gate)"
+        self.vol_gate_ratio = 2.0     # "Fuel Gauge: RVOL > 2.0 (Hard Gate)"
+        self.aggressor_ratio_min = 1.2 # "Buy Vol > Sell Vol * 1.2"
+        self.adx_threshold = 25.0     # Standard trend strength requirement
         
-        # Volume Gate - Relaxed
-        self.vol_gate_ratio = 0.8 # Was 1.1 - Allow trades on standard volume
-        
-        # Momentum
-        self.aggressor_thresh = 0.52 # Was 0.55 - Lower bar for entry
+        # Aggressor Ratio Feature Threshold (Price Action proxy)
+        # 0.55 implies 55% dominance, but we rely on Volume Flow Ratio primarily now.
+        self.aggressor_thresh_price = 0.55 
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
         
@@ -141,10 +138,6 @@ class ResearchStrategy:
         # --- REC 1: Dynamic Gate Scaling State ---
         self.ker_drift_detector = drift.ADWIN(delta=0.01)
         self.dynamic_ker_offset = 0.0
-        
-        # --- TRAILING STOP & BREAK EVEN LOGIC (DISABLED IN V5.0) ---
-        self.use_trailing_stop = False
-        self.use_breakeven = False
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
@@ -252,7 +245,7 @@ class ResearchStrategy:
         # If distribution of KER changes significantly (Drift), adjust threshold
         if self.ker_drift_detector.drift_detected:
             # Drift implies regime shift. Relax gate temporarily.
-            self.dynamic_ker_offset = max(-0.15, self.dynamic_ker_offset - 0.05)
+            self.dynamic_ker_offset = max(-0.10, self.dynamic_ker_offset - 0.05)
         else:
             # Slowly decay offset back to 0 (Normalization)
             self.dynamic_ker_offset = min(0.0, self.dynamic_ker_offset + 0.001)
@@ -272,10 +265,9 @@ class ResearchStrategy:
                 ret_scalar = math.log1p(abs(realized_ret) * 100.0)
                 ret_scalar = max(0.5, ret_scalar)
                 
-                # --- REC 3: EFFICIENCY-WEIGHTED LEARNING ---
+                # --- EFFICIENCY-WEIGHTED LEARNING ---
                 # Weight samples by KER. High efficiency bars are more valuable.
                 hist_ker = stored_feats.get('ker', 0.5)
-                # Boost multiplier from 1.0+ker to ker*2.0
                 ker_weight = hist_ker * 2.0 
                 
                 final_weight = base_weight * ret_scalar * ker_weight
@@ -292,12 +284,10 @@ class ResearchStrategy:
                     self.meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
 
         # C. Add CURRENT Bar as new Trade Opportunity
-        # --- REC 2: Volatility Passing ---
-        # Inject Parkinson for Labeler boost (Rec 2)
         parkinson = features.get('parkinson_vol', 0.0)
         features['parkinson_vol'] = parkinson 
         
-        current_atr = features.get('atr', 0.0)
+        current_atr = features.get('atr', 0.001)
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp, parkinson_vol=parkinson)
 
         # ============================================================
@@ -308,52 +298,51 @@ class ResearchStrategy:
         if self.symbol in broker.positions:
             return 
 
-        # --- ENTRY BLOCK: FRIDAY AFTERNOON (AUDIT FIX) ---
+        # --- ENTRY BLOCK: FRIDAY AFTERNOON ---
         if is_friday_afternoon:
             self.rejection_stats["Friday Entry Guard"] += 1
             return 
         # -------------------------------------------------
 
         # ============================================================
-        # E. ENTRY LOGIC GATES (V6.0 OVERHAUL)
+        # E. ENTRY LOGIC GATES (V7.0 AGGRESSOR ONLY)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
         rvol = features.get('rvol', 1.0)
         aggressor = features.get('aggressor', 0.5)
-        atr_val = features.get('atr', 0.0001)
         mtf_align = features.get('mtf_alignment', 0.0)
         adx_val = features.get('adx', 0.0)
         
-        # Bollinger Bands for Regime C
-        bb_upper = features.get('bb_upper', price * 1.01)
-        bb_lower = features.get('bb_lower', price * 0.99)
-        bb_width = features.get('bb_width', 0.0)
-        
-        # RSI for Regime C
-        rsi_val = features.get('rsi_norm', 0.5) * 100.0
-        
-        # --- CRITICAL FILTER 1: VOLUME EXHAUSTION FILTER ---
+        # --- CRITICAL FILTER 1: FUEL GAUGE (HARD GATE) ---
+        # RVOL must be > 2.0 to inject momentum
+        if rvol < self.vol_gate_ratio:
+            self.rejection_stats[f"Low Fuel (RVol {rvol:.2f} < {self.vol_gate_ratio})"] += 1
+            return
+
+        # --- CRITICAL FILTER 2: VOLUME EXHAUSTION ---
         if rvol > self.max_rvol_thresh:
             self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
-            return # Block trade
+            return 
         
-        # --- CORRECTED STREAK BREAKER (V6.0) & DYNAMIC SCALING ---
-        # Apply Dynamic Offset from ADWIN (Rec 1)
-        effective_ker_thresh = self.ker_thresh + self.dynamic_ker_offset
+        # --- CRITICAL FILTER 3: EFFICIENCY GATE (HARD GATE) ---
+        # Apply Dynamic Offset from ADWIN but keep hard floor
+        effective_ker_thresh = max(0.20, self.ker_thresh + self.dynamic_ker_offset)
         
         if self.consecutive_losses > 0:
-            if self.consecutive_losses >= 3:
-                # FIRM BREAKER: Softened to +0.05 to avoid dormancy
-                effective_ker_thresh += 0.05 
-            else:
-                # SOFT BREAKER: Mild penalty for 1-2 losses
-                effective_ker_thresh += min(0.05, self.consecutive_losses * 0.01)
-        
-        # Ensure gate doesn't go below absolute safety minimum
-        effective_ker_thresh = max(0.05, effective_ker_thresh)
+            # Soft Breaker: Require higher efficiency if losing
+            effective_ker_thresh += min(0.1, self.consecutive_losses * 0.02)
             
-        # --- CRITICAL FILTER 2: MTF TREND CONTEXT ---
+        if ker_val < effective_ker_thresh:
+            self.rejection_stats[f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f})"] += 1
+            return
+
+        # --- CRITICAL FILTER 4: TREND STRENGTH ---
+        if adx_val < self.adx_threshold:
+            self.rejection_stats[f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
+            return
+
+        # --- CRITICAL FILTER 5: MTF CONTEXT ---
         d1_ema = context_data.get('d1', {}).get('ema200', 0.0)
         d1_trend_up = (price > d1_ema) if d1_ema > 0 else True
         d1_trend_down = (price < d1_ema) if d1_ema > 0 else True
@@ -362,74 +351,46 @@ class ResearchStrategy:
         h4_bull = h4_rsi > 50
         h4_bear = h4_rsi < 50
         
-        # Gate Definitions
-        vol_gate = rvol > self.vol_gate_ratio
-        
-        # Momentum Direction (Aggressor Ratio)
-        is_bullish_candle = aggressor > self.aggressor_thresh
-        is_bearish_candle = aggressor < (1.0 - self.aggressor_thresh)
-        
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
-        regime_label = "C (Noise)"
-        
-        # --- REGIME DETERMINATION ---
-        is_trending = adx_val > self.adx_threshold
-        
-        # >>> LOGIC BRANCH 1: TREND FOLLOWING (REGIME A/B) <<<
-        if is_trending and vol_gate:
-            
-            # REQUIRE H4 ALIGNMENT (Stronger than D1 for Intraday)
-            if is_bullish_candle and h4_bull:
-                proposed_action = 1
-                regime_label = "Trend-Long"
-                
-                # Downgraded D1 Check: Only block if D1 is aggressively against us
-                # Now handled as a soft bias rather than a hard lock
-                if not d1_trend_up:
-                    regime_label += " (Counter-D1)"
-                    
-            elif is_bearish_candle and h4_bear:
-                proposed_action = -1
-                regime_label = "Trend-Short"
-                if not d1_trend_down:
-                    regime_label += " (Counter-D1)"
-            
-            else:
-                self.rejection_stats["Trend: H4 Mismatch"] += 1
+        regime_label = "Trend"
 
-        # >>> LOGIC BRANCH 2: MEAN REVERSION (REGIME C) <<<
-        # "Unlock the Chop" - Monetize ranging markets
-        elif self.enable_regime_c and not is_trending:
-            # Conditions:
-            # 1. Price is interacting with Bands
-            # 2. RSI confirms overbought/oversold
-            # 3. Not in a squeeze (BB Width decent)
-            
-            if bb_width > 0.001: # Ensure bands aren't pinched tight
-                # Reversion to Mean (Long)
-                if price <= bb_lower and rsi_val < 35:
-                    proposed_action = 1
-                    regime_label = "MeanRev-Long"
-                
-                # Reversion to Mean (Short)
-                elif price >= bb_upper and rsi_val > 65:
-                    proposed_action = -1
-                    regime_label = "MeanRev-Short"
-                else:
-                    self.rejection_stats["MeanRev: No Trigger"] += 1
-            else:
-                self.rejection_stats["MeanRev: Squeeze"] += 1
+        # --- AGGRESSOR TRIGGER (ORDER FLOW IMBALANCE) ---
+        # Logic: Confirm Buy Vol > Sell Vol * 1.2
         
+        # Prevent division by zero
+        safe_sell_vol = sell_vol if sell_vol > 0 else 1.0
+        safe_buy_vol = buy_vol if buy_vol > 0 else 1.0
+        
+        flow_ratio_bull = buy_vol / safe_sell_vol
+        flow_ratio_bear = sell_vol / safe_buy_vol
+        
+        is_bullish_flow = flow_ratio_bull > self.aggressor_ratio_min
+        is_bearish_flow = flow_ratio_bear > self.aggressor_ratio_min
+        
+        # Secondary Price Action Check
+        is_bullish_pa = aggressor > self.aggressor_thresh_price
+        is_bearish_pa = aggressor < (1.0 - self.aggressor_thresh_price)
+
+        # >>> ENTRY LOGIC <<<
+        
+        # BUY SCENARIO
+        if is_bullish_flow and is_bullish_pa and h4_bull:
+            if not d1_trend_up:
+                self.rejection_stats["Counter-D1 Trend"] += 1
+                return
+            proposed_action = 1
+            regime_label = "Aggressor-Long"
+
+        # SELL SCENARIO
+        elif is_bearish_flow and is_bearish_pa and h4_bear:
+            if not d1_trend_down:
+                self.rejection_stats["Counter-D1 Trend"] += 1
+                return
+            proposed_action = -1
+            regime_label = "Aggressor-Short"
+            
         else:
-            self.rejection_stats["No Regime"] += 1
-
-        # --- FINAL GATE CHECK ---
-        if proposed_action == 0:
-            return 
-
-        # Ker Check (Only applicable for Trend Trades, skipped for MeanRev)
-        if "Trend" in regime_label and ker_val < effective_ker_thresh:
-            self.rejection_stats[f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f})"] += 1
+            self.rejection_stats["No Trigger"] += 1
             return
 
         # ============================================================
@@ -449,33 +410,24 @@ class ResearchStrategy:
             is_profitable = self.meta_labeler.predict(
                 features, 
                 proposed_action, 
-                threshold=self.params.get('meta_labeling_threshold', 0.50) # Relaxed to 0.50
+                threshold=self.params.get('meta_labeling_threshold', 0.50)
             )
             
             if proposed_action != 0:
                 self.meta_label_events += 1
 
-            # --- EXECUTION WITH DYNAMIC CONFIDENCE (CORRECTED BREAKER) ---
-            min_prob = self.params.get('min_calibrated_probability', 0.55) # Lowered base to 0.55
-            
-            # Penalize Counter-Trend / MeanRev slightly to ensure quality
-            if "MeanRev" in regime_label or "Counter" in regime_label:
-                min_prob += 0.05
+            # --- EXECUTION WITH DYNAMIC CONFIDENCE ---
+            min_prob = self.params.get('min_calibrated_probability', 0.55)
             
             if self.consecutive_losses > 0:
-                if self.consecutive_losses >= 3:
-                    # FIRM BREAKER: +5% Confidence
-                    min_prob += 0.05
-                else:
-                    # SOFT BREAKER: +1% per loss
-                    min_prob += min(0.05, self.consecutive_losses * 0.01)
+                # Streak Breaker: Increase required confidence if losing
+                min_prob += min(0.1, self.consecutive_losses * 0.02)
                 
             if confidence < min_prob:
                 self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob:.2f})"] += 1
                 return
 
             if is_profitable:
-                # CRITICAL FIX: Pass the datetime object (dt_ts) to _execute_entry
                 self._execute_entry(confidence, price, features, broker, dt_ts, proposed_action, regime_label)
             else:
                 self.rejection_stats['Meta-Labeler Reject'] += 1
@@ -491,7 +443,7 @@ class ResearchStrategy:
         """
         action = "BUY" if action_int == 1 else "SELL"
         
-        # --- AUDIT FIX: DYNAMIC CORRELATION CHECK ---
+        # Dynamic Correlation Check
         exposure_count = 0
         quote_currency = self.symbol[-3:] 
         for pos in broker.open_positions:
@@ -499,7 +451,6 @@ class ResearchStrategy:
                 exposure_count += 1
         
         # Construct Context
-        # Note: Risk Reward passed here is informational, sizing is handled by RiskManager
         ctx = TradeContext(
             symbol=self.symbol,
             price=price,
@@ -507,16 +458,15 @@ class ResearchStrategy:
             account_equity=broker.equity,
             account_currency="USD",
             win_rate=0.45, 
-            risk_reward_ratio=self.optimized_reward_mult # Use Optimized R:R
+            risk_reward_ratio=self.optimized_reward_mult 
         )
 
-        # Calculate Size using RiskManager (Calculates default TP/SL from Config)
+        # Calculate Size using RiskManager 
         current_atr = features.get('atr', 0.001)
         current_ker = features.get('ker', 1.0)
         volatility = features.get('volatility', 0.001)
 
-        # --- RETRIEVE OPTIMIZED RISK PARAMETER (AUDIT FIX) ---
-        # Check self.params for 'risk_per_trade_percent' which Optuna injects
+        # Retrieve Optimized Risk Parameter
         risk_override = self.params.get('risk_per_trade_percent')
 
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
@@ -528,19 +478,23 @@ class ResearchStrategy:
             atr=current_atr, 
             ker=current_ker,
             account_size=broker.equity,
-            risk_percent_override=risk_override # NEW: Pass Override to Risk Manager
+            risk_percent_override=risk_override
         )
 
         if trade_intent.volume <= 0:
             self.rejection_stats[f"Risk Zero: {trade_intent.comment}"] += 1
             return
 
-        # --- OPTIMIZATION OVERRIDE (CRITICAL FOR R:R SEARCH) ---
-        # RiskManager returns Config-based TP. We must override it with
-        # the 'barrier_width' (Reward Multiplier) found by Optuna.
-        # This ensures the Strategy executes exactly what the ML model learned.
+        # --- STOP LOSS ENFORCEMENT (ATR * 1.5) ---
+        # RiskManager defaults might be different, so we strictly enforce 1.5 here
+        # and adjust TP to match the ML's target R:R
+        stop_dist = current_atr * 1.5
+        trade_intent.stop_loss = stop_dist
         
-        # 1. Recalculate Dynamic TP
+        # TP based on Optimized R:R (e.g., 3.0 * ATR)
+        # Note: If ML says Reward is 3.0, TP is 3.0 * ATR.
+        # But if we fix SL at 1.5 ATR, then R:R becomes 2.0 (3.0/1.5).
+        # We must honor the 'barrier_width' (Reward Mult) as the TP distance.
         dynamic_tp_dist = current_atr * self.optimized_reward_mult
         trade_intent.take_profit = dynamic_tp_dist
         
@@ -548,7 +502,6 @@ class ResearchStrategy:
         trade_intent.action = action
 
         qty = trade_intent.volume
-        stop_dist = trade_intent.stop_loss # Keep RiskManager's SL (Fixed Risk)
         tp_dist = trade_intent.take_profit
 
         if qty < 0.01:
@@ -589,8 +542,8 @@ class ResearchStrategy:
         # Track Features for Explainability
         imp_feats = []
         imp_feats.append(regime)
-        if features.get('rvol', 0) > 1.2: imp_feats.append('High_Volume')
-        if features.get('parkinson_vol', 0) > 0.002: imp_feats.append('High_Parkinson')
+        if features.get('rvol', 0) > 2.0: imp_feats.append('High_Fuel')
+        if features.get('aggressor', 0) > 0.6: imp_feats.append('High_Aggressor')
         if features.get('mtf_alignment', 0) == 1.0: imp_feats.append('MTF_Aligned')
         
         for f in imp_feats:
@@ -613,11 +566,11 @@ class ResearchStrategy:
     def _check_daily_loss_limit(self, broker: BacktestBroker) -> bool:
         """
         Simulates SessionGuard in Backtest.
-        If Daily Drawdown > 4.9% (Relaxed from 4.8%), returns True (BLOCK TRADES).
+        If Daily Drawdown > 4.9%, returns True (BLOCK TRADES).
         """
         try:
             current_dd_pct = (broker.initial_balance - broker.equity) / broker.initial_balance
-            if current_dd_pct > 0.049: # V5.0: Relaxed to 4.9%
+            if current_dd_pct > 0.049: 
                 return True
             return False
         except:
@@ -631,7 +584,6 @@ class ResearchStrategy:
             self.consecutive_losses = 0
             return
             
-        # Re-calc streak from history tail (stateless safe)
         streak = 0
         for trade in reversed(broker.closed_positions):
             if trade.net_pnl < 0:

@@ -5,15 +5,12 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# AUDIT REMEDIATION (2025-01-01 - ANALYSIS IMPLEMENTATION V5.3):
-# 1. OPTIMIZATION: Dynamically ingests fine-tuned R:R (1.5-3.5) and Risk (0.1-0.5%).
-# 2. SCORING FUNCTION: Added explicit penalty for Drawdown > 5% to filter volatility.
-# 3. SAFETY: Single-threaded math ops to prevent worker deadlocks.
-#
-# IMPLEMENTATION UPDATE (PROFIT FOCUS V6.0):
-# - SCORING: Primary Objective is now Raw PnL (USD).
-# - INCENTIVE: Added Trade Frequency Bonus (+5 score per trade) to break pruning loops.
-# - FIX: Drawdown calculation is strictly Ratio-based (0.0-1.0) internally.
+# PHOENIX STRATEGY V7.0 (OPTIMIZATION THEORY):
+# 1. PROP SCORE OBJECTIVE: Replaced PnL with Calmar Ratio (Return/DD).
+# 2. HARD CONSTRAINTS: 
+#    - Max Drawdown > 8% = Immediate Failure (Score -1000).
+#    - Trades < 30 = Stability Failure (Score 0).
+# 3. ROBUSTNESS: Prioritizes smooth equity curves over "lucky" high returns.
 # =============================================================================
 import os
 import sys
@@ -81,55 +78,50 @@ class EmojiCallback:
         rr = attrs.get('risk_reward_ratio', 0.0)
         trades = attrs.get('trades', 0)
         pnl = attrs.get('pnl', 0.0)
-        risk_pct = attrs.get('risk_pct', 0.5)
+        dd = attrs.get('max_dd_pct', 0.0) * 100
+        calmar = attrs.get('calmar', 0.0)
         
         if attrs.get('blown', False):
-            icon = "💀" # Blown Account
+            icon = "💀" # Blown Account (>10% DD or Ruin)
             status = "BLOWN"
+        elif dd > 8.0:
+            icon = "⚠️" # High Risk (>8% DD)
+            status = "RISKY"
         elif attrs.get('pruned', False):
-            icon = "✂️" # Pruned (Low Trades / Gate Rejection)
+            icon = "✂️" # Pruned (Low Trades)
             status = "PRUNE"
-        elif trades == 0:
-            icon = "💤" # No Trades
-            status = "IDLE "
-        elif pnl >= 5000.0:
-            icon = "🚀" # To the Moon
+        elif pnl > 0 and calmar > 2.0:
+            icon = "🚀" # High Quality
             status = "ALPHA"
-        elif pnl > 0.0:
-            icon = "🛡️" # Profit
-            status = "PROFIT"
+        elif pnl > 0:
+            icon = "✅" # Profitable
+            status = "PASS"
         else:
             icon = "🔻" # Loss
-            status = "LOSS "
+            status = "FAIL"
 
-        # 2. Extract Metrics (Safe Defaults)
-        # Note: Internal DD is ratio (0.05), so multiply by 100 for display (5.0%)
-        dd = attrs.get('max_dd_pct', 0.0) * 100
+        # 2. Extract Metrics
         wr = attrs.get('win_rate', 0.0) * 100
         pf = attrs.get('profit_factor', 0.0)
-        sqn = attrs.get('sqn', 0.0)
-        dd_ev = attrs.get('dd_events', 0)
         
         # 3. Format Output (Column Aligned)
-        # Structure: [ICON] STATUS | SYMBOL | ID | RISK | R:R | PnL | WR | DD | PF | SQN | TRADES
+        # Structure: [ICON] STATUS | SYMBOL | ID | CALMAR | PnL | DD | WR | TRADES
         msg = (
             f"{icon} {status:<6} | {symbol:<6} | Trial {trial.number:<3} | "
-            f"🎲 RISK: {risk_pct}% | "
-            f"⚖️ R:R: {rr:>4.2f} | "
+            f"🏆 CALMAR: {calmar:>5.2f} | "
             f"💰 PnL: ${pnl:>9,.2f} | "
+            f"📉 DD: {dd:>5.2f}% | "
             f"🎯 WR: {wr:>5.1f}% | "
-            f"📉 DD: {dd:>5.2f}% ({dd_ev} ev) | "
             f"⚡ PF: {pf:>4.2f} | "
-            f"💎 SQN: {sqn:>4.2f} | "
             f"#️⃣ {trades:<4}"
         )
         
         # 4. Log to File & Console
         log.info(msg.strip())
         
-        # 5. Detailed Analysis (Victory Lap OR Autopsy for ALL active trials)
+        # 5. Detailed Analysis (Victory Lap OR Autopsy)
         if 'autopsy' in attrs and trades > 0:
-            if pnl > 0:
+            if calmar > 3.0:
                 report_type = "🏁 VICTORY LAP"
             else:
                 report_type = "🔎 AUTOPSY"
@@ -170,7 +162,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
 def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url: str) -> None:
     """
     ISOLATED WORKER FUNCTION: Runs in a separate process.
-    Executes Optuna Optimization for a single symbol.
+    Executes Optuna Optimization for a single symbol using "Prop Score".
     """
     # Double-Ensure Single Threading in Worker
     os.environ["OMP_NUM_THREADS"] = "1"
@@ -223,9 +215,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             # Strategy Execution
             params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
             
-            # --- CRITICAL: RISK OPTIMIZATION ---
-            # Optimizing Risk Per Trade to find the balance between Drawdown and Profit
-            # Now ingesting 0.1 - 0.5% range from Config
+            # --- RISK OPTIMIZATION ---
             risk_options = CONFIG['wfo'].get('risk_per_trade_options', [0.25, 0.5])
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             
@@ -253,52 +243,47 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             # --- RICH METRICS EXTRACTION ---
             metrics = pipeline_inst.calculate_performance_metrics(broker.trade_log, broker.initial_balance)
             
+            # --- SECTION 6.1: "PROP SCORE" OBJECTIVE FUNCTION ---
+            
+            total_return = metrics['total_pnl']
+            max_dd_pct = metrics['max_dd_pct'] # Ratio (e.g. 0.05)
+            trades = metrics['total_trades']
+            
+            # Calculate Calmar (Risk-Adjusted Reward)
+            # Avoid division by zero
+            safe_dd = max_dd_pct if max_dd_pct > 0.001 else 0.001
+            calmar = (total_return / init_bal) / safe_dd
+            
+            # 1. IMMEDIATE FAILURE: If DD > 8% (Safety Buffer for 10% limit)
+            if max_dd_pct > 0.08:
+                trial.set_user_attr("blown", True)
+                return -1000.0 # Heavy penalty
+            
+            # 2. STABILITY BONUS: Penalize strategies with < 30 trades (Luck)
+            if trades < 30:
+                trial.set_user_attr("pruned", True)
+                return 0.0 
+                
+            # 3. BLOWOUT CHECK (Broker level)
+            if broker.is_blown:
+                trial.set_user_attr("blown", True)
+                return -5000.0
+
             # Pass metrics to Callback
-            trial.set_user_attr("pnl", metrics['total_pnl'])
-            trial.set_user_attr("max_dd_pct", metrics['max_dd_pct'])
+            trial.set_user_attr("pnl", total_return)
+            trial.set_user_attr("max_dd_pct", max_dd_pct)
             trial.set_user_attr("win_rate", metrics['win_rate'])
-            trial.set_user_attr("trades", metrics['total_trades'])
+            trial.set_user_attr("trades", trades)
             trial.set_user_attr("profit_factor", metrics['profit_factor'])
             trial.set_user_attr("risk_reward_ratio", metrics['risk_reward_ratio'])
             trial.set_user_attr("sqn", metrics['sqn'])
-            trial.set_user_attr("sharpe", metrics['sharpe'])
-            trial.set_user_attr("risk_pct", params['risk_per_trade_percent'])
-            trial.set_user_attr("dd_events", metrics.get('dd_events_gt_5', 0))
+            trial.set_user_attr("calmar", calmar)
             
             # ALWAYS Generate Autopsy/Victory Lap Report for analysis
             trial.set_user_attr("autopsy", strategy.generate_autopsy())
             
-            # --- PROFIT-FIRST SCORING FUNCTION (PROFIT & FREQUENCY) ---
-            
-            # 1. Base Score = Raw PnL (Maximize Dollars)
-            score = metrics['total_pnl']
-            
-            # 2. Activity Bonus (Incentivize Trading)
-            # Add $5 score per trade to break "fear of losing" and inactivity
-            score += (metrics['total_trades'] * 5.0)
-            
-            # 3. Pruning Check (Relaxed)
-            min_trades = 10 # Lowered from 15 to allow emerging strategies
-            if metrics['total_trades'] < min_trades:
-                trial.set_user_attr("pruned", True)
-                return -500.0 # Softer penalty (was -1000.0)
-            
-            # 4. Blowout Check
-            if broker.is_blown:
-                trial.set_user_attr("blown", True)
-                return -5000.0
-            
-            # 5. Strategic Penalties (Drawdown Frequency)
-            # Penalize based on how many trades were closed while in > 5% drawdown.
-            dd_count = metrics.get('dd_events_gt_5', 0)
-            score -= (dd_count * 20.0)
-            
-            # Legacy Safety Cap (DD > 10% = Heavy Penalty)
-            # Threshold is 0.10 (Ratio)
-            if metrics['max_dd_pct'] > 0.10:
-                score -= 1000.0
-            
-            return score
+            # Objective: Maximize Calmar Ratio
+            return calmar
 
         # 3. Connect to Shared Study
         study_name = f"study_{symbol}"
@@ -573,7 +558,7 @@ class ResearchPipeline:
 
     def run_training(self, fresh_start: bool = False):
         log.info(f"{LogSymbols.TIME} STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
-        log.info(f"OBJECTIVE: MAXIMIZE PROFIT (Primary) + RISK REWARD (Secondary)")
+        log.info(f"OBJECTIVE: MAXIMIZE CALMAR RATIO (Risk-Adjusted Return)")
         log.info(f"HARDWARE DETECTED: {psutil.cpu_count(logical=True)} Cores. Using {self.total_cores} workers (Configured).")
         
         for symbol in self.symbols:

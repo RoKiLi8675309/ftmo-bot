@@ -4,10 +4,10 @@
 # PATH: shared/data.py
 # DEPENDENCIES: pandas, numpy, psycopg2 (optional), sqlalchemy
 # DESCRIPTION: Data loading with Adaptive Volume Normalization.
-# AUDIT REMEDIATION:
-#   - FIXED (CRITICAL): VolumeBarAggregator now ingests external L2 flows.
-#   - FALLBACK: Implemented Lee-Ready (Tick Rule) for Retail Brokers/Backtesting.
-#   - PROBLEM #4 (JPY Bias): Implemented AdaptiveVolumeNormalizer.
+#
+# PHOENIX STRATEGY V7.0 (DATA INTEGRITY):
+# 1. AGGRESSOR FLOWS: VolumeBarAggregator ensures precise Buy/Sell splitting.
+# 2. BACKTEST COMPATIBILITY: Lee-Ready fallback enables OFI testing on historical data.
 # =============================================================================
 from __future__ import annotations
 import warnings

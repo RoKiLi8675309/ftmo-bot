@@ -5,11 +5,12 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# AUDIT REMEDIATION (2025-01-02 - FRIDAY GUARD & TIERED RISK):
-# 1. FRIDAY GUARD: Added is_friday_afternoon() to separate "Stop Entries" from
-#    "Liquidation". Stops churn at 17:00, liquidates at 21:00.
-# 2. SIZING: Maintained strict fixed_risk logic with Optuna Override support.
-# 3. COMPATIBILITY: SessionGuard now accepts timestamps for Backtest accuracy.
+# PHOENIX STRATEGY V7.0 (RISK DYNAMICS):
+# 1. STOP LOSS: Hardcoded to 1.5 * ATR (Document Section 5.3).
+# 2. DYNAMIC SIZING (Section 7):
+#    - Buffer Build (Profit < 3%): Risk 0.5%.
+#    - Aggressive Compounding (Profit > 3%): Risk 1.0%.
+# 3. COMPLIANCE: SessionGuard enforces Friday Liquidation and Trading Hours.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -148,7 +149,7 @@ class RiskManager:
         risk_percent_override: Optional[float] = None # NEW: Optimization Override
     ) -> Tuple[Trade, float]:
         """
-        Calculates position size using 'fixed_risk' logic only.
+        Calculates position size using strict prop firm logic (Section 7).
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -162,9 +163,12 @@ class RiskManager:
         
         # USE DETECTED ACCOUNT SIZE (if available), else default to Config
         start_equity = account_size if account_size else float(CONFIG.get('env', {}).get('initial_balance', 100000.0))
+        initial_balance_static = float(CONFIG.get('env', {}).get('initial_balance', 100000.0))
         
-        # --- ADAPTIVE STOP LOSS (ATR Based) ---
-        atr_mult_sl = risk_conf.get('stop_loss_atr_mult', 1.5)
+        # --- DOCUMENT SECTION 5.3: VOLATILITY-ADJUSTED STOPS ---
+        # "Stop Loss = Entry - (ATR(14) * 1.5)"
+        # We enforce 1.5 multiplier strictly.
+        atr_mult_sl = 1.5 
         atr_mult_tp = risk_conf.get('take_profit_atr_mult', 3.0)
         
         # ATR Fallback Logic
@@ -197,21 +201,34 @@ class RiskManager:
         lots = 0.0
         calculated_risk_usd = 0.0
         
-        # --- PROP FIRM STANDARD: Risk % of Equity ---
-        # PRIORITY: Override (Optimizer) > Config > Default 0.5%
+        # --- DOCUMENT SECTION 7: RISK DYNAMICS (BUFFER BUILD vs AGGRESSIVE) ---
+        # Calculate Profit Buffer
+        profit_buffer_pct = (balance - initial_balance_static) / initial_balance_static
+        
         if risk_percent_override is not None:
+            # Optuna/WFO override has highest priority
             risk_pct = risk_percent_override
         else:
-            risk_pct = risk_conf.get('base_risk_per_trade_percent', 0.5)
+            # Default Strategy Logic
+            if profit_buffer_pct > 0.03:
+                # SECTION 7.2: Aggressive Compounding (Buffer > 3%)
+                # "Risk the house's money" -> 1.0%
+                risk_pct = 1.0
+            else:
+                # SECTION 7.1: Buffer Build (Buffer < 3%)
+                # Safety First -> 0.5%
+                risk_pct = 0.5
         
-        # Drawdown Brake: If in significant drawdown (>4%), reduce risk
+        # Drawdown Brake: If in significant drawdown (>4%), reduce risk further
         if balance < (start_equity * 0.96):
-            risk_pct *= 0.75 
+            risk_pct *= 0.5  # Slash risk to survive
         
         # Calculate Risk Amount in USD
         calculated_risk_usd = balance * (risk_pct / 100.0)
         
-        # KER Scaling: Clamp KER between 0.8 and 1.0
+        # KER Scaling: Reward High Efficiency
+        # If KER is high, we take full risk. If low (but passed gate), we reduce slightly.
+        # Clamp KER between 0.8 and 1.0 to avoid over-penalizing valid trades
         ker_scalar = max(0.8, min(ker, 1.0))
         calculated_risk_usd *= ker_scalar
         
@@ -255,7 +272,7 @@ class RiskManager:
             entry_price=price,
             stop_loss=stop_dist,
             take_profit=stop_dist * (atr_mult_tp / atr_mult_sl),
-            comment=f"FixRisk|R:${final_risk_usd:.0f}|ATR:{atr_val:.5f}|C:{conf:.2f}"
+            comment=f"Risk:{risk_pct:.1f}%|R:${final_risk_usd:.0f}|ATR:{atr_val:.5f}"
         )
         
         return trade, final_risk_usd
@@ -275,7 +292,7 @@ class SessionGuard:
         self.rollover_end = dt_time(1, 15)
         
         # FTMO Spec: Stop entries early, Liquidate later
-        self.friday_entry_cutoff_hour = risk_conf.get('friday_entry_cutoff_hour', 17)
+        self.friday_entry_cutoff_hour = risk_conf.get('friday_entry_cutoff_hour', 16)
         self.liquidation_hour = risk_conf.get('friday_liquidation_hour_server', 21)
 
     def is_trading_allowed(self) -> bool:
@@ -297,7 +314,7 @@ class SessionGuard:
 
     def is_friday_afternoon(self, timestamp: Optional[datetime] = None) -> bool:
         """
-        Returns True if it is Friday and past the entry cutoff hour (e.g., 17:00).
+        Returns True if it is Friday and past the entry cutoff hour (e.g., 16:00).
         This differentiates "No New Entries" from "Market Closed".
         """
         if timestamp:

@@ -6,16 +6,13 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# AUDIT REMEDIATION (2025-01-01 - AGGRESSIVE RECOVERY):
-# 1. CORRECTED STREAK BREAKER: Synchronized with Research Strategy V6.0.
-#    - Softened penalty to prevent "Dormancy Trap".
-# 2. RISK LOADING: Loads 'risk_per_trade_percent' from optimized params file.
-#
-# IMPLEMENTATION UPDATE (PROFITABILITY FIXES V6.0):
-# - REGIME C UNLOCKED: Trading ranging markets (Mean Reversion).
-# - RELAXED GATES: Lowered RVol (0.8), ADX (15), Aggressor (0.52).
-# - DYNAMIC GATES: ADWIN monitors KER to adjust thresholds.
-# - WEIGHTED LEARNING: Sample weights boosted by KER * 2.0.
+# PHOENIX STRATEGY V7.0 (AGGRESSOR BREAKOUT - LIVE):
+# 1. MEAN REVERSION PURGED: Removed Regime C.
+# 2. AGGRESSOR LOGIC ALIGNMENT:
+#    - KER > 0.3 (Hard Efficiency Gate).
+#    - RVOL > 2.0 (Hard Fuel Gate).
+#    - TRIGGER: Order Flow Imbalance (Buy > 1.2x Sell) + PA Aggressor > 0.55.
+# 3. RISK: Metadata passed to Engine now assumes Aggressor constraints.
 # =============================================================================
 import logging
 import pickle
@@ -76,7 +73,10 @@ class MultiAssetPredictor:
         
         # 2. Adaptive Triple Barrier (Per-Symbol Dynamic Configuration)
         tbm_conf = CONFIG['online_learning']['tbm']
-        risk_mult_conf = CONFIG['risk_management'].get('stop_loss_atr_mult', 1.5)
+        
+        # STRICT REQUIREMENT: Risk is ATR * 1.5 (Hardcoded override for V7.0)
+        # We set risk_mult to 1.5 for labeling consistency with execution
+        risk_mult_conf = 1.5
         
         self.labelers = {}
         self.optimized_params = {} # Cache for gates
@@ -108,7 +108,6 @@ class MultiAssetPredictor:
                             if s not in self.optimized_params: self.optimized_params[s] = {}
                             self.optimized_params[s]['risk_per_trade_percent'] = float(bp['risk_per_trade_percent'])
                             
-                    # logger.info(f"⚡ {s}: Loaded Optimized Params (TP: {s_reward} ATR)")
                 except Exception as e:
                     logger.warning(f"Failed to load optimized params for {s}: {e}")
 
@@ -150,11 +149,11 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (DEFAULTS) ---
+        # --- PHOENIX STRATEGY PARAMETERS (DEFAULTS V7.0) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        # Updated default to 0.20 to match Config V5.5
-        self.default_ker_thresh = phx_conf.get('ker_trend_threshold', 0.20)
-        self.default_max_rvol = phx_conf.get('max_relative_volume', 4.0)
+        # STRICT THRESHOLDS FROM DOC
+        self.default_ker_thresh = 0.30 
+        self.default_max_rvol = 6.0
         
         # Friday Guard
         self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 16)
@@ -221,8 +220,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V6.0 Logic.
-        Includes Rec 1 (Dynamic Gates) and Rec 3 (Weighted Learning).
+        Executes the Learn-Predict Loop with Project Phoenix V7.0 Logic (Aggressor Only).
         """
         if symbol not in self.symbols: return None
         
@@ -285,10 +283,8 @@ class MultiAssetPredictor:
         
         # If distribution of KER changes significantly (Drift), adjust threshold
         if self.ker_drift_detectors[symbol].drift_detected:
-            # Drift implies regime shift. Relax gate temporarily to catch new trends.
-            # Reduce threshold by 0.05 (Min limit handled in effective calc)
-            self.dynamic_ker_offsets[symbol] = max(-0.15, self.dynamic_ker_offsets[symbol] - 0.05)
-            # logger.info(f"🌊 {symbol}: KER Drift Detected. Relaxing gate by {self.dynamic_ker_offsets[symbol]:.2f}")
+            # Drift implies regime shift. Relax gate temporarily.
+            self.dynamic_ker_offsets[symbol] = max(-0.10, self.dynamic_ker_offsets[symbol] - 0.05)
         else:
             # Slowly decay offset back to 0 (Normalization)
             self.dynamic_ker_offsets[symbol] = min(0.0, self.dynamic_ker_offsets[symbol] + 0.001)
@@ -310,7 +306,6 @@ class MultiAssetPredictor:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
                 
                 # --- STREAK BREAKER UPDATE ---
-                # Outcome_label: 1=Win(Target), -1=Loss(Stop), 0=Neutral
                 if self.active_signals[symbol]:
                     _ = self.active_signals[symbol].popleft()
                     
@@ -331,8 +326,6 @@ class MultiAssetPredictor:
                 ret_scalar = max(0.5, min(ret_scalar, 5.0))
                 
                 # --- REC 3: EFFICIENCY-WEIGHTED LEARNING ---
-                # Weight samples by KER. High efficiency bars are more valuable for trend learning.
-                # Prioritize high-quality data points (High KER = Clean Trend)
                 hist_ker = stored_feats.get('ker', 0.5)
                 ker_weight = hist_ker * 2.0  # Scale 0-2 (e.g., 0.8 KER -> 1.6x weight)
                 
@@ -350,49 +343,41 @@ class MultiAssetPredictor:
                     meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
 
         # 3. Add CURRENT Bar as new Trade Opportunity
-        # --- REC 2: Volatility Passing ---
         # Explicitly pass parkinson_vol to labeler for dynamic barrier sizing
         current_atr = features.get('atr', 0.0)
         
-        # Inject Parkinson into features if missing (though FeatureEngineer should provide it)
+        # Inject Parkinson into features
         features['parkinson_vol'] = parkinson 
         
-        # Pass parkinson_vol explicitly to match the updated AdaptiveTripleBarrier API
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp(), parkinson_vol=parkinson)
 
         # ============================================================
-        # 4. PHOENIX STRATEGY LOGIC: GATES & REGIMES (V6.0 AGGRESSIVE)
+        # 4. PHOENIX STRATEGY V7.0: AGGRESSOR BREAKOUT GATES
         # ============================================================
         
         # Extract Core Indicators
         rvol = features.get('rvol', 1.0)
-        # ker_val already extracted
         aggressor = features.get('aggressor', 0.5)
-        amihud = features.get('amihud', 0.0)
-        atr_val = features.get('atr', 0.0001)
-        # parkinson already extracted
-        mtf_align = features.get('mtf_alignment', 0.0)
         adx_val = features.get('adx', 0.0)
         
-        # Bollinger Bands for Regime C
-        bb_upper = features.get('bb_upper', bar.close * 1.01)
-        bb_lower = features.get('bb_lower', bar.close * 0.99)
-        bb_width = features.get('bb_width', 0.0)
-        
-        # RSI for Regime C
-        rsi_val = features.get('rsi_norm', 0.5) * 100.0
-        
-        # Retrieve Optimized or Default Params
-        opt = self.optimized_params.get(symbol, {})
+        # Hard Gates
         max_rvol_thresh = self.default_max_rvol
-        ker_thresh = 0.15 # Aggressively lowered default
+        ker_thresh = 0.30
+        vol_gate_ratio = 2.0
+        aggressor_ratio_min = 1.2
+        aggressor_pa_thresh = 0.55
         
         # --- FRIDAY GUARD ---
         if bar.timestamp.weekday() == 4 and bar.timestamp.hour >= self.friday_entry_cutoff:
              stats["Friday Entry Guard"] += 1
              return Signal(symbol, "HOLD", 0.0, {"reason": "Friday Entry Guard"})
 
-        # --- CRITICAL FILTER 1: VOLUME EXHAUSTION FILTER ---
+        # --- CRITICAL FILTER 1: FUEL GAUGE (HARD GATE) ---
+        if rvol < vol_gate_ratio:
+            stats[f"Low Fuel (RVol {rvol:.2f} < {vol_gate_ratio})"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "Low Fuel"})
+
+        # --- CRITICAL FILTER 2: VOLUME EXHAUSTION FILTER ---
         if rvol > max_rvol_thresh:
             stats[f"Volume Climax"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
@@ -402,124 +387,67 @@ class MultiAssetPredictor:
         effective_ker_thresh = ker_thresh + self.dynamic_ker_offsets[symbol]
         
         streak = self.consecutive_losses[symbol]
-        
         if streak > 0:
-            if streak >= 3:
-                # FIRM BREAKER: Require cleaner trend
-                effective_ker_thresh += 0.05
-            else:
-                # SOFT BREAKER
-                effective_ker_thresh += min(0.05, streak * 0.01)
+            # Soft Breaker: Require cleaner trend if losing
+            effective_ker_thresh += min(0.1, streak * 0.02)
         
-        # Ensure gate doesn't go below absolute safety minimum
-        effective_ker_thresh = max(0.05, effective_ker_thresh)
+        # Ensure gate doesn't go below absolute safety minimum of 0.20
+        effective_ker_thresh = max(0.20, effective_ker_thresh)
 
-        # Ker Check (Only for Trend Trades, logic handled inside regime block below)
-        # But we do a pre-check rejection if it's super low and we aren't in Regime C
-        
-        # --- CRITICAL FILTER 2: MTF TREND CONTEXT ---
+        # --- CRITICAL FILTER 3: EFFICIENCY GATE ---
+        ker_val = features.get('ker', 0.5)
+        if ker_val < effective_ker_thresh:
+            stats[f"Low Efficiency"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f})"})
+
+        # --- CRITICAL FILTER 4: MTF TREND CONTEXT ---
         d1_ema = context_data.get('d1', {}).get('ema200', 0.0) if context_data else 0.0
         d1_trend_up = (bar.close > d1_ema) if d1_ema > 0 else True
         d1_trend_down = (bar.close < d1_ema) if d1_ema > 0 else True
         
-        # --- NEW: H4 RSI ALIGNMENT ---
+        # H4 Alignment
         h4_rsi = context_data.get('h4', {}).get('rsi', 50.0) if context_data else 50.0
         h4_bull = h4_rsi > 50
         h4_bear = h4_rsi < 50
         
-        phx_conf = CONFIG.get('phoenix_strategy', {})
-        enable_regime_a = True
-        enable_regime_c = True # Enable Mean Reversion
-        require_d1_trend = phx_conf.get('require_d1_trend', True)
-        require_h4_alignment = phx_conf.get('require_h4_alignment', True)
-        vol_gate_ratio = 0.8 # Relaxed
-        aggressor_thresh = 0.52 # Relaxed
-        
-        # Gate Definitions
-        vol_gate = rvol > vol_gate_ratio
-        
-        # Momentum Direction
-        is_bullish_candle = aggressor > aggressor_thresh
-        is_bearish_candle = aggressor < (1.0 - aggressor_thresh)
-        
         proposed_action = 0
-        regime_label = "C (Noise)"
+        regime_label = "Chop"
 
-        # --- REGIME DETERMINATION ---
-        is_trending = adx_val > 15.0 # Relaxed ADX
+        # --- AGGRESSOR TRIGGER (ORDER FLOW IMBALANCE) ---
+        # Logic: Confirm Buy Vol > Sell Vol * 1.2
+        safe_sell_vol = sell_vol if sell_vol > 0 else 1.0
+        safe_buy_vol = buy_vol if buy_vol > 0 else 1.0
         
-        # >>> LOGIC BRANCH 1: TREND FOLLOWING (REGIME A/B) <<<
-        if is_trending and vol_gate:
-            # Check for Flow Alignment: D1 Trend + Micro Structure + VOLUME GATE
-            
-            # REQUIRE H4 ALIGNMENT (Stronger than D1 for Intraday)
-            if is_bullish_candle and h4_bull:
-                proposed_action = 1
-                regime_label = "Trend-Long"
-                
-                # Downgraded D1 Check: Only block if D1 is aggressively against us
-                if not d1_trend_up:
-                    regime_label += " (Counter-D1)"
-                    
-            elif is_bearish_candle and h4_bear:
-                proposed_action = -1
-                regime_label = "Trend-Short"
-                if not d1_trend_down:
-                    regime_label += " (Counter-D1)"
-            
-            else:
-                stats["Trend: H4 Mismatch"] += 1
+        flow_ratio_bull = buy_vol / safe_sell_vol
+        flow_ratio_bear = sell_vol / safe_buy_vol
+        
+        is_bullish_flow = flow_ratio_bull > aggressor_ratio_min
+        is_bearish_flow = flow_ratio_bear > aggressor_ratio_min
+        
+        is_bullish_pa = aggressor > aggressor_pa_thresh
+        is_bearish_pa = aggressor < (1.0 - aggressor_pa_thresh)
 
-        # >>> LOGIC BRANCH 2: MEAN REVERSION (REGIME C) <<<
-        # "Unlock the Chop" - Monetize ranging markets
-        elif enable_regime_c and not is_trending:
-            # Conditions:
-            # 1. Price is interacting with Bands
-            # 2. RSI confirms overbought/oversold
-            # 3. Not in a squeeze (BB Width decent)
-            
-            if bb_width > 0.001: # Ensure bands aren't pinched tight
-                # Reversion to Mean (Long)
-                if bar.close <= bb_lower and rsi_val < 35:
-                    proposed_action = 1
-                    regime_label = "MeanRev-Long"
-                
-                # Reversion to Mean (Short)
-                elif bar.close >= bb_upper and rsi_val > 65:
-                    proposed_action = -1
-                    regime_label = "MeanRev-Short"
-                else:
-                    stats["MeanRev: No Trigger"] += 1
-            else:
-                stats["MeanRev: Squeeze"] += 1
+        # >>> ENTRY LOGIC <<<
         
+        # BUY SCENARIO
+        if is_bullish_flow and is_bullish_pa and h4_bull:
+            if not d1_trend_up:
+                stats["Counter-D1 Trend"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": "Counter-D1 Trend"})
+            proposed_action = 1
+            regime_label = "Aggressor-Long"
+
+        # SELL SCENARIO
+        elif is_bearish_flow and is_bearish_pa and h4_bear:
+            if not d1_trend_down:
+                stats["Counter-D1 Trend"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": "Counter-D1 Trend"})
+            proposed_action = -1
+            regime_label = "Aggressor-Short"
+            
         else:
-            stats["No Regime"] += 1
-
-        # --- FINAL GATE CHECK ---
-        if proposed_action == 0:
-            regime_label = "C (Noise)"
-            stats[f"No Signal Condition"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "Regime C (Noise)"})
-
-        # Ker Check (Only applicable for Trend Trades, skipped for MeanRev)
-        if "Trend" in regime_label and ker_val < effective_ker_thresh:
-            stats[f"Low Efficiency"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f})"})
-
-        # ---------------------------------------------------------------------
-        # MEAN REVERSION FILTER (Safety Check)
-        # ---------------------------------------------------------------------
-        bb_pos = features.get('bb_position', 0.5)
-        
-        if proposed_action == -1: # SELL
-            if bb_pos < 0.0 or rsi_val < 30:
-                stats[f"Mean Rev Filter"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "Mean Rev Filter"})
-        elif proposed_action == 1: # BUY
-            if bb_pos > 1.0 or rsi_val > 70:
-                stats[f"Mean Rev Filter"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "Mean Rev Filter"})
+            stats["No Trigger"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "No Trigger"})
 
         # 5. ML Confirmation & Execution
         pred_proba = model.predict_proba_one(features)
@@ -529,26 +457,19 @@ class MultiAssetPredictor:
         confidence = prob_buy if proposed_action == 1 else prob_sell
         
         # Meta Labeling
-        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.50) # Relaxed
+        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.50)
         is_profitable = meta_labeler.predict(
             features,
             proposed_action,
             threshold=meta_threshold
         )
 
-        # --- EXECUTION WITH DYNAMIC CONFIDENCE (CORRECTED BREAKER) ---
-        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.55) # Relaxed
+        # --- EXECUTION WITH DYNAMIC CONFIDENCE ---
+        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
         
-        # Penalize Counter-Trend / MeanRev slightly to ensure quality
-        if "MeanRev" in regime_label or "Counter" in regime_label:
-            min_prob += 0.05
-        
-        # STREAK BREAKER: Increase required confidence
+        # Streak Breaker: Increase required confidence
         if streak > 0:
-            if streak >= 3:
-                min_prob += 0.05
-            else:
-                min_prob += min(0.05, streak * 0.01)
+            min_prob += min(0.1, streak * 0.02)
 
         if confidence < min_prob:
             stats[f"ML Disagreement (Streak: {streak})"] += 1
@@ -563,9 +484,8 @@ class MultiAssetPredictor:
                 # FEATURE IMPORTANCE TRACKING
                 imp_feats = []
                 imp_feats.append(regime_label)
-                if rvol > 1.2: imp_feats.append('High_Volume')
-                if parkinson > 0.002: imp_feats.append('High_Parkinson')
-                if mtf_align == 1.0: imp_feats.append('MTF_Aligned')
+                if rvol > 2.0: imp_feats.append('High_Fuel')
+                if aggressor > 0.6: imp_feats.append('High_Aggressor')
                 
                 for f in imp_feats:
                     self.feature_importance_counter[symbol][f] += 1
@@ -581,9 +501,8 @@ class MultiAssetPredictor:
                     "ker": ker_val,
                     "parkinson_vol": parkinson,
                     "rvol": rvol,
-                    "amihud": amihud,
+                    "amihud": features.get('amihud', 0.0),
                     "regime": regime_label,
-                    "mtf_align": mtf_align,
                     "drivers": imp_feats,
                     "optimized_rr": opt_rr,
                     "risk_percent_override": opt_risk,

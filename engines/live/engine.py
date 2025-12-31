@@ -5,12 +5,10 @@
 # DEPENDENCIES: shared, engines.live.dispatcher, engines.live.predictor
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates bars, generates signals.
 #
-# AUDIT REMEDIATION (2025-12-31 - OPTIMIZATION EXECUTION):
-# 1. DYNAMIC R:R EXECUTION: Now applies the 'optimized_rr' (barrier_width) 
-#    from the Predictor to override the default Config-based Take Profit.
-#    This ensures Live Trading respects the ML optimization findings.
-# 2. CLOCK SKEW GUARD: Latency checks for robust data sync.
-# 3. FRIDAY LIQUIDATION: Hard closing of positions before weekend.
+# PHOENIX STRATEGY V7.0 (LIVE EXECUTION):
+# 1. AGGRESSOR DATA: Ensures buy_vol/sell_vol are passed to Predictor.
+# 2. FRIDAY GUARD: Enforces "No New Entries" after 16:00 (Section 8.2).
+# 3. LIQUIDATION: Hard closes all positions at 21:00 (Section 9).
 # =============================================================================
 import logging
 import time
@@ -273,11 +271,20 @@ class LiveTradingEngine:
         
         if not signal: return
 
-        # --- FRIDAY LIQUIDATION CHECK ---
+        # --- SECTION 9: FRIDAY LIQUIDATION CHECK ---
+        # Hard Close at 21:00 Server Time
         if self.session_guard.should_liquidate():
             if not self.liquidation_triggered_map[bar.symbol]:
                 logger.warning(f"{LogSymbols.CLOSE} FRIDAY LIQUIDATION: Closing all {bar.symbol} trades.")
-                close_intent = Trade(symbol=bar.symbol, action="CLOSE_ALL", volume=0.0, entry_price=0.0, stop_loss=0.0, take_profit=0.0, comment="Friday Liquidation")
+                close_intent = Trade(
+                    symbol=bar.symbol, 
+                    action="CLOSE_ALL", 
+                    volume=0.0, 
+                    entry_price=0.0, 
+                    stop_loss=0.0, 
+                    take_profit=0.0, 
+                    comment="Friday Liquidation"
+                )
                 self.dispatcher.send_order(close_intent, 0.0)
                 self.liquidation_triggered_map[bar.symbol] = True
             return 
@@ -307,6 +314,7 @@ class LiveTradingEngine:
                 return
 
         # 5. Check Risk & Compliance Gates
+        # Includes Section 8.2: Friday Entry Guard (checked inside SessionGuard logic)
         if not self._check_risk_gates(bar.symbol):
             return
 
@@ -323,6 +331,9 @@ class LiveTradingEngine:
         except:
             account_size = self.ftmo_guard.equity
 
+        # Retrieve Risk Override from Predictor (Optimized)
+        risk_percent_override = signal.meta_data.get('risk_percent_override')
+
         # Initial Context (R:R is informational here)
         ctx = TradeContext(
             symbol=bar.symbol,
@@ -330,7 +341,7 @@ class LiveTradingEngine:
             stop_loss_price=0.0,
             account_equity=self.ftmo_guard.equity,
             account_currency="USD",
-            win_rate=0.55,
+            win_rate=0.45,
             risk_reward_ratio=2.0 
         )
 
@@ -342,7 +353,8 @@ class LiveTradingEngine:
             active_correlations=active_corrs,
             market_prices=self.latest_prices,
             atr=current_atr,
-            account_size=account_size
+            account_size=account_size,
+            risk_percent_override=risk_percent_override
         )
 
         if trade_intent.volume <= 0:
@@ -363,7 +375,6 @@ class LiveTradingEngine:
             
             # Update comment for audit
             trade_intent.comment += f"|OptRR:{optimized_rr:.2f}"
-            # logger.info(f"⚡ {bar.symbol}: Applying Optimized R:R {optimized_rr:.2f} (TP: {new_tp_dist:.5f})")
         # ---------------------------------------------
 
         # --- PYRAMIDING LOGIC ---
@@ -387,7 +398,14 @@ class LiveTradingEngine:
             logger.warning(f"{LogSymbols.LOCK} FTMO Guard: Trading Halted (Drawdown).")
             return False
 
+        # General Market Hours
         if not self.session_guard.is_trading_allowed():
+            return False
+            
+        # Section 8.2: Friday Entry Guard (No new trades after 16:00)
+        if self.session_guard.is_friday_afternoon():
+            # Only block NEW entries, not exits (dispatches handle action type)
+            # Since this flow is for Signal -> Entry, we block.
             return False
 
         if self.portfolio_mgr.check_penalty_box(symbol):

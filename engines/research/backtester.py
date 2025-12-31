@@ -6,11 +6,10 @@
 # DESCRIPTION: Event-Driven Backtesting Broker. Simulates execution, spread,
 # commissions, and PnL tracking for strategy validation.
 #
-# AUDIT REMEDIATION (2025-12-31):
-# 1. METRICS UPDATE: Added native 'risk_reward_ratio' to get_stats().
-# 2. CRITICAL FIX: Removed hardcoded commissions ($7/$10). Linked to Config ($5).
-# 3. CRITICAL FIX: Removed hardcoded slippage. Linked to Config Spread Map.
-# 4. COMPATIBILITY: Added positions property and submit_order API.
+# PHOENIX STRATEGY V7.0 (AGGRESSOR COMPATIBILITY):
+# 1. METADATA: Enhanced trade logging to capture 'Regime' (Aggressor/Trend).
+# 2. COSTS: Strict spread and commission application to verify edge.
+# 3. METRICS: Native support for Risk:Reward Ratio tracking.
 # =============================================================================
 from __future__ import annotations
 import pandas as pd

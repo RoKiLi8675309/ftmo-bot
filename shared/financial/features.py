@@ -5,15 +5,11 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 # 
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - L1 PROXIES):
-# 1. CORE FEATURES: Implemented 7 Core L1 Proxies (Parkinson, Amihud, RVol, etc.).
-# 2. VOLATILITY: Added High-Low Range Volatility (Parkinson) for expansion detection.
-# 3. LIQUIDITY: Added Amihud Illiquidity Proxy (Return / DollarVolume).
-# 4. MOMENTUM: Added Aggressor Ratio (Close vs Range) and Relative Volume (Duration Intensity).
-#
-# IMPLEMENTATION UPDATE (Rec 2):
-# - AdaptiveTripleBarrier: Now accepts 'parkinson_vol' to boost barrier width
-#   during volatility expansion phases (> 0.002).
+# PHOENIX STRATEGY V7.0 (AGGRESSOR BREAKOUT):
+# 1. MEAN REVERSION PURGED: Removed Bollinger Band position features.
+# 2. AGGRESSOR FEATURES: Added Flow Imbalance and Flow Ratio (Buy/Sell Vol).
+# 3. EFFICIENCY: Validated KaufmanEfficiencyRatio for Regime Filter (>0.3).
+# 4. FUEL: Validated RelativeVolume for Fuel Gauge (>2.0).
 # =============================================================================
 from __future__ import annotations
 import math
@@ -69,8 +65,6 @@ class WelfordScaler:
     """
     Online Standardization using Welford's Algorithm.
     Computes running Mean and Variance in a single pass (O(1)).
-    Used to normalize non-stationary features (e.g., Volume, OFI) dynamically
-    without the memory cost or lag of a sliding window.
     """
     def __init__(self):
         self.n = 0
@@ -103,7 +97,6 @@ class WelfordScaler:
 class RecursiveEMA:
     """
     Dependency-free Exponential Moving Average.
-    Solves compatibility issues with changing River API signatures.
     Formula: S_t = alpha * Y_t + (1 - alpha) * S_{t-1}
     """
     def __init__(self, alpha: float):
@@ -122,13 +115,12 @@ class RecursiveEMA:
     def get(self) -> float:
         return self.value if self.value is not None else 0.0
 
-# --- 1. PROJECT PHOENIX L1 PROXIES (NEW) ---
+# --- 1. PROJECT PHOENIX L1 PROXIES (AGGRESSOR LOGIC) ---
 
 class StreamingParkinsonVolatility:
     """
     Estimates volatility using High/Low range.
     More efficient than Close-to-Close volatility for detecting expansion.
-    Formula: (1 / 4*ln(2)) * ln(High/Low)^2
     """
     def __init__(self, alpha: float = 0.1):
         self.factor = 1.0 / (4.0 * math.log(2.0))
@@ -154,9 +146,6 @@ class StreamingAmihudLiquidity:
     """
     Proxy for Illiquidity using L1 data.
     Ratio of absolute return to dollar volume.
-    High Value = Price moved significantly on low volume (Illiquid/Gap).
-    Low Value = Price moved little on high volume (Liquid/Absorbed).
-    Formula: |Return| / (Price * Volume)
     """
     def __init__(self, alpha: float = 0.05):
         self.ema = RecursiveEMA(alpha)
@@ -166,13 +155,12 @@ class StreamingAmihudLiquidity:
             return 0.0
             
         dollar_vol = price * volume
-        if dollar_vol < 1.0: # Avoid division by near-zero
+        if dollar_vol < 1.0: 
             return 0.0
             
         illiquidity = abs_return / dollar_vol
         
-        # We assume standard lot sizes, so this number might be very small (e.g. 1e-9)
-        # We scale it up for feature stability
+        # Scale up for feature stability
         scaled_illiquidity = illiquidity * 1e6
         
         self.ema.update(scaled_illiquidity)
@@ -183,7 +171,7 @@ class StreamingRelativeVolume:
     Measures Duration Intensity for Volume Bars.
     Since volume is constant in Volume Bars, we measure Time to Fill.
     Intensity = AvgDuration / CurrentDuration.
-    High Intensity (> 1.0) = Fast filling bars = High Momentum.
+    High Intensity (> 2.0) = FUEL GAUGE for Aggressor Strategy.
     """
     def __init__(self, window: int = 20):
         self.dur_ema = RecursiveEMA(alpha=2.0/(window+1))
@@ -208,16 +196,14 @@ class StreamingRelativeVolume:
             
         self.dur_ema.update(duration)
         
-        # Intensity: If Avg is 60s and Current is 10s -> Intensity = 6.0
+        # Intensity: If Avg is 60s and Current is 30s -> Intensity = 2.0 (Fuel Gauge Met)
         return avg_dur / duration
 
 class StreamingAggressorRatio:
     """
-    Determines who is in control within the bar.
-    Formula: (Close - Low) / (High - Low)
+    Price Action Aggressor: (Close - Low) / (High - Low)
     1.0 = Bulls closed at High.
     0.0 = Bears closed at Low.
-    0.5 = Indecision (Doji).
     """
     def update(self, high: float, low: float, close: float) -> float:
         rng = high - low
@@ -227,13 +213,11 @@ class StreamingAggressorRatio:
         ratio = (close - low) / rng
         return max(0.0, min(ratio, 1.0)) # Clamp 0-1
 
-# --- 2. QUANTITATIVE MATH KERNELS (EXISTING) ---
+# --- 2. QUANTITATIVE MATH KERNELS ---
 
 class StreamingFracDiff:
     """
-    Computes the Fractionally Differentiated value of a time series
-    in a streaming (online) fashion with O(1) complexity per update.
-    Preserves memory (d < 1) while ensuring stationarity.
+    Computes the Fractionally Differentiated value of a time series.
     """
     def __init__(self, d=0.4, window=2000, tolerance=1e-5):
         self.d = d
@@ -269,6 +253,7 @@ class StreamingFracDiff:
 class MicrostructureAnalyzer:
     """
     Analyzes Volume Bars to calculate Order Flow Imbalance (OFI).
+    Used for the Aggressor Trigger.
     """
     def __init__(self, ema_alpha=0.1):
         self.ofi_smoothed = 0.0
@@ -284,7 +269,7 @@ class MicrostructureAnalyzer:
 class KaufmanEfficiencyRatio:
     """
     Quantifies trend efficiency (Signal vs Noise).
-    Range: 0.0 (Pure Noise) to 1.0 (Perfect Efficiency).
+    CRITICAL: Must be > 0.3 for Aggressor Strategy to fire.
     """
     def __init__(self, window: int = 10):
         self.window = window
@@ -344,8 +329,6 @@ class RegimeDetector:
         self.fit_counter = 0
         
         if HMM_AVAILABLE:
-            # FORCE SILENCE HMM LOGGERS
-            # These emit warnings via the logging module, not the warnings module
             logging.getLogger("hmmlearn").setLevel(logging.ERROR)
             logging.getLogger("hmmlearn.base").setLevel(logging.ERROR)
             
@@ -385,7 +368,7 @@ class RegimeDetector:
                     self.fit_failures = 0
                 elif hasattr(self.model, 'startprob_'):
                     self.model.init_params = ""
-                # Standard Warning suppression + context capture
+                
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
@@ -412,6 +395,9 @@ class RegimeDetector:
 # --- 4. STREAMING INDICATORS ---
 
 class StreamingBollingerBands:
+    """
+    Kept as utility, but output removed from FeatureEngineer to stop Mean Reversion learning.
+    """
     def __init__(self, period: int = 20, std_dev: float = 2.0):
         self.period = period
         self.std_dev = std_dev
@@ -438,6 +424,9 @@ class StreamingBollingerBands:
         }
 
 class StreamingADX:
+    """
+    Critical for Trend Detection.
+    """
     def __init__(self, period: int = 14):
         self.period = period
         self.dm_plus_ema = RecursiveEMA(alpha=1/period)
@@ -568,6 +557,10 @@ class StreamingIndicators:
 # --- 5. ADAPTIVE TRIPLE BARRIER ---
 
 class AdaptiveTripleBarrier:
+    """
+    Labeling engine.
+    Updated to accept Parkinson Volatility for dynamic barrier adjustment.
+    """
     def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.75):
         self.buffer = deque()
         self.time_limit = horizon_ticks
@@ -578,19 +571,16 @@ class AdaptiveTripleBarrier:
     def add_trade_opportunity(self, features: Dict[str, float], entry_price: float, current_atr: float, timestamp: float, parkinson_vol: float = 0.0):
         if current_atr <= 0: current_atr = entry_price * 0.0001
         
-        # Base Volatility Scaling (Standard Deviation based)
+        # Base Volatility Scaling
         volatility = features.get('volatility', 0.0)
         adaptive_scalar = 1.0 + (volatility * 100.0)
         
-        # --- REC 2: Parkinson Volatility Boost ---
-        # If range-based volatility (Parkinson) indicates expansion (> 0.002),
-        # we widen barriers to prevent premature stops in volatile moves.
-        # Use argument if provided, else fallback to features
+        # Parkinson Volatility Boost (Expansion Logic)
         p_vol = parkinson_vol if parkinson_vol > 0 else features.get('parkinson_vol', 0.0)
         
         vol_boost = 0.0
         if p_vol > 0.002:
-            vol_boost = 0.5 # Add 0.5x ATR room
+            vol_boost = 0.5 # Add 0.5x ATR room during expansion
         
         effective_risk_mult = (self.risk_mult + vol_boost) * adaptive_scalar
         effective_reward_mult = (self.reward_mult + vol_boost) * adaptive_scalar
@@ -730,7 +720,7 @@ class MetaLabeler:
                 clean[k] = 0.0
         return clean
 
-# --- 7. ONLINE FEATURE ENGINEER (PROJECT PHOENIX UPGRADE) ---
+# --- 7. ONLINE FEATURE ENGINEER (PROJECT PHOENIX V7.0) ---
 
 class OnlineFeatureEngineer:
     def __init__(self, window_size: int = 50):
@@ -809,7 +799,7 @@ class OnlineFeatureEngineer:
         # Update L1 Proxies (Project Phoenix)
         parkinson_val = self.parkinson.update(high, low)
         amihud_val = self.amihud.update(abs(ret_log), price, volume)
-        rvol_val = self.rvol.update(timestamp) # <-- CHANGED: Pass timestamp for Duration Intensity
+        rvol_val = self.rvol.update(timestamp) # Fuel Gauge (Duration Intensity)
         aggressor_val = self.aggressor.update(high, low, price)
         
         # Update Other Metrics
@@ -894,6 +884,13 @@ class OnlineFeatureEngineer:
             if d1_trend != 0 and (d1_trend == h4_trend == m5_trend):
                 mtf_align = 1.0
 
+        # --- FLOW IMBALANCE FEATURES (AGGRESSOR) ---
+        safe_total_vol = buy_vol + sell_vol
+        flow_imbalance = (buy_vol - sell_vol) / safe_total_vol if safe_total_vol > 0 else 0.0
+        
+        safe_sell = sell_vol if sell_vol > 0 else 1.0
+        flow_ratio = buy_vol / safe_sell
+        
         raw_features = {
             # Core
             'log_ret': ret_log,
@@ -906,6 +903,8 @@ class OnlineFeatureEngineer:
             'amihud': amihud_val,
             'rvol': rvol_val,
             'aggressor': aggressor_val,
+            'flow_imbalance': flow_imbalance, # NEW
+            'flow_ratio': flow_ratio,         # NEW
             
             # Regime & Math
             'ker': ker_val,
@@ -914,15 +913,15 @@ class OnlineFeatureEngineer:
             'entropy': entropy_val,
             'hurst': hurst_val,
             'frac_diff': fd_price,
-            'vpin': vpin_val, # Kept as proxy
+            'vpin': vpin_val,
             
-            # Technicals
+            # Technicals (Trend Focused)
             'rsi_norm': rsi_norm,
             'macd_norm': macd_norm,
             'macd_hist_norm': tech_feats['macd_hist'] / price,
             'adx': tech_feats.get('adx', 0.0),
-            'bb_width': tech_feats.get('bb_width', 0.0),
-            'bb_position': (price - tech_feats.get('bb_lower', price)) / (tech_feats.get('bb_upper', price) - tech_feats.get('bb_lower', price)) if tech_feats.get('bb_width', 0) > 0 else 0.5,
+            # REMOVED: bb_position (Mean Reversion bias)
+            'bb_width': tech_feats.get('bb_width', 0.0), # Kept for volatility context
 
             # Context / Legacy
             'vol_ratio': vol_ratio,
