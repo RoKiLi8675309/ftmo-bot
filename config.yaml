@@ -336,4 +336,4 @@ wfo:
   min_trades_optimization: 12 
   # --- RISK OPTIMIZATION (BUFFER BUILD) ---
   # Start small, scale up. Safe range for Aggressor testing.
-  risk_per_trade_options: [0.10, 0.15, 0.20, 0.25]
+  risk_per_trade_options: [0.25, 0.50, 0.75, 1.00]

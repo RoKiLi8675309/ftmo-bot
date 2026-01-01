@@ -6,11 +6,13 @@
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
 # PHOENIX STRATEGY V7.0 (OPTIMIZATION THEORY):
-# 1. PROP SCORE OBJECTIVE: Replaced PnL with Calmar Ratio (Return/DD).
+# 1. PROP SCORE OBJECTIVE: CHANGED -> PROFIT IS KING.
+#    - Old: Maximize Calmar (led to low volume/low risk gaming).
+#    - New: Maximize Total PnL (USD) + Efficiency Bonus.
 # 2. HARD CONSTRAINTS: 
-#    - Max Drawdown > 8% = Immediate Failure (Score -1000).
+#    - Max Drawdown > 8% = Immediate Failure (Score -10,000).
 #    - Trades < 30 = Stability Failure (Score 0).
-# 3. ROBUSTNESS: Prioritizes smooth equity curves over "lucky" high returns.
+# 3. ROBUSTNESS: Prioritizes raw dollars generated while respecting the hard deck.
 # =============================================================================
 import os
 import sys
@@ -90,8 +92,8 @@ class EmojiCallback:
         elif attrs.get('pruned', False):
             icon = "✂️" # Pruned (Low Trades)
             status = "PRUNE"
-        elif pnl > 0 and calmar > 2.0:
-            icon = "🚀" # High Quality
+        elif pnl > 1000 and calmar > 2.0:
+            icon = "🚀" # High Quality & High Profit
             status = "ALPHA"
         elif pnl > 0:
             icon = "✅" # Profitable
@@ -108,7 +110,7 @@ class EmojiCallback:
         # Structure: [ICON] STATUS | SYMBOL | ID | CALMAR | PnL | DD | WR | TRADES
         msg = (
             f"{icon} {status:<6} | {symbol:<6} | Trial {trial.number:<3} | "
-            f"🏆 CALMAR: {calmar:>5.2f} | "
+            f"🏆 SCORE: {val:>8.1f} | "
             f"💰 PnL: ${pnl:>9,.2f} | "
             f"📉 DD: {dd:>5.2f}% | "
             f"🎯 WR: {wr:>5.1f}% | "
@@ -121,7 +123,8 @@ class EmojiCallback:
         
         # 5. Detailed Analysis (Victory Lap OR Autopsy)
         if 'autopsy' in attrs and trades > 0:
-            if calmar > 3.0:
+            # Threshold for Victory Lap increased to significant PnL
+            if pnl > 2000.0:
                 report_type = "🏁 VICTORY LAP"
             else:
                 report_type = "🔎 AUTOPSY"
@@ -162,7 +165,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
 def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url: str) -> None:
     """
     ISOLATED WORKER FUNCTION: Runs in a separate process.
-    Executes Optuna Optimization for a single symbol using "Prop Score".
+    Executes Optuna Optimization for a single symbol using "PROFIT IS KING" Logic.
     """
     # Double-Ensure Single Threading in Worker
     os.environ["OMP_NUM_THREADS"] = "1"
@@ -216,7 +219,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
             
             # --- RISK OPTIMIZATION ---
-            risk_options = CONFIG['wfo'].get('risk_per_trade_options', [0.25, 0.5])
+            # Retrieve risk options from WFO config or use default safe aggressive set
+            risk_options = CONFIG['wfo'].get('risk_per_trade_options', [0.25, 0.50, 0.75, 1.0])
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             
             # Instantiate Pipeline locally
@@ -243,21 +247,21 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             # --- RICH METRICS EXTRACTION ---
             metrics = pipeline_inst.calculate_performance_metrics(broker.trade_log, broker.initial_balance)
             
-            # --- SECTION 6.1: "PROP SCORE" OBJECTIVE FUNCTION ---
+            # --- SECTION 6.1: "PROFIT IS KING" OBJECTIVE FUNCTION ---
             
             total_return = metrics['total_pnl']
             max_dd_pct = metrics['max_dd_pct'] # Ratio (e.g. 0.05)
             trades = metrics['total_trades']
             
-            # Calculate Calmar (Risk-Adjusted Reward)
-            # Avoid division by zero
+            # Calculate Calmar (Used only for tie-breaking efficiency now)
             safe_dd = max_dd_pct if max_dd_pct > 0.001 else 0.001
             calmar = (total_return / init_bal) / safe_dd
             
             # 1. IMMEDIATE FAILURE: If DD > 8% (Safety Buffer for 10% limit)
+            # Penalize HEAVILY (-10,000) to ensure PnL doesn't mask risk
             if max_dd_pct > 0.08:
                 trial.set_user_attr("blown", True)
-                return -1000.0 # Heavy penalty
+                return -10000.0 
             
             # 2. STABILITY BONUS: Penalize strategies with < 30 trades (Luck)
             if trades < 30:
@@ -267,7 +271,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             # 3. BLOWOUT CHECK (Broker level)
             if broker.is_blown:
                 trial.set_user_attr("blown", True)
-                return -5000.0
+                return -10000.0
 
             # Pass metrics to Callback
             trial.set_user_attr("pnl", total_return)
@@ -282,8 +286,19 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             # ALWAYS Generate Autopsy/Victory Lap Report for analysis
             trial.set_user_attr("autopsy", strategy.generate_autopsy())
             
-            # Objective: Maximize Calmar Ratio
-            return calmar
+            # --- NEW OBJECTIVE LOGIC ---
+            # PROFIT IS KING.
+            # We optimize for Total PnL (Dollars).
+            # We add a small efficiency boost (Calmar * 100) to break ties between
+            # strategies that make the same money, favoring the smoother one.
+            # Example:
+            # Strat A: PnL $5000, DD 4% -> Calmar 1.25 -> Score 5125
+            # Strat B: PnL $100, DD 0.1% -> Calmar 1.0 -> Score 200
+            # This ensures the optimizer hunts for BIG MOVES.
+            
+            objective_score = total_return + (calmar * 100.0)
+            
+            return objective_score
 
         # 3. Connect to Shared Study
         study_name = f"study_{symbol}"
@@ -558,7 +573,7 @@ class ResearchPipeline:
 
     def run_training(self, fresh_start: bool = False):
         log.info(f"{LogSymbols.TIME} STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
-        log.info(f"OBJECTIVE: MAXIMIZE CALMAR RATIO (Risk-Adjusted Return)")
+        log.info(f"OBJECTIVE: PROFIT IS KING (Total PnL + Efficiency Tie-Breaker)")
         log.info(f"HARDWARE DETECTED: {psutil.cpu_count(logical=True)} Cores. Using {self.total_cores} workers (Configured).")
         
         for symbol in self.symbols:
