@@ -8,12 +8,15 @@
 # PHOENIX STRATEGY V7.5 (SNIPER PROTOCOL):
 # 1. MEAN REVERSION PURGED: Removed all Regime C logic.
 # 2. AGGRESSOR LOGIC:
-#    - REGIME FILTER: KER > 0.3 (Trend Efficiency).
-#    - FUEL GAUGE: RVOL > 2.0 (Momentum injection).
+#    - REGIME FILTER: KER > 0.3 AND Choppiness < 50.0.
+#    - FUEL GAUGE: RVOL > 1.5 (Momentum injection).
 #    - TRIGGER: Order Flow Imbalance (Buy > 1.2x Sell).
-# 3. SNIPER FILTERS (NEW):
+# 3. SNIPER FILTERS:
 #    - TREND: SMA 200 Filter (No counter-trend).
 #    - EXTENSION: RSI Filter (No buying tops/selling bottoms).
+# 4. TRADE MANAGEMENT:
+#    - SQN SCALING: Dynamic risk based on performance.
+#    - TRAILING STOP: Activates at 1R (Breakeven) -> Trails at 1.5R.
 # =============================================================================
 import logging
 import sys
@@ -68,7 +71,7 @@ class ResearchStrategy:
         self.risk_conf = params.get('risk_management', CONFIG.get('risk_management', {}))
         
         # AUDIT FIX: Load SL Multiplier from Config (Was Hardcoded 1.5)
-        self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 1.5))
+        self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 2.0))
         
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
@@ -133,8 +136,8 @@ class ResearchStrategy:
         self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 6.0)) # Cap for huge spikes
         
         # --- STRICT THRESHOLDS (FROM DOCUMENT) ---
-        self.ker_thresh = float(phx_conf.get('ker_trend_threshold', 0.30))
-        self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 2.0))
+        self.ker_thresh = float(phx_conf.get('ker_trend_threshold', 0.20)) # Relaxed to 0.20
+        self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 1.5)) # Relaxed to 1.5
         self.aggressor_ratio_min = 1.2 # "Buy Vol > Sell Vol * 1.2"
         self.adx_threshold = float(phx_conf.get('adx', {}).get('threshold', 25.0))
         
@@ -210,6 +213,9 @@ class ResearchStrategy:
 
         # --- UPDATE STREAK STATUS (CRITICAL FOR FILTER) ---
         self._update_streak_status(broker)
+        
+        # --- MANAGE TRAILING STOPS (ACTIVE MANAGEMENT) ---
+        self._manage_trailing_stops(broker, price, dt_ts)
 
         # --- FRIDAY LOGIC: LIQUIDATION VS ENTRY GUARD ---
         # 1. Liquidation (21:00 Server Time)
@@ -341,6 +347,14 @@ class ResearchStrategy:
         aggressor = features.get('aggressor', 0.5)
         adx_val = features.get('adx', 0.0)
         
+        # NEW: Regime Filters (Anti-Chop)
+        choppiness = features.get('choppiness', 50.0)
+        
+        # --- CRITICAL FILTER 0: ANTI-CHOP (HARD GATE) ---
+        if choppiness > 50.0:
+            self.rejection_stats[f"Chop Regime (CHOP {choppiness:.1f} > 50)"] += 1
+            return
+            
         # --- CRITICAL FILTER 1: FUEL GAUGE (HARD GATE) ---
         # RVOL must be > Threshold to inject momentum
         if rvol < self.vol_gate_ratio:
@@ -501,6 +515,9 @@ class ResearchStrategy:
 
         # Retrieve Optimized Risk Parameter
         risk_override = self.params.get('risk_per_trade_percent')
+        
+        # NEW: CALCULATE SQN PERFORMANCE SCORE
+        sqn_score = self._calculate_symbol_sqn(broker)
 
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
@@ -511,15 +528,15 @@ class ResearchStrategy:
             atr=current_atr, 
             ker=current_ker,
             account_size=broker.equity,
-            risk_percent_override=risk_override
+            risk_percent_override=risk_override,
+            performance_score=sqn_score # Pass SQN for scaling
         )
 
         if trade_intent.volume <= 0:
-            self.rejection_stats[f"Risk Zero: {trade_intent.comment}"] += 1
+            self.rejection_stats[f"Risk Zero ({trade_intent.comment})"] += 1
             return
 
         # --- STOP LOSS ENFORCEMENT (DYNAMIC CONFIG) ---
-        # AUDIT FIX: Use the configured SL multiplier, not hardcoded 1.5
         stop_dist = current_atr * self.sl_atr_mult
         trade_intent.stop_loss = stop_dist
         
@@ -562,7 +579,9 @@ class ResearchStrategy:
                 'parkinson': features.get('parkinson_vol', 0),
                 'ker': current_ker,
                 'atr': current_atr,
-                'optimized_rr': self.optimized_reward_mult
+                'optimized_rr': self.optimized_reward_mult,
+                'initial_risk_dist': stop_dist, # NEW: Stored for Trailing Stop Calc
+                'entry_price_snap': price
             }
         )
         
@@ -591,6 +610,93 @@ class ResearchStrategy:
             'regime': regime,
             'top_feats': imp_feats
         })
+
+    def _calculate_symbol_sqn(self, broker: BacktestBroker) -> float:
+        """
+        Calculates the rolling System Quality Number (SQN) for this symbol.
+        Used to throttle risk during losing streaks.
+        """
+        trades = [t.net_pnl for t in broker.closed_positions if t.symbol == self.symbol]
+        
+        # Need at least a few trades to establish a valid SQN
+        if len(trades) < 5: 
+            return 0.0
+            
+        # Analyze last 30 trades for responsiveness
+        window = trades[-30:]
+        avg_pnl = np.mean(window)
+        std_pnl = np.std(window)
+        
+        if std_pnl < 1e-9:
+            return 0.0
+            
+        sqn = math.sqrt(len(window)) * (avg_pnl / std_pnl)
+        return sqn
+
+    def _manage_trailing_stops(self, broker: BacktestBroker, current_price: float, timestamp: datetime):
+        """
+        Active Management:
+        1. Breakeven at 1R profit.
+        2. Aggressive Trail at 1.5R profit (Trail by 0.5R).
+        """
+        for pos in broker.open_positions:
+            if pos.symbol != self.symbol: continue
+            
+            # Retrieve initial risk distance from metadata (stored at entry)
+            risk_dist = pos.metadata.get('initial_risk_dist', 0.0)
+            if risk_dist <= 0: continue
+            
+            # Calculate PnL distance
+            if pos.side == 1: # BUY
+                dist_pnl = current_price - pos.entry_price
+            else: # SELL
+                dist_pnl = pos.entry_price - current_price
+                
+            # Calculate R-Multiple
+            r_multiple = dist_pnl / risk_dist
+            
+            new_sl = None
+            reason = ""
+            
+            # --- TIER 1: BREAKEVEN @ 1.0R ---
+            if r_multiple >= 1.0 and r_multiple < 1.5:
+                # Move to Entry Price (plus small buffer maybe? strict entry for now)
+                target_sl = pos.entry_price
+                
+                # Only update if it improves position
+                if pos.side == 1 and target_sl > pos.stop_loss:
+                    new_sl = target_sl
+                    reason = "BE (1R)"
+                elif pos.side == -1 and target_sl < pos.stop_loss:
+                    new_sl = target_sl
+                    reason = "BE (1R)"
+
+            # --- TIER 2: TRAILING @ 1.5R ---
+            elif r_multiple >= 1.5:
+                # Trail at 0.5R distance from current price
+                # If Price is at 1.5R, SL is at 1.0R (Locking in the win)
+                trail_dist = risk_dist * 0.5
+                
+                if pos.side == 1: # BUY
+                    target_sl = current_price - trail_dist
+                    if target_sl > pos.stop_loss:
+                        new_sl = target_sl
+                        reason = f"Trail ({r_multiple:.1f}R)"
+                else: # SELL
+                    target_sl = current_price + trail_dist
+                    if target_sl < pos.stop_loss:
+                        new_sl = target_sl
+                        reason = f"Trail ({r_multiple:.1f}R)"
+            
+            # Apply Update
+            if new_sl is not None:
+                pos.stop_loss = new_sl
+                if "Trail" in reason or "BE" in reason:
+                     # Add tag to comment if not present
+                     if reason not in pos.comment:
+                         pos.comment += f"|{reason}"
+                     if self.debug_mode:
+                         logger.info(f"🛡️ {self.symbol} SL Moved to {new_sl:.5f} ({reason})")
 
     def _check_daily_loss_limit(self, broker: BacktestBroker) -> bool:
         """

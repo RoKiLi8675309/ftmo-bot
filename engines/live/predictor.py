@@ -9,12 +9,12 @@
 # PHOENIX STRATEGY V7.5 (SNIPER PROTOCOL - LIVE):
 # 1. MEAN REVERSION PURGED: Removed Regime C.
 # 2. AGGRESSOR LOGIC ALIGNMENT:
-#    - KER > 0.2 (Relaxed Efficiency).
-#    - RVOL > 1.5 (Relaxed Fuel).
+#    - REGIME FILTER: KER > 0.2 AND Choppiness < 50.0.
+#    - FUEL GAUGE: RVOL > 1.5.
 #    - TRIGGER: Order Flow Imbalance (Buy > 1.2x Sell) + PA Aggressor > 0.55.
 # 3. SNIPER FILTERS:
-#    - TREND: SMA 200 Filter (No counter-trend).
-#    - EXTENSION: RSI Filter (No buying tops/selling bottoms).
+#    - TREND: SMA 200 Filter.
+#    - EXTENSION: RSI Filter.
 # =============================================================================
 import logging
 import pickle
@@ -236,7 +236,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V7.0 Logic (Aggressor Only).
+        Executes the Learn-Predict Loop with Project Phoenix V7.5 Logic.
         """
         if symbol not in self.symbols: return None
         
@@ -374,13 +374,16 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp(), parkinson_vol=parkinson)
 
         # ============================================================
-        # 4. PHOENIX STRATEGY V7.0: AGGRESSOR BREAKOUT GATES
+        # 4. PHOENIX STRATEGY V7.5: AGGRESSOR BREAKOUT GATES
         # ============================================================
         
         # Extract Core Indicators
         rvol = features.get('rvol', 1.0)
         aggressor = features.get('aggressor', 0.5)
         adx_val = features.get('adx', 0.0)
+        
+        # NEW: Anti-Chop Indicator
+        choppiness = features.get('choppiness', 50.0)
         
         # Pull Configs (Relaxed)
         phx = CONFIG.get('phoenix_strategy', {})
@@ -397,6 +400,11 @@ class MultiAssetPredictor:
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
              # Just return HOLD, do not spam stats if it happens often
              return Signal(symbol, "HOLD", 0.0, {"reason": "Friday Entry Guard"})
+
+        # --- CRITICAL FILTER 0: ANTI-CHOP (HARD GATE) ---
+        if choppiness > 50.0:
+            stats[f"Chop Regime (CHOP {choppiness:.1f} > 50)"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": f"Chop Regime (CHOP {choppiness:.1f})"})
 
         # --- CRITICAL FILTER 1: FUEL GAUGE (HARD GATE) ---
         if rvol < vol_gate_ratio:
@@ -535,6 +543,7 @@ class MultiAssetPredictor:
                     "parkinson_vol": parkinson,
                     "rvol": rvol,
                     "amihud": features.get('amihud', 0.0),
+                    "choppiness": choppiness, # NEW
                     "regime": regime_label,
                     "drivers": imp_feats,
                     "optimized_rr": opt_rr,

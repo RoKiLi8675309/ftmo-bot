@@ -10,6 +10,7 @@
 #    mean-reversion bias in the ML model. Volatility handled by ATR/Parkinson.
 # 2. AGGRESSOR FEATURES: Confirmed Flow Imbalance and Flow Ratio.
 # 3. EFFICIENCY: Validated KaufmanEfficiencyRatio for Regime Filter (>0.3).
+# 4. REGIME DETECTION: Added Vortex and Choppiness for Anti-Chop filtering.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -394,6 +395,114 @@ class RegimeDetector:
 
 # --- 4. STREAMING INDICATORS ---
 
+class StreamingVortex:
+    """
+    Vortex Indicator (VI) for Regime Detection.
+    VI > 1.0 implies Trend, VI < 1.0 implies Chop.
+    Uses sliding window summation for stability.
+    """
+    def __init__(self, period: int = 14):
+        self.period = period
+        self.tr_buffer = deque(maxlen=period)
+        self.vm_plus_buffer = deque(maxlen=period)
+        self.vm_minus_buffer = deque(maxlen=period)
+        self.prev_low = None
+        self.prev_high = None
+        self.prev_close = None
+
+    def update(self, high: float, low: float, close: float) -> Tuple[float, float]:
+        if self.prev_close is None:
+            self.prev_high = high
+            self.prev_low = low
+            self.prev_close = close
+            return 1.0, 1.0
+
+        # 1. True Range
+        tr1 = high - low
+        tr2 = abs(high - self.prev_close)
+        tr3 = abs(low - self.prev_close)
+        tr = max(tr1, tr2, tr3)
+        
+        # 2. Vortex Movements
+        vm_plus = abs(high - self.prev_low)
+        vm_minus = abs(low - self.prev_high)
+        
+        # 3. Update Buffers
+        self.tr_buffer.append(tr)
+        self.vm_plus_buffer.append(vm_plus)
+        self.vm_minus_buffer.append(vm_minus)
+        
+        # 4. Update State
+        self.prev_high = high
+        self.prev_low = low
+        self.prev_close = close
+        
+        if len(self.tr_buffer) < self.period:
+            return 1.0, 1.0
+            
+        sum_tr = sum(self.tr_buffer)
+        if sum_tr < 1e-9:
+            return 1.0, 1.0
+            
+        vi_plus = sum(self.vm_plus_buffer) / sum_tr
+        vi_minus = sum(self.vm_minus_buffer) / sum_tr
+        
+        return vi_plus, vi_minus
+
+class StreamingChoppiness:
+    """
+    Choppiness Index (CHOP) for Regime Detection.
+    CHOP > 50 implies Sideways/Consolidation.
+    CHOP < 38 implies Trending.
+    Formula: 100 * LOG10( SUM(ATR, n) / ( MaxHi(n) - MinLo(n) ) ) / LOG10(n)
+    """
+    def __init__(self, period: int = 14):
+        self.period = period
+        self.tr_buffer = deque(maxlen=period)
+        self.high_buffer = deque(maxlen=period)
+        self.low_buffer = deque(maxlen=period)
+        self.prev_close = None
+
+    def update(self, high: float, low: float, close: float) -> float:
+        if self.prev_close is None:
+            self.prev_close = close
+            self.high_buffer.append(high)
+            self.low_buffer.append(low)
+            return 50.0 # Neutral start
+
+        # 1. True Range
+        tr1 = high - low
+        tr2 = abs(high - self.prev_close)
+        tr3 = abs(low - self.prev_close)
+        tr = max(tr1, tr2, tr3)
+        
+        # 2. Update Buffers
+        self.tr_buffer.append(tr)
+        self.high_buffer.append(high)
+        self.low_buffer.append(low)
+        self.prev_close = close
+        
+        if len(self.tr_buffer) < self.period:
+            return 50.0
+            
+        # 3. Calculate CHOP
+        sum_tr = sum(self.tr_buffer)
+        max_hi = max(self.high_buffer)
+        min_lo = min(self.low_buffer)
+        rng = max_hi - min_lo
+        
+        if rng <= 1e-9 or sum_tr <= 1e-9:
+            return 50.0
+            
+        try:
+            # 100 * Log10(SumTR / Range) / Log10(n)
+            numerator = math.log10(sum_tr / rng)
+            denominator = math.log10(self.period)
+            chop = 100.0 * (numerator / denominator)
+            return max(0.0, min(100.0, chop))
+        except ValueError:
+            return 50.0
+
 class StreamingADX:
     """
     Critical for Trend Detection.
@@ -707,6 +816,10 @@ class OnlineFeatureEngineer:
         self.fdi = FractalDimensionIndex(window=30)
         self.regime_detector = RegimeDetector(n_states=2, window=100)
         
+        # New Regime Filters (Anti-Chop)
+        self.vortex = StreamingVortex(period=14)
+        self.choppiness = StreamingChoppiness(period=14)
+        
         # Project Phoenix L1 Proxies
         self.parkinson = StreamingParkinsonVolatility(alpha=0.1)
         self.amihud = StreamingAmihudLiquidity(alpha=0.05)
@@ -762,6 +875,10 @@ class OnlineFeatureEngineer:
         ker_val = self.ker.update(price)
         fdi_val = self.fdi.update(price)
         regime_hmm = self.regime_detector.update(ret_log)
+        
+        # Update Anti-Chop Filters
+        vi_plus, vi_minus = self.vortex.update(high, low, price)
+        chop_index = self.choppiness.update(high, low, price)
         
         # Update L1 Proxies (Project Phoenix)
         parkinson_val = self.parkinson.update(high, low)
@@ -881,6 +998,8 @@ class OnlineFeatureEngineer:
             'hurst': hurst_val,
             'frac_diff': fd_price,
             'vpin': vpin_val,
+            'choppiness': chop_index,    # NEW: 0-100 (50+ = Chop)
+            'vortex_spread': vi_plus - vi_minus, # NEW: >0 Bullish, <0 Bearish
             
             # Technicals (Trend Focused)
             'rsi_norm': rsi_norm,

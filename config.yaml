@@ -3,9 +3,9 @@
 # STATUS: REMEDIATION | TARGET: PASS FTMO CHALLENGE
 #
 # STRATEGY UPDATE (V7.5 - SNIPER):
-# 1. BASKET: Purged JPY concentration. Using Uncorrelated Majors.
-# 2. RISK: Reduced to 0.5% per trade (Survive Phase).
-# 3. LOGIC: Added Trend (SMA200) and Extension (RSI) Filters.
+# 1. REGIME: Added Choppiness Index (CHOP) & Vortex (VI) to filter Chop.
+# 2. RISK: SQN Scaling (Cut Losers) + Active Trailing Stop (Lock Winners).
+# 3. LOGIC: Strict Trend (SMA200) + Momentum (RVOL/Flow).
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -100,6 +100,10 @@ features:
   use_relative_volume: true    
   use_aggressor_ratio: true    
   
+  # NEW: Regime Filters (Anti-Chop)
+  use_choppiness: true
+  use_vortex: true
+  
   # Legacy / Context
   use_regime: true
   use_vol_breakout: true
@@ -110,6 +114,13 @@ features:
   macd_slow: 26
   macd_signal: 9
   atr_period: 14
+  
+  # New Regime Settings
+  choppiness:
+    period: 14
+    threshold: 50.0
+  vortex:
+    period: 14
   
   # Context Windows
   d1_ema_period: 200
@@ -124,26 +135,27 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 25 # Increased for stronger trend confirmation (Aggressor)
+    threshold: 25 
   
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V7.0 AGGRESSOR) ---
+# --- PHOENIX STRATEGY PARAMETERS (V7.5 SNIPER) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true       
   require_d1_trend: true              
   require_h4_alignment: true        
   
-  # --- FILTER THRESHOLDS (RELAXED FOR RECOVERY) ---
-  max_relative_volume: 6.0        # Cap raised to allow strong breakout volume
-  ker_trend_threshold: 0.20       # STRICT: Keep at 0.20 for safety
-  volume_gate_ratio: 1.5          # STRICT: Keep at 1.5 for safety
-  aggressor_threshold: 0.55       # Price Action confirmation
-  ml_confirmation_threshold: 0.70 # INCREASED: Sniper Standard (0.60 -> 0.70)
+  # --- FILTER THRESHOLDS ---
+  max_relative_volume: 6.0        
+  ker_trend_threshold: 0.20       
+  volume_gate_ratio: 1.5          
+  aggressor_threshold: 0.55       
+  ml_confirmation_threshold: 0.70 
+  choppiness_threshold: 50.0      # Hard Gate: If > 50, No Trade
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -179,10 +191,9 @@ optimization_search_space:
     max: 0.95
   
   # Triple Barrier Method (Labeling) -> Defines Reward Target (TP)
-  # TREND MODE: Higher R:R Targets (3.0x - 6.0x)
   tbm_barrier_width:
     min: 3.0
-    max: 6.0 # Increased to force "Letting winners run"
+    max: 6.0 
   tbm_horizon_minutes:
     min: 60
     max: 240
@@ -193,7 +204,7 @@ optimization_search_space:
   
   # Strategy Execution
   min_calibrated_probability:
-    min: 0.70 # RAISED: Floor is now 70%
+    min: 0.70 
     max: 0.85
 
 # --- RISK MANAGEMENT (FTMO COMPLIANCE) ---
@@ -203,36 +214,32 @@ risk_management:
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # CRITICAL UPDATE: 0.5% Risk Per Trade (Sniper Protocol)
-  base_risk_per_trade_percent: 0.005 # 0.5% Fixed Risk
+  # SNIPER PROTOCOL: 0.5% Fixed Risk per Trade
+  base_risk_per_trade_percent: 0.005 
   
   # LIMITS
   max_daily_loss_pct: 0.045       # 4.5% (Stay below FTMO 5%)
   max_total_loss_pct: 0.09        # 9.0% (Stay below FTMO 10%)
   
-  max_risk_percent: 1.5           # Max open risk at any time (3 trades * 0.5%)
-  max_open_trades: 3              # NEW: Limit exposure count
+  max_risk_percent: 1.5           # Max open risk at any time
+  max_open_trades: 3              
   
   max_leverage: 30.0
   max_lot_size: 50.0 
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (SNIPER MODE)
-  stop_loss_atr_mult: 2.0         # Maintain 2.0x ATR to breathe
-  take_profit_atr_mult: 3.0       # Adjusted to 3.0x for realistic targets
+  stop_loss_atr_mult: 2.0         
+  take_profit_atr_mult: 3.0       
   
-  # TIER 1: BREAKEVEN
-  breakeven:
-    enabled: true        
-    activation_atr: 1.5  
-    profit_pips: 2.0      
-  
-  # TIER 2: TRAILING STOP
+  # ACTIVE TRAILING STOP (Implementation in Strategy)
+  # Tier 1: BE @ 1.0 R
+  # Tier 2: Trail @ 1.5 R (Distance 0.5 R)
   trailing_stop:
     enabled: true        
-    activation_atr: 2.5           
-    distance_atr: 1.5               
-    step_atr: 0.5                   
+    activation_r: 1.0    # Breakeven Trigger
+    trail_trigger_r: 1.5 # Trailing Trigger
+    trail_dist_r: 0.5    # Distance behind price
   
   risk_timezone: "Europe/Prague"
   friday_entry_cutoff_hour: 16        # Stop entries at 16:00 Server Time
@@ -306,7 +313,7 @@ online_learning:
   learning_horizon_sec: 300
   
   # SNIPER PROTOCOL: High Conviction Only
-  min_calibrated_probability: 0.70 # RAISED: 0.60 -> 0.70
+  min_calibrated_probability: 0.70
 
 # --- NEWS FILTER ---
 news_filter:

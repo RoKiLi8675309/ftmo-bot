@@ -11,6 +11,7 @@
 # 3. STATIC RISK: STRICT 0.5% CAP. Removed "Aggressive" 1.0% tier.
 #    - Priority is SURVIVAL and consistency over volatility.
 # 4. COMPLIANCE: SessionGuard enforces Friday Liquidation and Trading Hours.
+# 5. SQN SCALING: Added Performance-Based Sizing (Cut Losers / Press Winners).
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -143,13 +144,15 @@ class RiskManager:
         active_correlations: int = 0,
         market_prices: Optional[Dict[str, float]] = None,
         atr: Optional[float] = None,
-        account_size: Optional[float] = None, # NEW ARGUMENT for Auto-Detection
-        contract_size_override: Optional[float] = None, # NEW: Allow overriding lot size
-        ker: float = 1.0, # Kaufman Efficiency Ratio input
-        risk_percent_override: Optional[float] = None # NEW: Optimization Override
+        account_size: Optional[float] = None, 
+        contract_size_override: Optional[float] = None, 
+        ker: float = 1.0, 
+        risk_percent_override: Optional[float] = None,
+        performance_score: float = 0.0 # NEW: SQN Input for Dynamic Sizing
     ) -> Tuple[Trade, float]:
         """
         Calculates position size using strict prop firm logic (Sniper Protocol).
+        Includes SQN Scaling to cut losers and press winners.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -209,12 +212,30 @@ class RiskManager:
             risk_pct = risk_percent_override * 100.0 if risk_percent_override < 1.0 else risk_percent_override
         else:
             # Default Strategy Logic: STATIC RISK
-            # No aggressive compounding until consistent profitability is proven.
             risk_pct = base_risk_pct
+        
+        # --- NEW: SQN PERFORMANCE SCALING ---
+        # "Cut the Losers, Press the Winners"
+        # Only apply if we have a valid performance score (not 0.0 default)
+        if performance_score != 0.0:
+            if performance_score < -1.0:
+                # TOXIC ASSET: Hard Stop
+                risk_pct = 0.0
+                return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, f"Toxic Asset (SQN {performance_score:.2f})"), 0.0
+                
+            elif performance_score < 0.0:
+                # LOSING STREAK: Probe Size Only (0.1%)
+                # This keeps the bot "in the game" to detect regime shift without bleeding equity
+                risk_pct = 0.1
+                
+            elif performance_score > 2.5:
+                # HOT HAND: Scale up slightly (1.25x)
+                # But CAP at 1.0% absolute max to prevent ruin
+                risk_pct = min(risk_pct * 1.25, 1.0)
         
         # Drawdown Brake: If in significant drawdown (>4%), reduce risk further (Survive Mode)
         if balance < (start_equity * 0.96):
-            risk_pct *= 0.5  # Slash risk to 0.25% to recover slowly
+            risk_pct *= 0.5  # Slash risk to recover slowly
         
         # Calculate Risk Amount in USD
         calculated_risk_usd = balance * (risk_pct / 100.0)
@@ -265,7 +286,7 @@ class RiskManager:
             entry_price=price,
             stop_loss=stop_dist,
             take_profit=stop_dist * (atr_mult_tp / atr_mult_sl),
-            comment=f"Risk:{risk_pct:.2f}%|R:${final_risk_usd:.0f}|ATR:{atr_val:.5f}"
+            comment=f"Risk:{risk_pct:.2f}%|SQN:{performance_score:.1f}|R:${final_risk_usd:.0f}"
         )
         
         return trade, final_risk_usd

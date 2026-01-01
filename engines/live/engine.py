@@ -9,6 +9,7 @@
 # 1. RISK ORCHESTRATION: Passes 'ker' to RiskManager for Efficiency Scaling.
 # 2. SNIPER GUARD: Enforces Friday Entry Cutoff (16:00) & Liquidation (21:00).
 # 3. DYNAMIC R:R: Applies optimized Reward Targets from Predictor metadata.
+# 4. SQN SCALING: Tracks closed trades to throttle risk on losing streaks.
 # =============================================================================
 import logging
 import time
@@ -16,8 +17,10 @@ import json
 import threading
 import signal
 import sys
+import numpy as np
+import math
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Any, Optional, Dict
 
 # Third-Party NLP (Guarded)
@@ -65,6 +68,7 @@ class LiveTradingEngine:
     3. Fetches News & Calculates Sentiment.
     4. Feeds Bars to Predictor (Ensemble ARF) -> Gets Optimized R:R.
     5. Dispatches Orders to Windows with Precise Limits.
+    6. Monitors Closed Trades for SQN Scaling (Cut Losers).
     """
     def __init__(self):
         self.shutdown_flag = False
@@ -115,6 +119,12 @@ class LiveTradingEngine:
             self.news_thread = threading.Thread(target=self.fetch_news_loop, daemon=True)
             self.news_thread.start()
 
+        # 7. Performance Monitor (SQN Tracking)
+        # Tracks last 30 trades per symbol to calculate SQN
+        self.performance_stats = defaultdict(lambda: deque(maxlen=30))
+        self.perf_thread = threading.Thread(target=self.fetch_performance_loop, daemon=True)
+        self.perf_thread.start()
+
         # State
         self.is_warm = False
         self.last_corr_update = time.time()
@@ -153,6 +163,55 @@ class LiveTradingEngine:
             except Exception as e:
                 logger.error(f"News Fetch Error: {e}")
                 time.sleep(60)
+
+    def fetch_performance_loop(self):
+        """
+        Background thread to listen for CLOSED trades and update SQN stats.
+        Essential for 'Dynamic Performance-Based Sizing'.
+        """
+        logger.info(f"{LogSymbols.INFO} Performance Monitor (SQN) Thread Started.")
+        stream_key = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
+        
+        # Start reading from current time ($) to avoid processing old history on restart
+        last_id = '$' 
+        
+        while not self.shutdown_flag:
+            try:
+                # Block for 1 second waiting for new closed trades
+                response = self.stream_mgr.r.xread({stream_key: last_id}, count=10, block=1000)
+                
+                if response:
+                    for stream, messages in response:
+                        for msg_id, data in messages:
+                            last_id = msg_id
+                            symbol = data.get('symbol')
+                            net_pnl = float(data.get('net_pnl', 0.0))
+                            
+                            if symbol:
+                                self.performance_stats[symbol].append(net_pnl)
+                                # logger.debug(f"📉 PnL Recorded: {symbol} ${net_pnl:.2f}")
+                                
+            except Exception as e:
+                logger.error(f"Performance Monitor Error: {e}")
+                time.sleep(5)
+
+    def _calculate_sqn(self, symbol: str) -> float:
+        """
+        Calculates the rolling System Quality Number (SQN) for a symbol.
+        SQN = (Mean PnL / Std Dev PnL) * Sqrt(N)
+        """
+        trades = list(self.performance_stats[symbol])
+        if len(trades) < 5: 
+            return 0.0 # Not enough data, neutral score
+            
+        avg_pnl = np.mean(trades)
+        std_pnl = np.std(trades)
+        
+        if std_pnl < 1e-9:
+            return 0.0
+            
+        sqn = (avg_pnl / std_pnl) * math.sqrt(len(trades))
+        return sqn
 
     def _get_open_positions_from_redis(self) -> Dict[str, Dict]:
         """
@@ -336,6 +395,9 @@ class LiveTradingEngine:
         
         # Retrieve KER for Risk Scaling (Sniper Protocol)
         ker_val = signal.meta_data.get('ker', 1.0)
+        
+        # --- NEW: CALCULATE SQN PERFORMANCE SCORE ---
+        sqn_score = self._calculate_sqn(bar.symbol)
 
         # Initial Context (R:R is informational here)
         ctx = TradeContext(
@@ -359,11 +421,12 @@ class LiveTradingEngine:
             account_size=account_size,
             contract_size_override=None,
             ker=ker_val, # PASSED FOR SCALING
-            risk_percent_override=risk_percent_override
+            risk_percent_override=risk_percent_override,
+            performance_score=sqn_score # NEW: Dynamic SQN Scaling
         )
 
         if trade_intent.volume <= 0:
-            logger.warning(f"Trade Size 0 for {bar.symbol} (Risk Constraints).")
+            logger.warning(f"Trade Size 0 for {bar.symbol} (Risk Constraints: {trade_intent.comment}).")
             return
 
         trade_intent.action = signal.action
