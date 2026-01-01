@@ -5,12 +5,12 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX STRATEGY V7.0 (RISK DYNAMICS):
-# 1. STOP LOSS: Hardcoded to 1.5 * ATR (Document Section 5.3).
-# 2. DYNAMIC SIZING (Section 7):
-#    - Buffer Build (Profit < 3%): Risk 0.5%.
-#    - Aggressive Compounding (Profit > 3%): Risk 1.0%.
-# 3. COMPLIANCE: SessionGuard enforces Friday Liquidation and Trading Hours.
+# PHOENIX STRATEGY V7.5 (SNIPER PROTOCOL RISK):
+# 1. STOP LOSS: Widened to 2.0 * ATR (Prevents premature noise stop-outs).
+# 2. TAKE PROFIT: Adjusted to 3.0 * ATR (Sniper Target).
+# 3. STATIC RISK: STRICT 0.5% CAP. Removed "Aggressive" 1.0% tier.
+#    - Priority is SURVIVAL and consistency over volatility.
+# 4. COMPLIANCE: SessionGuard enforces Friday Liquidation and Trading Hours.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -149,7 +149,7 @@ class RiskManager:
         risk_percent_override: Optional[float] = None # NEW: Optimization Override
     ) -> Tuple[Trade, float]:
         """
-        Calculates position size using strict prop firm logic (Section 7).
+        Calculates position size using strict prop firm logic (Sniper Protocol).
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -163,13 +163,12 @@ class RiskManager:
         
         # USE DETECTED ACCOUNT SIZE (if available), else default to Config
         start_equity = account_size if account_size else float(CONFIG.get('env', {}).get('initial_balance', 100000.0))
-        initial_balance_static = float(CONFIG.get('env', {}).get('initial_balance', 100000.0))
         
-        # --- DOCUMENT SECTION 5.3: VOLATILITY-ADJUSTED STOPS ---
-        # "Stop Loss = Entry - (ATR(14) * 1.5)"
-        # We enforce 1.5 multiplier strictly.
-        atr_mult_sl = 1.5 
-        atr_mult_tp = risk_conf.get('take_profit_atr_mult', 3.0)
+        # --- SNIPER PROTOCOL: VOLATILITY-ADJUSTED STOPS ---
+        # Stop Loss = Entry +/- (ATR(14) * 2.0)
+        # We enforce 2.0 multiplier strictly to survive news/noise.
+        atr_mult_sl = float(risk_conf.get('stop_loss_atr_mult', 2.0))
+        atr_mult_tp = float(risk_conf.get('take_profit_atr_mult', 3.0))
         
         # ATR Fallback Logic
         if atr and atr > 0:
@@ -201,27 +200,21 @@ class RiskManager:
         lots = 0.0
         calculated_risk_usd = 0.0
         
-        # --- DOCUMENT SECTION 7: RISK DYNAMICS (BUFFER BUILD vs AGGRESSIVE) ---
-        # Calculate Profit Buffer
-        profit_buffer_pct = (balance - initial_balance_static) / initial_balance_static
+        # --- SNIPER PROTOCOL: STRICT RISK CAP ---
+        # Default Base Risk: 0.5% (0.005)
+        base_risk_pct = risk_conf.get('base_risk_per_trade_percent', 0.005) * 100.0 # Convert to %
         
         if risk_percent_override is not None:
-            # Optuna/WFO override has highest priority
-            risk_pct = risk_percent_override
+            # Optuna/WFO override has highest priority (used during optimization)
+            risk_pct = risk_percent_override * 100.0 if risk_percent_override < 1.0 else risk_percent_override
         else:
-            # Default Strategy Logic
-            if profit_buffer_pct > 0.03:
-                # SECTION 7.2: Aggressive Compounding (Buffer > 3%)
-                # "Risk the house's money" -> 1.0%
-                risk_pct = 1.0
-            else:
-                # SECTION 7.1: Buffer Build (Buffer < 3%)
-                # Safety First -> 0.5%
-                risk_pct = 0.5
+            # Default Strategy Logic: STATIC RISK
+            # No aggressive compounding until consistent profitability is proven.
+            risk_pct = base_risk_pct
         
-        # Drawdown Brake: If in significant drawdown (>4%), reduce risk further
+        # Drawdown Brake: If in significant drawdown (>4%), reduce risk further (Survive Mode)
         if balance < (start_equity * 0.96):
-            risk_pct *= 0.5  # Slash risk to survive
+            risk_pct *= 0.5  # Slash risk to 0.25% to recover slowly
         
         # Calculate Risk Amount in USD
         calculated_risk_usd = balance * (risk_pct / 100.0)
@@ -272,7 +265,7 @@ class RiskManager:
             entry_price=price,
             stop_loss=stop_dist,
             take_profit=stop_dist * (atr_mult_tp / atr_mult_sl),
-            comment=f"Risk:{risk_pct:.1f}%|R:${final_risk_usd:.0f}|ATR:{atr_val:.5f}"
+            comment=f"Risk:{risk_pct:.2f}%|R:${final_risk_usd:.0f}|ATR:{atr_val:.5f}"
         )
         
         return trade, final_risk_usd

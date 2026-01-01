@@ -6,13 +6,15 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V7.0 (AGGRESSOR BREAKOUT - LIVE):
+# PHOENIX STRATEGY V7.5 (SNIPER PROTOCOL - LIVE):
 # 1. MEAN REVERSION PURGED: Removed Regime C.
 # 2. AGGRESSOR LOGIC ALIGNMENT:
 #    - KER > 0.2 (Relaxed Efficiency).
 #    - RVOL > 1.5 (Relaxed Fuel).
 #    - TRIGGER: Order Flow Imbalance (Buy > 1.2x Sell) + PA Aggressor > 0.55.
-# 3. RISK: Metadata passed to Engine now assumes Aggressor constraints (2.0 ATR).
+# 3. SNIPER FILTERS:
+#    - TREND: SMA 200 Filter (No counter-trend).
+#    - EXTENSION: RSI Filter (No buying tops/selling bottoms).
 # =============================================================================
 import logging
 import pickle
@@ -177,6 +179,10 @@ class MultiAssetPredictor:
         self.ker_drift_detectors = {s: drift.ADWIN(delta=0.01) for s in symbols}
         self.dynamic_ker_offsets = {s: 0.0 for s in symbols}
 
+        # --- SNIPER PROTOCOL BUFFERS ---
+        self.sniper_closes = {s: deque(maxlen=200) for s in symbols} # For SMA 200
+        self.sniper_rsi = {s: deque(maxlen=15) for s in symbols}     # For RSI 14
+
         # Inject Default Data for JPY Basket (Prevents Risk Manager Zeros)
         self._inject_auxiliary_data()
 
@@ -250,6 +256,12 @@ class MultiAssetPredictor:
         
         # Ensure we have a price for risk calculations (Live update)
         self.last_close_prices[symbol] = bar.close
+
+        # --- UPDATE SNIPER BUFFERS ---
+        self.sniper_closes[symbol].append(bar.close)
+        if len(self.sniper_closes[symbol]) > 1:
+            delta = self.sniper_closes[symbol][-1] - self.sniper_closes[symbol][-2]
+            self.sniper_rsi[symbol].append(delta)
 
         # Extract Flows (Populated by Aggregator in shared/data.py)
         buy_vol = getattr(bar, 'buy_vol', 0.0)
@@ -489,6 +501,13 @@ class MultiAssetPredictor:
             stats[f"ML Disagreement (Streak: {streak})"] += 1
             return Signal(symbol, "HOLD", confidence, {"reason": f"ML Disagreement (Conf < {min_prob:.2f})"})
 
+        # --- SNIPER PROTOCOL: FINAL FILTER GATE ---
+        # Validate Trend (SMA200) and Extension (RSI) before executing
+        if not self._check_sniper_filters(symbol, proposed_action, bar.close):
+            stats["Sniper Reject"] += 1
+            return Signal(symbol, "HOLD", confidence, {"reason": "Sniper Filter Reject"})
+        # ------------------------------------------
+
         if is_profitable:
                 action_str = "BUY" if proposed_action == 1 else "SELL"
                 
@@ -534,6 +553,40 @@ class MultiAssetPredictor:
             stats.clear()
             
         return Signal(symbol, "HOLD", confidence, {})
+
+    def _check_sniper_filters(self, symbol: str, signal: int, price: float) -> bool:
+        """
+        SNIPER PROTOCOL (LIVE):
+        1. Trend Filter: Trade ONLY if price is above/below SMA 200.
+        2. Extension Filter: Don't Buy if RSI > 70, Don't Sell if RSI < 30.
+        """
+        closes = self.sniper_closes[symbol]
+        rsi_buf = self.sniper_rsi[symbol]
+        
+        if len(closes) < 200:
+            return True # Not enough data, allow (or False to be safe)
+
+        # 1. Calculate SMA 200
+        sma_200 = sum(closes) / len(closes)
+        
+        # 2. Calculate Simple RSI (Approximate)
+        gains = [x for x in rsi_buf if x > 0]
+        losses = [abs(x) for x in rsi_buf if x < 0]
+        avg_gain = sum(gains) / 14 if gains else 0
+        avg_loss = sum(losses) / 14 if losses else 1e-9
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+
+        # 3. Apply Filters
+        if signal == 1: # BUY Signal
+            if price < sma_200: return False # Counter-Trend
+            if rsi > 70: return False        # Overbought
+                
+        elif signal == -1: # SELL Signal
+            if price > sma_200: return False # Counter-Trend
+            if rsi < 30: return False        # Oversold
+                
+        return True
 
     def _inject_auxiliary_data(self):
         """Injects static approximations ONLY if missing."""

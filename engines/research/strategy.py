@@ -5,13 +5,15 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V7.0 (AGGRESSOR BREAKOUT):
+# PHOENIX STRATEGY V7.5 (SNIPER PROTOCOL):
 # 1. MEAN REVERSION PURGED: Removed all Regime C logic.
 # 2. AGGRESSOR LOGIC:
 #    - REGIME FILTER: KER > 0.3 (Trend Efficiency).
 #    - FUEL GAUGE: RVOL > 2.0 (Momentum injection).
 #    - TRIGGER: Order Flow Imbalance (Buy > 1.2x Sell).
-# 3. RISK: Dynamic ATR Stop (Configurable).
+# 3. SNIPER FILTERS (NEW):
+#    - TREND: SMA 200 Filter (No counter-trend).
+#    - EXTENSION: RSI Filter (No buying tops/selling bottoms).
 # =============================================================================
 import logging
 import sys
@@ -49,7 +51,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Aggressor Breakout System.
+    Strictly implements the Aggressor Breakout System with Sniper Protocols.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -110,6 +112,10 @@ class ResearchStrategy:
         self.last_h4_idx = -1
         self.last_d1_idx = -1
         
+        # --- SNIPER PROTOCOL INDICATORS ---
+        self.closes = deque(maxlen=200)     # For Trend (SMA 200)
+        self.rsi_buffer = deque(maxlen=15)  # For Extension (RSI 14)
+        
         # --- FORENSIC RECORDER ---
         self.decision_log = deque(maxlen=1000)
         self.trade_events = []
@@ -169,6 +175,12 @@ class ResearchStrategy:
         if self.symbol not in self.last_price_map:
             self.last_price_map[self.symbol] = price
 
+        # Update Sniper Buffers (SMA 200 / RSI)
+        self.closes.append(price)
+        if len(self.closes) > 1:
+            delta = self.closes[-1] - self.closes[-2]
+            self.rsi_buffer.append(delta)
+
         # Inject Aux Data for single-symbol tests
         self._inject_auxiliary_data()
 
@@ -211,8 +223,6 @@ class ResearchStrategy:
         # 2. Entry Guard (16:00 Server Time) - Aggressive Filter
         # Stop new entries, but do not spam the logs
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
-            # Silent return to avoid polluting stats
-            # We track it internally but don't list it as a "Failure"
             return 
         # -------------------------------------------------
 
@@ -444,6 +454,12 @@ class ResearchStrategy:
                 self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob:.2f})"] += 1
                 return
 
+            # --- SNIPER PROTOCOL: FINAL FILTER GATE ---
+            # Validate Trend (SMA200) and Extension (RSI) before executing
+            if not self._check_sniper_filters(proposed_action, price):
+                return
+            # ------------------------------------------
+
             if is_profitable:
                 self._execute_entry(confidence, price, features, broker, dt_ts, proposed_action, regime_label)
             else:
@@ -657,6 +673,49 @@ class ResearchStrategy:
             ctx['h4']['rsi'] = 50.0
             
         return ctx
+
+    def _check_sniper_filters(self, signal: int, price: float) -> bool:
+        """
+        SNIPER PROTOCOL:
+        1. Trend Filter: Trade ONLY if price is above/below SMA 200.
+        2. Extension Filter: Don't Buy if RSI > 70, Don't Sell if RSI < 30.
+        """
+        if len(self.closes) < 200:
+            return True # Not enough data, default to allow (or False to be safe)
+
+        # 1. Calculate SMA 200
+        sma_200 = sum(self.closes) / len(self.closes)
+        
+        # 2. Calculate Simple RSI (Approximate)
+        gains = [x for x in self.rsi_buffer if x > 0]
+        losses = [abs(x) for x in self.rsi_buffer if x < 0]
+        avg_gain = sum(gains) / 14 if gains else 0
+        avg_loss = sum(losses) / 14 if losses else 1e-9
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+
+        # 3. Apply Filters
+        if signal == 1: # BUY Signal
+            # Trend Check: Price MUST be > SMA 200 (Uptrend)
+            if price < sma_200:
+                self.rejection_stats['Counter_Trend_SMA200'] += 1
+                return False
+            # Extension Check: Price MUST NOT be Overbought
+            if rsi > 70:
+                self.rejection_stats['Overbought_RSI'] += 1
+                return False
+                
+        elif signal == -1: # SELL Signal
+            # Trend Check: Price MUST be < SMA 200 (Downtrend)
+            if price > sma_200:
+                self.rejection_stats['Counter_Trend_SMA200'] += 1
+                return False
+            # Extension Check: Price MUST NOT be Oversold
+            if rsi < 30:
+                self.rejection_stats['Oversold_RSI'] += 1
+                return False
+                
+        return True
 
     def _inject_auxiliary_data(self):
         """Injects static approximations ONLY if missing."""

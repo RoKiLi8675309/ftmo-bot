@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V7.0 (AGGRESSOR BREAKOUT)
-# STATUS: CONFIGURABLE | TARGET: 10% IN 90 DAYS
+# config.yaml – PROJECT PHOENIX V7.5 (SNIPER PROTOCOL REMEDIATION)
+# STATUS: REMEDIATION | TARGET: PASS FTMO CHALLENGE
 #
-# STRATEGY UPDATE (V7.0):
-# 1. LOGIC: Pure Trend Aggressor. No Mean Reversion.
-# 2. GATES: KER > 0.20 (Relaxed Efficiency), RVOL > 1.5 (Relaxed Fuel).
-# 3. RISK: 2.0 ATR Hard Stop (Survive Volatility).
+# STRATEGY UPDATE (V7.5 - SNIPER):
+# 1. BASKET: Purged JPY concentration. Using Uncorrelated Majors.
+# 2. RISK: Reduced to 0.5% per trade (Survive Phase).
+# 3. LOGIC: Added Trend (SMA200) and Extension (RSI) Filters.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -140,10 +140,10 @@ phoenix_strategy:
   
   # --- FILTER THRESHOLDS (RELAXED FOR RECOVERY) ---
   max_relative_volume: 6.0        # Cap raised to allow strong breakout volume
-  ker_trend_threshold: 0.20       # RELAXED: 0.30 -> 0.20 to catch earlier trends
-  volume_gate_ratio: 1.5          # RELAXED: 2.0 -> 1.5 to reduce "Low Fuel" rejects
+  ker_trend_threshold: 0.20       # STRICT: Keep at 0.20 for safety
+  volume_gate_ratio: 1.5          # STRICT: Keep at 1.5 for safety
   aggressor_threshold: 0.55       # Price Action confirmation
-  ml_confirmation_threshold: 0.60 
+  ml_confirmation_threshold: 0.70 # INCREASED: Sniper Standard (0.60 -> 0.70)
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -175,14 +175,14 @@ optimization_search_space:
     min: 0.85
     max: 0.95
   vpin_threshold:
-    min: 0.85
+    min: 0.85 
     max: 0.95
   
   # Triple Barrier Method (Labeling) -> Defines Reward Target (TP)
-  # TREND MODE: Higher R:R Targets
+  # TREND MODE: Higher R:R Targets (3.0x - 6.0x)
   tbm_barrier_width:
-    min: 2.0
-    max: 5.0 # Increased Max Reward to allow finding higher R:R
+    min: 3.0
+    max: 6.0 # Increased to force "Letting winners run"
   tbm_horizon_minutes:
     min: 60
     max: 240
@@ -193,7 +193,7 @@ optimization_search_space:
   
   # Strategy Execution
   min_calibrated_probability:
-    min: 0.60
+    min: 0.70 # RAISED: Floor is now 70%
     max: 0.85
 
 # --- RISK MANAGEMENT (FTMO COMPLIANCE) ---
@@ -203,19 +203,23 @@ risk_management:
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # Default Risk Per Trade (Can be overridden by WFO)
-  base_risk_per_trade_percent: 0.20
+  # CRITICAL UPDATE: 0.5% Risk Per Trade (Sniper Protocol)
+  base_risk_per_trade_percent: 0.005 # 0.5% Fixed Risk
   
-  max_daily_loss_pct: 0.048       # 4.8% (FTMO Limit is 5% - Keep buffer)
-  max_total_loss_pct: 0.098       # 9.8% (FTMO Limit is 10%)
-  max_risk_percent: 1.0           # Max open risk at any time
+  # LIMITS
+  max_daily_loss_pct: 0.045       # 4.5% (Stay below FTMO 5%)
+  max_total_loss_pct: 0.09        # 9.0% (Stay below FTMO 10%)
+  
+  max_risk_percent: 1.5           # Max open risk at any time (3 trades * 0.5%)
+  max_open_trades: 3              # NEW: Limit exposure count
+  
   max_leverage: 30.0
   max_lot_size: 50.0 
   min_lot_size: 0.01
   
-  # PROJECT PHOENIX V7.0 EXIT LOGIC
-  stop_loss_atr_mult: 2.0         # RELAXED: 1.5 -> 2.0 to survive volatility noise
-  take_profit_atr_mult: 4.0       # Adjusted to maintain 1:2 R:R Baseline
+  # PROJECT PHOENIX EXIT LOGIC (SNIPER MODE)
+  stop_loss_atr_mult: 2.0         # Maintain 2.0x ATR to breathe
+  take_profit_atr_mult: 3.0       # Adjusted to 3.0x for realistic targets
   
   # TIER 1: BREAKEVEN
   breakeven:
@@ -243,18 +247,22 @@ risk_management:
   hard_stop_equity_usd: 80000.0
   min_stop_loss_pips: 3.0
 
-# --- TRADING PORTFOLIO (JPY BASKET) ---
+# --- TRADING PORTFOLIO (SNIPER BASKET) ---
 trading:
+  # UPDATED: Broken JPY Correlation. Majors + 1 Yen Pair.
   symbols:
-    - "GBPJPY"  
-    - "USDJPY"
-    - "EURJPY"  
-    - "AUDJPY"  
+    - "EURUSD"  # Major - Mean Reverting
+    - "GBPUSD"  # Major - Trend Following
+    - "AUDUSD"  # Commodities
+    - "EURJPY"  # Keep ONLY ONE Yen pair (The best performer)
   
   auxiliary_symbols:
-    - "GBPUSD"
-    - "EURUSD"
-    - "AUDUSD"
+    - "USDJPY"
+    - "USDCAD"
+    - "USDCHF"
+    - "NZDUSD"
+    - "GBPJPY"
+    - "AUDJPY"
     
   timeframe: "M5"
   magic_number: 621001
@@ -291,14 +299,14 @@ online_learning:
   
   tbm:
     horizon_minutes: 120      
-    barrier_width: 4.0        # Default Reward Target aligned with 2.0 ATR SL
+    barrier_width: 3.0        # Synced with TP 3.0
     min_profit_pips: 10.0      
     drift_threshold: 1.5 
   
   learning_horizon_sec: 300
   
-  # Standard Confidence
-  min_calibrated_probability: 0.60 
+  # SNIPER PROTOCOL: High Conviction Only
+  min_calibrated_probability: 0.70 # RAISED: 0.60 -> 0.70
 
 # --- NEWS FILTER ---
 news_filter:
@@ -326,7 +334,6 @@ forensic_audit:
     AUDJPY: 2.5 
     GBPUSD: 1.8
     EURUSD: 1.2
-    XAUUSD: 30.0
 
 # --- WFO OPTIMIZATION ---
 wfo:
@@ -334,6 +341,6 @@ wfo:
   train_years: 2
   test_months: 6
   min_trades_optimization: 12 
-  # --- RISK OPTIMIZATION (BUFFER BUILD) ---
-  # Start small, scale up. Safe range for Aggressor testing.
-  risk_per_trade_options: [0.25, 0.50, 0.75, 1.00]
+  # --- RISK OPTIMIZATION (SNIPER MODE) ---
+  # Adjusted to prevent Daily Blowouts while maintaining growth potential.
+  risk_per_trade_options: [0.005] # Only test 0.5% risk

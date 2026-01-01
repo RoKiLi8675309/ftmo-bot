@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, engines.live.dispatcher, engines.live.predictor
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates bars, generates signals.
 #
-# PHOENIX STRATEGY V7.0 (LIVE EXECUTION):
-# 1. AGGRESSOR DATA: Ensures buy_vol/sell_vol are passed to Predictor.
-# 2. FRIDAY GUARD: Enforces "No New Entries" after 16:00 (Section 8.2).
-# 3. LIQUIDATION: Hard closes all positions at 21:00 (Section 9).
+# PHOENIX STRATEGY V7.5 (SNIPER PROTOCOL - LIVE EXECUTION):
+# 1. RISK ORCHESTRATION: Passes 'ker' to RiskManager for Efficiency Scaling.
+# 2. SNIPER GUARD: Enforces Friday Entry Cutoff (16:00) & Liquidation (21:00).
+# 3. DYNAMIC R:R: Applies optimized Reward Targets from Predictor metadata.
 # =============================================================================
 import logging
 import time
@@ -333,6 +333,9 @@ class LiveTradingEngine:
 
         # Retrieve Risk Override from Predictor (Optimized)
         risk_percent_override = signal.meta_data.get('risk_percent_override')
+        
+        # Retrieve KER for Risk Scaling (Sniper Protocol)
+        ker_val = signal.meta_data.get('ker', 1.0)
 
         # Initial Context (R:R is informational here)
         ctx = TradeContext(
@@ -354,6 +357,8 @@ class LiveTradingEngine:
             market_prices=self.latest_prices,
             atr=current_atr,
             account_size=account_size,
+            contract_size_override=None,
+            ker=ker_val, # PASSED FOR SCALING
             risk_percent_override=risk_percent_override
         )
 

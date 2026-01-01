@@ -5,11 +5,11 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 # 
-# PHOENIX STRATEGY V7.0 (AGGRESSOR BREAKOUT):
-# 1. MEAN REVERSION PURGED: Removed Bollinger Band position features.
-# 2. AGGRESSOR FEATURES: Added Flow Imbalance and Flow Ratio (Buy/Sell Vol).
+# PHOENIX STRATEGY V7.5 (SNIPER COMPLIANCE):
+# 1. MEAN REVERSION PURGED: Removed ALL Bollinger Band logic to prevent
+#    mean-reversion bias in the ML model. Volatility handled by ATR/Parkinson.
+# 2. AGGRESSOR FEATURES: Confirmed Flow Imbalance and Flow Ratio.
 # 3. EFFICIENCY: Validated KaufmanEfficiencyRatio for Regime Filter (>0.3).
-# 4. FUEL: Validated RelativeVolume for Fuel Gauge (>2.0).
 # =============================================================================
 from __future__ import annotations
 import math
@@ -394,35 +394,6 @@ class RegimeDetector:
 
 # --- 4. STREAMING INDICATORS ---
 
-class StreamingBollingerBands:
-    """
-    Kept as utility, but output removed from FeatureEngineer to stop Mean Reversion learning.
-    """
-    def __init__(self, period: int = 20, std_dev: float = 2.0):
-        self.period = period
-        self.std_dev = std_dev
-        self.buffer = deque(maxlen=period)
-        
-    def update(self, price: float) -> Dict[str, float]:
-        self.buffer.append(price)
-        if len(self.buffer) < 2:
-            return {'bb_mid': price, 'bb_upper': price, 'bb_lower': price, 'bb_width': 0.0}
-            
-        arr = np.array(self.buffer)
-        mean = np.mean(arr)
-        std = np.std(arr)
-        
-        upper = mean + (self.std_dev * std)
-        lower = mean - (self.std_dev * std)
-        width = (upper - lower) / mean if mean != 0 else 0.0
-        
-        return {
-            'bb_mid': mean,
-            'bb_upper': upper,
-            'bb_lower': lower,
-            'bb_width': width
-        }
-
 class StreamingADX:
     """
     Critical for Trend Detection.
@@ -498,8 +469,6 @@ class StreamingIndicators:
         self.atr_mean = RecursiveEMA(alpha=1 / atr_period)
         self.prev_close = None
         
-        bb_dev = CONFIG.get('features', {}).get('bollinger_bands', {}).get('std_dev', 2.0)
-        self.bb = StreamingBollingerBands(period=20, std_dev=bb_dev)
         self.adx = StreamingADX(period=14)
 
     def update(self, price: float, high: float, low: float) -> Dict[str, float]:
@@ -544,9 +513,7 @@ class StreamingIndicators:
         else:
             features['atr'] = high - low if (high > 0 and low > 0 and high != low) else 0.001
             
-        # BB & ADX
-        bb_vals = self.bb.update(price)
-        features.update(bb_vals)
+        # ADX Only
         adx_val = self.adx.update(high, low, price)
         features['adx'] = adx_val
             
@@ -720,7 +687,7 @@ class MetaLabeler:
                 clean[k] = 0.0
         return clean
 
-# --- 7. ONLINE FEATURE ENGINEER (PROJECT PHOENIX V7.0) ---
+# --- 7. ONLINE FEATURE ENGINEER (PROJECT PHOENIX V7.5) ---
 
 class OnlineFeatureEngineer:
     def __init__(self, window_size: int = 50):
@@ -903,8 +870,8 @@ class OnlineFeatureEngineer:
             'amihud': amihud_val,
             'rvol': rvol_val,
             'aggressor': aggressor_val,
-            'flow_imbalance': flow_imbalance, # NEW
-            'flow_ratio': flow_ratio,         # NEW
+            'flow_imbalance': flow_imbalance, 
+            'flow_ratio': flow_ratio,         
             
             # Regime & Math
             'ker': ker_val,
@@ -920,8 +887,7 @@ class OnlineFeatureEngineer:
             'macd_norm': macd_norm,
             'macd_hist_norm': tech_feats['macd_hist'] / price,
             'adx': tech_feats.get('adx', 0.0),
-            # REMOVED: bb_position (Mean Reversion bias)
-            'bb_width': tech_feats.get('bb_width', 0.0), # Kept for volatility context
+            # REMOVED: bb_width (Fully Purged)
 
             # Context / Legacy
             'vol_ratio': vol_ratio,

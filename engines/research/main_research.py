@@ -5,14 +5,11 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# PHOENIX STRATEGY V7.0 (OPTIMIZATION THEORY):
-# 1. PROP SCORE OBJECTIVE: CHANGED -> PROFIT IS KING.
-#    - Old: Maximize Calmar (led to low volume/low risk gaming).
-#    - New: Maximize Total PnL (USD) + Efficiency Bonus.
-# 2. HARD CONSTRAINTS: 
-#    - Max Drawdown > 8% = Immediate Failure (Score -10,000).
-#    - Trades < 30 = Stability Failure (Score 0).
-# 3. ROBUSTNESS: Prioritizes raw dollars generated while respecting the hard deck.
+# PHOENIX STRATEGY V7.5 (SNIPER COMPLIANCE):
+# 1. PRUNING UPDATE: Lowered trade threshold to support "High Conviction" logic.
+#    - Sniper Protocol trades less often; dynamic config threshold ensures validity.
+# 2. RISK ALIGNMENT: Synced Drawdown Failure threshold with new 9% limit.
+# 3. REPORTING: Preserved Autopsy visibility for forensic analysis.
 # =============================================================================
 import os
 import sys
@@ -77,17 +74,20 @@ class EmojiCallback:
         symbol = study.study_name.replace("study_", "")
         
         # 1. Determine Status Icon & Rank
-        rr = attrs.get('risk_reward_ratio', 0.0)
+        risk_pct = attrs.get('risk_pct', 0.0) # Retrieved from attributes
         trades = attrs.get('trades', 0)
         pnl = attrs.get('pnl', 0.0)
         dd = attrs.get('max_dd_pct', 0.0) * 100
         calmar = attrs.get('calmar', 0.0)
         
+        status = "FAIL"
+        icon = "🔻"
+        
         if attrs.get('blown', False):
             icon = "💀" # Blown Account (>10% DD or Ruin)
             status = "BLOWN"
-        elif dd > 8.0:
-            icon = "⚠️" # High Risk (>8% DD)
+        elif dd > 9.0: # UPDATED: 9.0% aligned with Config
+            icon = "⚠️" # High Risk
             status = "RISKY"
         elif attrs.get('pruned', False):
             icon = "✂️" # Pruned (Low Trades)
@@ -98,23 +98,21 @@ class EmojiCallback:
         elif pnl > 0:
             icon = "✅" # Profitable
             status = "PASS"
-        else:
-            icon = "🔻" # Loss
-            status = "FAIL"
 
         # 2. Extract Metrics
         wr = attrs.get('win_rate', 0.0) * 100
         pf = attrs.get('profit_factor', 0.0)
         
         # 3. Format Output (Column Aligned)
-        # Structure: [ICON] STATUS | SYMBOL | ID | CALMAR | PnL | DD | WR | TRADES
+        # Structure: [ICON] STATUS | SYMBOL | ID | RISK | SCORE | PnL | DD | WR | TRADES
         msg = (
             f"{icon} {status:<6} | {symbol:<6} | Trial {trial.number:<3} | "
-            f"🏆 SCORE: {val:>8.1f} | "
-            f"💰 PnL: ${pnl:>9,.2f} | "
-            f"📉 DD: {dd:>5.2f}% | "
-            f"🎯 WR: {wr:>5.1f}% | "
-            f"⚡ PF: {pf:>4.2f} | "
+            f"R: {risk_pct:>4.2f}% | "
+            f"🏆 {val:>8.1f} | "
+            f"💰 ${pnl:>9,.0f} | " # Compacted PnL for space
+            f"📉 {dd:>5.2f}% | "
+            f"🎯 {wr:>5.1f}% | "
+            f"⚡ {pf:>4.2f} | "
             f"#️⃣ {trades:<4}"
         )
         
@@ -122,15 +120,19 @@ class EmojiCallback:
         log.info(msg.strip())
         
         # 5. Detailed Analysis (Victory Lap OR Autopsy)
-        if 'autopsy' in attrs and trades > 0:
-            # Threshold for Victory Lap increased to significant PnL
-            if pnl > 2000.0:
+        # UPDATED LOGIC: Always print Autopsy if PnL is negative, trades are 0, or account is blown.
+        if 'autopsy' in attrs:
+            # Victory Lap for significant profit
+            if pnl > 1000.0:
                 report_type = "🏁 VICTORY LAP"
-            else:
-                report_type = "🔎 AUTOPSY"
-                
-            report_msg = f"\n{report_type} (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
-            log.info(report_msg)
+                report_msg = f"\n{report_type} (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
+                log.info(report_msg)
+            
+            # Failure Autopsy for ANY loss or zero trades
+            elif pnl < 0 or trades == 0 or attrs.get('blown', False):
+                report_type = "🔎 FAILURE AUTOPSY"
+                report_msg = f"\n{report_type} (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
+                log.info(report_msg)
 
 def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     """
@@ -223,6 +225,9 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             risk_options = CONFIG['wfo'].get('risk_per_trade_options', [0.25, 0.50, 0.75, 1.0])
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             
+            # CAPTURE RISK PERCENT FOR REPORTING
+            trial.set_user_attr("risk_pct", params['risk_per_trade_percent'])
+            
             # Instantiate Pipeline locally
             pipeline_inst = ResearchPipeline()
             
@@ -256,24 +261,12 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             # Calculate Calmar (Used only for tie-breaking efficiency now)
             safe_dd = max_dd_pct if max_dd_pct > 0.001 else 0.001
             calmar = (total_return / init_bal) / safe_dd
-            
-            # 1. IMMEDIATE FAILURE: If DD > 8% (Safety Buffer for 10% limit)
-            # Penalize HEAVILY (-10,000) to ensure PnL doesn't mask risk
-            if max_dd_pct > 0.08:
-                trial.set_user_attr("blown", True)
-                return -10000.0 
-            
-            # 2. STABILITY BONUS: Penalize strategies with < 30 trades (Luck)
-            if trades < 30:
-                trial.set_user_attr("pruned", True)
-                return 0.0 
-                
-            # 3. BLOWOUT CHECK (Broker level)
-            if broker.is_blown:
-                trial.set_user_attr("blown", True)
-                return -10000.0
 
-            # Pass metrics to Callback
+            # --- CRITICAL: GENERATE AUTOPSY BEFORE PRUNING ---
+            # This ensures we see WHY a bot took 0 trades (e.g. "Low Confidence" vs "Low Fuel")
+            trial.set_user_attr("autopsy", strategy.generate_autopsy())
+            
+            # Pass metrics to Callback (Set these BEFORE returning failure)
             trial.set_user_attr("pnl", total_return)
             trial.set_user_attr("max_dd_pct", max_dd_pct)
             trial.set_user_attr("win_rate", metrics['win_rate'])
@@ -282,10 +275,28 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("risk_reward_ratio", metrics['risk_reward_ratio'])
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("calmar", calmar)
+
+            # 1. IMMEDIATE FAILURE: If DD > 9.0% (Safety Buffer for 10% limit)
+            # Penalize HEAVILY (-10,000) to ensure PnL doesn't mask risk
+            if max_dd_pct > 0.09: # UPDATED: 9% align with config
+                trial.set_user_attr("blown", True)
+                return -10000.0 
             
-            # ALWAYS Generate Autopsy/Victory Lap Report for analysis
-            trial.set_user_attr("autopsy", strategy.generate_autopsy())
-            
+            # 2. BLOWOUT CHECK (Broker level - covers floating PnL blowouts)
+            if broker.is_blown:
+                trial.set_user_attr("blown", True)
+                # If trades were 0 but account blown, it implies massive opening gap or error
+                if trades == 0:
+                    log.warning(f"⚠️ {symbol} BLOWN with 0 closed trades. Likely floating loss stop-out.")
+                return -10000.0
+
+            # 3. STABILITY BONUS: Penalize strategies with < MIN_TRADES (Luck/Sniper)
+            # DYNAMIC: Use Configured Minimum (Sniper Mode allows lower count)
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 30)
+            if trades < min_trades:
+                trial.set_user_attr("pruned", True)
+                return 0.0 
+                
             # --- NEW OBJECTIVE LOGIC ---
             # PROFIT IS KING.
             # We optimize for Total PnL (Dollars).

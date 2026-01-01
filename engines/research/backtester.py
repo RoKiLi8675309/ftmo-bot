@@ -6,8 +6,8 @@
 # DESCRIPTION: Event-Driven Backtesting Broker. Simulates execution, spread,
 # commissions, and PnL tracking for strategy validation.
 #
-# PHOENIX STRATEGY V7.0 (AGGRESSOR COMPATIBILITY):
-# 1. METADATA: Enhanced trade logging to capture 'Regime' (Aggressor/Trend).
+# PHOENIX STRATEGY V7.5 (SNIPER PROTOCOL BACKTESTER):
+# 1. METADATA: Enhanced logging to capture 'Regime' (Aggressor/Sniper).
 # 2. COSTS: Strict spread and commission application to verify edge.
 # 3. METRICS: Native support for Risk:Reward Ratio tracking.
 # =============================================================================
