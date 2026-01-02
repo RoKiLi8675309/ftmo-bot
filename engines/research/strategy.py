@@ -5,15 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V7.5 (SNIPER PROTOCOL):
-# 1. MEAN REVERSION PURGED: Removed all Regime C logic.
-# 2. AGGRESSOR LOGIC:
-#    - REGIME FILTER: KER > 0.3 AND Choppiness < 50.0.
-#    - FUEL GAUGE: RVOL > 1.5 (Momentum injection).
-#    - TRIGGER: Order Flow Imbalance (Buy > 1.2x Sell).
-# 3. SNIPER FILTERS:
-#    - TREND: SMA 200 Filter (No counter-trend).
-#    - EXTENSION: RSI Filter (No buying tops/selling bottoms).
+# PHOENIX STRATEGY V7.6 (RECOVERY MODE):
+# 1. TRIGGER RELAXATION: Changed (Flow AND PA) to (Flow OR PA).
+# 2. GATES: Removed H4 Hard Gate (Relies on ML). Raised Chop Threshold.
+# 3. STREAK LOGIC: Removed "Death Spiral" penalties during drawdowns.
 # 4. TRADE MANAGEMENT:
 #    - SQN SCALING: Dynamic risk based on performance.
 #    - TRAILING STOP: Activates at 1R (Breakeven) -> Trails at 1.5R.
@@ -125,24 +120,25 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX V7.0 PARAMETERS (AGGRESSOR) ---
+        # --- PHOENIX V7.6 PARAMETERS (RECOVERY) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
         # Gates
         self.require_d1_trend = phx_conf.get('require_d1_trend', True)
-        self.require_h4_alignment = phx_conf.get('require_h4_alignment', True)
+        # H4 Gate Removed in V7.6
         
         # Safety Cap
-        self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 6.0)) # Cap for huge spikes
+        self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 8.0)) # Relaxed Cap
         
         # --- STRICT THRESHOLDS (FROM DOCUMENT) ---
-        self.ker_thresh = float(phx_conf.get('ker_trend_threshold', 0.20)) # Relaxed to 0.20
-        self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 1.5)) # Relaxed to 1.5
+        self.ker_thresh = float(phx_conf.get('ker_trend_threshold', 0.10)) # Relaxed to 0.10
+        self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 1.1)) # Relaxed to 1.1
         self.aggressor_ratio_min = 1.2 # "Buy Vol > Sell Vol * 1.2"
-        self.adx_threshold = float(phx_conf.get('adx', {}).get('threshold', 25.0))
+        self.adx_threshold = float(phx_conf.get('adx', {}).get('threshold', 20.0)) # Relaxed to 20
+        self.chop_threshold = float(phx_conf.get('choppiness_threshold', 55.0)) # Relaxed to 55
         
         # Aggressor Ratio Feature Threshold (Price Action proxy)
-        self.aggressor_thresh_price = float(phx_conf.get('aggressor_threshold', 0.55))
+        self.aggressor_thresh_price = float(phx_conf.get('aggressor_threshold', 0.53))
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
         
@@ -339,7 +335,7 @@ class ResearchStrategy:
             return 
 
         # ============================================================
-        # E. ENTRY LOGIC GATES (V7.0 AGGRESSOR ONLY)
+        # E. ENTRY LOGIC GATES (V7.6 RECOVERY MODE)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
@@ -351,12 +347,13 @@ class ResearchStrategy:
         choppiness = features.get('choppiness', 50.0)
         
         # --- CRITICAL FILTER 0: ANTI-CHOP (HARD GATE) ---
-        if choppiness > 50.0:
-            self.rejection_stats[f"Chop Regime (CHOP {choppiness:.1f} > 50)"] += 1
+        # Relaxed to 55.0
+        if choppiness > self.chop_threshold:
+            self.rejection_stats[f"Chop Regime (CHOP {choppiness:.1f} > {self.chop_threshold})"] += 1
             return
             
         # --- CRITICAL FILTER 1: FUEL GAUGE (HARD GATE) ---
-        # RVOL must be > Threshold to inject momentum
+        # RVOL must be > Threshold (Relaxed to 1.1)
         if rvol < self.vol_gate_ratio:
             self.rejection_stats[f"Low Fuel (RVol {rvol:.2f} < {self.vol_gate_ratio})"] += 1
             return
@@ -368,11 +365,8 @@ class ResearchStrategy:
         
         # --- CRITICAL FILTER 3: EFFICIENCY GATE (HARD GATE) ---
         # Apply Dynamic Offset from ADWIN but keep hard floor
-        effective_ker_thresh = max(0.15, self.ker_thresh + self.dynamic_ker_offset)
-        
-        if self.consecutive_losses > 0:
-            # Soft Breaker: Require higher efficiency if losing
-            effective_ker_thresh += min(0.1, self.consecutive_losses * 0.02)
+        # REMOVED: Streak Penalty (Death Spiral Prevention)
+        effective_ker_thresh = max(0.10, self.ker_thresh + self.dynamic_ker_offset)
             
         if ker_val < effective_ker_thresh:
             self.rejection_stats[f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f})"] += 1
@@ -388,9 +382,7 @@ class ResearchStrategy:
         d1_trend_up = (price > d1_ema) if d1_ema > 0 else True
         d1_trend_down = (price < d1_ema) if d1_ema > 0 else True
         
-        h4_rsi = context_data.get('h4', {}).get('rsi', 50.0)
-        h4_bull = h4_rsi > 50
-        h4_bear = h4_rsi < 50
+        # REMOVED: H4 Hard Gate. Only used for Logic Confirmation.
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "Trend"
@@ -412,10 +404,14 @@ class ResearchStrategy:
         is_bullish_pa = aggressor > self.aggressor_thresh_price
         is_bearish_pa = aggressor < (1.0 - self.aggressor_thresh_price)
 
-        # >>> ENTRY LOGIC <<<
+        # >>> ENTRY LOGIC (V7.6: OR LOGIC) <<<
+        # We allow entry if Flow OR PA confirms, provided Context is aligned.
         
+        trigger_bull = (is_bullish_flow or is_bullish_pa)
+        trigger_bear = (is_bearish_flow or is_bearish_pa)
+
         # BUY SCENARIO
-        if is_bullish_flow and is_bullish_pa and h4_bull:
+        if trigger_bull:
             if self.require_d1_trend and not d1_trend_up:
                 self.rejection_stats["Counter-D1 Trend"] += 1
                 return
@@ -423,7 +419,7 @@ class ResearchStrategy:
             regime_label = "Aggressor-Long"
 
         # SELL SCENARIO
-        elif is_bearish_flow and is_bearish_pa and h4_bear:
+        elif trigger_bear:
             if self.require_d1_trend and not d1_trend_down:
                 self.rejection_stats["Counter-D1 Trend"] += 1
                 return
@@ -458,11 +454,8 @@ class ResearchStrategy:
                 self.meta_label_events += 1
 
             # --- EXECUTION WITH DYNAMIC CONFIDENCE ---
+            # REMOVED: Streak Penalty (Death Spiral Prevention)
             min_prob = float(self.params.get('min_calibrated_probability', 0.55))
-            
-            if self.consecutive_losses > 0:
-                # Streak Breaker: Increase required confidence if losing
-                min_prob += min(0.1, self.consecutive_losses * 0.02)
                 
             if confidence < min_prob:
                 self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob:.2f})"] += 1

@@ -6,15 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V7.5 (SNIPER PROTOCOL - LIVE):
-# 1. MEAN REVERSION PURGED: Removed Regime C.
-# 2. AGGRESSOR LOGIC ALIGNMENT:
-#    - REGIME FILTER: KER > 0.2 AND Choppiness < 50.0.
-#    - FUEL GAUGE: RVOL > 1.5.
-#    - TRIGGER: Order Flow Imbalance (Buy > 1.2x Sell) + PA Aggressor > 0.55.
-# 3. SNIPER FILTERS:
-#    - TREND: SMA 200 Filter.
-#    - EXTENSION: RSI Filter.
+# PHOENIX STRATEGY V7.6 (RECOVERY MODE - LIVE):
+# 1. TRIGGER RELAXATION: Changed (Flow AND PA) to (Flow OR PA).
+# 2. GATES: Removed H4 Hard Gate. Raised Chop Threshold to 55.0.
+# 3. STREAK LOGIC: Removed "Death Spiral" penalties during drawdowns.
+# 4. TRADE MANAGEMENT: Dynamic SQN Risk & Active Trailing Stop.
 # =============================================================================
 import logging
 import pickle
@@ -154,11 +150,11 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (DEFAULTS V7.0) ---
+        # --- PHOENIX STRATEGY PARAMETERS (DEFAULTS V7.6 RECOVERY) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         # STRICT THRESHOLDS FROM DOC
-        self.default_ker_thresh = 0.30 
-        self.default_max_rvol = 6.0
+        self.default_ker_thresh = 0.10  # Relaxed
+        self.default_max_rvol = 8.0     # Relaxed
         
         # Friday Guard
         self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 16)
@@ -236,7 +232,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V7.5 Logic.
+        Executes the Learn-Predict Loop with Project Phoenix V7.6 Logic.
         """
         if symbol not in self.symbols: return None
         
@@ -374,24 +370,26 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp(), parkinson_vol=parkinson)
 
         # ============================================================
-        # 4. PHOENIX STRATEGY V7.5: AGGRESSOR BREAKOUT GATES
+        # 4. PHOENIX STRATEGY V7.6: RECOVERY MODE GATES
         # ============================================================
         
         # Extract Core Indicators
         rvol = features.get('rvol', 1.0)
         aggressor = features.get('aggressor', 0.5)
-        adx_val = features.get('adx', 0.0)
         
         # NEW: Anti-Chop Indicator
         choppiness = features.get('choppiness', 50.0)
         
         # Pull Configs (Relaxed)
         phx = CONFIG.get('phoenix_strategy', {})
-        max_rvol_thresh = float(phx.get('max_relative_volume', 6.0))
-        ker_thresh = float(phx.get('ker_trend_threshold', 0.20)) # Was 0.30
-        vol_gate_ratio = float(phx.get('volume_gate_ratio', 1.5)) # Was 2.0
+        max_rvol_thresh = float(phx.get('max_relative_volume', 8.0)) # Relaxed Cap
+        ker_thresh = float(phx.get('ker_trend_threshold', 0.10)) # Relaxed to 0.10
+        vol_gate_ratio = float(phx.get('volume_gate_ratio', 1.1)) # Relaxed to 1.1
         aggressor_ratio_min = 1.2
-        aggressor_pa_thresh = 0.55
+        aggressor_pa_thresh = float(phx.get('aggressor_threshold', 0.53)) # Relaxed
+        chop_threshold = float(phx.get('choppiness_threshold', 55.0)) # Relaxed to 55
+        
+        require_d1 = phx.get('require_d1_trend', True)
         
         # --- FRIDAY GUARD (Timezone Aware) ---
         # Convert UTC bar time to Server Time (Prague)
@@ -402,8 +400,8 @@ class MultiAssetPredictor:
              return Signal(symbol, "HOLD", 0.0, {"reason": "Friday Entry Guard"})
 
         # --- CRITICAL FILTER 0: ANTI-CHOP (HARD GATE) ---
-        if choppiness > 50.0:
-            stats[f"Chop Regime (CHOP {choppiness:.1f} > 50)"] += 1
+        if choppiness > chop_threshold:
+            stats[f"Chop Regime (CHOP {choppiness:.1f} > {chop_threshold})"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Chop Regime (CHOP {choppiness:.1f})"})
 
         # --- CRITICAL FILTER 1: FUEL GAUGE (HARD GATE) ---
@@ -416,17 +414,9 @@ class MultiAssetPredictor:
             stats[f"Volume Climax"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
             
-        # --- CORRECTED STREAK BREAKER: DYNAMIC EFFICIENCY GATE ---
-        # Apply Dynamic Offset from ADWIN (Rec 1)
-        effective_ker_thresh = ker_thresh + self.dynamic_ker_offsets[symbol]
-        
-        streak = self.consecutive_losses[symbol]
-        if streak > 0:
-            # Soft Breaker: Require cleaner trend if losing
-            effective_ker_thresh += min(0.1, streak * 0.02)
-        
-        # Ensure gate doesn't go below absolute safety minimum of 0.15
-        effective_ker_thresh = max(0.15, effective_ker_thresh)
+        # --- DYNAMIC EFFICIENCY GATE ---
+        # Apply Dynamic Offset from ADWIN (Rec 1) - No Streak Penalty
+        effective_ker_thresh = max(0.10, ker_thresh + self.dynamic_ker_offsets[symbol])
 
         # --- CRITICAL FILTER 3: EFFICIENCY GATE ---
         ker_val = features.get('ker', 0.5)
@@ -439,10 +429,7 @@ class MultiAssetPredictor:
         d1_trend_up = (bar.close > d1_ema) if d1_ema > 0 else True
         d1_trend_down = (bar.close < d1_ema) if d1_ema > 0 else True
         
-        # H4 Alignment
-        h4_rsi = context_data.get('h4', {}).get('rsi', 50.0) if context_data else 50.0
-        h4_bull = h4_rsi > 50
-        h4_bear = h4_rsi < 50
+        # H4 Alignment (Removed from Hard Gate - ML Weight Only)
         
         proposed_action = 0
         regime_label = "Chop"
@@ -461,19 +448,22 @@ class MultiAssetPredictor:
         is_bullish_pa = aggressor > aggressor_pa_thresh
         is_bearish_pa = aggressor < (1.0 - aggressor_pa_thresh)
 
-        # >>> ENTRY LOGIC <<<
+        # >>> ENTRY LOGIC (V7.6: OR LOGIC) <<<
         
+        trigger_bull = (is_bullish_flow or is_bullish_pa)
+        trigger_bear = (is_bearish_flow or is_bearish_pa)
+
         # BUY SCENARIO
-        if is_bullish_flow and is_bullish_pa and h4_bull:
-            if not d1_trend_up:
+        if trigger_bull:
+            if require_d1 and not d1_trend_up:
                 stats["Counter-D1 Trend"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "Counter-D1 Trend"})
             proposed_action = 1
             regime_label = "Aggressor-Long"
 
         # SELL SCENARIO
-        elif is_bearish_flow and is_bearish_pa and h4_bear:
-            if not d1_trend_down:
+        elif trigger_bear:
+            if require_d1 and not d1_trend_down:
                 stats["Counter-D1 Trend"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "Counter-D1 Trend"})
             proposed_action = -1
@@ -499,14 +489,11 @@ class MultiAssetPredictor:
         )
 
         # --- EXECUTION WITH DYNAMIC CONFIDENCE ---
+        # Relaxed Floor (0.55), Removed Streak Penalty
         min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
         
-        # Streak Breaker: Increase required confidence
-        if streak > 0:
-            min_prob += min(0.1, streak * 0.02)
-
         if confidence < min_prob:
-            stats[f"ML Disagreement (Streak: {streak})"] += 1
+            stats[f"ML Disagreement"] += 1
             return Signal(symbol, "HOLD", confidence, {"reason": f"ML Disagreement (Conf < {min_prob:.2f})"})
 
         # --- SNIPER PROTOCOL: FINAL FILTER GATE ---

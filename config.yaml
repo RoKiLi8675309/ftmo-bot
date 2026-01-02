@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V7.5 (SNIPER PROTOCOL REMEDIATION)
-# STATUS: REMEDIATION | TARGET: PASS FTMO CHALLENGE
+# config.yaml – PROJECT PHOENIX V7.6 (RECOVERY MODE)
+# STATUS: TUNING | TARGET: PASS FTMO CHALLENGE
 #
-# STRATEGY UPDATE (V7.5 - SNIPER):
-# 1. REGIME: Added Choppiness Index (CHOP) & Vortex (VI) to filter Chop.
-# 2. RISK: SQN Scaling (Cut Losers) + Active Trailing Stop (Lock Winners).
-# 3. LOGIC: Strict Trend (SMA200) + Momentum (RVOL/Flow).
+# STRATEGY UPDATE (V7.6 - RELAXATION):
+# 1. TRIGGER: Relaxed thresholds to reduce "No Trigger" rates.
+# 2. GATES: Lifted Choppiness to 55.0 and Lowered RVOL to 1.1.
+# 3. LOGIC: Shifted from "AND" logic to "OR" logic for Aggressor/Flow.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -118,7 +118,7 @@ features:
   # New Regime Settings
   choppiness:
     period: 14
-    threshold: 50.0
+    threshold: 55.0 # RELAXED: 50 -> 55
   vortex:
     period: 14
   
@@ -135,27 +135,27 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 25 
+    threshold: 20 # RELAXED: 25 -> 20
   
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V7.5 SNIPER) ---
+# --- PHOENIX STRATEGY PARAMETERS (V7.6 RELAXED) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true       
   require_d1_trend: true              
-  require_h4_alignment: true        
+  require_h4_alignment: false # DISABLED HARD GATE (Moved to ML weight)       
   
-  # --- FILTER THRESHOLDS ---
-  max_relative_volume: 6.0        
-  ker_trend_threshold: 0.20       
-  volume_gate_ratio: 1.5          
-  aggressor_threshold: 0.55       
-  ml_confirmation_threshold: 0.70 
-  choppiness_threshold: 50.0      # Hard Gate: If > 50, No Trade
+  # --- FILTER THRESHOLDS (LOOSENED) ---
+  max_relative_volume: 8.0        # RELAXED: 6.0 -> 8.0
+  ker_trend_threshold: 0.10       # RELAXED: 0.20 -> 0.10 (Allow weaker trends start)
+  volume_gate_ratio: 1.1          # RELAXED: 1.5 -> 1.1 (Allow average volume entries)
+  aggressor_threshold: 0.53       # RELAXED: 0.55 -> 0.53
+  ml_confirmation_threshold: 0.55 
+  choppiness_threshold: 55.0      # RELAXED: 50.0 -> 55.0
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -192,8 +192,8 @@ optimization_search_space:
   
   # Triple Barrier Method (Labeling) -> Defines Reward Target (TP)
   tbm_barrier_width:
-    min: 3.0
-    max: 6.0 
+    min: 2.0  # LOWERED FLOOR: 3.0 -> 2.0 (Take profits sooner if needed)
+    max: 5.0 
   tbm_horizon_minutes:
     min: 60
     max: 240
@@ -204,8 +204,8 @@ optimization_search_space:
   
   # Strategy Execution
   min_calibrated_probability:
-    min: 0.70 
-    max: 0.85
+    min: 0.55 # LOWERED FLOOR: 0.70 -> 0.55 (Trust the model more)
+    max: 0.80
 
 # --- RISK MANAGEMENT (FTMO COMPLIANCE) ---
 risk_management:
@@ -248,7 +248,7 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 10              
+  max_trades_per_day: 15              # INCREASED: 10 -> 15
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
@@ -297,7 +297,7 @@ online_learning:
   # Volatility Gate
   volatility_gate:
     enabled: true
-    min_atr_spread_ratio: 1.5 
+    min_atr_spread_ratio: 1.0 # RELAXED: 1.5 -> 1.0
   
   positive_class_weight: 1.5 
   negative_class_weight: 1.0
@@ -313,7 +313,7 @@ online_learning:
   learning_horizon_sec: 300
   
   # SNIPER PROTOCOL: High Conviction Only
-  min_calibrated_probability: 0.70
+  min_calibrated_probability: 0.55 # RELAXED: 0.70 -> 0.55
 
 # --- NEWS FILTER ---
 news_filter:
