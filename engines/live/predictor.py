@@ -6,11 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V7.6 (RECOVERY MODE - LIVE):
-# 1. TRIGGER RELAXATION: Changed (Flow AND PA) to (Flow OR PA).
-# 2. GATES: Removed H4 Hard Gate. Raised Chop Threshold to 55.0.
-# 3. STREAK LOGIC: Removed "Death Spiral" penalties during drawdowns.
-# 4. TRADE MANAGEMENT: Dynamic SQN Risk & Active Trailing Stop.
+# PHOENIX STRATEGY V9.0 (MOMENTUM BREAKOUT - LIVE):
+# 1. TRIGGER: Replaced "Aggressor" with Volatility Breakout (Price > BB_Upper).
+# 2. GATES: Removed D1 Trend Filter to capture mean reversion & intraday shifts.
+# 3. TRADE MANAGEMENT:
+#    - Aligned with Strategy V9.0 logic (BB 20,2 + RSI 50 crossover).
 # =============================================================================
 import logging
 import pickle
@@ -23,6 +23,7 @@ from datetime import datetime
 from collections import defaultdict, deque, Counter
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
+import numpy as np # Added for BB calculation
 
 # Third-Party ML Imports
 try:
@@ -77,10 +78,15 @@ class MultiAssetPredictor:
         
         # AUDIT FIX: Load SL Multiplier from Config (Was Hardcoded 1.5)
         # Now defaults to 2.0 per config update
-        risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 1.5))
+        risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 2.0))
         
         self.labelers = {}
         self.optimized_params = {} # Cache for gates
+        
+        # --- V9.0 MOMENTUM INDICATORS (Bollinger Bands) ---
+        self.bb_window = 20
+        self.bb_std = 2.0
+        self.bb_buffers = {s: deque(maxlen=self.bb_window) for s in symbols}
         
         for s in symbols:
             # Default from Config
@@ -150,7 +156,7 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (DEFAULTS V7.6 RECOVERY) ---
+        # --- PHOENIX STRATEGY PARAMETERS (DEFAULTS V9.0) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         # STRICT THRESHOLDS FROM DOC
         self.default_ker_thresh = 0.10  # Relaxed
@@ -232,7 +238,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V7.6 Logic.
+        Executes the Learn-Predict Loop with Project Phoenix V9.0 Logic.
         """
         if symbol not in self.symbols: return None
         
@@ -258,6 +264,9 @@ class MultiAssetPredictor:
         if len(self.sniper_closes[symbol]) > 1:
             delta = self.sniper_closes[symbol][-1] - self.sniper_closes[symbol][-2]
             self.sniper_rsi[symbol].append(delta)
+            
+        # --- UPDATE V9 MOMENTUM BUFFERS ---
+        self.bb_buffers[symbol].append(bar.close)
 
         # Extract Flows (Populated by Aggregator in shared/data.py)
         buy_vol = getattr(bar, 'buy_vol', 0.0)
@@ -370,26 +379,25 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp(), parkinson_vol=parkinson)
 
         # ============================================================
-        # 4. PHOENIX STRATEGY V7.6: RECOVERY MODE GATES
+        # 4. PHOENIX STRATEGY V9.0: MOMENTUM BREAKOUT GATES
         # ============================================================
         
         # Extract Core Indicators
         rvol = features.get('rvol', 1.0)
-        aggressor = features.get('aggressor', 0.5)
+        adx_val = features.get('adx', 0.0)
         
-        # NEW: Anti-Chop Indicator
+        # Regime Filters (Anti-Chop)
         choppiness = features.get('choppiness', 50.0)
         
         # Pull Configs (Relaxed)
         phx = CONFIG.get('phoenix_strategy', {})
-        max_rvol_thresh = float(phx.get('max_relative_volume', 8.0)) # Relaxed Cap
-        ker_thresh = float(phx.get('ker_trend_threshold', 0.10)) # Relaxed to 0.10
-        vol_gate_ratio = float(phx.get('volume_gate_ratio', 1.1)) # Relaxed to 1.1
-        aggressor_ratio_min = 1.2
-        aggressor_pa_thresh = float(phx.get('aggressor_threshold', 0.53)) # Relaxed
-        chop_threshold = float(phx.get('choppiness_threshold', 55.0)) # Relaxed to 55
+        max_rvol_thresh = float(phx.get('max_relative_volume', 8.0)) 
+        ker_thresh = float(phx.get('ker_trend_threshold', 0.10)) 
+        vol_gate_ratio = float(phx.get('volume_gate_ratio', 1.1)) 
+        chop_threshold = float(phx.get('choppiness_threshold', 55.0)) 
         
-        require_d1 = phx.get('require_d1_trend', True)
+        # V9 Update: D1 Trend is Disabled (M5 Breakout Focus)
+        require_d1 = False
         
         # --- FRIDAY GUARD (Timezone Aware) ---
         # Convert UTC bar time to Server Time (Prague)
@@ -424,54 +432,55 @@ class MultiAssetPredictor:
             stats[f"Low Efficiency"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f})"})
 
-        # --- CRITICAL FILTER 4: MTF TREND CONTEXT ---
+        # --- CRITICAL FILTER 4: TREND STRENGTH ---
+        if adx_val < 20.0:
+            stats[f"Weak Trend (ADX {adx_val:.1f} < 20)"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": f"Weak Trend (ADX {adx_val:.1f})"})
+
+        # --- MTF TREND CONTEXT (INFORMATIONAL ONLY IN V9) ---
         d1_ema = context_data.get('d1', {}).get('ema200', 0.0) if context_data else 0.0
-        d1_trend_up = (bar.close > d1_ema) if d1_ema > 0 else True
-        d1_trend_down = (bar.close < d1_ema) if d1_ema > 0 else True
-        
-        # H4 Alignment (Removed from Hard Gate - ML Weight Only)
         
         proposed_action = 0
         regime_label = "Chop"
 
-        # --- AGGRESSOR TRIGGER (ORDER FLOW IMBALANCE) ---
-        # Logic: Confirm Buy Vol > Sell Vol * 1.2
-        safe_sell_vol = sell_vol if sell_vol > 0 else 1.0
-        safe_buy_vol = buy_vol if buy_vol > 0 else 1.0
+        # --- MOMENTUM BREAKOUT TRIGGER (V9.0) ---
+        # Replaces "Aggressor" Logic with Price Action Breakout
         
-        flow_ratio_bull = buy_vol / safe_sell_vol
-        flow_ratio_bear = sell_vol / safe_buy_vol
+        # 1. Calculate Bollinger Bands (20, 2)
+        if len(self.bb_buffers[symbol]) < self.bb_window:
+            stats["Warming Up BB"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "Warming Up BB"})
+            
+        bb_mu = np.mean(self.bb_buffers[symbol])
+        bb_std = np.std(self.bb_buffers[symbol])
+        upper_bb = bb_mu + (self.bb_std * bb_std)
+        lower_bb = bb_mu - (self.bb_std * bb_std)
         
-        is_bullish_flow = flow_ratio_bull > aggressor_ratio_min
-        is_bearish_flow = flow_ratio_bear > aggressor_ratio_min
+        # 2. Get RSI (Normalized 0-1 from Features, convert to 0-100)
+        rsi_val = features.get('rsi_norm', 0.5) * 100.0
         
-        is_bullish_pa = aggressor > aggressor_pa_thresh
-        is_bearish_pa = aggressor < (1.0 - aggressor_pa_thresh)
+        # 3. Trigger Logic
+        # BUY: Price Breakout Upper BB + Momentum (RSI > 50)
+        trigger_bull = (bar.close > upper_bb) and (rsi_val > 50)
+        
+        # SELL: Price Breakdown Lower BB + Momentum (RSI < 50)
+        trigger_bear = (bar.close < lower_bb) and (rsi_val < 50)
 
-        # >>> ENTRY LOGIC (V7.6: OR LOGIC) <<<
+        # >>> ENTRY LOGIC (V9.0: BREAKOUT) <<<
         
-        trigger_bull = (is_bullish_flow or is_bullish_pa)
-        trigger_bear = (is_bearish_flow or is_bearish_pa)
-
         # BUY SCENARIO
         if trigger_bull:
-            if require_d1 and not d1_trend_up:
-                stats["Counter-D1 Trend"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "Counter-D1 Trend"})
             proposed_action = 1
-            regime_label = "Aggressor-Long"
+            regime_label = "Breakout-Long"
 
         # SELL SCENARIO
         elif trigger_bear:
-            if require_d1 and not d1_trend_down:
-                stats["Counter-D1 Trend"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "Counter-D1 Trend"})
             proposed_action = -1
-            regime_label = "Aggressor-Short"
+            regime_label = "Breakout-Short"
             
         else:
-            stats["No Trigger"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "No Trigger"})
+            stats["No Breakout"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "No Breakout"})
 
         # 5. ML Confirmation & Execution
         pred_proba = model.predict_proba_one(features)
@@ -489,7 +498,7 @@ class MultiAssetPredictor:
         )
 
         # --- EXECUTION WITH DYNAMIC CONFIDENCE ---
-        # Relaxed Floor (0.55), Removed Streak Penalty
+        # Relaxed Floor (0.55)
         min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
         
         if confidence < min_prob:
@@ -513,7 +522,6 @@ class MultiAssetPredictor:
                 imp_feats = []
                 imp_feats.append(regime_label)
                 if rvol > 2.0: imp_feats.append('High_Fuel')
-                if aggressor > 0.6: imp_feats.append('High_Aggressor')
                 
                 for f in imp_feats:
                     self.feature_importance_counter[symbol][f] += 1

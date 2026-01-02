@@ -5,12 +5,11 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 # 
-# PHOENIX STRATEGY V7.5 (SNIPER COMPLIANCE):
-# 1. MEAN REVERSION PURGED: Removed ALL Bollinger Band logic to prevent
-#    mean-reversion bias in the ML model. Volatility handled by ATR/Parkinson.
-# 2. AGGRESSOR FEATURES: Confirmed Flow Imbalance and Flow Ratio.
-# 3. EFFICIENCY: Validated KaufmanEfficiencyRatio for Regime Filter (>0.3).
-# 4. REGIME DETECTION: Added Vortex and Choppiness for Anti-Chop filtering.
+# PHOENIX STRATEGY V9.0 (MOMENTUM BREAKOUT FEATURES):
+# 1. CORE UPDATE: Restored StreamingBollingerBands for V9 Breakout Logic.
+# 2. FEATURE SET: Added 'bb_breakout', 'bb_width', 'bb_pct_b' to ML vector.
+# 3. LEGACY SUPPORT: Retained Aggressor/Flow features as secondary signals.
+# 4. CLEANUP: Optimized dependencies and error handling.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -116,7 +115,58 @@ class RecursiveEMA:
     def get(self) -> float:
         return self.value if self.value is not None else 0.0
 
-# --- 1. PROJECT PHOENIX L1 PROXIES (AGGRESSOR LOGIC) ---
+# --- 1. PROJECT PHOENIX V9.0 MOMENTUM INDICATORS ---
+
+class StreamingBollingerBands:
+    """
+    V9.0 CORE LOGIC: Momentum Breakout Indicator.
+    Calculates Upper/Lower Bands and Width for Breakout Detection.
+    Uses standard (20, 2) settings by default but configurable.
+    """
+    def __init__(self, window: int = 20, num_std: float = 2.0):
+        self.window = window
+        self.num_std = num_std
+        self.buffer = deque(maxlen=window)
+        
+    def update(self, price: float) -> Dict[str, float]:
+        self.buffer.append(price)
+        
+        if len(self.buffer) < self.window:
+            return {
+                'bb_upper': price, 
+                'bb_lower': price, 
+                'bb_mid': price, 
+                'bb_width': 0.0, 
+                'bb_pct_b': 0.5,
+                'bb_breakout': 0.0
+            }
+            
+        # Calculate Stats
+        mu = np.mean(self.buffer)
+        std = np.std(self.buffer)
+        
+        upper = mu + (self.num_std * std)
+        lower = mu - (self.num_std * std)
+        width = (upper - lower) / mu if mu > 0 else 0.0
+        
+        # Percent B: Where is price relative to bands? (0=Lower, 1=Upper)
+        pct_b = (price - lower) / (upper - lower) if (upper - lower) > 0 else 0.5
+        
+        # Breakout Signal: >0 if above upper, <0 if below lower
+        breakout = 0.0
+        if price > upper:
+            breakout = (price - upper) / price
+        elif price < lower:
+            breakout = (price - lower) / price # Negative value
+            
+        return {
+            'bb_upper': upper,
+            'bb_lower': lower,
+            'bb_mid': mu,
+            'bb_width': width,
+            'bb_pct_b': pct_b,
+            'bb_breakout': breakout
+        }
 
 class StreamingParkinsonVolatility:
     """
@@ -270,7 +320,7 @@ class MicrostructureAnalyzer:
 class KaufmanEfficiencyRatio:
     """
     Quantifies trend efficiency (Signal vs Noise).
-    CRITICAL: Must be > 0.3 for Aggressor Strategy to fire.
+    CRITICAL: Must be > 0.10 for V9 Breakout Strategy.
     """
     def __init__(self, window: int = 10):
         self.window = window
@@ -796,7 +846,7 @@ class MetaLabeler:
                 clean[k] = 0.0
         return clean
 
-# --- 7. ONLINE FEATURE ENGINEER (PROJECT PHOENIX V7.5) ---
+# --- 7. ONLINE FEATURE ENGINEER (PROJECT PHOENIX V9.0) ---
 
 class OnlineFeatureEngineer:
     def __init__(self, window_size: int = 50):
@@ -826,6 +876,9 @@ class OnlineFeatureEngineer:
         self.rvol = StreamingRelativeVolume(window=20)
         self.aggressor = StreamingAggressorRatio()
         
+        # V9.0 MOMENTUM LOGIC: Bollinger Bands (Restored)
+        self.bb = StreamingBollingerBands(window=20, num_std=2.0)
+
         # Microstructure & Math Engines
         self.entropy = EntropyMonitor(window=window_size)
         self.vpin = VPINMonitor(bucket_size=1000)
@@ -886,6 +939,9 @@ class OnlineFeatureEngineer:
         rvol_val = self.rvol.update(timestamp) # Fuel Gauge (Duration Intensity)
         aggressor_val = self.aggressor.update(high, low, price)
         
+        # Update V9 Momentum
+        bb_feats = self.bb.update(price)
+
         # Update Other Metrics
         entropy_val = self.entropy.update(price)
         vpin_val = self.vpin.update(volume, price, buy_vol, sell_vol)
@@ -990,6 +1046,11 @@ class OnlineFeatureEngineer:
             'flow_imbalance': flow_imbalance, 
             'flow_ratio': flow_ratio,         
             
+            # V9 Momentum Features (NEW)
+            'bb_breakout': bb_feats['bb_breakout'],
+            'bb_width': bb_feats['bb_width'],
+            'bb_pct_b': bb_feats['bb_pct_b'],
+            
             # Regime & Math
             'ker': ker_val,
             'fdi': fdi_val,
@@ -1006,8 +1067,7 @@ class OnlineFeatureEngineer:
             'macd_norm': macd_norm,
             'macd_hist_norm': tech_feats['macd_hist'] / price,
             'adx': tech_feats.get('adx', 0.0),
-            # REMOVED: bb_width (Fully Purged)
-
+            
             # Context / Legacy
             'vol_ratio': vol_ratio,
             'volatility_log': math.log(volatility_val + 1e-9),

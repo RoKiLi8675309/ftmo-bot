@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V7.6 (RECOVERY MODE)
-# STATUS: TUNING | TARGET: PASS FTMO CHALLENGE
+# config.yaml – PROJECT PHOENIX V9.0 (PRICE ACTION DOMINANCE)
+# STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE
 #
-# STRATEGY UPDATE (V7.6 - RELAXATION):
-# 1. TRIGGER: Relaxed thresholds to reduce "No Trigger" rates.
-# 2. GATES: Lifted Choppiness to 55.0 and Lowered RVOL to 1.1.
-# 3. LOGIC: Shifted from "AND" logic to "OR" logic for Aggressor/Flow.
+# STRATEGY UPDATE (V9.0 - MOMENTUM BREAKOUT):
+# 1. LOGIC: Shifted from Flow-based "Aggressor" to Price Action "Breakout".
+# 2. GATES: Disabled D1 Trend Filter to capture intraday mean reversion/volatility.
+# 3. RISK: Standardized to 0.5% risk. Relaxed SQN bans to -3.0 threshold.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -95,10 +95,10 @@ features:
   use_log_returns: true
   
   # Project Phoenix L1 Proxies
-  use_parkinson_vol: true      
+  use_parkinson_vol: true       
   use_amihud_liquidity: true 
-  use_relative_volume: true    
-  use_aggressor_ratio: true    
+  use_relative_volume: true     
+  use_aggressor_ratio: true     
   
   # NEW: Regime Filters (Anti-Chop)
   use_choppiness: true
@@ -142,20 +142,20 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V7.6 RELAXED) ---
+# --- PHOENIX STRATEGY PARAMETERS (V9.0 PRICE ACTION) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true       
-  require_d1_trend: true              
-  require_h4_alignment: false # DISABLED HARD GATE (Moved to ML weight)       
+  enable_regime_a_entries: true        
+  require_d1_trend: false             # DISABLED: Trade the chart in front of you (M5)       
+  require_h4_alignment: false         # DISABLED: Relies on ML weight       
   
   # --- FILTER THRESHOLDS (LOOSENED) ---
-  max_relative_volume: 8.0        # RELAXED: 6.0 -> 8.0
-  ker_trend_threshold: 0.10       # RELAXED: 0.20 -> 0.10 (Allow weaker trends start)
-  volume_gate_ratio: 1.1          # RELAXED: 1.5 -> 1.1 (Allow average volume entries)
-  aggressor_threshold: 0.53       # RELAXED: 0.55 -> 0.53
+  max_relative_volume: 8.0        
+  ker_trend_threshold: 0.10       # Trend Efficiency Floor
+  volume_gate_ratio: 1.1          # Min Relative Volume
+  aggressor_threshold: 0.53       
   ml_confirmation_threshold: 0.55 
-  choppiness_threshold: 55.0      # RELAXED: 50.0 -> 55.0
+  choppiness_threshold: 55.0      
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -192,8 +192,8 @@ optimization_search_space:
   
   # Triple Barrier Method (Labeling) -> Defines Reward Target (TP)
   tbm_barrier_width:
-    min: 2.0  # LOWERED FLOOR: 3.0 -> 2.0 (Take profits sooner if needed)
-    max: 5.0 
+    min: 2.0  # WIDENED: Allow smaller scalps
+    max: 6.0  # WIDENED: Allow larger runners (Volatility Expansion)
   tbm_horizon_minutes:
     min: 60
     max: 240
@@ -204,7 +204,7 @@ optimization_search_space:
   
   # Strategy Execution
   min_calibrated_probability:
-    min: 0.55 # LOWERED FLOOR: 0.70 -> 0.55 (Trust the model more)
+    min: 0.55 
     max: 0.80
 
 # --- RISK MANAGEMENT (FTMO COMPLIANCE) ---
@@ -214,7 +214,7 @@ risk_management:
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # SNIPER PROTOCOL: 0.5% Fixed Risk per Trade
+  # SNIPER PROTOCOL: 0.5% Fixed Risk per Trade (Standard)
   base_risk_per_trade_percent: 0.005 
   
   # LIMITS
@@ -229,8 +229,8 @@ risk_management:
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (SNIPER MODE)
-  stop_loss_atr_mult: 2.0         
-  take_profit_atr_mult: 3.0       
+  stop_loss_atr_mult: 2.0          
+  take_profit_atr_mult: 3.0        
   
   # ACTIVE TRAILING STOP (Implementation in Strategy)
   # Tier 1: BE @ 1.0 R
@@ -349,5 +349,5 @@ wfo:
   test_months: 6
   min_trades_optimization: 12 
   # --- RISK OPTIMIZATION (SNIPER MODE) ---
-  # Adjusted to prevent Daily Blowouts while maintaining growth potential.
-  risk_per_trade_options: [0.005] # Only test 0.5% risk
+  # Standard 0.5% risk
+  risk_per_trade_options: [0.005]

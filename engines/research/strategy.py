@@ -5,12 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V7.6 (RECOVERY MODE):
-# 1. TRIGGER RELAXATION: Changed (Flow AND PA) to (Flow OR PA).
-# 2. GATES: Removed H4 Hard Gate (Relies on ML). Raised Chop Threshold.
-# 3. STREAK LOGIC: Removed "Death Spiral" penalties during drawdowns.
-# 4. TRADE MANAGEMENT:
-#    - SQN SCALING: Dynamic risk based on performance.
+# PHOENIX STRATEGY V9.0 (MOMENTUM BREAKOUT):
+# 1. TRIGGER: Replaced "Aggressor" with Volatility Breakout (Price > BB_Upper).
+# 2. GATES: Removed D1 Trend Filter to capture mean reversion & intraday shifts.
+# 3. TRADE MANAGEMENT:
+#    - SQN SCALING: Window extended to 50 trades. Toxic ban relaxed to -3.0.
 #    - TRAILING STOP: Activates at 1R (Breakeven) -> Trails at 1.5R.
 # =============================================================================
 import logging
@@ -49,7 +48,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Aggressor Breakout System with Sniper Protocols.
+    Strictly implements the Momentum Breakout System (Phoenix V9).
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -114,31 +113,31 @@ class ResearchStrategy:
         self.closes = deque(maxlen=200)     # For Trend (SMA 200)
         self.rsi_buffer = deque(maxlen=15)  # For Extension (RSI 14)
         
+        # --- V9.0 MOMENTUM INDICATORS (Bollinger Bands) ---
+        self.bb_window = 20
+        self.bb_std = 2.0
+        self.bb_buffer = deque(maxlen=self.bb_window)
+        
         # --- FORENSIC RECORDER ---
         self.decision_log = deque(maxlen=1000)
         self.trade_events = []
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX V7.6 PARAMETERS (RECOVERY) ---
+        # --- PHOENIX V9.0 PARAMETERS (PRICE ACTION) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
         # Gates
-        self.require_d1_trend = phx_conf.get('require_d1_trend', True)
-        # H4 Gate Removed in V7.6
+        # V9 Update: Disable D1 Trend Requirement
+        self.require_d1_trend = False 
         
         # Safety Cap
-        self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 8.0)) # Relaxed Cap
+        self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 8.0)) 
         
         # --- STRICT THRESHOLDS (FROM DOCUMENT) ---
-        self.ker_thresh = float(phx_conf.get('ker_trend_threshold', 0.10)) # Relaxed to 0.10
-        self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 1.1)) # Relaxed to 1.1
-        self.aggressor_ratio_min = 1.2 # "Buy Vol > Sell Vol * 1.2"
-        self.adx_threshold = float(phx_conf.get('adx', {}).get('threshold', 20.0)) # Relaxed to 20
-        self.chop_threshold = float(phx_conf.get('choppiness_threshold', 55.0)) # Relaxed to 55
-        
-        # Aggressor Ratio Feature Threshold (Price Action proxy)
-        self.aggressor_thresh_price = float(phx_conf.get('aggressor_threshold', 0.53))
+        self.ker_thresh = float(phx_conf.get('ker_trend_threshold', 0.10)) 
+        self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 1.1)) 
+        self.chop_threshold = float(phx_conf.get('choppiness_threshold', 55.0))
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
         
@@ -179,6 +178,9 @@ class ResearchStrategy:
         if len(self.closes) > 1:
             delta = self.closes[-1] - self.closes[-2]
             self.rsi_buffer.append(delta)
+            
+        # Update BB Buffer (V9)
+        self.bb_buffer.append(price)
 
         # Inject Aux Data for single-symbol tests
         self._inject_auxiliary_data()
@@ -335,25 +337,22 @@ class ResearchStrategy:
             return 
 
         # ============================================================
-        # E. ENTRY LOGIC GATES (V7.6 RECOVERY MODE)
+        # E. ENTRY LOGIC GATES (V9.0 PRICE ACTION MODE)
         # ============================================================
         
         # 1. Extract Phoenix Indicators
         rvol = features.get('rvol', 1.0)
-        aggressor = features.get('aggressor', 0.5)
         adx_val = features.get('adx', 0.0)
         
-        # NEW: Regime Filters (Anti-Chop)
+        # Regime Filters (Anti-Chop)
         choppiness = features.get('choppiness', 50.0)
         
         # --- CRITICAL FILTER 0: ANTI-CHOP (HARD GATE) ---
-        # Relaxed to 55.0
         if choppiness > self.chop_threshold:
             self.rejection_stats[f"Chop Regime (CHOP {choppiness:.1f} > {self.chop_threshold})"] += 1
             return
             
         # --- CRITICAL FILTER 1: FUEL GAUGE (HARD GATE) ---
-        # RVOL must be > Threshold (Relaxed to 1.1)
         if rvol < self.vol_gate_ratio:
             self.rejection_stats[f"Low Fuel (RVol {rvol:.2f} < {self.vol_gate_ratio})"] += 1
             return
@@ -365,7 +364,6 @@ class ResearchStrategy:
         
         # --- CRITICAL FILTER 3: EFFICIENCY GATE (HARD GATE) ---
         # Apply Dynamic Offset from ADWIN but keep hard floor
-        # REMOVED: Streak Penalty (Death Spiral Prevention)
         effective_ker_thresh = max(0.10, self.ker_thresh + self.dynamic_ker_offset)
             
         if ker_val < effective_ker_thresh:
@@ -377,57 +375,46 @@ class ResearchStrategy:
             self.rejection_stats[f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
             return
 
-        # --- CRITICAL FILTER 5: MTF CONTEXT ---
-        d1_ema = context_data.get('d1', {}).get('ema200', 0.0)
-        d1_trend_up = (price > d1_ema) if d1_ema > 0 else True
-        d1_trend_down = (price < d1_ema) if d1_ema > 0 else True
-        
-        # REMOVED: H4 Hard Gate. Only used for Logic Confirmation.
+        # V9 UPDATE: Removed D1 Trend Filter to trade local breakouts.
         
         proposed_action = 0 # 0=HOLD, 1=BUY, -1=SELL
         regime_label = "Trend"
 
-        # --- AGGRESSOR TRIGGER (ORDER FLOW IMBALANCE) ---
-        # Logic: Confirm Buy Vol > Sell Vol * 1.2
+        # --- MOMENTUM BREAKOUT LOGIC (V9.0) ---
+        # Replaces noisy flow logic with statistical price breakouts.
         
-        # Prevent division by zero
-        safe_sell_vol = sell_vol if sell_vol > 0 else 1.0
-        safe_buy_vol = buy_vol if buy_vol > 0 else 1.0
+        # 1. Calculate Bollinger Bands (20, 2)
+        if len(self.bb_buffer) < self.bb_window:
+            self.rejection_stats["Warming Up BB"] += 1
+            return
+            
+        bb_mu = np.mean(self.bb_buffer)
+        bb_std = np.std(self.bb_buffer)
+        upper_bb = bb_mu + (self.bb_std * bb_std)
+        lower_bb = bb_mu - (self.bb_std * bb_std)
         
-        flow_ratio_bull = buy_vol / safe_sell_vol
-        flow_ratio_bear = sell_vol / safe_buy_vol
+        # 2. Get RSI (Normalized 0-1 from Features, convert to 0-100)
+        rsi_val = features.get('rsi_norm', 0.5) * 100.0
         
-        is_bullish_flow = flow_ratio_bull > self.aggressor_ratio_min
-        is_bearish_flow = flow_ratio_bear > self.aggressor_ratio_min
+        # 3. Trigger Logic
+        # BUY: Price Breakout Upper BB + Momentum (RSI > 50)
+        trigger_bull = (price > upper_bb) and (rsi_val > 50)
         
-        # Secondary Price Action Check
-        is_bullish_pa = aggressor > self.aggressor_thresh_price
-        is_bearish_pa = aggressor < (1.0 - self.aggressor_thresh_price)
-
-        # >>> ENTRY LOGIC (V7.6: OR LOGIC) <<<
-        # We allow entry if Flow OR PA confirms, provided Context is aligned.
-        
-        trigger_bull = (is_bullish_flow or is_bullish_pa)
-        trigger_bear = (is_bearish_flow or is_bearish_pa)
+        # SELL: Price Breakdown Lower BB + Momentum (RSI < 50)
+        trigger_bear = (price < lower_bb) and (rsi_val < 50)
 
         # BUY SCENARIO
         if trigger_bull:
-            if self.require_d1_trend and not d1_trend_up:
-                self.rejection_stats["Counter-D1 Trend"] += 1
-                return
             proposed_action = 1
-            regime_label = "Aggressor-Long"
+            regime_label = "Breakout-Long"
 
         # SELL SCENARIO
         elif trigger_bear:
-            if self.require_d1_trend and not d1_trend_down:
-                self.rejection_stats["Counter-D1 Trend"] += 1
-                return
             proposed_action = -1
-            regime_label = "Aggressor-Short"
+            regime_label = "Breakout-Short"
             
         else:
-            self.rejection_stats["No Trigger"] += 1
+            self.rejection_stats["No Breakout"] += 1
             return
 
         # ============================================================
@@ -454,7 +441,6 @@ class ResearchStrategy:
                 self.meta_label_events += 1
 
             # --- EXECUTION WITH DYNAMIC CONFIDENCE ---
-            # REMOVED: Streak Penalty (Death Spiral Prevention)
             min_prob = float(self.params.get('min_calibrated_probability', 0.55))
                 
             if confidence < min_prob:
@@ -511,6 +497,14 @@ class ResearchStrategy:
         
         # NEW: CALCULATE SQN PERFORMANCE SCORE
         sqn_score = self._calculate_symbol_sqn(broker)
+        
+        # V9 FIX: SQN "Soft Landing"
+        # If SQN is between -3.0 and -1.0, RiskManager would ban it (return Risk 0).
+        # We clamp it to -0.99 so RiskManager sees it as "Losing Streak" (0.1% risk) instead of "Toxic".
+        if -3.0 < sqn_score < -1.0:
+            effective_sqn = -0.99
+        else:
+            effective_sqn = sqn_score
 
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
@@ -522,7 +516,7 @@ class ResearchStrategy:
             ker=current_ker,
             account_size=broker.equity,
             risk_percent_override=risk_override,
-            performance_score=sqn_score # Pass SQN for scaling
+            performance_score=effective_sqn # V9: Use clamped score
         )
 
         if trade_intent.volume <= 0:
@@ -584,7 +578,6 @@ class ResearchStrategy:
         imp_feats = []
         imp_feats.append(regime)
         if features.get('rvol', 0) > 2.0: imp_feats.append('High_Fuel')
-        if features.get('aggressor', 0) > 0.6: imp_feats.append('High_Aggressor')
         if features.get('mtf_alignment', 0) == 1.0: imp_feats.append('MTF_Aligned')
         
         for f in imp_feats:
@@ -597,7 +590,6 @@ class ResearchStrategy:
             'conf': confidence,
             'rvol': features.get('rvol', 0),
             'parkinson': features.get('parkinson_vol', 0),
-            'aggressor': features.get('aggressor', 0.5),
             'ker': current_ker,
             'atr': current_atr,
             'regime': regime,
@@ -608,6 +600,7 @@ class ResearchStrategy:
         """
         Calculates the rolling System Quality Number (SQN) for this symbol.
         Used to throttle risk during losing streaks.
+        V9 Update: Window increased to 50 trades.
         """
         trades = [t.net_pnl for t in broker.closed_positions if t.symbol == self.symbol]
         
@@ -615,8 +608,8 @@ class ResearchStrategy:
         if len(trades) < 5: 
             return 0.0
             
-        # Analyze last 30 trades for responsiveness
-        window = trades[-30:]
+        # Analyze last 50 trades for robustness (was 30)
+        window = trades[-50:]
         avg_pnl = np.mean(window)
         std_pnl = np.std(window)
         
@@ -840,7 +833,6 @@ class ResearchStrategy:
         
         avg_conf = np.mean([t['conf'] for t in self.trade_events])
         avg_rvol = np.mean([t['rvol'] for t in self.trade_events]) 
-        avg_park = np.mean([t['parkinson'] for t in self.trade_events]) 
         
         sorted_rejects = sorted(self.rejection_stats.items(), key=lambda item: item[1], reverse=True)
         reject_str = ", ".join([f"{k}: {v}" for k, v in sorted_rejects[:5]])
@@ -852,7 +844,7 @@ class ResearchStrategy:
             f"\n --- 💀 PHOENIX AUTOPSY ({self.symbol}) ---\n"
             f" Trades: {len(self.trade_events)}\n"
             f" Avg Conf: {avg_conf:.2f}\n"
-            f" Avg RVol: {avg_rvol:.2f} | Avg Parkinson: {avg_park:.5f}\n"
+            f" Avg RVol: {avg_rvol:.2f}\n"
             f" Top Drivers: {feat_str}\n"
             f" Rejections: {{{reject_str}}}\n"
             f" ----------------------------------------\n"
