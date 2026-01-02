@@ -5,11 +5,12 @@
 # DEPENDENCIES: shared, engines.live.dispatcher, engines.live.predictor
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates bars, generates signals.
 #
-# PHOENIX STRATEGY V7.5 (SNIPER PROTOCOL - LIVE EXECUTION):
-# 1. RISK ORCHESTRATION: Passes 'ker' to RiskManager for Efficiency Scaling.
-# 2. SNIPER GUARD: Enforces Friday Entry Cutoff (16:00) & Liquidation (21:00).
-# 3. DYNAMIC R:R: Applies optimized Reward Targets from Predictor metadata.
-# 4. SQN SCALING: Tracks closed trades to throttle risk on losing streaks.
+# PHOENIX STRATEGY V10.0 (DEFENSIVE EXECUTION):
+# 1. CIRCUIT BREAKER: Tracks REALIZED daily losses. Locks symbol if:
+#    - Trades Lost >= 2
+#    - Daily PnL < -1% of Equity
+# 2. GATES: Enforces Friday Liquidation (21:00) & Entry Cutoff (16:00).
+# 3. EXECUTION: Passes MTF Context (D1/H4) to Predictor for Trend Filtering.
 # =============================================================================
 import logging
 import time
@@ -19,6 +20,7 @@ import signal
 import sys
 import numpy as np
 import math
+import pytz
 from datetime import datetime
 from collections import defaultdict, deque
 from typing import Any, Optional, Dict
@@ -65,10 +67,9 @@ class LiveTradingEngine:
     The Central Logic Unit for the Linux Consumer.
     1. Consumes Ticks from Redis.
     2. Aggregates Ticks into Volume Bars.
-    3. Fetches News & Calculates Sentiment.
-    4. Feeds Bars to Predictor (Ensemble ARF) -> Gets Optimized R:R.
-    5. Dispatches Orders to Windows with Precise Limits.
-    6. Monitors Closed Trades for SQN Scaling (Cut Losers).
+    3. Feeds Bars to Predictor (V10.0 Logic).
+    4. Enforces Execution Circuit Breakers (Realized PnL).
+    5. Dispatches Orders to Windows.
     """
     def __init__(self):
         self.shutdown_flag = False
@@ -119,9 +120,15 @@ class LiveTradingEngine:
             self.news_thread = threading.Thread(target=self.fetch_news_loop, daemon=True)
             self.news_thread.start()
 
-        # 7. Performance Monitor (SQN Tracking)
+        # 7. Performance Monitor (Circuit Breaker & SQN)
         # Tracks last 30 trades per symbol to calculate SQN
         self.performance_stats = defaultdict(lambda: deque(maxlen=30))
+        
+        # V10.0: Daily Circuit Breaker State (Realized Execution)
+        # {symbol: {'date': date_obj, 'losses': int, 'pnl': float}}
+        self.daily_execution_stats = defaultdict(lambda: {'date': None, 'losses': 0, 'pnl': 0.0})
+        self.max_daily_losses_per_symbol = 2
+        
         self.perf_thread = threading.Thread(target=self.fetch_performance_loop, daemon=True)
         self.perf_thread.start()
 
@@ -139,6 +146,13 @@ class LiveTradingEngine:
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
         self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.5)
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
+        
+        # Timezone for Circuit Breaker Reset
+        tz_str = CONFIG['risk_management'].get('risk_timezone', 'Europe/Prague')
+        try:
+            self.server_tz = pytz.timezone(tz_str)
+        except Exception:
+            self.server_tz = pytz.timezone('Europe/Prague')
 
     def fetch_news_loop(self):
         """
@@ -166,13 +180,14 @@ class LiveTradingEngine:
 
     def fetch_performance_loop(self):
         """
-        Background thread to listen for CLOSED trades and update SQN stats.
-        Essential for 'Dynamic Performance-Based Sizing'.
+        Background thread to listen for CLOSED trades.
+        1. Updates SQN stats (performance sizing).
+        2. Updates Daily Circuit Breaker (stops trading on bad days).
         """
-        logger.info(f"{LogSymbols.INFO} Performance Monitor (SQN) Thread Started.")
+        logger.info(f"{LogSymbols.INFO} Performance Monitor (SQN & Circuit Breaker) Thread Started.")
         stream_key = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
         
-        # Start reading from current time ($) to avoid processing old history on restart
+        # Start reading from current time ($)
         last_id = '$' 
         
         while not self.shutdown_flag:
@@ -188,8 +203,21 @@ class LiveTradingEngine:
                             net_pnl = float(data.get('net_pnl', 0.0))
                             
                             if symbol:
+                                # 1. SQN Window Update
                                 self.performance_stats[symbol].append(net_pnl)
-                                # logger.debug(f"📉 PnL Recorded: {symbol} ${net_pnl:.2f}")
+                                
+                                # 2. V10.0 Circuit Breaker Update
+                                now_server = datetime.now(self.server_tz).date()
+                                
+                                # Reset if new day
+                                if self.daily_execution_stats[symbol]['date'] != now_server:
+                                    self.daily_execution_stats[symbol] = {'date': now_server, 'losses': 0, 'pnl': 0.0}
+                                
+                                self.daily_execution_stats[symbol]['pnl'] += net_pnl
+                                
+                                if net_pnl < 0:
+                                    self.daily_execution_stats[symbol]['losses'] += 1
+                                    logger.info(f"📉 LOSS DETECTED {symbol}: ${net_pnl:.2f} | Daily Losses: {self.daily_execution_stats[symbol]['losses']}")
                                 
             except Exception as e:
                 logger.error(f"Performance Monitor Error: {e}")
@@ -212,6 +240,33 @@ class LiveTradingEngine:
             
         sqn = (avg_pnl / std_pnl) * math.sqrt(len(trades))
         return sqn
+        
+    def _check_circuit_breaker(self, symbol: str) -> bool:
+        """
+        V10.0: Checks if the symbol is locked out for the day due to losses.
+        Returns TRUE if trading should be BLOCKED.
+        """
+        now_server = datetime.now(self.server_tz).date()
+        stats = self.daily_execution_stats[symbol]
+        
+        # Auto-reset if accessed on a new day before trade loop hits it
+        if stats['date'] != now_server:
+            self.daily_execution_stats[symbol] = {'date': now_server, 'losses': 0, 'pnl': 0.0}
+            return False
+            
+        # Rule 1: Max 2 Losses per day
+        if stats['losses'] >= self.max_daily_losses_per_symbol:
+            return True
+            
+        # Rule 2: Daily PnL < -1% of Equity
+        # Estimate equity roughly from risk monitor
+        current_equity = self.ftmo_guard.equity
+        if current_equity > 0:
+            limit = current_equity * 0.01
+            if stats['pnl'] < -limit:
+                return True
+                
+        return False
 
     def _get_open_positions_from_redis(self) -> Dict[str, Dict]:
         """
@@ -302,6 +357,11 @@ class LiveTradingEngine:
         Triggered when a Volume Bar is closed.
         Executes the Prediction and Dispatch logic with Dynamic R:R.
         """
+        # --- V10.0 EXECUTION CIRCUIT BREAKER ---
+        if self._check_circuit_breaker(bar.symbol):
+            # Silent return to avoid log spam, or log once per bar if needed
+            return
+
         # 1. Update Portfolio Risk State
         try:
             ret = (bar.close - bar.open) / bar.open if bar.open > 0 else 0.0

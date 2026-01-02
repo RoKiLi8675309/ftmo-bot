@@ -6,11 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V9.0 (MOMENTUM BREAKOUT - LIVE):
-# 1. TRIGGER: Replaced "Aggressor" with Volatility Breakout (Price > BB_Upper).
-# 2. GATES: Removed D1 Trend Filter to capture mean reversion & intraday shifts.
-# 3. TRADE MANAGEMENT:
-#    - Aligned with Strategy V9.0 logic (BB 20,2 + RSI 50 crossover).
+# PHOENIX STRATEGY V10.0 (DEFENSIVE PROTOCOL - LIVE):
+# 1. LOGIC: Re-enabled D1 Trend Filter (Bias) & RSI Extremes Guard.
+# 2. GATES: Stricter KER (0.25) & Anti-Chop (50.0) to filter noise.
+# 3. RISK: Per-Symbol Circuit Breaker (Max 2 Losses/Day).
 # =============================================================================
 import logging
 import pickle
@@ -19,11 +18,11 @@ import json
 import time
 import math
 import pytz 
-from datetime import datetime
+from datetime import datetime, date
 from collections import defaultdict, deque, Counter
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
-import numpy as np # Added for BB calculation
+import numpy as np 
 
 # Third-Party ML Imports
 try:
@@ -76,14 +75,12 @@ class MultiAssetPredictor:
         tbm_conf = CONFIG['online_learning']['tbm']
         risk_conf = CONFIG.get('risk_management', {})
         
-        # AUDIT FIX: Load SL Multiplier from Config (Was Hardcoded 1.5)
-        # Now defaults to 2.0 per config update
         risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 2.0))
         
         self.labelers = {}
         self.optimized_params = {} # Cache for gates
         
-        # --- V9.0 MOMENTUM INDICATORS (Bollinger Bands) ---
+        # --- V10.0 MOMENTUM INDICATORS ---
         self.bb_window = 20
         self.bb_std = 2.0
         self.bb_buffers = {s: deque(maxlen=self.bb_window) for s in symbols}
@@ -95,23 +92,19 @@ class MultiAssetPredictor:
             s_horizon = tbm_conf.get('horizon_minutes', 120)
             
             # --- DYNAMIC PARAMETER LOADING ---
-            # Try to load optimized R:R and Risk from Research
             params_path = self.models_dir / f"best_params_{s}.json"
             if params_path.exists():
                 try:
                     with open(params_path, 'r') as f:
                         bp = json.load(f)
-                        self.optimized_params[s] = bp # Store for gate logic
+                        self.optimized_params[s] = bp 
                         
-                        # Optuna stores this as a flat key if suggested via suggest_float
                         if 'barrier_width' in bp:
                             s_reward = float(bp['barrier_width'])
                         if 'horizon_minutes' in bp:
                             s_horizon = int(bp['horizon_minutes'])
                         
-                        # NEW: Load Risk Param
                         if 'risk_per_trade_percent' in bp:
-                            # Store in dict to ensure persistence
                             if s not in self.optimized_params: self.optimized_params[s] = {}
                             self.optimized_params[s]['risk_per_trade_percent'] = float(bp['risk_per_trade_percent'])
                             
@@ -141,9 +134,14 @@ class MultiAssetPredictor:
         self.bar_counters = {s: 0 for s in symbols}
         self.feature_importance_counter = {s: Counter() for s in symbols}
         
-        # 6. Streak Breaker State (Internal Tracking)
+        # 6. Streak Breaker & Daily Circuit Breaker State
         self.consecutive_losses = {s: 0 for s in symbols}
-        self.active_signals = {s: deque() for s in symbols} # Track issued signals to match outcomes
+        self.active_signals = {s: deque() for s in symbols} 
+        
+        # V10.0: Daily Performance Tracking (Symbol Circuit Breaker)
+        # Structure: {symbol: {'date': date_obj, 'losses': int, 'pnl': float}}
+        self.daily_performance = {s: {'date': None, 'losses': 0, 'pnl': 0.0} for s in symbols}
+        self.daily_max_losses = 2 # Circuit Breaker Limit
         
         # 7. Architecture: Auto-Save Timer
         self.last_save_time = time.time()
@@ -156,11 +154,9 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (DEFAULTS V9.0) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V10.0 STRICT) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        # STRICT THRESHOLDS FROM DOC
-        self.default_ker_thresh = 0.10  # Relaxed
-        self.default_max_rvol = 8.0     # Relaxed
+        self.default_max_rvol = 8.0     
         
         # Friday Guard
         self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 16)
@@ -177,7 +173,6 @@ class MultiAssetPredictor:
             self.server_tz = pytz.timezone('Europe/Prague')
 
         # --- REC 1: Dynamic Gate Scaling State ---
-        # ADWIN Drift detectors for KER monitoring per symbol
         self.ker_drift_detectors = {s: drift.ADWIN(delta=0.01) for s in symbols}
         self.dynamic_ker_offsets = {s: 0.0 for s in symbols}
 
@@ -185,7 +180,7 @@ class MultiAssetPredictor:
         self.sniper_closes = {s: deque(maxlen=200) for s in symbols} # For SMA 200
         self.sniper_rsi = {s: deque(maxlen=15) for s in symbols}     # For RSI 14
 
-        # Inject Default Data for JPY Basket (Prevents Risk Manager Zeros)
+        # Inject Default Data 
         self._inject_auxiliary_data()
 
         # Initialize Models & Load State
@@ -194,20 +189,13 @@ class MultiAssetPredictor:
 
     def _init_models(self):
         """
-        Initializes the machine learning pipelines using Golden Config hyperparameters.
+        Initializes the machine learning pipelines.
         """
         conf = CONFIG['online_learning']
-        
-        metric_map = {
-            "LogLoss": metrics.LogLoss(),
-            "F1": metrics.F1(),
-            "Accuracy": metrics.Accuracy(),
-            "ROCAUC": metrics.ROCAUC()
-        }
+        metric_map = {"LogLoss": metrics.LogLoss(), "F1": metrics.F1(), "Accuracy": metrics.Accuracy(), "ROCAUC": metrics.ROCAUC()}
         selected_metric = metric_map.get(conf.get('metric', 'LogLoss'), metrics.LogLoss())
         
         for sym in self.symbols:
-            # Base Classifier: ARF
             base_clf = forest.ARFClassifier(
                 n_models=conf.get('n_models', 50),
                 grace_period=conf['grace_period'],
@@ -221,24 +209,17 @@ class MultiAssetPredictor:
                 drift_detector=drift.ADWIN(delta=conf['delta'])
             )
             
-            # Ensemble Wrapper (Bagging)
             self.models[sym] = compose.Pipeline(
                 preprocessing.StandardScaler(),
-                ensemble.ADWINBaggingClassifier(
-                    model=base_clf,
-                    n_models=5,
-                    seed=42
-                )
+                ensemble.ADWINBaggingClassifier(model=base_clf, n_models=5, seed=42)
             )
-            
-            # Meta Model & Calibrator
             self.meta_labelers[sym] = MetaLabeler()
             self.calibrators[sym] = ProbabilityCalibrator()
 
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V9.0 Logic.
+        Executes the Learn-Predict Loop with Project Phoenix V10.0 Logic.
         """
         if symbol not in self.symbols: return None
         
@@ -255,8 +236,6 @@ class MultiAssetPredictor:
         feat_stats = self.feature_stats[symbol]
         
         self.bar_counters[symbol] += 1
-        
-        # Ensure we have a price for risk calculations (Live update)
         self.last_close_prices[symbol] = bar.close
 
         # --- UPDATE SNIPER BUFFERS ---
@@ -264,29 +243,24 @@ class MultiAssetPredictor:
         if len(self.sniper_closes[symbol]) > 1:
             delta = self.sniper_closes[symbol][-1] - self.sniper_closes[symbol][-2]
             self.sniper_rsi[symbol].append(delta)
-            
-        # --- UPDATE V9 MOMENTUM BUFFERS ---
         self.bb_buffers[symbol].append(bar.close)
 
-        # Extract Flows (Populated by Aggregator in shared/data.py)
+        # Extract Flows 
         buy_vol = getattr(bar, 'buy_vol', 0.0)
         sell_vol = getattr(bar, 'sell_vol', 0.0)
         
-        # --- RETAIL FALLBACK ---
+        # Retail Fallback
         if buy_vol == 0 and sell_vol == 0:
             if not self.l2_missing_warned[symbol]:
                 logger.warning(f"⚠️ {symbol}: Zero Flow Detected. Using Local Tick Rule Fallback.")
                 self.l2_missing_warned[symbol] = True
             
             last_price = self.last_close_prices.get(symbol, bar.close)
-            if bar.close > last_price:
-                buy_vol = bar.volume; sell_vol = 0.0
-            elif bar.close < last_price:
-                buy_vol = 0.0; sell_vol = bar.volume
-            else:
-                buy_vol = bar.volume / 2.0; sell_vol = bar.volume / 2.0
+            if bar.close > last_price: buy_vol = bar.volume; sell_vol = 0.0
+            elif bar.close < last_price: buy_vol = 0.0; sell_vol = bar.volume
+            else: buy_vol = bar.volume / 2.0; sell_vol = bar.volume / 2.0
         
-        # 1. Feature Engineering (Digesting D1/H4 Context)
+        # 1. Feature Engineering
         features = fe.update(
             price=bar.close,
             timestamp=bar.timestamp.timestamp(),
@@ -304,149 +278,133 @@ class MultiAssetPredictor:
         ker_val = features.get('ker', 0.5)
         parkinson = features.get('parkinson_vol', 0.0)
 
-        # --- REC 1: DYNAMIC GATE SCALING (Drift Detection) ---
-        # Update drift detector with current KER
+        # --- REC 1: DYNAMIC GATE SCALING ---
         self.ker_drift_detectors[symbol].update(ker_val)
-        
-        # If distribution of KER changes significantly (Drift), adjust threshold
         if self.ker_drift_detectors[symbol].drift_detected:
-            # Drift implies regime shift. Relax gate temporarily.
             self.dynamic_ker_offsets[symbol] = max(-0.10, self.dynamic_ker_offsets[symbol] - 0.05)
         else:
-            # Slowly decay offset back to 0 (Normalization)
             self.dynamic_ker_offsets[symbol] = min(0.0, self.dynamic_ker_offsets[symbol] + 0.001)
 
-        # Update Feature Stats
-        alpha = 0.01
-        feat_stats['avg_ker'] = (1 - alpha) * feat_stats.get('avg_ker', 0.5) + alpha * features.get('ker', 0.5)
-        feat_stats['avg_rvol'] = (1 - alpha) * feat_stats.get('avg_rvol', 1.0) + alpha * features.get('rvol', 1.0)
+        feat_stats['avg_ker'] = (0.99) * feat_stats.get('avg_ker', 0.5) + 0.01 * features.get('ker', 0.5)
+        feat_stats['avg_rvol'] = (0.99) * feat_stats.get('avg_rvol', 1.0) + 0.01 * features.get('rvol', 1.0)
         
         # --- WARM-UP GATE ---
         if self.burn_in_counters[symbol] < self.burn_in_limit:
             self.burn_in_counters[symbol] += 1
             return Signal(symbol, "WARMUP", 0.0, {})
 
-        # 2. Delayed Training (Label Resolution) & Streak Update
+        # --- SERVER TIME & DAILY STATS MANAGEMENT ---
+        server_time = bar.timestamp.astimezone(self.server_tz)
+        current_date = server_time.date()
+        
+        # Reset Daily Stats if New Day
+        if self.daily_performance[symbol]['date'] != current_date:
+            self.daily_performance[symbol] = {'date': current_date, 'losses': 0, 'pnl': 0.0}
+
+        # --- V10.0 CIRCUIT BREAKER (Signal Level) ---
+        if self.daily_performance[symbol]['losses'] >= self.daily_max_losses:
+            stats["Circuit Breaker (Daily Losses)"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "Circuit Breaker Active"})
+
+        # 2. Delayed Training (Label Resolution)
         resolved_labels = labeler.resolve_labels(bar.high, bar.low)
         
         if resolved_labels:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
                 
+                # --- UPDATE PERFORMANCE METRICS ---
+                if outcome_label != 0:
+                    self.daily_performance[symbol]['pnl'] += realized_ret
+                    # Count as loss if realized return is negative (slippage included)
+                    if realized_ret < 0:
+                        self.daily_performance[symbol]['losses'] += 1
+                
                 # --- STREAK BREAKER UPDATE ---
                 if self.active_signals[symbol]:
                     _ = self.active_signals[symbol].popleft()
-                    
-                    if outcome_label == 1:
-                        self.consecutive_losses[symbol] = 0 # WIN -> Reset Streak
-                    elif outcome_label == -1:
-                        self.consecutive_losses[symbol] += 1 # LOSS -> Increment Streak
-                    # Ignore 0 (Time expiry usually scratch)
+                    if outcome_label == 1: self.consecutive_losses[symbol] = 0
+                    elif outcome_label == -1: self.consecutive_losses[symbol] += 1
 
                 # --- LEARNING ---
                 w_pos = CONFIG['online_learning'].get('positive_class_weight', 1.5)
                 w_neg = CONFIG['online_learning'].get('negative_class_weight', 1.0)
-                
                 base_weight = w_pos if outcome_label != 0 else w_neg
                 
-                # Scale by Profit Magnitude (Log Scale)
                 ret_scalar = math.log1p(abs(realized_ret) * 100.0)
                 ret_scalar = max(0.5, min(ret_scalar, 5.0))
                 
-                # --- REC 3: EFFICIENCY-WEIGHTED LEARNING ---
                 hist_ker = stored_feats.get('ker', 0.5)
-                ker_weight = hist_ker * 2.0  # Scale 0-2 (e.g., 0.8 KER -> 1.6x weight)
+                ker_weight = hist_ker * 2.0 
                 
                 final_weight = base_weight * ret_scalar * ker_weight
                 
-                # Train Primary Model
                 model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
-                
-                # Double Learn for Positive outcomes
                 if outcome_label != 0:
                      model.learn_one(stored_feats, outcome_label, sample_weight=final_weight * 1.5)
-
-                # Update Meta-Labeler
                 if outcome_label != 0:
                     meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
 
-        # 3. Add CURRENT Bar as new Trade Opportunity
-        # Explicitly pass parkinson_vol to labeler for dynamic barrier sizing
+        # 3. Add Trade Opportunity
         current_atr = features.get('atr', 0.0)
-        
-        # Inject Parkinson into features
         features['parkinson_vol'] = parkinson 
-        
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp(), parkinson_vol=parkinson)
 
         # ============================================================
-        # 4. PHOENIX STRATEGY V9.0: MOMENTUM BREAKOUT GATES
+        # 4. PHOENIX V10.0: DEFENSIVE GATES
         # ============================================================
         
-        # Extract Core Indicators
         rvol = features.get('rvol', 1.0)
         adx_val = features.get('adx', 0.0)
-        
-        # Regime Filters (Anti-Chop)
         choppiness = features.get('choppiness', 50.0)
         
-        # Pull Configs (Relaxed)
         phx = CONFIG.get('phoenix_strategy', {})
         max_rvol_thresh = float(phx.get('max_relative_volume', 8.0)) 
-        ker_thresh = float(phx.get('ker_trend_threshold', 0.10)) 
         vol_gate_ratio = float(phx.get('volume_gate_ratio', 1.1)) 
-        chop_threshold = float(phx.get('choppiness_threshold', 55.0)) 
         
-        # V9 Update: D1 Trend is Disabled (M5 Breakout Focus)
-        require_d1 = False
+        # V10 STRICT THRESHOLDS (Hardcoded Floors)
+        chop_threshold = 50.0 # Strict Cap
         
-        # --- FRIDAY GUARD (Timezone Aware) ---
-        # Convert UTC bar time to Server Time (Prague)
-        server_time = bar.timestamp.astimezone(self.server_tz)
-        
+        # FRIDAY GUARD
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
-             # Just return HOLD, do not spam stats if it happens often
              return Signal(symbol, "HOLD", 0.0, {"reason": "Friday Entry Guard"})
 
-        # --- CRITICAL FILTER 0: ANTI-CHOP (HARD GATE) ---
+        # G1: ANTI-CHOP
         if choppiness > chop_threshold:
-            stats[f"Chop Regime (CHOP {choppiness:.1f} > {chop_threshold})"] += 1
+            stats[f"Chop Regime (CHOP {choppiness:.1f})"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Chop Regime (CHOP {choppiness:.1f})"})
 
-        # --- CRITICAL FILTER 1: FUEL GAUGE (HARD GATE) ---
+        # G2: FUEL GAUGE
         if rvol < vol_gate_ratio:
-            stats[f"Low Fuel (RVol {rvol:.2f} < {vol_gate_ratio})"] += 1
+            stats[f"Low Fuel"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Low Fuel"})
 
-        # --- CRITICAL FILTER 2: VOLUME EXHAUSTION FILTER ---
+        # G3: EXHAUSTION
         if rvol > max_rvol_thresh:
             stats[f"Volume Climax"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
             
-        # --- DYNAMIC EFFICIENCY GATE ---
-        # Apply Dynamic Offset from ADWIN (Rec 1) - No Streak Penalty
-        effective_ker_thresh = max(0.10, ker_thresh + self.dynamic_ker_offsets[symbol])
+        # G4: STRICT EFFICIENCY (V10)
+        # Ensure KER is at least 0.25 regardless of config or drift
+        config_ker = float(phx.get('ker_trend_threshold', 0.10))
+        base_thresh = max(0.25, config_ker) # Hard floor at 0.25
+        effective_ker_thresh = max(0.25, base_thresh + self.dynamic_ker_offsets[symbol])
 
-        # --- CRITICAL FILTER 3: EFFICIENCY GATE ---
-        ker_val = features.get('ker', 0.5)
         if ker_val < effective_ker_thresh:
             stats[f"Low Efficiency"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f})"})
 
-        # --- CRITICAL FILTER 4: TREND STRENGTH ---
+        # G5: TREND STRENGTH
         if adx_val < 20.0:
-            stats[f"Weak Trend (ADX {adx_val:.1f} < 20)"] += 1
+            stats[f"Weak Trend"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Weak Trend (ADX {adx_val:.1f})"})
 
-        # --- MTF TREND CONTEXT (INFORMATIONAL ONLY IN V9) ---
+        # --- MTF TREND CONTEXT (V10 ENABLED) ---
         d1_ema = context_data.get('d1', {}).get('ema200', 0.0) if context_data else 0.0
         
         proposed_action = 0
         regime_label = "Chop"
 
-        # --- MOMENTUM BREAKOUT TRIGGER (V9.0) ---
-        # Replaces "Aggressor" Logic with Price Action Breakout
-        
-        # 1. Calculate Bollinger Bands (20, 2)
+        # --- MOMENTUM BREAKOUT TRIGGER ---
         if len(self.bb_buffers[symbol]) < self.bb_window:
             stats["Warming Up BB"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Warming Up BB"})
@@ -456,69 +414,48 @@ class MultiAssetPredictor:
         upper_bb = bb_mu + (self.bb_std * bb_std)
         lower_bb = bb_mu - (self.bb_std * bb_std)
         
-        # 2. Get RSI (Normalized 0-1 from Features, convert to 0-100)
         rsi_val = features.get('rsi_norm', 0.5) * 100.0
         
-        # 3. Trigger Logic
-        # BUY: Price Breakout Upper BB + Momentum (RSI > 50)
         trigger_bull = (bar.close > upper_bb) and (rsi_val > 50)
-        
-        # SELL: Price Breakdown Lower BB + Momentum (RSI < 50)
         trigger_bear = (bar.close < lower_bb) and (rsi_val < 50)
 
-        # >>> ENTRY LOGIC (V9.0: BREAKOUT) <<<
-        
-        # BUY SCENARIO
         if trigger_bull:
             proposed_action = 1
             regime_label = "Breakout-Long"
-
-        # SELL SCENARIO
         elif trigger_bear:
             proposed_action = -1
             regime_label = "Breakout-Short"
-            
         else:
             stats["No Breakout"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "No Breakout"})
 
-        # 5. ML Confirmation & Execution
+        # 5. ML Confirmation
         pred_proba = model.predict_proba_one(features)
         prob_buy = pred_proba.get(1, 0.0)
         prob_sell = pred_proba.get(-1, 0.0)
-        
         confidence = prob_buy if proposed_action == 1 else prob_sell
         
-        # Meta Labeling
-        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.50)
-        is_profitable = meta_labeler.predict(
-            features,
-            proposed_action,
-            threshold=meta_threshold
-        )
+        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.60) # V10 Strict
+        is_profitable = meta_labeler.predict(features, proposed_action, threshold=meta_threshold)
 
-        # --- EXECUTION WITH DYNAMIC CONFIDENCE ---
-        # Relaxed Floor (0.55)
-        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
+        # --- EXECUTION WITH DYNAMIC CONFIDENCE (V10 Strict) ---
+        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.60)
         
         if confidence < min_prob:
             stats[f"ML Disagreement"] += 1
             return Signal(symbol, "HOLD", confidence, {"reason": f"ML Disagreement (Conf < {min_prob:.2f})"})
 
-        # --- SNIPER PROTOCOL: FINAL FILTER GATE ---
-        # Validate Trend (SMA200) and Extension (RSI) before executing
-        if not self._check_sniper_filters(symbol, proposed_action, bar.close):
-            stats["Sniper Reject"] += 1
+        # --- SNIPER PROTOCOL: FINAL FILTER GATE (V10) ---
+        # Checks D1 Trend Bias & RSI Extremes
+        if not self._check_sniper_filters(symbol, proposed_action, bar.close, d1_ema):
+            stats["Sniper Reject (Trend/RSI)"] += 1
             return Signal(symbol, "HOLD", confidence, {"reason": "Sniper Filter Reject"})
         # ------------------------------------------
 
         if is_profitable:
                 action_str = "BUY" if proposed_action == 1 else "SELL"
-                
-                # Register Signal for Streak Tracking
                 self.active_signals[symbol].append(action_str)
                 
-                # FEATURE IMPORTANCE TRACKING
                 imp_feats = []
                 imp_feats.append(regime_label)
                 if rvol > 2.0: imp_feats.append('High_Fuel')
@@ -526,7 +463,6 @@ class MultiAssetPredictor:
                 for f in imp_feats:
                     self.feature_importance_counter[symbol][f] += 1
                 
-                # Retrieve optimized R:R for metadata
                 opt_rr = self.labelers[symbol].reward_mult
                 opt_risk = self.optimized_params.get(symbol, {}).get('risk_per_trade_percent')
 
@@ -538,7 +474,7 @@ class MultiAssetPredictor:
                     "parkinson_vol": parkinson,
                     "rvol": rvol,
                     "amihud": features.get('amihud', 0.0),
-                    "choppiness": choppiness, # NEW
+                    "choppiness": choppiness,
                     "regime": regime_label,
                     "drivers": imp_feats,
                     "optimized_rr": opt_rr,
@@ -549,31 +485,26 @@ class MultiAssetPredictor:
             stats['Meta Rejected'] += 1
             return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
 
-        # Periodic Stats Logging
         if self.bar_counters[symbol] % 250 == 0:
-            top_drivers = self.feature_importance_counter[symbol].most_common(3)
-            logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} RVol:{feat_stats['avg_rvol']:.2f} Streak:{self.consecutive_losses[symbol]}")
+            logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} Streak:{self.consecutive_losses[symbol]}")
             logger.info(f"🔍 {symbol} Rejections: {dict(stats)}")
             stats.clear()
             
         return Signal(symbol, "HOLD", confidence, {})
 
-    def _check_sniper_filters(self, symbol: str, signal: int, price: float) -> bool:
+    def _check_sniper_filters(self, symbol: str, signal: int, price: float, d1_ema: float) -> bool:
         """
-        SNIPER PROTOCOL (LIVE):
-        1. Trend Filter: Trade ONLY if price is above/below SMA 200.
-        2. Extension Filter: Don't Buy if RSI > 70, Don't Sell if RSI < 30.
+        V10.0 SNIPER PROTOCOL (LIVE):
+        1. Trend Filter: Trade ONLY if price aligns with D1 EMA 200 (if available).
+        2. RSI Guard: Strict Overbought (70) / Oversold (30) rejection.
         """
         closes = self.sniper_closes[symbol]
         rsi_buf = self.sniper_rsi[symbol]
         
         if len(closes) < 200:
-            return True # Not enough data, allow (or False to be safe)
+            return True # Not enough data, default to allow
 
-        # 1. Calculate SMA 200
-        sma_200 = sum(closes) / len(closes)
-        
-        # 2. Calculate Simple RSI (Approximate)
+        # 1. Calculate Simple RSI (Approximate for speed)
         gains = [x for x in rsi_buf if x > 0]
         losses = [abs(x) for x in rsi_buf if x < 0]
         avg_gain = sum(gains) / 14 if gains else 0
@@ -581,14 +512,23 @@ class MultiAssetPredictor:
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
 
-        # 3. Apply Filters
-        if signal == 1: # BUY Signal
-            if price < sma_200: return False # Counter-Trend
-            if rsi > 70: return False        # Overbought
-                
-        elif signal == -1: # SELL Signal
-            if price > sma_200: return False # Counter-Trend
-            if rsi < 30: return False        # Oversold
+        # 2. TREND FILTER (D1 Bias)
+        trend_aligned = False
+        if d1_ema > 0: # If context available
+            if signal == 1: # BUY
+                if price > d1_ema: trend_aligned = True
+                else: return False # Reject Counter-Trend
+            elif signal == -1: # SELL
+                if price < d1_ema: trend_aligned = True
+                else: return False # Reject Counter-Trend
+        else:
+            trend_aligned = True # Pass if no D1 data (fallback)
+
+        # 3. RSI EXTREME GUARD
+        if signal == 1: # BUY
+            if rsi > 70: return False # Reject Overbought
+        elif signal == -1: # SELL
+            if rsi < 30: return False # Reject Oversold
                 
         return True
 
@@ -597,7 +537,7 @@ class MultiAssetPredictor:
         defaults = {
             "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
             "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
-            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0 # JPY Basket
+            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0
         }
         for sym, price in defaults.items():
             if sym not in self.last_close_prices or self.last_close_prices[sym] == 0:
@@ -614,7 +554,6 @@ class MultiAssetPredictor:
                 with open(self.models_dir / f"calibrators_{sym}.pkl", "wb") as f:
                     pickle.dump(self.calibrators[sym], f)
                 
-                # Persist Feature Engineer State
                 with open(self.models_dir / f"feature_engineer_{sym}.pkl", "wb") as f:
                     pickle.dump(self.feature_engineers[sym], f)
                     

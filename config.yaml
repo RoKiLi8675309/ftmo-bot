@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V9.0 (PRICE ACTION DOMINANCE)
+# config.yaml – PROJECT PHOENIX V10.0 (DEFENSIVE PROTOCOL)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE
 #
-# STRATEGY UPDATE (V9.0 - MOMENTUM BREAKOUT):
-# 1. LOGIC: Shifted from Flow-based "Aggressor" to Price Action "Breakout".
-# 2. GATES: Disabled D1 Trend Filter to capture intraday mean reversion/volatility.
-# 3. RISK: Standardized to 0.5% risk. Relaxed SQN bans to -3.0 threshold.
+# STRATEGY UPDATE (V10.0 - DEFENSIVE PROTOCOL):
+# 1. LOGIC: Re-enabled D1 Trend Filter (Bias) & RSI Extremes Guard.
+# 2. GATES: Stricter KER (0.25) & Anti-Chop (50.0) to filter noise.
+# 3. RISK: Per-Symbol Circuit Breaker (Max 2 Losses/Day).
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -118,7 +118,7 @@ features:
   # New Regime Settings
   choppiness:
     period: 14
-    threshold: 55.0 # RELAXED: 50 -> 55
+    threshold: 50.0 # STRICT: Lowered to 50.0 to reject noise
   vortex:
     period: 14
   
@@ -135,27 +135,27 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 20 # RELAXED: 25 -> 20
+    threshold: 20 
   
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V9.0 PRICE ACTION) ---
+# --- PHOENIX STRATEGY PARAMETERS (V10.0 DEFENSIVE) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true        
-  require_d1_trend: false             # DISABLED: Trade the chart in front of you (M5)       
-  require_h4_alignment: false         # DISABLED: Relies on ML weight       
+  require_d1_trend: true              # ENABLED: Must align with D1 EMA 200       
+  require_h4_alignment: false         # Still rely on ML for H4 nuance       
   
-  # --- FILTER THRESHOLDS (LOOSENED) ---
+  # --- FILTER THRESHOLDS (TIGHTENED) ---
   max_relative_volume: 8.0        
-  ker_trend_threshold: 0.10       # Trend Efficiency Floor
+  ker_trend_threshold: 0.25       # STRICT: Raised from 0.10 to 0.25 (Clean Moves Only)
   volume_gate_ratio: 1.1          # Min Relative Volume
   aggressor_threshold: 0.53       
-  ml_confirmation_threshold: 0.55 
-  choppiness_threshold: 55.0      
+  ml_confirmation_threshold: 0.60 # STRICT: Raised for higher conviction
+  choppiness_threshold: 50.0      # STRICT: Hard Chop Gate
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -190,10 +190,10 @@ optimization_search_space:
     min: 0.85 
     max: 0.95
   
-  # Triple Barrier Method (Labeling) -> Defines Reward Target (TP)
+  # Triple Barrier Method (Labeling)
   tbm_barrier_width:
-    min: 2.0  # WIDENED: Allow smaller scalps
-    max: 6.0  # WIDENED: Allow larger runners (Volatility Expansion)
+    min: 2.0  
+    max: 6.0  
   tbm_horizon_minutes:
     min: 60
     max: 240
@@ -202,10 +202,10 @@ optimization_search_space:
     min: 1.0
     max: 2.0
   
-  # Strategy Execution
+  # Strategy Execution - STRICTER LOWER BOUND
   min_calibrated_probability:
-    min: 0.55 
-    max: 0.80
+    min: 0.60 
+    max: 0.85
 
 # --- RISK MANAGEMENT (FTMO COMPLIANCE) ---
 risk_management:
@@ -232,9 +232,7 @@ risk_management:
   stop_loss_atr_mult: 2.0          
   take_profit_atr_mult: 3.0        
   
-  # ACTIVE TRAILING STOP (Implementation in Strategy)
-  # Tier 1: BE @ 1.0 R
-  # Tier 2: Trail @ 1.5 R (Distance 0.5 R)
+  # ACTIVE TRAILING STOP
   trailing_stop:
     enabled: true        
     activation_r: 1.0    # Breakeven Trigger
@@ -242,13 +240,13 @@ risk_management:
     trail_dist_r: 0.5    # Distance behind price
   
   risk_timezone: "Europe/Prague"
-  friday_entry_cutoff_hour: 16        # Stop entries at 16:00 Server Time
-  friday_liquidation_hour_server: 21  # Hard Close at 21:00 Server Time
+  friday_entry_cutoff_hour: 16        
+  friday_liquidation_hour_server: 21  
   
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 15              # INCREASED: 10 -> 15
+  max_trades_per_day: 5               # STRICT: Reduced from 15 to 5 per symbol (Quality > Quantity)
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
@@ -256,12 +254,11 @@ risk_management:
 
 # --- TRADING PORTFOLIO (SNIPER BASKET) ---
 trading:
-  # UPDATED: Broken JPY Correlation. Majors + 1 Yen Pair.
   symbols:
-    - "EURUSD"  # Major - Mean Reverting
-    - "GBPUSD"  # Major - Trend Following
-    - "AUDUSD"  # Commodities
-    - "EURJPY"  # Keep ONLY ONE Yen pair (The best performer)
+    - "EURUSD"  
+    - "GBPUSD"  
+    - "AUDUSD"  
+    - "EURJPY"  
   
   auxiliary_symbols:
     - "USDJPY"
@@ -297,23 +294,23 @@ online_learning:
   # Volatility Gate
   volatility_gate:
     enabled: true
-    min_atr_spread_ratio: 1.0 # RELAXED: 1.5 -> 1.0
+    min_atr_spread_ratio: 1.0 
   
   positive_class_weight: 1.5 
   negative_class_weight: 1.0
   
-  meta_labeling_threshold: 0.55 
+  meta_labeling_threshold: 0.60 # STRICT: Raised from 0.55
   
   tbm:
     horizon_minutes: 120      
-    barrier_width: 3.0        # Synced with TP 3.0
+    barrier_width: 3.0        
     min_profit_pips: 10.0      
     drift_threshold: 1.5 
   
   learning_horizon_sec: 300
   
   # SNIPER PROTOCOL: High Conviction Only
-  min_calibrated_probability: 0.55 # RELAXED: 0.70 -> 0.55
+  min_calibrated_probability: 0.60 # STRICT: Raised from 0.55
 
 # --- NEWS FILTER ---
 news_filter:
@@ -348,6 +345,4 @@ wfo:
   train_years: 2
   test_months: 6
   min_trades_optimization: 12 
-  # --- RISK OPTIMIZATION (SNIPER MODE) ---
-  # Standard 0.5% risk
   risk_per_trade_options: [0.005]
