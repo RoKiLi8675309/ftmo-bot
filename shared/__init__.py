@@ -53,7 +53,8 @@ from shared.data import (
     load_real_data,
     batch_generate_volume_bars,
     VolumeBarAggregator,
-    TemporalPipeline
+    TemporalPipeline,
+    AdaptiveImbalanceBarGenerator # V10.0: Added TIB Generator
 )
 
 # --- OPTIONAL DEPENDENCY CHECKS ---
