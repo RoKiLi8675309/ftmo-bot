@@ -6,10 +6,9 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V12.2 (LIVE PREDICTOR):
-# 1. LOGIC: Implemented Priority Regime Detection (Trend > Reversion > Neutral).
-#    Ensures correct regime mapping for new pairs (USDCAD, USDCHF, etc.).
-# 2. TRIGGER: Lowered BB Deviation (1.5) for earlier entries.
+# PHOENIX STRATEGY V12.3 (LIVE PREDICTOR):
+# 1. LOGIC: Implemented "SOFT" Regime Enforcement (High Conf > 0.75 overrides).
+# 2. RISK: Added Portfolio Heat checks (Max Currency Exposure).
 # 3. GATES: Dynamic KER Scaling via ADWIN Drift Detection.
 # =============================================================================
 import logging
@@ -163,7 +162,7 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V12.0) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V12.3) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         self.default_max_rvol = 8.0
         
@@ -174,8 +173,12 @@ class MultiAssetPredictor:
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
         
-        # V12.0 ASSET MAP
+        # V12.3: Regime Enforcement Mode (HARD vs SOFT)
+        self.regime_enforcement = phx_conf.get('regime_enforcement', 'HARD').upper()
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
+        
+        # V12.3: Portfolio Heat
+        self.max_currency_exposure = int(CONFIG['risk_management'].get('max_currency_exposure', 2))
         
         # Friday Guard
         self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 18)
@@ -319,6 +322,36 @@ class MultiAssetPredictor:
             return "MEAN_REVERSION"
             
         return "NEUTRAL"
+
+    def _check_currency_exposure(self, symbol: str, open_positions: Dict[str, Any]) -> bool:
+        """
+        V12.3: Enforces Portfolio Heat Limits.
+        Prevents stacking too much risk on one currency (e.g. max 2 USD pairs).
+        """
+        base_ccy = symbol[:3]
+        quote_ccy = symbol[3:]
+        
+        base_count = 0
+        quote_count = 0
+        
+        for sym in open_positions:
+            pos_base = sym[:3]
+            pos_quote = sym[3:]
+            
+            if base_ccy == pos_base or base_ccy == pos_quote:
+                base_count += 1
+            if quote_ccy == pos_base or quote_ccy == pos_quote:
+                quote_count += 1
+        
+        if base_count >= self.max_currency_exposure:
+            self.rejection_stats[symbol][f"Max Exposure ({base_ccy})"] += 1
+            return False
+            
+        if quote_count >= self.max_currency_exposure:
+            self.rejection_stats[symbol][f"Max Exposure ({quote_ccy})"] += 1
+            return False
+            
+        return True
 
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
@@ -464,8 +497,13 @@ class MultiAssetPredictor:
         features['parkinson_vol'] = parkinson 
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp(), parkinson_vol=parkinson)
 
+        # D. ACTIVE TRADE MANAGEMENT (Local check)
+        open_positions = context_data.get('positions', {}) if context_data else {}
+        if symbol in open_positions:
+            return 
+
         # ============================================================
-        # 4. PHOENIX V12.0: AGGRESSOR GATES & ASSET PERSONALITY
+        # 4. PHOENIX V12.3: AGGRESSOR GATES & SOFT REGIME
         # ============================================================
         
         phx = CONFIG.get('phoenix_strategy', {})
@@ -483,12 +521,11 @@ class MultiAssetPredictor:
             stats[f"Low Efficiency"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (KER {ker_val:.3f} < {effective_ker_thresh:.3f})"})
 
-        # G2: REGIME IDENTIFICATION (Hurst) & ASSET PERSONALITY (V12.0)
-        # Determine Preferred Regime for this Asset
+        # G2: REGIME IDENTIFICATION
         preferred_regime = self._get_preferred_regime(symbol)
-        
         regime_label = "Neutral"
         proposed_action = 0 # 0=Hold, 1=Buy, -1=Sell
+        is_regime_clash = False
         
         # Check Bollinger Bands state for signals
         if len(self.bb_buffers[symbol]) < self.bb_window:
@@ -500,17 +537,14 @@ class MultiAssetPredictor:
         lower_bb = bb_mu - (self.bb_std * bb_std)
         
         # --- V12.0 LOGIC MAPPING ---
-        # 1. DETECT PHYSICS
         is_trending = hurst > self.hurst_breakout
         is_reverting = hurst < self.hurst_mean_rev
         
-        # 2. FILTER BY PERSONALITY
         if is_trending:
             if preferred_regime == "MEAN_REVERSION":
-                stats["Personality Clash (Trend Signal on Range Asset)"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "Asset Personality Clash"})
-                
-            # Valid Trend Signal
+                is_regime_clash = True
+            
+            # Trend Logic
             regime_label = "TREND_BREAKOUT"
             if bar.close > upper_bb:
                 proposed_action = 1 # Breakout Buy
@@ -519,8 +553,7 @@ class MultiAssetPredictor:
                 
         elif is_reverting:
             if preferred_regime == "TREND_BREAKOUT":
-                stats["Personality Clash (Revert Signal on Trend Asset)"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "Asset Personality Clash"})
+                is_regime_clash = True
                 
             # Valid Reversion Signal
             regime_label = "MEAN_REVERSION"
@@ -530,13 +563,21 @@ class MultiAssetPredictor:
                 proposed_action = 1 # Fade Sell (Long the bottom)
                 
         else:
-            # NEUTRAL ZONE (0.45 - 0.55)
+            # NEUTRAL ZONE
             stats[f"Random Walk Regime (H={hurst:.2f})"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Random Walk (Hurst {hurst:.2f})"})
 
         if proposed_action == 0:
             stats["No Trigger"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "No BB Trigger in Regime"})
+            
+        # --- REGIME ENFORCEMENT (V12.3) ---
+        regime_mode = phx.get('regime_enforcement', 'HARD').upper()
+        if is_regime_clash:
+            if regime_mode == "HARD":
+                stats["Personality Clash (Hard Block)"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": "Asset Personality Clash"})
+            # If SOFT, we proceed but require high confidence later
 
         # G3: EXHAUSTION
         if rvol_val > max_rvol_thresh:
@@ -562,12 +603,19 @@ class MultiAssetPredictor:
         meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.52) 
         is_profitable = meta_labeler.predict(features, proposed_action, threshold=meta_threshold)
 
-        # --- EXECUTION WITH DYNAMIC CONFIDENCE (V11 Relaxed) ---
+        # --- EXECUTION WITH DYNAMIC CONFIDENCE (V12.3 SOFT MODE) ---
         min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.52)
         
-        if confidence < min_prob:
-            stats[f"ML Disagreement"] += 1
-            return Signal(symbol, "HOLD", confidence, {"reason": f"ML Disagreement (Conf {confidence:.2f} < {min_prob:.2f})"})
+        if is_regime_clash:
+            # SOFT Override: Require "God Mode" confidence (>0.75)
+            if confidence < 0.75:
+                stats["Regime Clash Low Conf"] += 1
+                return Signal(symbol, "HOLD", confidence, {"reason": f"Regime Clash Conf ({confidence:.2f} < 0.75)"})
+        else:
+            # Standard Entry
+            if confidence < min_prob:
+                stats[f"ML Disagreement"] += 1
+                return Signal(symbol, "HOLD", confidence, {"reason": f"ML Disagreement (Conf {confidence:.2f} < {min_prob:.2f})"})
 
         # --- SNIPER PROTOCOL: FINAL FILTER GATE (V11) ---
         # Checks D1 Trend Bias (If enabled) & RSI Extremes
@@ -576,6 +624,10 @@ class MultiAssetPredictor:
             stats["Sniper Reject (Trend/RSI)"] += 1
             return Signal(symbol, "HOLD", confidence, {"reason": "Sniper Filter Reject"})
         # ------------------------------------------
+
+        # --- V12.3: PORTFOLIO HEAT CHECK ---
+        if not self._check_currency_exposure(symbol, open_positions):
+            return Signal(symbol, "HOLD", confidence, {"reason": "Max Currency Exposure"})
 
         if is_profitable:
                 action_str = "BUY" if proposed_action == 1 else "SELL"

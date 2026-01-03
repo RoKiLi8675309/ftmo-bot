@@ -6,11 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX STRATEGY V12.0 (INTRADAY ALPHA SEEKER):
-# 1. SAMPLING: Adaptive Tick Imbalance Bars (TIBs).
-# 2. RISK: Profit Buffer Scaling (Earn to Burn) & Volatility Stops.
-# 3. MANAGEMENT: Active Position Loop (Time Stop + 0.5R Trailing).
-# 4. CIRCUIT BREAKER: Realized Daily Loss Limits.
+# PHOENIX STRATEGY V12.3 (LIVE ENGINE):
+# 1. RISK: Integrated V12.3 Profit Buffer Scaling (daily_pnl_pct calculation).
+# 2. LOGIC: Supports Soft Regime Enforcement via Predictor.
+# 3. SAFETY: Strict adherence to V12.3 FTMO Limits.
 # =============================================================================
 import logging
 import time
@@ -67,7 +66,7 @@ class LiveTradingEngine:
     The Central Logic Unit for the Linux Consumer.
     1. Consumes Ticks from Redis.
     2. Aggregates Ticks into Adaptive Imbalance Bars (TIBs).
-    3. Feeds Bars to Golden Trio Predictor (V12.0 Logic).
+    3. Feeds Bars to Golden Trio Predictor (V12.3 Logic).
     4. Manages Active Positions (Time Stop / Trailing).
     5. Dispatches Orders to Windows.
     """
