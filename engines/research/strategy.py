@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V12.0 (INTRADAY ALPHA SEEKER):
-# 1. PARITY: Exact Logic Mirror of engines/live/predictor.py (Asset Personality).
-# 2. RISK: Profit Buffer Scaling (0.5% -> 1.0%) & Asymptotic Decay.
-# 3. TRIGGER: Lowered BB Deviation (1.5) for earlier entries.
+# PHOENIX STRATEGY V12.2 (ROBUST REGIME LOGIC):
+# 1. LOGIC: Implemented Priority Regime Detection (Trend > Reversion > Neutral).
+#    Ensures USDCAD/USDCHF are correctly identified as Mean Reversion despite 'USD'.
+# 2. RISK: Profit Buffer Scaling active.
 # =============================================================================
 import logging
 import sys
@@ -226,19 +226,31 @@ class ResearchStrategy:
 
     def _get_preferred_regime(self, symbol: str) -> str:
         """
-        V12.0: Determines the 'Personality' of the asset.
+        V12.2: ROBUST ASSET PERSONALITY DETECTION.
+        Prevents 'USD' (Neutral) from overriding 'CAD' (MeanRev) in USDCAD.
+        Logic: Trend > MeanReversion > Neutral.
         """
-        # 1. Check explicit map first
+        # 1. Check for Exact Match (e.g. if we map "USDCAD" explicitly)
+        if symbol in self.asset_regime_map:
+            return self.asset_regime_map[symbol]
+        
+        # 2. Scan Components (Priority Logic)
+        regimes_found = []
         for key, regime in self.asset_regime_map.items():
             if key in symbol:
-                return regime
+                regimes_found.append(regime)
         
-        # 2. Fallback Heuristics
-        if "GBP" in symbol or "JPY" in symbol:
+        # Priority 1: Trend Breakout (Aggressor)
+        # If ANY component is Trend (e.g., JPY in GBPJPY), we treat it as Trend.
+        if "TREND_BREAKOUT" in regimes_found:
             return "TREND_BREAKOUT"
-        if "EUR" in symbol or "AUD" in symbol or "NZD" in symbol:
+            
+        # Priority 2: Mean Reversion
+        # If NO Trend, but ANY component is Mean Rev (e.g., CAD in USDCAD), treat as Mean Rev.
+        if "MEAN_REVERSION" in regimes_found:
             return "MEAN_REVERSION"
             
+        # Priority 3: Neutral (Default for EURUSD if defined as such)
         return "NEUTRAL"
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
@@ -437,7 +449,7 @@ class ResearchStrategy:
         is_trending = hurst > self.hurst_breakout
         is_reverting = hurst < self.hurst_mean_rev
         
-        # 2. FILTER BY PERSONALITY
+        # 2. FILTER BY PERSONALITY (Robust Match)
         if is_trending:
             if preferred_regime == "MEAN_REVERSION":
                 self.rejection_stats["Personality Clash (Trend on MeanRev Asset)"] += 1

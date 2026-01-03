@@ -5,9 +5,11 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# PHOENIX STRATEGY V12.1 (FINE-TUNED):
-# 1. DATA: Relaxed minimum bar threshold in Auto-Calibration to allow M5 granularity.
-# 2. OPTIMIZATION: Updated parallel processing to respect new settings.
+# PHOENIX STRATEGY V12.2 (DIVERSIFICATION & ROBUSTNESS):
+# 1. OPTIMIZATION: Implemented strict post-optimization filtering to reject
+#    trials with insufficient trade samples (prevent overfitting to low-N luck).
+# 2. SELECTION: Workers now scan all trials for the best *valid* candidate
+#    instead of blindly accepting study.best_params.
 # =============================================================================
 import os
 import sys
@@ -473,6 +475,7 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
 def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_dir: Path) -> None:
     """
     Trains the Final Production Model using the Best Params found.
+    V12.2 UPDATE: Filters for Statistical Significance (min_trades).
     """
     os.environ["OMP_NUM_THREADS"] = "1"
     setup_logging(f"Worker_Final_{symbol}")
@@ -488,8 +491,29 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         if len(study.trials) == 0:
             log.warning(f"No trials found for {symbol}. Skipping finalization.")
             return
+
+        # --- V12.2: ROBUST SELECTION LOGIC ---
+        # Filter trials that met the trade count threshold
+        min_trades = CONFIG['wfo'].get('min_trades_optimization', 20)
+        
+        valid_trials = [
+            t for t in study.trials 
+            if t.state == optuna.trial.TrialState.COMPLETE 
+            and t.value is not None 
+            and t.user_attrs.get('trades', 0) >= min_trades
+            and not t.user_attrs.get('blown', False)
+        ]
+        
+        if valid_trials:
+            # Select the one with the highest objective value
+            best_trial = max(valid_trials, key=lambda t: t.value)
+            log.info(f"✅ Selected Robust Trial {best_trial.number} (Trades: {best_trial.user_attrs.get('trades')} >= {min_trades}, Score: {best_trial.value:.2f})")
+        else:
+            # Fallback (Warning)
+            log.warning(f"⚠️ No trials met min_trades={min_trades}. Falling back to absolute best (Risk of Overfitting).")
+            best_trial = study.best_trial
             
-        best_params = study.best_params
+        best_params = best_trial.params
         
         params_path = models_dir / f"best_params_{symbol}.json"
         with open(params_path, "w") as f:
@@ -520,7 +544,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         with open(models_dir / f"calibrators_{symbol}.pkl", "wb") as f:
             pickle.dump(cal_state, f)
             
-        log.info(f"✅ FINALIZED {symbol} | Best Score: {study.best_value:.4f}")
+        log.info(f"✅ FINALIZED {symbol} | Best Score: {best_trial.value:.4f}")
         gc.collect()
         
     except Exception as e:

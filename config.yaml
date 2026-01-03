@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V12.1 (FINE-TUNED)
+# config.yaml – PROJECT PHOENIX V12.2 (EXPANDED PORTFOLIO)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGY UPDATE (V12.1 - FINE TUNING):
-# 1. FIX: EURUSD Regime set to NEUTRAL (Allow Trend & Reversion).
-# 2. DATA: Volume Threshold lowered to 50 for granular M5 data.
-# 3. ALPHA: GBP/JPY prioritized in Risk Logic.
+# STRATEGY UPDATE (V12.2 - DIVERSIFICATION):
+# 1. PORTFOLIO: Added USDCAD, USDCHF, GBPJPY, EURJPY (Total 8 Pairs).
+# 2. LOGIC: Explicit Regime Mapping for new pairs.
+# 3. SAFETY: Strict enforcement of 20+ trades for Optimization.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -143,15 +143,18 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V12.1 ASSET SPECIFIC) ---
+# --- PHOENIX STRATEGY PARAMETERS (V12.2 EXPANDED) ---
 phoenix_strategy:
   # --- ASSET REGIME MAPPING (CRITICAL UPDATE) ---
   # Forces specific logic paths based on asset characteristics
   asset_regime_map:
     GBP: "TREND_BREAKOUT"   # GBP pairs favor momentum
-    EUR: "NEUTRAL"          # FINE-TUNED: Changed to NEUTRAL to unblock EURUSD
-    USD: "NEUTRAL"          # USD pairs allow both (Fallback)
+    EUR: "NEUTRAL"          # EUR pairs allow both Trend & Reversion
+    USD: "NEUTRAL"          # USD pairs allow both
     JPY: "TREND_BREAKOUT"   # JPY favors strong trends
+    AUD: "MEAN_REVERSION"   # AUD often ranges
+    CAD: "MEAN_REVERSION"   # NEW: CAD tends to revert
+    CHF: "MEAN_REVERSION"   # NEW: CHF often ranges
 
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true        
@@ -242,7 +245,7 @@ risk_management:
   max_total_loss_pct: 0.09         # 9.0% (Stay below FTMO 10%)
   
   max_risk_percent: 2.5            # Allow more open risk
-  max_open_trades: 5               
+  max_open_trades: 8               # UPDATED: Increased for 8 pairs
   
   max_leverage: 30.0
   max_lot_size: 50.0 
@@ -255,9 +258,9 @@ risk_management:
   # ACTIVE TRAILING STOP
   trailing_stop:
     enabled: true        
-    activation_r: 0.5     # AGGRESSIVE: Start trailing at 0.5R profit
+    activation_r: 0.5      # AGGRESSIVE: Start trailing at 0.5R profit
     trail_trigger_r: 0.75 # Trigger next step
-    trail_dist_r: 0.3     # TIGHT: 0.3R Distance behind price
+    trail_dist_r: 0.3      # TIGHT: 0.3R Distance behind price
   
   risk_timezone: "Europe/Prague"
   friday_entry_cutoff_hour: 18        
@@ -266,26 +269,27 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 20                 
+  max_trades_per_day: 20                  
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
   min_stop_loss_pips: 3.0
 
-# --- TRADING PORTFOLIO (ALPHA SQUAD) ---
+# --- TRADING PORTFOLIO (V12.2 EXPANDED) ---
 trading:
   symbols:
-    - "EURUSD"  # TARGET: NEUTRAL (Fixed)
-    - "GBPUSD"  # TARGET: TREND BREAKOUT (Alpha)
-    - "USDJPY"  # TARGET: TREND BREAKOUT (Alpha)
-    - "AUDUSD"  # TARGET: MEAN REVERSION
-    # Add other pairs here if you have data for them
+    - "EURUSD"
+    - "GBPUSD"
+    - "USDJPY"
+    - "AUDUSD"
+    # NEW PAIRS (Diversification)
+    - "USDCAD"  # Mean Reversion
+    - "USDCHF"  # Mean Reversion
+    - "GBPJPY"  # Trend (Aggressor)
+    - "EURJPY"  # Cross Trend
   
   auxiliary_symbols:
-    - "USDCAD"
-    - "USDCHF"
     - "NZDUSD"
-    - "GBPJPY"
     - "AUDJPY"
     
   timeframe: "M5"
@@ -302,9 +306,9 @@ online_learning:
   
   # CONFIGURATION
   n_models: 50        
-  grace_period: 200       
+  grace_period: 200        
   delta: 0.00001        
-  warning_delta: 0.001       
+  warning_delta: 0.001        
   lambda_value: 10        
   max_features: 'sqrt'    
   metric: "LogLoss"        
@@ -322,7 +326,7 @@ online_learning:
   meta_labeling_threshold: 0.52 # RELAXED
   
   tbm:
-    horizon_minutes: 120       
+    horizon_minutes: 120        
     barrier_width: 3.0        
     min_profit_pips: 5.0        
     drift_threshold: 1.5 
@@ -344,6 +348,9 @@ news_filter:
     EUR: ["ECB", "CPI", "Rate"]
     GBP: ["BOE", "CPI", "Rate"]
     JPY: ["BOJ", "Rate"]
+    CAD: ["BOC", "CPI", "Rate"]
+    CHF: ["SNB", "CPI", "Rate"]
+    AUD: ["RBA", "CPI", "Rate"]
 
 # --- FORENSIC AUDIT ASSUMPTIONS ---
 forensic_audit:
@@ -358,11 +365,13 @@ forensic_audit:
     AUDJPY: 2.5 
     GBPUSD: 1.8
     EURUSD: 1.2
+    USDCAD: 1.8
+    USDCHF: 1.6
 
 # --- WFO OPTIMIZATION ---
 wfo:
   n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 20 
+  min_trades_optimization: 20 # STRICT: Minimum valid trades
   risk_per_trade_options: [0.005, 0.010]

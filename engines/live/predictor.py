@@ -6,10 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V12.0 (INTRADAY ALPHA SEEKER):
-# 1. LOGIC: Asset-Specific Regimes (GBP=Trend, EUR=MeanRev).
+# PHOENIX STRATEGY V12.2 (LIVE PREDICTOR):
+# 1. LOGIC: Implemented Priority Regime Detection (Trend > Reversion > Neutral).
+#    Ensures correct regime mapping for new pairs (USDCAD, USDCHF, etc.).
 # 2. TRIGGER: Lowered BB Deviation (1.5) for earlier entries.
-# 3. GATES: Slashed KER (>0.02).
+# 3. GATES: Dynamic KER Scaling via ADWIN Drift Detection.
 # =============================================================================
 import logging
 import pickle
@@ -295,18 +296,26 @@ class MultiAssetPredictor:
 
     def _get_preferred_regime(self, symbol: str) -> str:
         """
-        V12.0: Determines the 'Personality' of the asset.
-        Returns: 'TREND_BREAKOUT', 'MEAN_REVERSION', or 'NEUTRAL'
+        V12.2: ROBUST ASSET PERSONALITY DETECTION.
+        Prevents 'USD' (Neutral) from overriding 'CAD' (MeanRev) in USDCAD.
+        Logic: Trend > MeanReversion > Neutral.
         """
-        # 1. Check explicit map first
+        # 1. Check for Exact Match
+        if symbol in self.asset_regime_map:
+            return self.asset_regime_map[symbol]
+        
+        # 2. Scan Components (Priority Logic)
+        regimes_found = []
         for key, regime in self.asset_regime_map.items():
             if key in symbol:
-                return regime
+                regimes_found.append(regime)
         
-        # 2. Fallback Heuristics
-        if "GBP" in symbol or "JPY" in symbol:
+        # Priority 1: Trend Breakout
+        if "TREND_BREAKOUT" in regimes_found:
             return "TREND_BREAKOUT"
-        if "EUR" in symbol or "AUD" in symbol or "NZD" in symbol:
+            
+        # Priority 2: Mean Reversion
+        if "MEAN_REVERSION" in regimes_found:
             return "MEAN_REVERSION"
             
         return "NEUTRAL"
@@ -496,9 +505,6 @@ class MultiAssetPredictor:
         is_reverting = hurst < self.hurst_mean_rev
         
         # 2. FILTER BY PERSONALITY
-        # If asset wants TREND but physics says REVERT -> Block.
-        # If asset wants REVERT but physics says TREND -> Block.
-        
         if is_trending:
             if preferred_regime == "MEAN_REVERSION":
                 stats["Personality Clash (Trend Signal on Range Asset)"] += 1
@@ -622,22 +628,20 @@ class MultiAssetPredictor:
         1. Trend Filter: D1 Alignment (DISABLED in V11 Aggressor Mode).
         2. RSI Guard: Strict Overbought (70) / Oversold (30) rejection.
         """
-        closes = self.sniper_closes[symbol]
-        rsi_buf = self.sniper_rsi[symbol]
-        
-        if len(closes) < 200:
-            return True # Not enough data, default to allow
-
-        # 1. Calculate Simple RSI (Approximate for speed)
-        gains = [x for x in rsi_buf if x > 0]
-        losses = [abs(x) for x in rsi_buf if x < 0]
-        avg_gain = sum(gains) / 14 if gains else 0
-        avg_loss = sum(losses) / 14 if losses else 1e-9
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
+        # 1. RSI CALCULATION (M5 Extension)
+        if len(self.sniper_rsi[symbol]) < 14:
+            rsi = 50.0 
+        else:
+            gains = [x for x in self.sniper_rsi[symbol] if x > 0]
+            losses = [abs(x) for x in self.sniper_rsi[symbol] if x < 0]
+            avg_gain = sum(gains) / 14 if gains else 0
+            avg_loss = sum(losses) / 14 if losses else 1e-9
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
 
         # 2. TREND FILTER (D1 Bias)
         trend_aligned = False
+        
         if self.require_d1_trend and d1_ema > 0: # Check if Enabled in Config
             if signal == 1: # BUY
                 if price > d1_ema: trend_aligned = True
