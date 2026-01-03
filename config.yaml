@@ -373,5 +373,5 @@ wfo:
   n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 20 # STRICT: Minimum valid trades
+  min_trades_optimization: 100 # STRICT: Minimum valid trades
   risk_per_trade_options: [0.005, 0.010]
