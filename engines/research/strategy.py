@@ -5,10 +5,11 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V11.0 (AGGRESSOR PROTOCOL):
+# PHOENIX STRATEGY V11.1 (ALPHA SEEKER):
 # 1. PARITY: Exact Logic Mirror of engines/live/predictor.py.
-# 2. LOGIC: Independent M5 Momentum (D1 Filter Disabled).
-# 3. GATES: Slashed KER (>0.02) & Relaxed ML (>0.52).
+# 2. TRIGGER: Lowered BB Deviation (1.5) for earlier entries.
+# 3. EXIT: 24-Hour Time Stop (Force Close Stale Trades).
+# 4. TRAIL: Aggressive activation at 0.5R.
 # =============================================================================
 import logging
 import sys
@@ -19,7 +20,7 @@ import pytz
 import json
 from collections import deque, defaultdict, Counter
 from typing import Any, Dict, Optional, List, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Third-Party Imports
 from river import drift
@@ -47,7 +48,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V11.0 Aggressor Protocol.
+    Strictly implements the Phoenix V11.1 Alpha Seeker Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -62,7 +63,7 @@ class ResearchStrategy:
         
         # --- RISK CONFIGURATION ---
         self.risk_conf = params.get('risk_management', CONFIG.get('risk_management', {}))
-        # V11.0 Aggressor: Tighter stops (1.5 ATR) by default
+        # V11.1: Tighter stops (1.5 ATR) by default
         self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 1.5))
         
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
@@ -113,9 +114,9 @@ class ResearchStrategy:
         self.sniper_closes = deque(maxlen=200)      
         self.sniper_rsi = deque(maxlen=15)   
         
-        # --- V11.0 MOMENTUM INDICATORS ---
+        # --- V11.1 MOMENTUM INDICATORS ---
         self.bb_window = 20
-        self.bb_std = 2.0
+        self.bb_std = 1.5 # V11.1 FIX: Lowered from 2.0 to 1.5 to catch starts of moves
         self.bb_buffer = deque(maxlen=self.bb_window)
         
         # --- FORENSIC RECORDER ---
@@ -124,10 +125,10 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX V11.0 CONFIGURATION (AGGRESSOR) ---
+        # --- PHOENIX V11.1 CONFIGURATION ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V11.0 Logic Thresholds
+        # V11.1 Logic Thresholds
         self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.02)) 
         self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.55))
         self.hurst_mean_rev = float(phx_conf.get('hurst_mean_reversion_threshold', 0.45))
@@ -223,7 +224,7 @@ class ResearchStrategy:
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (V11.0 Research Parity).
+        Main Event Loop for the Strategy (V11.1 Alpha Seeker).
         """
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
@@ -282,6 +283,7 @@ class ResearchStrategy:
 
         self._update_streak_status(broker)
         self._manage_trailing_stops(broker, price, dt_ts)
+        self._manage_time_stops(broker, dt_ts) # V11.1 NEW: Force close stale trades
 
         # --- FRIDAY LOGIC ---
         if server_time.weekday() == 4 and server_time.hour >= self.friday_close_hour:
@@ -382,7 +384,7 @@ class ResearchStrategy:
             return 
 
         # ============================================================
-        # E. AGGRESSOR GATES & LOGIC MAPPING (V11.0)
+        # E. AGGRESSOR GATES & LOGIC MAPPING (V11.1)
         # ============================================================
         
         # G1: EFFICIENCY (KER) - AGGRESSIVE (V11.0)
@@ -407,8 +409,10 @@ class ResearchStrategy:
             
         bb_mu = np.mean(self.bb_buffer)
         bb_std = np.std(self.bb_buffer)
-        upper_bb = bb_mu + (self.bb_std * bb_std)
-        lower_bb = bb_mu - (self.bb_std * bb_std)
+        # V11.1: Use 1.5 StdDev to reduce "No Trigger" rejections
+        bb_mult = 1.5
+        upper_bb = bb_mu + (bb_mult * bb_std)
+        lower_bb = bb_mu - (bb_mult * bb_std)
         
         # LOGIC MAPPING (V11 Tighter Regimes):
         if hurst > self.hurst_breakout:
@@ -625,6 +629,49 @@ class ResearchStrategy:
         sqn = math.sqrt(len(window)) * (avg_pnl / std_pnl)
         return sqn
 
+    def _manage_time_stops(self, broker: BacktestBroker, current_time: datetime):
+        """
+        V11.1 FEATURE: Time-Based Force Exit.
+        If a trade has been open for > 24 hours, close it to free up capital.
+        """
+        # 24 hours in seconds
+        cutoff_seconds = 86400 
+        
+        # We need to iterate over a copy or use the broker's method safely
+        # backtester.py usually provides open_positions list
+        
+        # Find trades to close first
+        to_close = []
+        for pos in broker.open_positions:
+            if pos.symbol != self.symbol: continue
+            
+            # Check duration
+            # Ensure timestamp_created is aware/compatible
+            if pos.timestamp_created.tzinfo is None:
+                pos_time = pos.timestamp_created.replace(tzinfo=pytz.utc)
+            else:
+                pos_time = pos.timestamp_created
+                
+            if current_time.tzinfo is None:
+                curr_time_aware = current_time.replace(tzinfo=pytz.utc)
+            else:
+                curr_time_aware = current_time
+            
+            duration = (curr_time_aware - pos_time).total_seconds()
+            
+            if duration > cutoff_seconds:
+                to_close.append(pos)
+        
+        # Execute closures
+        for pos in to_close:
+            broker._close_partial_position(
+                pos, 
+                pos.quantity, 
+                self.last_price, 
+                current_time, 
+                "Time Stop (24h)"
+            )
+
     def _manage_trailing_stops(self, broker: BacktestBroker, current_price: float, timestamp: datetime):
         for pos in broker.open_positions:
             if pos.symbol != self.symbol: continue
@@ -641,17 +688,22 @@ class ResearchStrategy:
             new_sl = None
             reason = ""
             
-            # V11.0: Earlier Trailing (Aggressor)
-            if r_multiple >= 1.0 and r_multiple < 1.2:
-                target_sl = pos.entry_price
+            # V11.1: Aggressive Scalp Trailing (0.5R Activation)
+            if r_multiple >= 0.5 and r_multiple < 1.0:
+                # Move to half-risk (Breakeven - 0.5R) or just tighten risk
+                # Let's move to entry price if possible, or at least cut risk in half
+                target_sl = pos.entry_price - (risk_dist * 0.5) if pos.side == 1 else pos.entry_price + (risk_dist * 0.5)
+                
+                # Check if this improves current SL
                 if pos.side == 1 and target_sl > pos.stop_loss:
                     new_sl = target_sl
-                    reason = "BE (1R)"
+                    reason = "Tighten (0.5R)"
                 elif pos.side == -1 and target_sl < pos.stop_loss:
                     new_sl = target_sl
-                    reason = "BE (1R)"
+                    reason = "Tighten (0.5R)"
 
-            elif r_multiple >= 1.2:
+            elif r_multiple >= 1.0:
+                # Standard Trail
                 trail_dist = risk_dist * 0.5
                 if pos.side == 1: 
                     target_sl = current_price - trail_dist
@@ -666,7 +718,7 @@ class ResearchStrategy:
             
             if new_sl is not None:
                 pos.stop_loss = new_sl
-                if "Trail" in reason or "BE" in reason:
+                if "Trail" in reason or "Tighten" in reason:
                       if reason not in pos.comment:
                           pos.comment += f"|{reason}"
                       if self.debug_mode:

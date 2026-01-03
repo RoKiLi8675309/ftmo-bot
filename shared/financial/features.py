@@ -5,8 +5,8 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 # 
-# PHOENIX STRATEGY V9.0 (MOMENTUM BREAKOUT FEATURES):
-# 1. CORE UPDATE: Restored StreamingBollingerBands for V9 Breakout Logic.
+# PHOENIX STRATEGY V11.1 (ALPHA SEEKER):
+# 1. CORE UPDATE: Lowered BB Deviation default to 1.5 for Alpha Seeker Logic.
 # 2. FEATURE SET: Added 'bb_breakout', 'bb_width', 'bb_pct_b' to ML vector.
 # 3. LEGACY SUPPORT: Retained Aggressor/Flow features as secondary signals.
 # 4. CLEANUP: Optimized dependencies and error handling.
@@ -121,9 +121,9 @@ class StreamingBollingerBands:
     """
     V9.0 CORE LOGIC: Momentum Breakout Indicator.
     Calculates Upper/Lower Bands and Width for Breakout Detection.
-    Uses standard (20, 2) settings by default but configurable.
+    V11.1 Update: Default num_std lowered to 1.5 to catch earlier moves.
     """
-    def __init__(self, window: int = 20, num_std: float = 2.0):
+    def __init__(self, window: int = 20, num_std: float = 1.5):
         self.window = window
         self.num_std = num_std
         self.buffer = deque(maxlen=window)
@@ -877,7 +877,8 @@ class OnlineFeatureEngineer:
         self.aggressor = StreamingAggressorRatio()
         
         # V9.0 MOMENTUM LOGIC: Bollinger Bands (Restored)
-        self.bb = StreamingBollingerBands(window=20, num_std=2.0)
+        # V11.1 Update: Default num_std lowered to 1.5 to catch earlier moves.
+        self.bb = StreamingBollingerBands(window=20, num_std=1.5)
 
         # Microstructure & Math Engines
         self.entropy = EntropyMonitor(window=window_size)

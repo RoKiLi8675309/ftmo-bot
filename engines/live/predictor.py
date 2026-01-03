@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V11.0 (AGGRESSOR PROTOCOL):
-# 1. LOGIC: Independent M5 Momentum (D1 Trend Filter Disabled).
-# 2. GATES: Slashed KER (>0.02) to maximize velocity.
-# 3. REGIME: Narrowed Neutral Zone (0.45-0.55).
+# PHOENIX STRATEGY V11.1 (ALPHA SEEKER):
+# 1. LOGIC: Independent M5 Momentum.
+# 2. TRIGGER: Lowered BB Deviation (1.5) for earlier entries.
+# 3. GATES: Slashed KER (>0.02).
 # =============================================================================
 import logging
 import pickle
@@ -87,7 +87,7 @@ class MultiAssetPredictor:
         self.closes_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         self.volume_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         self.bb_window = 20
-        self.bb_std = 2.0
+        self.bb_std = 1.5 # V11.1 FIX: Lowered from 2.0 to catch earlier moves
         self.bb_buffers = {s: deque(maxlen=self.bb_window) for s in symbols}
         
         # --- SNIPER PROTOCOL BUFFERS ---

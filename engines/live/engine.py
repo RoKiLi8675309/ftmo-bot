@@ -6,10 +6,11 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX STRATEGY V10.2 (INSTITUTIONAL EXECUTION):
+# PHOENIX STRATEGY V11.1 (ALPHA SEEKER):
 # 1. SAMPLING: Adaptive Tick Imbalance Bars (TIBs).
 # 2. RISK: Volatility-Adjusted Stops (RVOL Trigger) & Price Conversion.
-# 3. CIRCUIT BREAKER: Realized Daily Loss Limits.
+# 3. MANAGEMENT: Active Position Loop (Time Stop + 0.5R Trailing).
+# 4. CIRCUIT BREAKER: Realized Daily Loss Limits.
 # =============================================================================
 import logging
 import time
@@ -20,7 +21,7 @@ import sys
 import numpy as np
 import math
 import pytz
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from typing import Any, Optional, Dict
 
@@ -66,8 +67,8 @@ class LiveTradingEngine:
     The Central Logic Unit for the Linux Consumer.
     1. Consumes Ticks from Redis.
     2. Aggregates Ticks into Adaptive Imbalance Bars (TIBs).
-    3. Feeds Bars to Golden Trio Predictor (V10.2 Logic).
-    4. Enforces Execution Circuit Breakers (Realized PnL).
+    3. Feeds Bars to Golden Trio Predictor (V11.1 Logic).
+    4. Manages Active Positions (Time Stop / Trailing).
     5. Dispatches Orders to Windows.
     """
     def __init__(self):
@@ -160,6 +161,10 @@ class LiveTradingEngine:
             self.server_tz = pytz.timezone(tz_str)
         except Exception:
             self.server_tz = pytz.timezone('Europe/Prague')
+
+        # V11.1: Active Position Management Thread
+        self.mgmt_thread = threading.Thread(target=self._manage_active_positions_loop, daemon=True)
+        self.mgmt_thread.start()
 
     def fetch_news_loop(self):
         """
@@ -295,6 +300,112 @@ class LiveTradingEngine:
             return pos_map
         except Exception:
             return {}
+
+    def _manage_active_positions_loop(self):
+        """
+        V11.1: Active Position Management Thread.
+        Enforces 24h Time Stop and 0.5R Trailing Logic.
+        """
+        logger.info(f"{LogSymbols.INFO} Active Position Manager Started (Time-Stop: 24h, Trail: 0.5R).")
+        while not self.shutdown_flag:
+            try:
+                positions = self._get_open_positions_from_redis()
+                if not positions:
+                    time.sleep(5)
+                    continue
+
+                now_utc = datetime.now(pytz.utc)
+                cutoff_seconds = 86400 # 24 hours
+
+                for sym, pos in positions.items():
+                    # 1. Time Stop Check
+                    entry_ts = float(pos.get('time', 0))
+                    if entry_ts > 0:
+                        entry_dt = datetime.fromtimestamp(entry_ts, pytz.utc)
+                        duration = (now_utc - entry_dt).total_seconds()
+                        
+                        if duration > cutoff_seconds:
+                            logger.warning(f"⌛ TIME STOP: {sym} held for {duration/3600:.1f}h. Closing.")
+                            close_intent = Trade(
+                                symbol=sym,
+                                action="CLOSE_ALL",
+                                volume=0.0,
+                                entry_price=0.0, 
+                                stop_loss=0.0, 
+                                take_profit=0.0, 
+                                comment="Time Stop (24h)"
+                            )
+                            self.dispatcher.send_order(close_intent, 0.0)
+                            continue
+
+                    # 2. Trailing Stop Logic (0.5R)
+                    current_price = self.latest_prices.get(sym, 0.0)
+                    if current_price <= 0: continue
+
+                    entry_price = float(pos.get('entry_price', 0.0))
+                    sl_price = float(pos.get('sl', 0.0))
+                    tp_price = float(pos.get('tp', 0.0))
+                    pos_type = pos.get('type') # "BUY" or "SELL"
+                    ticket = pos.get('ticket')
+
+                    if entry_price == 0 or sl_price == 0: continue
+
+                    # Calculate Risk Distance (1R)
+                    risk_dist = abs(entry_price - sl_price)
+                    if risk_dist < 1e-5: continue
+
+                    new_sl = None
+                    
+                    if pos_type == "BUY":
+                        dist_pnl = current_price - entry_price
+                        r_multiple = dist_pnl / risk_dist
+                        
+                        # Activate at 0.5R
+                        if r_multiple >= 0.5:
+                            # Move SL to Entry + 0.1R (Small lock-in)
+                            target_sl = entry_price + (risk_dist * 0.1)
+                            # Or if deep in profit (>1R), trail by 0.3R behind price
+                            if r_multiple >= 1.0:
+                                target_sl = current_price - (risk_dist * 0.3)
+                            
+                            # Only move UP
+                            if target_sl > sl_price:
+                                new_sl = target_sl
+
+                    elif pos_type == "SELL":
+                        dist_pnl = entry_price - current_price
+                        r_multiple = dist_pnl / risk_dist
+                        
+                        # Activate at 0.5R
+                        if r_multiple >= 0.5:
+                            # Move SL to Entry - 0.1R
+                            target_sl = entry_price - (risk_dist * 0.1)
+                            # Trail if deep profit
+                            if r_multiple >= 1.0:
+                                target_sl = current_price + (risk_dist * 0.3)
+                                
+                            # Only move DOWN
+                            if target_sl < sl_price:
+                                new_sl = target_sl
+
+                    if new_sl:
+                        logger.info(f"🛡️ TRAILING STOP: {sym} (R={r_multiple:.2f}) -> New SL {new_sl:.5f}")
+                        modify_intent = Trade(
+                            symbol=sym,
+                            action="MODIFY",
+                            volume=0.0,
+                            entry_price=0.0,
+                            stop_loss=new_sl,
+                            take_profit=tp_price, # Keep TP
+                            ticket=ticket,
+                            comment="Trail 0.5R"
+                        )
+                        self.dispatcher.send_order(modify_intent, 0.0)
+
+            except Exception as e:
+                logger.error(f"Position Manager Error: {e}")
+            
+            time.sleep(5) # Check every 5 seconds
 
     def process_tick(self, tick_data: dict):
         """
