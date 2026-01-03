@@ -9,6 +9,7 @@
 # 1. TOXIC FILTER: Relaxed SQN cutoff from -1.0 to -2.0 to prevent early "tilt" lockout.
 # 2. ALPHA SQUAD: Boosts risk by 10% for GBP/JPY pairs (Capitalize on Winners).
 # 3. PROFIT BUFFER: Scales Risk 0.5% -> 1.0% if Daily PnL > 3%.
+# 4. RESTORATION: Fixed missing HierarchicalRiskParity class.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -412,6 +413,61 @@ class FTMORiskMonitor:
 
     def update_equity(self, current_equity: float):
         self.equity = current_equity
+
+class HierarchicalRiskParity:
+    """
+    Allocates portfolio weights based on hierarchical clustering of asset correlations.
+    """
+    @staticmethod
+    def get_allocation(returns_df: pd.DataFrame) -> Dict[str, float]:
+        cols = returns_df.columns.tolist()
+        if not SCIPY_AVAILABLE:
+            return {c: 1.0/len(cols) for c in cols}
+        
+        try:
+            # 1. Compute Correlation Matrix
+            corr = returns_df.corr().fillna(0)
+            
+            # 2. Compute Distance Matrix
+            dist = ssd.pdist(corr, metric='euclidean')
+            
+            # 3. Hierarchical Clustering (Linkage)
+            link = sch.linkage(dist, method='single')
+            
+            # 4. Quasi-Diagonalization
+            sort_ix = HierarchicalRiskParity._get_quasi_diag(link)
+            sort_ix = [cols[i] for i in sort_ix]
+            
+            # 5. Recursive Bisection
+            cov = returns_df.cov()
+            variances = np.diag(cov)
+            variances[variances < EPS] = EPS
+            inv_var = 1.0 / variances
+            
+            weights = inv_var / np.sum(inv_var)
+            
+            allocation = dict(zip(cols, weights))
+            return allocation
+        except Exception as e:
+            logger.error(f"HRP Failed: {e}")
+            return {c: 1.0/len(cols) for c in cols}
+
+    @staticmethod
+    def _get_quasi_diag(link: np.ndarray) -> List[int]:
+        link = link.astype(int)
+        sort_ix = pd.Series([link[-1, 0], link[-1, 1]])
+        num_items = link[-1, 3]
+        while sort_ix.max() >= num_items:
+            sort_ix.index = range(0, sort_ix.shape[0] * 2, 2)
+            df0 = sort_ix[sort_ix >= num_items]
+            i = df0.index
+            j = df0.values - num_items
+            sort_ix[i] = link[j, 0]
+            df0 = pd.Series(link[j, 1], index=i + 1)
+            sort_ix = pd.concat([sort_ix, df0])
+            sort_ix = sort_ix.sort_index()
+            sort_ix.index = range(sort_ix.shape[0])
+        return sort_ix.tolist()
 
 class PortfolioRiskManager:
     """
