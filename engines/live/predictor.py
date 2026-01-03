@@ -6,8 +6,8 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V11.1 (ALPHA SEEKER):
-# 1. LOGIC: Independent M5 Momentum.
+# PHOENIX STRATEGY V12.0 (INTRADAY ALPHA SEEKER):
+# 1. LOGIC: Asset-Specific Regimes (GBP=Trend, EUR=MeanRev).
 # 2. TRIGGER: Lowered BB Deviation (1.5) for earlier entries.
 # 3. GATES: Slashed KER (>0.02).
 # =============================================================================
@@ -162,16 +162,19 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V11.0 AGGRESSOR) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V12.0) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         self.default_max_rvol = 8.0
         
-        # V11.0 Logic Thresholds (Optimized for velocity)
+        # V12.0 Logic Thresholds (Optimized for velocity)
         self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.02))
         self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.55))
         self.hurst_mean_rev = float(phx_conf.get('hurst_mean_reversion_threshold', 0.45))
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
+        
+        # V12.0 ASSET MAP
+        self.asset_regime_map = phx_conf.get('asset_regime_map', {})
         
         # Friday Guard
         self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 18)
@@ -210,7 +213,6 @@ class MultiAssetPredictor:
         
         for sym in self.symbols:
             # V10.0 Upgrade: Adaptive Random Forest
-            # ARF handles concept drift internally better than standard BaggingClassifier
             base_clf = forest.ARFClassifier(
                 n_models=conf.get('n_models', 50),
                 grace_period=conf['grace_period'],
@@ -235,9 +237,6 @@ class MultiAssetPredictor:
     def _calculate_golden_trio(self, symbol: str) -> Tuple[float, float, float]:
         """
         Calculates the "Golden Trio" of features locally using accurate buffers.
-        1. Hurst Exponent (Trend Persistence)
-        2. Kaufman Efficiency Ratio (KER) (Noise Filter)
-        3. Relative Volume (RVOL) (Liquidity Surge)
         """
         closes = self.closes_buffer[symbol]
         vols = self.volume_buffer[symbol]
@@ -253,8 +252,6 @@ class MultiAssetPredictor:
         prices = np.array(closes)
         
         # 1. Simple Hurst (Rescaled Range Proxy)
-        # Using a simplified approach for speed: StdDev of Diff / StdDev of Prices (approximation)
-        # Or standard R/S analysis on small window
         try:
             lags = range(2, 20)
             tau = [np.std(np.subtract(prices[lag:], prices[:-lag])) for lag in lags]
@@ -265,7 +262,6 @@ class MultiAssetPredictor:
             hurst = 0.5
 
         # 2. KER (Efficiency Ratio)
-        # Abs(Net Change) / Sum(Abs Changes)
         try:
             diffs = np.diff(prices)
             net_change = abs(prices[-1] - prices[0])
@@ -291,18 +287,35 @@ class MultiAssetPredictor:
     def _calibrate_confidence(self, raw_conf: float) -> float:
         """
         Calibrates raw model probability to a more reliable confidence score.
-        Uses a sigmoid-like mapping to push weak signals down and strong signals up.
         """
         # Center around 0.5
         x = (raw_conf - 0.5) * 10.0 
         calibrated = 1 / (1 + np.exp(-x))
         return calibrated
 
+    def _get_preferred_regime(self, symbol: str) -> str:
+        """
+        V12.0: Determines the 'Personality' of the asset.
+        Returns: 'TREND_BREAKOUT', 'MEAN_REVERSION', or 'NEUTRAL'
+        """
+        # 1. Check explicit map first
+        for key, regime in self.asset_regime_map.items():
+            if key in symbol:
+                return regime
+        
+        # 2. Fallback Heuristics
+        if "GBP" in symbol or "JPY" in symbol:
+            return "TREND_BREAKOUT"
+        if "EUR" in symbol or "AUD" in symbol or "NZD" in symbol:
+            return "MEAN_REVERSION"
+            
+        return "NEUTRAL"
+
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V11.0 Logic.
-        Implements Aggressor Protocol (Relaxed Gates, Higher Velocity).
+        Executes the Learn-Predict Loop with Project Phoenix V12.0 Logic.
+        Enforces Asset-Specific Regimes (The "Personality Filter").
         """
         if symbol not in self.symbols: return None
         
@@ -359,7 +372,7 @@ class MultiAssetPredictor:
         
         if features is None: return None
         
-        # --- V11.0: GOLDEN TRIO CALCULATION ---
+        # --- V12.0: GOLDEN TRIO CALCULATION ---
         hurst, ker_val, rvol_val = self._calculate_golden_trio(symbol)
         
         # Inject into features for model training
@@ -443,7 +456,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp(), parkinson_vol=parkinson)
 
         # ============================================================
-        # 4. PHOENIX V11.0: AGGRESSOR GATES & LOGIC MAPPING
+        # 4. PHOENIX V12.0: AGGRESSOR GATES & ASSET PERSONALITY
         # ============================================================
         
         phx = CONFIG.get('phoenix_strategy', {})
@@ -454,18 +467,17 @@ class MultiAssetPredictor:
              return Signal(symbol, "HOLD", 0.0, {"reason": "Friday Entry Guard"})
 
         # G1: EFFICIENCY (KER) - AGGRESSIVE (V11.0)
-        # Use config threshold (default 0.02)
-        # We reject only absolute flatlines.
         base_thresh = self.ker_floor 
-        # Adapt slightly if drift detected, but never drop below 0.005 (Safety Floor)
         effective_ker_thresh = max(0.005, base_thresh + self.dynamic_ker_offsets[symbol])
 
         if ker_val < effective_ker_thresh:
             stats[f"Low Efficiency"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (KER {ker_val:.3f} < {effective_ker_thresh:.3f})"})
 
-        # G2: REGIME IDENTIFICATION (Hurst)
-        # Map Market Physics to Bot Action
+        # G2: REGIME IDENTIFICATION (Hurst) & ASSET PERSONALITY (V12.0)
+        # Determine Preferred Regime for this Asset
+        preferred_regime = self._get_preferred_regime(symbol)
+        
         regime_label = "Neutral"
         proposed_action = 0 # 0=Hold, 1=Buy, -1=Sell
         
@@ -478,18 +490,33 @@ class MultiAssetPredictor:
         upper_bb = bb_mu + (self.bb_std * bb_std)
         lower_bb = bb_mu - (self.bb_std * bb_std)
         
-        # LOGIC MAPPING (V11: Tighter Neutral Zone):
-        # Breakout if > 0.55, MeanRev if < 0.45
-        if hurst > self.hurst_breakout:
-            # TREND MODE -> Breakout Logic
+        # --- V12.0 LOGIC MAPPING ---
+        # 1. DETECT PHYSICS
+        is_trending = hurst > self.hurst_breakout
+        is_reverting = hurst < self.hurst_mean_rev
+        
+        # 2. FILTER BY PERSONALITY
+        # If asset wants TREND but physics says REVERT -> Block.
+        # If asset wants REVERT but physics says TREND -> Block.
+        
+        if is_trending:
+            if preferred_regime == "MEAN_REVERSION":
+                stats["Personality Clash (Trend Signal on Range Asset)"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": "Asset Personality Clash"})
+                
+            # Valid Trend Signal
             regime_label = "TREND_BREAKOUT"
             if bar.close > upper_bb:
                 proposed_action = 1 # Breakout Buy
             elif bar.close < lower_bb:
                 proposed_action = -1 # Breakout Sell
                 
-        elif hurst < self.hurst_mean_rev:
-            # REVERSION MODE -> Bollinger Fades
+        elif is_reverting:
+            if preferred_regime == "TREND_BREAKOUT":
+                stats["Personality Clash (Revert Signal on Trend Asset)"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": "Asset Personality Clash"})
+                
+            # Valid Reversion Signal
             regime_label = "MEAN_REVERSION"
             if bar.close > upper_bb:
                 proposed_action = -1 # Fade Buy (Short the top)
@@ -497,7 +524,7 @@ class MultiAssetPredictor:
                 proposed_action = 1 # Fade Sell (Long the bottom)
                 
         else:
-            # NEUTRAL ZONE (0.45 - 0.55) -> Random Walk / Transition
+            # NEUTRAL ZONE (0.45 - 0.55)
             stats[f"Random Walk Regime (H={hurst:.2f})"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Random Walk (Hurst {hurst:.2f})"})
 
@@ -513,7 +540,7 @@ class MultiAssetPredictor:
         # G4: TREND STRENGTH (ADX) - Only relevant for Trend Regime
         if regime_label == "TREND_BREAKOUT":
             adx_val = features.get('adx', 0.0)
-            if adx_val < 20.0: # RELAXED: Lowered to 20 for V11
+            if adx_val < 20.0: 
                 stats[f"Weak Trend"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"Weak Trend (ADX {adx_val:.1f})"})
 

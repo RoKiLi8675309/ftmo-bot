@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V11.1 (ALPHA SEEKER)
+# config.yaml – PROJECT PHOENIX V12.0 (INTRADAY ALPHA SEEKER)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGY UPDATE (V11.1):
-# 1. PORTFOLIO: Purged toxic assets (AUDUSD/EURJPY). Focus on EURUSD/GBPUSD.
-# 2. ENTRY: Lowered BB Deviation to 1.5 (Code level) to fix "No Trigger".
-# 3. EXIT: Aggressive Trailing (0.5R activation) + 24h Time Stop.
+# STRATEGY UPDATE (V12.0 - IMPROVEMENT PLAN IMPLEMENTATION):
+# 1. PHILOSOPHY: Shift from generic swing to Asset-Specific Intraday.
+# 2. LOGIC: GBP = Trend Following | EUR = Mean Reversion.
+# 3. RISK: "Profit Buffer" Scaling (0.5% -> 1.0% after 3% gain).
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -98,8 +98,8 @@ features:
   # Project Phoenix L1 Proxies
   use_parkinson_vol: true        
   use_amihud_liquidity: true 
-  use_relative_volume: true       
-  use_aggressor_ratio: true       
+  use_relative_volume: true        
+  use_aggressor_ratio: true        
   
   # NEW: Regime Filters (Anti-Chop)
   use_choppiness: true
@@ -143,11 +143,19 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V11.1 ALPHA SEEKER) ---
+# --- PHOENIX STRATEGY PARAMETERS (V12.0 ASSET SPECIFIC) ---
 phoenix_strategy:
+  # --- ASSET REGIME MAPPING (CRITICAL UPDATE) ---
+  # Forces specific logic paths based on asset characteristics
+  asset_regime_map:
+    GBP: "TREND_BREAKOUT"   # GBP pairs favor momentum
+    EUR: "MEAN_REVERSION"   # EUR pairs favor ranging
+    USD: "NEUTRAL"          # USD pairs allow both (Fallback)
+    JPY: "TREND_BREAKOUT"   # JPY favors strong trends
+
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true        
-  require_d1_trend: false             # DISABLED: M5 Trend is independent       
+  require_d1_trend: false             # DISABLED: M5 Trend is independent        
   require_h4_alignment: false         # Rely on ML for context        
   
   # --- LOGIC MAPPING THRESHOLDS ---
@@ -218,33 +226,38 @@ optimization_search_space:
 risk_management:
   account_currency: "USD"
   
-  # --- SIZING METHOD: STRICT PROP FIRM MODE ---
+  # --- SIZING METHOD: PROFIT BUFFER SCALING ---
   sizing_method: "fixed_risk"
   
-  # AGGRESSOR PROTOCOL: 0.75% Risk per Trade
-  base_risk_per_trade_percent: 0.0075 
+  # INITIAL RISK: Conservative start (0.5%)
+  base_risk_per_trade_percent: 0.005 
+  
+  # PROFIT BUFFER LOGIC (NEW)
+  # Once daily profit exceeds 3%, scale risk to 1.0%
+  profit_buffer_threshold: 0.03
+  scaled_risk_percent: 0.010
   
   # LIMITS
-  max_daily_loss_pct: 0.045       # 4.5% (Stay below FTMO 5%)
-  max_total_loss_pct: 0.09        # 9.0% (Stay below FTMO 10%)
+  max_daily_loss_pct: 0.045        # 4.5% (Stay below FTMO 5%)
+  max_total_loss_pct: 0.09         # 9.0% (Stay below FTMO 10%)
   
-  max_risk_percent: 2.5           # Allow more open risk
-  max_open_trades: 5              
+  max_risk_percent: 2.5            # Allow more open risk
+  max_open_trades: 5               
   
   max_leverage: 30.0
   max_lot_size: 50.0 
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (SCALPER MODE)
-  stop_loss_atr_mult: 1.5         # TIGHTER: Cut losers fast   
+  stop_loss_atr_mult: 1.5         # TIGHTER: Cut losers fast    
   take_profit_atr_mult: 2.0       # TIGHTER: Bag wins fast    
   
   # ACTIVE TRAILING STOP
   trailing_stop:
     enabled: true        
-    activation_r: 0.5    # AGGRESSIVE: Start trailing at 0.5R profit
+    activation_r: 0.5     # AGGRESSIVE: Start trailing at 0.5R profit
     trail_trigger_r: 0.75 # Trigger next step
-    trail_dist_r: 0.3    # TIGHT: 0.3R Distance behind price
+    trail_dist_r: 0.3     # TIGHT: 0.3R Distance behind price
   
   risk_timezone: "Europe/Prague"
   friday_entry_cutoff_hour: 18        
@@ -253,7 +266,7 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 20                
+  max_trades_per_day: 20                 
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
@@ -262,8 +275,8 @@ risk_management:
 # --- TRADING PORTFOLIO (ALPHA SQUAD) ---
 trading:
   symbols:
-    - "EURUSD"  # PROVEN ALPHA
-    - "GBPUSD"  # PROVEN ALPHA
+    - "EURUSD"  # TARGET: MEAN REVERSION
+    - "GBPUSD"  # TARGET: TREND BREAKOUT
   
   auxiliary_symbols:
     - "USDJPY"
@@ -279,7 +292,7 @@ trading:
   
   # --- EXECUTION OPTIMIZATION ---
   limit_order_offset_pips: 0.2 
-  limit_order_ttl_seconds: 60      
+  limit_order_ttl_seconds: 30      # TIGHTER: 60s -> 30s for intraday precision
 
 # --- ONLINE LEARNING ---
 online_learning:
@@ -287,9 +300,9 @@ online_learning:
   
   # CONFIGURATION
   n_models: 50        
-  grace_period: 200      
+  grace_period: 200       
   delta: 0.00001        
-  warning_delta: 0.001      
+  warning_delta: 0.001       
   lambda_value: 10        
   max_features: 'sqrt'    
   metric: "LogLoss"        
@@ -307,9 +320,9 @@ online_learning:
   meta_labeling_threshold: 0.52 # RELAXED
   
   tbm:
-    horizon_minutes: 120      
+    horizon_minutes: 120       
     barrier_width: 3.0        
-    min_profit_pips: 5.0       
+    min_profit_pips: 5.0        
     drift_threshold: 1.5 
   
   learning_horizon_sec: 300
@@ -350,4 +363,4 @@ wfo:
   train_years: 2
   test_months: 6
   min_trades_optimization: 20 
-  risk_per_trade_options: [0.0075]
+  risk_per_trade_options: [0.005, 0.010]

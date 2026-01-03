@@ -5,11 +5,11 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX STRATEGY V7.5 (SNIPER PROTOCOL RISK):
+# PHOENIX STRATEGY V12.0 (INTRADAY ALPHA SEEKER):
 # 1. STOP LOSS: Widened to 2.0 * ATR (Prevents premature noise stop-outs).
 # 2. TAKE PROFIT: Adjusted to 3.0 * ATR (Sniper Target).
-# 3. STATIC RISK: STRICT 0.5% CAP. Removed "Aggressive" 1.0% tier.
-#    - Priority is SURVIVAL and consistency over volatility.
+# 3. PROFIT BUFFER: Scale Risk 0.5% -> 1.0% if Daily PnL > 3%.
+#    - Priority is SURVIVAL, then ACCELERATION.
 # 4. COMPLIANCE: SessionGuard enforces Friday Liquidation and Trading Hours.
 # 5. SQN SCALING: Added Performance-Based Sizing (Cut Losers / Press Winners).
 # =============================================================================
@@ -148,11 +148,13 @@ class RiskManager:
         contract_size_override: Optional[float] = None, 
         ker: float = 1.0, 
         risk_percent_override: Optional[float] = None,
-        performance_score: float = 0.0 # NEW: SQN Input for Dynamic Sizing
+        performance_score: float = 0.0, # NEW: SQN Input for Dynamic Sizing
+        daily_pnl_pct: float = 0.0      # V12.0: Daily PnL for Buffer Scaling
     ) -> Tuple[Trade, float]:
         """
         Calculates position size using strict prop firm logic (Sniper Protocol).
         Includes SQN Scaling to cut losers and press winners.
+        V12.0 UPDATE: Profit Buffer Scaling & Asymptotic Decay.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -203,16 +205,27 @@ class RiskManager:
         lots = 0.0
         calculated_risk_usd = 0.0
         
-        # --- SNIPER PROTOCOL: STRICT RISK CAP ---
-        # Default Base Risk: 0.5% (0.005)
-        base_risk_pct = risk_conf.get('base_risk_per_trade_percent', 0.005) * 100.0 # Convert to %
+        # --- V12.0: PROFIT BUFFER SCALING (The "Earn to Burn" Logic) ---
+        # "Start with 0.5% risk. Once a 3% buffer is built, scale to 1.0%."
+        
+        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.005)
+        buffer_threshold = risk_conf.get('profit_buffer_threshold', 0.03)
+        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.01)
+        
+        scaling_comment = ""
         
         if risk_percent_override is not None:
             # Optuna/WFO override has highest priority (used during optimization)
             risk_pct = risk_percent_override * 100.0 if risk_percent_override < 1.0 else risk_percent_override
         else:
-            # Default Strategy Logic: STATIC RISK
-            risk_pct = base_risk_pct
+            # Default Strategy Logic with Buffer Scaling
+            if daily_pnl_pct >= buffer_threshold:
+                # We are well in profit for the day/challenge
+                risk_pct = scaled_risk_val * 100.0
+                scaling_comment = "|Buf:ON"
+            else:
+                # Building the buffer
+                risk_pct = default_base_risk * 100.0
         
         # --- NEW: SQN PERFORMANCE SCALING ---
         # "Cut the Losers, Press the Winners"
@@ -225,24 +238,36 @@ class RiskManager:
                 
             elif performance_score < 0.0:
                 # LOSING STREAK: Probe Size Only (0.1%)
-                # This keeps the bot "in the game" to detect regime shift without bleeding equity
                 risk_pct = 0.1
+                scaling_comment += "|SQN:Low"
                 
             elif performance_score > 2.5:
                 # HOT HAND: Scale up slightly (1.25x)
                 # But CAP at 1.0% absolute max to prevent ruin
                 risk_pct = min(risk_pct * 1.25, 1.0)
+                scaling_comment += "|SQN:High"
         
-        # Drawdown Brake: If in significant drawdown (>4%), reduce risk further (Survive Mode)
-        if balance < (start_equity * 0.96):
-            risk_pct *= 0.5  # Slash risk to recover slowly
+        # --- V12.0 DEFENSIVE LAYER: ASYMPTOTIC DECAY ---
+        # If we are in drawdown for the day, reduce risk as we approach the 5% limit.
+        # Formula: Risk = min(TargetRisk, (DailyLimit - DailyLoss) / 2)
+        daily_limit_pct = risk_conf.get('max_daily_loss_pct', 0.045) # e.g. 0.045 (4.5%)
         
+        if daily_pnl_pct < 0:
+            current_loss_pct = abs(daily_pnl_pct)
+            remaining_buffer = daily_limit_pct - current_loss_pct
+            
+            # If buffer is tight, decay the risk
+            if remaining_buffer < 0.02: # Less than 2% room left
+                # Decay formula: Half the remaining distance
+                decay_risk_pct = (remaining_buffer / 2.0) * 100.0
+                if decay_risk_pct < risk_pct:
+                    risk_pct = max(0.0, decay_risk_pct)
+                    scaling_comment += "|Decay:ON"
+
         # Calculate Risk Amount in USD
         calculated_risk_usd = balance * (risk_pct / 100.0)
         
         # KER Scaling: Reward High Efficiency
-        # If KER is high, we take full risk. If low (but passed gate), we reduce slightly.
-        # Clamp KER between 0.8 and 1.0 to avoid over-penalizing valid trades
         ker_scalar = max(0.8, min(ker, 1.0))
         calculated_risk_usd *= ker_scalar
         
@@ -276,7 +301,6 @@ class RiskManager:
         lots = round(lots, 2)
         
         final_risk_usd = lots * loss_per_lot_usd
-        atr_val = atr if atr is not None else 0.0
         
         # Construct Trade Object
         trade = Trade(
@@ -286,7 +310,7 @@ class RiskManager:
             entry_price=price,
             stop_loss=stop_dist,
             take_profit=stop_dist * (atr_mult_tp / atr_mult_sl),
-            comment=f"Risk:{risk_pct:.2f}%|SQN:{performance_score:.1f}|R:${final_risk_usd:.0f}"
+            comment=f"Risk:{risk_pct:.2f}%{scaling_comment}|SQN:{performance_score:.1f}|R:${final_risk_usd:.0f}"
         )
         
         return trade, final_risk_usd

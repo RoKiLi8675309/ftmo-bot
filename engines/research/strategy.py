@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V11.1 (ALPHA SEEKER):
-# 1. PARITY: Exact Logic Mirror of engines/live/predictor.py.
-# 2. TRIGGER: Lowered BB Deviation (1.5) for earlier entries.
-# 3. EXIT: 24-Hour Time Stop (Force Close Stale Trades).
-# 4. TRAIL: Aggressive activation at 0.5R.
+# PHOENIX STRATEGY V12.0 (INTRADAY ALPHA SEEKER):
+# 1. PARITY: Exact Logic Mirror of engines/live/predictor.py (Asset Personality).
+# 2. RISK: Profit Buffer Scaling (0.5% -> 1.0%) & Asymptotic Decay.
+# 3. TRIGGER: Lowered BB Deviation (1.5) for earlier entries.
 # =============================================================================
 import logging
 import sys
@@ -48,7 +47,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V11.1 Alpha Seeker Protocol.
+    Strictly implements the Phoenix V12.0 Alpha Seeker Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -125,15 +124,18 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX V11.1 CONFIGURATION ---
+        # --- PHOENIX V12.0 CONFIGURATION ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V11.1 Logic Thresholds
+        # V12.0 Logic Thresholds
         self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.02)) 
         self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.55))
         self.hurst_mean_rev = float(phx_conf.get('hurst_mean_reversion_threshold', 0.45))
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
+        
+        # V12.0 ASSET MAP
+        self.asset_regime_map = phx_conf.get('asset_regime_map', {})
         
         self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 1.1)) 
         self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 8.0))
@@ -222,9 +224,26 @@ class ResearchStrategy:
         calibrated = 1 / (1 + np.exp(-x))
         return calibrated
 
+    def _get_preferred_regime(self, symbol: str) -> str:
+        """
+        V12.0: Determines the 'Personality' of the asset.
+        """
+        # 1. Check explicit map first
+        for key, regime in self.asset_regime_map.items():
+            if key in symbol:
+                return regime
+        
+        # 2. Fallback Heuristics
+        if "GBP" in symbol or "JPY" in symbol:
+            return "TREND_BREAKOUT"
+        if "EUR" in symbol or "AUD" in symbol or "NZD" in symbol:
+            return "MEAN_REVERSION"
+            
+        return "NEUTRAL"
+
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (V11.1 Alpha Seeker).
+        Main Event Loop for the Strategy (V12.0 Alpha Seeker).
         """
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
@@ -326,7 +345,7 @@ class ResearchStrategy:
         
         if features is None: return
 
-        # --- V11.0: GOLDEN TRIO INJECTION ---
+        # --- V12.0: GOLDEN TRIO INJECTION ---
         hurst, ker_val, rvol_val = self._calculate_golden_trio()
         
         features['hurst'] = hurst
@@ -384,13 +403,11 @@ class ResearchStrategy:
             return 
 
         # ============================================================
-        # E. AGGRESSOR GATES & LOGIC MAPPING (V11.1)
+        # E. AGGRESSOR GATES & ASSET PERSONALITY (V12.0)
         # ============================================================
         
         # G1: EFFICIENCY (KER) - AGGRESSIVE (V11.0)
-        # Use config threshold (default 0.02)
         base_thresh = self.ker_floor 
-        # Lowered safety floor from 0.15 to 0.005 for Aggressor Mode
         effective_ker_thresh = max(0.005, base_thresh + self.dynamic_ker_offset)
             
         if ker_val < effective_ker_thresh:
@@ -398,7 +415,9 @@ class ResearchStrategy:
             return
 
         # G2: REGIME IDENTIFICATION (Hurst)
-        # Map Market Physics to Bot Action
+        # Determine Preferred Regime for this Asset
+        preferred_regime = self._get_preferred_regime(self.symbol)
+        
         regime_label = "Neutral"
         proposed_action = 0 # 0=Hold, 1=Buy, -1=Sell
         
@@ -409,22 +428,34 @@ class ResearchStrategy:
             
         bb_mu = np.mean(self.bb_buffer)
         bb_std = np.std(self.bb_buffer)
-        # V11.1: Use 1.5 StdDev to reduce "No Trigger" rejections
         bb_mult = 1.5
         upper_bb = bb_mu + (bb_mult * bb_std)
         lower_bb = bb_mu - (bb_mult * bb_std)
         
-        # LOGIC MAPPING (V11 Tighter Regimes):
-        if hurst > self.hurst_breakout:
-            # TREND MODE -> Breakout Logic
+        # --- V12.0 LOGIC MAPPING ---
+        # 1. DETECT PHYSICS
+        is_trending = hurst > self.hurst_breakout
+        is_reverting = hurst < self.hurst_mean_rev
+        
+        # 2. FILTER BY PERSONALITY
+        if is_trending:
+            if preferred_regime == "MEAN_REVERSION":
+                self.rejection_stats["Personality Clash (Trend on MeanRev Asset)"] += 1
+                return 
+            
+            # Valid Trend Signal
             regime_label = "TREND_BREAKOUT"
             if price > upper_bb:
                 proposed_action = 1 # Breakout Buy
             elif price < lower_bb:
                 proposed_action = -1 # Breakout Sell
                 
-        elif hurst < self.hurst_mean_rev:
-            # REVERSION MODE -> Bollinger Fades
+        elif is_reverting:
+            if preferred_regime == "TREND_BREAKOUT":
+                self.rejection_stats["Personality Clash (MeanRev on Trend Asset)"] += 1
+                return
+                
+            # Valid Reversion Signal
             regime_label = "MEAN_REVERSION"
             if price > upper_bb:
                 proposed_action = -1 # Fade Buy (Short the top)
@@ -432,7 +463,7 @@ class ResearchStrategy:
                 proposed_action = 1 # Fade Sell (Long the bottom)
                 
         else:
-            # NEUTRAL ZONE (0.45 - 0.55) -> Random Walk / Transition
+            # NEUTRAL ZONE
             self.rejection_stats[f"Random Walk Regime (H={hurst:.2f})"] += 1
             return
 
@@ -498,6 +529,7 @@ class ResearchStrategy:
     def _execute_entry(self, confidence, price, features, broker, dt_timestamp, action_int, regime, tighten_stops):
         """
         Executes the trade entry logic with Fixed Risk.
+        V12.0: Includes Profit Buffer Scaling Logic.
         """
         action = "BUY" if action_int == 1 else "SELL"
         
@@ -529,6 +561,12 @@ class ResearchStrategy:
         else:
             effective_sqn = sqn_score
 
+        # V12.0: CALCULATE DAILY PNL PCT FOR BUFFER SCALING
+        # (Start Equity - Current Equity) / Start Equity = Drawdown
+        # Current Equity - Start Equity = Profit
+        daily_pnl_val = broker.equity - broker.daily_start_equity
+        daily_pnl_pct = daily_pnl_val / broker.daily_start_equity if broker.daily_start_equity > 0 else 0.0
+
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=confidence,
@@ -539,7 +577,8 @@ class ResearchStrategy:
             ker=current_ker,
             account_size=broker.equity,
             risk_percent_override=risk_override,
-            performance_score=effective_sqn 
+            performance_score=effective_sqn,
+            daily_pnl_pct=daily_pnl_pct # V12.0 UPDATE
         )
 
         if trade_intent.volume <= 0:
@@ -547,10 +586,9 @@ class ResearchStrategy:
             return
 
         # V11.0: If Volatility Trigger is active (tighten_stops), reduce the ATR multiplier
-        # Standard: 1.5 ATR. Tightened: 1.1 ATR.
         atr_mult = self.sl_atr_mult
         if tighten_stops:
-            atr_mult = max(1.0, atr_mult * 0.75) # 25% tighter stops in high volatility to protect capital
+            atr_mult = max(1.0, atr_mult * 0.75) 
 
         stop_dist = current_atr * atr_mult
         trade_intent.stop_loss = stop_dist
@@ -632,21 +670,13 @@ class ResearchStrategy:
     def _manage_time_stops(self, broker: BacktestBroker, current_time: datetime):
         """
         V11.1 FEATURE: Time-Based Force Exit.
-        If a trade has been open for > 24 hours, close it to free up capital.
         """
-        # 24 hours in seconds
         cutoff_seconds = 86400 
         
-        # We need to iterate over a copy or use the broker's method safely
-        # backtester.py usually provides open_positions list
-        
-        # Find trades to close first
         to_close = []
         for pos in broker.open_positions:
             if pos.symbol != self.symbol: continue
             
-            # Check duration
-            # Ensure timestamp_created is aware/compatible
             if pos.timestamp_created.tzinfo is None:
                 pos_time = pos.timestamp_created.replace(tzinfo=pytz.utc)
             else:
@@ -662,7 +692,6 @@ class ResearchStrategy:
             if duration > cutoff_seconds:
                 to_close.append(pos)
         
-        # Execute closures
         for pos in to_close:
             broker._close_partial_position(
                 pos, 
@@ -690,11 +719,8 @@ class ResearchStrategy:
             
             # V11.1: Aggressive Scalp Trailing (0.5R Activation)
             if r_multiple >= 0.5 and r_multiple < 1.0:
-                # Move to half-risk (Breakeven - 0.5R) or just tighten risk
-                # Let's move to entry price if possible, or at least cut risk in half
                 target_sl = pos.entry_price - (risk_dist * 0.5) if pos.side == 1 else pos.entry_price + (risk_dist * 0.5)
                 
-                # Check if this improves current SL
                 if pos.side == 1 and target_sl > pos.stop_loss:
                     new_sl = target_sl
                     reason = "Tighten (0.5R)"
@@ -703,7 +729,6 @@ class ResearchStrategy:
                     reason = "Tighten (0.5R)"
 
             elif r_multiple >= 1.0:
-                # Standard Trail
                 trail_dist = risk_dist * 0.5
                 if pos.side == 1: 
                     target_sl = current_price - trail_dist
@@ -725,7 +750,6 @@ class ResearchStrategy:
                           logger.info(f"🛡️ {self.symbol} SL Moved to {new_sl:.5f} ({reason})")
 
     def _check_daily_loss_limit(self, broker: BacktestBroker) -> bool:
-        """Global Account Circuit Breaker (Max 4.9% DD)"""
         try:
             current_dd_pct = (broker.initial_balance - broker.equity) / broker.initial_balance
             if current_dd_pct > 0.049: 
@@ -735,9 +759,6 @@ class ResearchStrategy:
             return False
 
     def _check_symbol_circuit_breaker(self, broker: BacktestBroker, server_time: datetime) -> bool:
-        """
-        V10.0 FEATURE: Per-Symbol Daily Circuit Breaker.
-        """
         today_losses = 0
         today_pnl = 0.0
         
@@ -777,9 +798,6 @@ class ResearchStrategy:
         self.consecutive_losses = streak
 
     def _simulate_mtf_context(self, price: float, dt: datetime) -> Dict[str, Any]:
-        """
-        Approximates D1 and H4 context from the M5 stream.
-        """
         h4_idx = (dt.day * 6) + (dt.hour // 4)
         if h4_idx != self.last_h4_idx:
             self.h4_buffer.append(price)
@@ -848,7 +866,6 @@ class ResearchStrategy:
         trend_aligned = False
         d1_ema = self.current_d1_ema
         
-        # V11: Respect Config Flag
         if self.require_d1_trend and d1_ema > 0:
             if signal == 1: # BUY Signal
                 if price > d1_ema: trend_aligned = True
@@ -861,7 +878,6 @@ class ResearchStrategy:
                     self.rejection_stats['Counter_Trend_D1_EMA'] += 1
                     return False
         else:
-            # Aggressor Mode: Ignore D1 Trend
             trend_aligned = True 
 
         # 3. RSI EXTREME GUARD

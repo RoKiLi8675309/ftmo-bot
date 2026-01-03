@@ -6,9 +6,9 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX STRATEGY V11.1 (ALPHA SEEKER):
+# PHOENIX STRATEGY V12.0 (INTRADAY ALPHA SEEKER):
 # 1. SAMPLING: Adaptive Tick Imbalance Bars (TIBs).
-# 2. RISK: Volatility-Adjusted Stops (RVOL Trigger) & Price Conversion.
+# 2. RISK: Profit Buffer Scaling (Earn to Burn) & Volatility Stops.
 # 3. MANAGEMENT: Active Position Loop (Time Stop + 0.5R Trailing).
 # 4. CIRCUIT BREAKER: Realized Daily Loss Limits.
 # =============================================================================
@@ -67,7 +67,7 @@ class LiveTradingEngine:
     The Central Logic Unit for the Linux Consumer.
     1. Consumes Ticks from Redis.
     2. Aggregates Ticks into Adaptive Imbalance Bars (TIBs).
-    3. Feeds Bars to Golden Trio Predictor (V11.1 Logic).
+    3. Feeds Bars to Golden Trio Predictor (V12.0 Logic).
     4. Manages Active Positions (Time Stop / Trailing).
     5. Dispatches Orders to Windows.
     """
@@ -479,7 +479,6 @@ class LiveTradingEngine:
         """
         # --- V10.0 EXECUTION CIRCUIT BREAKER ---
         if self._check_circuit_breaker(bar.symbol):
-            # Silent return to avoid log spam, or log once per bar if needed
             return
 
         # 1. Update Portfolio Risk State
@@ -590,8 +589,17 @@ class LiveTradingEngine:
             risk_reward_ratio=2.0 
         )
 
-        # Get Base Trade Intent (Uses Config R:R by default)
-        # Note: RiskManager returns StopLoss/TakeProfit as DISTANCES, not Prices.
+        # --- V12.0: CALCULATE DAILY PNL FOR BUFFER SCALING ---
+        try:
+            start_eq = float(self.stream_mgr.r.get(CONFIG['redis']['risk_keys']['daily_starting_equity']) or 0.0)
+            if start_eq > 0:
+                daily_pnl_pct = (self.ftmo_guard.equity - start_eq) / start_eq
+            else:
+                daily_pnl_pct = 0.0
+        except:
+            daily_pnl_pct = 0.0
+
+        # Get Base Trade Intent with Buffer Scaling
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=signal.confidence,
@@ -601,9 +609,10 @@ class LiveTradingEngine:
             atr=current_atr,
             account_size=account_size,
             contract_size_override=None,
-            ker=ker_val, # PASSED FOR SCALING
+            ker=ker_val,
             risk_percent_override=risk_percent_override,
-            performance_score=sqn_score # Dynamic SQN Scaling
+            performance_score=sqn_score,
+            daily_pnl_pct=daily_pnl_pct # V12.0 Pass PnL
         )
 
         if trade_intent.volume <= 0:
@@ -613,8 +622,6 @@ class LiveTradingEngine:
         trade_intent.action = signal.action
 
         # --- V10.2: VOLATILITY TRIGGER (TIGHTEN STOPS) ---
-        # If RVOL > 3.0, we expect expansion, but we reduce risk distance to protect capital against noise.
-        # This effectively keeps the lot size the same (calculated above) but reduces the 'Distance to Ruin' for this trade.
         tighten = signal.meta_data.get('tighten_stops', False)
         
         # Current SL/TP are Distances
@@ -627,14 +634,12 @@ class LiveTradingEngine:
             logger.info(f"🛡️ STOP TIGHTENED: {bar.symbol} (High Volatility) -> SL Dist {sl_dist:.5f}")
 
         # --- DYNAMIC R:R OVERRIDE ---
-        # Look for 'optimized_rr' in the signal (passed from Predictor)
         optimized_rr = signal.meta_data.get('optimized_rr')
         if optimized_rr and optimized_rr > 0 and current_atr > 0:
             tp_dist = current_atr * optimized_rr
             trade_intent.comment += f"|OptRR:{optimized_rr:.2f}"
 
         # --- CRITICAL FIX: CONVERT DISTANCES TO ABSOLUTE PRICES ---
-        # MetaTrader 5 requires absolute prices for Limit Orders and SL/TP fields.
         if trade_intent.action == "BUY":
             trade_intent.stop_loss = bar.close - sl_dist
             trade_intent.take_profit = bar.close + tp_dist
@@ -660,15 +665,12 @@ class LiveTradingEngine:
         Runs the gauntlet of safety checks.
         V10.0: Includes strict Midnight Anchor and Freeze check.
         """
-        # 1. Midnight Freeze Check (Set by Windows Producer)
-        # This ensures we do not trade during the critical rollover period
-        # or if the daily high-water mark hasn't been established.
+        # 1. Midnight Freeze Check
         if self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['midnight_freeze']):
             logger.warning(f"{LogSymbols.FROZEN} Midnight Freeze Active. Holding for Daily Anchor.")
             return False
 
         # 2. Daily Anchor Existence Check
-        # We must know the Starting Equity of the day to trade safely.
         if not self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['daily_starting_equity']):
             logger.warning(f"{LogSymbols.LOCK} Daily Anchor Missing. Waiting for Producer Sync.")
             return False

@@ -6,10 +6,11 @@
 # DESCRIPTION: Event-Driven Backtesting Broker. Simulates execution, spread,
 # commissions, and PnL tracking for strategy validation.
 #
-# PHOENIX STRATEGY V10.0 (RESEARCH PARITY):
+# PHOENIX STRATEGY V12.0 (RESEARCH PARITY):
 # 1. HARD DECK: Enforces Daily Loss Limit (Midnight Anchor) during backtest.
 # 2. METADATA: Enhanced logging to capture 'Regime' (Aggressor/Sniper).
 # 3. COSTS: Strict spread and commission application to verify edge.
+# 4. BUFFER SCALING: Added support for Daily PnL tracking.
 # =============================================================================
 from __future__ import annotations
 import pandas as pd
@@ -163,6 +164,17 @@ class BacktestBroker:
         for p in self.open_positions:
             pos_map[p.symbol] = p
         return pos_map
+
+    def get_daily_pnl_pct(self) -> float:
+        """
+        V12.0: Calculates the current Daily PnL % relative to the Daily Start Equity.
+        Used for Profit Buffer Scaling (Earn to Burn).
+        """
+        if self.daily_start_equity <= 0:
+            return 0.0
+        
+        current_pnl = self.equity - self.daily_start_equity
+        return current_pnl / self.daily_start_equity
 
     def _inject_aux_data(self):
         """
