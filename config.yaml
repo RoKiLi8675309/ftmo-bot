@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V10.1 (DATA SCARCITY FIX)
+# config.yaml – PROJECT PHOENIX V10.2 (INSTITUTIONAL OPTIMIZATION)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE
 #
-# STRATEGY UPDATE (V10.1 - DATA FIX):
-# 1. DATA: Lowered Imbalance Threshold (1000 -> 100) to fix "Cold Start".
-# 2. GATES: Stricter KER (0.05) & Anti-Chop (50.0) to filter noise.
-# 3. RISK: Midnight Anchor Protocol & Hard Deck Liquidation.
+# STRATEGY UPDATE (V10.2 - AUDIT COMPLIANCE):
+# 1. LOGIC MAPPING: Enforced Hurst-based Regime Switching (Trend vs Mean Rev).
+# 2. GATES: Stricter KER (0.3) to reject "Noise/Chop".
+# 3. RISK: RVOL > 3.0 triggers volatility tightening.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -98,8 +98,8 @@ features:
   # Project Phoenix L1 Proxies
   use_parkinson_vol: true        
   use_amihud_liquidity: true 
-  use_relative_volume: true      
-  use_aggressor_ratio: true      
+  use_relative_volume: true       
+  use_aggressor_ratio: true       
   
   # NEW: Regime Filters (Anti-Chop)
   use_choppiness: true
@@ -136,23 +136,30 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 20 
+    threshold: 25 # STRICT: Raised to 25 to ensure trend strength
   
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V10.0 DEFENSIVE) ---
+# --- PHOENIX STRATEGY PARAMETERS (V10.2 OPTIMIZED) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true        
   require_d1_trend: true              # ENABLED: Must align with D1 EMA 200        
   require_h4_alignment: false         # Still rely on ML for H4 nuance        
   
-  # --- FILTER THRESHOLDS (TIGHTENED) ---
+  # --- LOGIC MAPPING THRESHOLDS ---
+  # See Table 2 in Audit Document
+  hurst_breakout_threshold: 0.60      # Persistent Trend -> Breakout Logic
+  hurst_mean_reversion_threshold: 0.40 # Mean Reversion -> Bollinger Fades
+  ker_trend_threshold: 0.30           # AUDIT FIX: Raised from 0.05 to 0.30 (Noise Block)
+  
+  rvol_volatility_trigger: 3.0        # Liquidity Injection -> Tighten Stops
+  
+  # --- FILTER THRESHOLDS ---
   max_relative_volume: 8.0        
-  ker_trend_threshold: 0.05       # LOWERED: Changed from 0.25 to 0.05 to learn from standard volatility
   volume_gate_ratio: 1.1          # Min Relative Volume
   aggressor_threshold: 0.53        
   ml_confirmation_threshold: 0.60 # STRICT: Raised for higher conviction
@@ -231,7 +238,7 @@ risk_management:
   
   # PROJECT PHOENIX EXIT LOGIC (SNIPER MODE)
   stop_loss_atr_mult: 2.0            
-  take_profit_atr_mult: 3.0          
+  take_profit_atr_mult: 3.0           
   
   # ACTIVE TRAILING STOP
   trailing_stop:
@@ -247,7 +254,7 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 5                # STRICT: Reduced from 15 to 5 per symbol (Quality > Quantity)
+  max_trades_per_day: 5                 # STRICT: Reduced from 15 to 5 per symbol (Quality > Quantity)
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
@@ -283,9 +290,9 @@ online_learning:
   
   # CONFIGURATION
   n_models: 50        
-  grace_period: 200     
-  delta: 0.00001       
-  warning_delta: 0.001     
+  grace_period: 200      
+  delta: 0.00001        
+  warning_delta: 0.001      
   lambda_value: 10        
   max_features: 'sqrt'    
   metric: "LogLoss"        
@@ -305,7 +312,7 @@ online_learning:
   tbm:
     horizon_minutes: 120      
     barrier_width: 3.0        
-    min_profit_pips: 10.0      
+    min_profit_pips: 10.0       
     drift_threshold: 1.5 
   
   learning_horizon_sec: 300

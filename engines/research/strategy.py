@@ -5,9 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V10.2 (THRESHOLD FIX):
-# 1. GATES: Removed Hard KER Floor (0.25) to allow optimization on noisy data.
-# 2. PARITY: Matches Live Predictor logic.
+# PHOENIX STRATEGY V10.2 (FORENSIC PARITY):
+# 1. PARITY: Exact Logic Mirror of engines/live/predictor.py.
+# 2. LOGIC: Hurst-Based Regime Switching & High KER Gating.
+# 3. RISK: Volatility Detection (RVOL > 3.0).
 # =============================================================================
 import logging
 import sys
@@ -46,7 +47,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V10.0 Defensive System for Research Parity.
+    Strictly implements the Phoenix V10.2 Defensive System for Research Parity.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -95,7 +96,7 @@ class ResearchStrategy:
         self.bars_processed = 0
         self.consecutive_losses = 0 
         
-        # --- V10.0 GOLDEN TRIO BUFFERS (Research Parity) ---
+        # --- V10.2 GOLDEN TRIO BUFFERS (Research Parity) ---
         self.window_size_trio = 100
         self.closes_buffer = deque(maxlen=self.window_size_trio)
         self.volume_buffer = deque(maxlen=self.window_size_trio)
@@ -108,10 +109,10 @@ class ResearchStrategy:
         self.current_d1_ema = 0.0 
         
         # --- SNIPER PROTOCOL INDICATORS ---
-        self.sniper_closes = deque(maxlen=200)     
-        self.sniper_rsi = deque(maxlen=15)  
+        self.sniper_closes = deque(maxlen=200)      
+        self.sniper_rsi = deque(maxlen=15)   
         
-        # --- V10.0 MOMENTUM INDICATORS ---
+        # --- V10.2 MOMENTUM INDICATORS ---
         self.bb_window = 20
         self.bb_std = 2.0
         self.bb_buffer = deque(maxlen=self.bb_window)
@@ -122,23 +123,21 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX V10.0 CONFIGURATION ---
+        # --- PHOENIX V10.2 CONFIGURATION ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # 1. Trend Filter: ENABLED (V10 Requirement)
-        self.require_d1_trend = True 
-        
-        # 2. Efficiency Filter: RELAXED FOR OPTIMIZATION
-        # AUDIT FIX: Removed hard floor of 0.25. Now respects config (default 0.05).
-        config_ker = float(phx_conf.get('ker_trend_threshold', 0.05))
-        self.ker_thresh = config_ker 
+        # V10.2 Logic Thresholds
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.30)) # AUDIT FIX: 0.30
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.60))
+        self.hurst_mean_rev = float(phx_conf.get('hurst_mean_reversion_threshold', 0.40))
+        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
         
         self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 1.1)) 
         self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 8.0))
         self.chop_threshold = float(phx_conf.get('choppiness_threshold', 50.0)) 
         
         adx_cfg = CONFIG.get('features', {}).get('adx', {})
-        self.adx_threshold = float(params.get('adx_threshold', adx_cfg.get('threshold', 20.0)))
+        self.adx_threshold = float(params.get('adx_threshold', adx_cfg.get('threshold', 25.0))) # AUDIT FIX: 25.0
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
         
@@ -221,7 +220,7 @@ class ResearchStrategy:
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (V10.0 Research).
+        Main Event Loop for the Strategy (V10.2 Research Parity).
         """
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
@@ -322,7 +321,7 @@ class ResearchStrategy:
         
         if features is None: return
 
-        # --- V10.0: GOLDEN TRIO INJECTION ---
+        # --- V10.2: GOLDEN TRIO INJECTION ---
         hurst, ker_val, rvol_val = self._calculate_golden_trio()
         
         features['hurst'] = hurst
@@ -380,44 +379,24 @@ class ResearchStrategy:
             return 
 
         # ============================================================
-        # E. ENTRY LOGIC GATES (V10.0 DEFENSIVE)
+        # E. INSTITUTIONAL GATES & LOGIC MAPPING (V10.2)
         # ============================================================
         
-        adx_val = features.get('adx', 0.0)
-        choppiness = features.get('choppiness', 50.0)
-        
-        # G1: ANTI-CHOP (Hurst Filter)
-        if hurst < 0.45:
-            self.rejection_stats[f"Chop Regime (Hurst {hurst:.2f})"] += 1
-            return
-
-        # G2: FUEL GAUGE
-        if rvol_val < self.vol_gate_ratio:
-            self.rejection_stats[f"Low Fuel (RVol {rvol_val:.2f})"] += 1
-            return
-
-        # G3: EXHAUSTION
-        if rvol_val > self.max_rvol_thresh:
-            self.rejection_stats[f"Volume Climax"] += 1
-            return 
-        
-        # G4: EFFICIENCY (KER) - FIX: Use Soft Floor 0.05
-        base_thresh = max(0.05, self.ker_thresh)
-        effective_ker_thresh = max(0.05, base_thresh + self.dynamic_ker_offset)
+        # G1: EFFICIENCY (KER) - STRICT (V10.2)
+        # We reject immediately if price movement is noise.
+        base_thresh = self.ker_floor 
+        effective_ker_thresh = max(0.15, base_thresh + self.dynamic_ker_offset)
             
         if ker_val < effective_ker_thresh:
-            self.rejection_stats[f"Low Efficiency (KER {ker_val:.2f})"] += 1
+            self.rejection_stats[f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f})"] += 1
             return
 
-        # G5: TREND STRENGTH
-        if adx_val < self.adx_threshold:
-            self.rejection_stats[f"Weak Trend"] += 1
-            return
-
-        proposed_action = 0 
-        regime_label = "Trend"
-
-        # --- MOMENTUM BREAKOUT TRIGGER ---
+        # G2: REGIME IDENTIFICATION (Hurst)
+        # Map Market Physics to Bot Action
+        regime_label = "Neutral"
+        proposed_action = 0 # 0=Hold, 1=Buy, -1=Sell
+        
+        # Check Bollinger Bands state
         if len(self.bb_buffer) < self.bb_window:
             self.rejection_stats["Warming Up BB"] += 1
             return
@@ -427,20 +406,43 @@ class ResearchStrategy:
         upper_bb = bb_mu + (self.bb_std * bb_std)
         lower_bb = bb_mu - (self.bb_std * bb_std)
         
-        rsi_val = features.get('rsi_norm', 0.5) * 100.0
-        
-        trigger_bull = (price > upper_bb) and (rsi_val > 50)
-        trigger_bear = (price < lower_bb) and (rsi_val < 50)
-
-        if trigger_bull:
-            proposed_action = 1
-            regime_label = "Breakout-Long"
-        elif trigger_bear:
-            proposed_action = -1
-            regime_label = "Breakout-Short"
+        # LOGIC MAPPING:
+        if hurst > self.hurst_breakout:
+            # TREND MODE -> Breakout Logic
+            regime_label = "TREND_BREAKOUT"
+            if price > upper_bb:
+                proposed_action = 1 # Breakout Buy
+            elif price < lower_bb:
+                proposed_action = -1 # Breakout Sell
+                
+        elif hurst < self.hurst_mean_rev:
+            # REVERSION MODE -> Bollinger Fades
+            regime_label = "MEAN_REVERSION"
+            if price > upper_bb:
+                proposed_action = -1 # Fade Buy (Short the top)
+            elif price < lower_bb:
+                proposed_action = 1 # Fade Sell (Long the bottom)
+                
         else:
-            self.rejection_stats["No Breakout"] += 1
+            # NEUTRAL ZONE (0.4 - 0.6) -> Random Walk / Transition
+            self.rejection_stats[f"Random Walk Regime (H={hurst:.2f})"] += 1
             return
+
+        if proposed_action == 0:
+            self.rejection_stats["No Trigger"] += 1
+            return
+
+        # G3: EXHAUSTION
+        if rvol_val > self.max_rvol_thresh:
+            self.rejection_stats[f"Volume Climax"] += 1
+            return 
+        
+        # G4: TREND STRENGTH (ADX) - Only for Trend Regime
+        if regime_label == "TREND_BREAKOUT":
+            adx_val = features.get('adx', 0.0)
+            if adx_val < self.adx_threshold:
+                self.rejection_stats[f"Weak Trend"] += 1
+                return
 
         # ============================================================
         # F. ML CONFIRMATION & EXECUTION
@@ -475,7 +477,9 @@ class ResearchStrategy:
                 return
 
             if is_profitable:
-                self._execute_entry(confidence, price, features, broker, dt_ts, proposed_action, regime_label)
+                # V10.2: Tighten Stops Logic (RVOL Trigger)
+                tighten_stops = (rvol_val > self.rvol_trigger)
+                self._execute_entry(confidence, price, features, broker, dt_ts, proposed_action, regime_label, tighten_stops)
             else:
                 self.rejection_stats['Meta-Labeler Reject'] += 1
 
@@ -483,7 +487,7 @@ class ResearchStrategy:
             if self.debug_mode: logger.error(f"Strategy Error: {e}")
             pass
 
-    def _execute_entry(self, confidence, price, features, broker, dt_timestamp, action_int, regime):
+    def _execute_entry(self, confidence, price, features, broker, dt_timestamp, action_int, regime, tighten_stops):
         """
         Executes the trade entry logic with Fixed Risk.
         """
@@ -534,7 +538,15 @@ class ResearchStrategy:
             self.rejection_stats[f"Risk Zero ({trade_intent.comment})"] += 1
             return
 
-        stop_dist = current_atr * self.sl_atr_mult
+        # V10.2: If Volatility Trigger is active (tighten_stops), reduce the ATR multiplier
+        # This prevents getting stopped out by noise in high vol, OR effectively "scalps" quickly
+        # Actually, audit says "Tighten Stops" -> Reduced Distance.
+        # Standard: 2.0 ATR. Tightened: 1.5 ATR.
+        atr_mult = self.sl_atr_mult
+        if tighten_stops:
+            atr_mult = max(1.0, atr_mult * 0.75) # 25% tighter stops in high volatility to protect capital
+
+        stop_dist = current_atr * atr_mult
         trade_intent.stop_loss = stop_dist
         dynamic_tp_dist = current_atr * self.optimized_reward_mult
         trade_intent.take_profit = dynamic_tp_dist
@@ -573,7 +585,8 @@ class ResearchStrategy:
                 'atr': current_atr,
                 'optimized_rr': self.optimized_reward_mult,
                 'initial_risk_dist': stop_dist, 
-                'entry_price_snap': price
+                'entry_price_snap': price,
+                'tighten_stops': tighten_stops
             }
         )
         
@@ -651,10 +664,10 @@ class ResearchStrategy:
             if new_sl is not None:
                 pos.stop_loss = new_sl
                 if "Trail" in reason or "BE" in reason:
-                     if reason not in pos.comment:
-                         pos.comment += f"|{reason}"
-                     if self.debug_mode:
-                         logger.info(f"🛡️ {self.symbol} SL Moved to {new_sl:.5f} ({reason})")
+                      if reason not in pos.comment:
+                          pos.comment += f"|{reason}"
+                      if self.debug_mode:
+                          logger.info(f"🛡️ {self.symbol} SL Moved to {new_sl:.5f} ({reason})")
 
     def _check_daily_loss_limit(self, broker: BacktestBroker) -> bool:
         """Global Account Circuit Breaker (Max 4.9% DD)"""

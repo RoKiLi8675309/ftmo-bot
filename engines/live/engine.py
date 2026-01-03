@@ -6,12 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX STRATEGY V10.0 (DEFENSIVE EXECUTION):
-# 1. SAMPLING: Replaced Time/Volume Bars with Adaptive Tick Imbalance Bars (TIBs).
-# 2. ANCHOR: Enforces "Midnight Anchor" logic to respect daily High Water Mark.
-# 3. CIRCUIT BREAKER: Tracks REALIZED daily losses. Locks symbol if:
-#    - Trades Lost >= 2
-#    - Daily PnL < -1% of Equity
+# PHOENIX STRATEGY V10.2 (INSTITUTIONAL EXECUTION):
+# 1. SAMPLING: Adaptive Tick Imbalance Bars (TIBs).
+# 2. RISK: Volatility-Adjusted Stops (RVOL Trigger) & Price Conversion.
+# 3. CIRCUIT BREAKER: Realized Daily Loss Limits.
 # =============================================================================
 import logging
 import time
@@ -46,7 +44,7 @@ from shared import (
     SessionGuard,
     FTMOComplianceGuard,
     NewsEventMonitor,
-    AdaptiveImbalanceBarGenerator, # V10.0: Replaced VolumeBarAggregator
+    AdaptiveImbalanceBarGenerator, 
     VolumeBar,
     Trade,
     RiskManager,
@@ -68,7 +66,7 @@ class LiveTradingEngine:
     The Central Logic Unit for the Linux Consumer.
     1. Consumes Ticks from Redis.
     2. Aggregates Ticks into Adaptive Imbalance Bars (TIBs).
-    3. Feeds Bars to Golden Trio Predictor (V10.0 Logic).
+    3. Feeds Bars to Golden Trio Predictor (V10.2 Logic).
     4. Enforces Execution Circuit Breakers (Realized PnL).
     5. Dispatches Orders to Windows.
     """
@@ -96,11 +94,10 @@ class LiveTradingEngine:
         self.news_monitor = NewsEventMonitor()
         
         # 3. Data Aggregation (Adaptive Imbalance Bars)
-        # V10.0 Upgrade: Switched to AdaptiveImbalanceBarGenerator
         self.aggregators = {}
         
         # Use Volume Threshold config as a proxy for Initial Imbalance Threshold
-        init_threshold = CONFIG['data'].get('volume_bar_threshold', 1000)
+        init_threshold = CONFIG['data'].get('volume_bar_threshold', 100) # V10.1 Default
         # Default alpha 0.05 if not in config
         alpha = CONFIG['data'].get('imbalance_alpha', 0.05) 
 
@@ -483,6 +480,7 @@ class LiveTradingEngine:
         )
 
         # Get Base Trade Intent (Uses Config R:R by default)
+        # Note: RiskManager returns StopLoss/TakeProfit as DISTANCES, not Prices.
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=signal.confidence,
@@ -503,19 +501,35 @@ class LiveTradingEngine:
 
         trade_intent.action = signal.action
 
+        # --- V10.2: VOLATILITY TRIGGER (TIGHTEN STOPS) ---
+        # If RVOL > 3.0, we expect expansion, but we reduce risk distance to protect capital against noise.
+        # This effectively keeps the lot size the same (calculated above) but reduces the 'Distance to Ruin' for this trade.
+        tighten = signal.meta_data.get('tighten_stops', False)
+        
+        # Current SL/TP are Distances
+        sl_dist = trade_intent.stop_loss
+        tp_dist = trade_intent.take_profit
+        
+        if tighten:
+            sl_dist *= 0.75 # Compress Stop by 25%
+            trade_intent.comment += "|Tightened"
+            logger.info(f"🛡️ STOP TIGHTENED: {bar.symbol} (High Volatility) -> SL Dist {sl_dist:.5f}")
+
         # --- DYNAMIC R:R OVERRIDE ---
         # Look for 'optimized_rr' in the signal (passed from Predictor)
-        # and override the default Take Profit.
         optimized_rr = signal.meta_data.get('optimized_rr')
-        
         if optimized_rr and optimized_rr > 0 and current_atr > 0:
-            # Overwrite the default config-based TP
-            new_tp_dist = current_atr * optimized_rr
-            trade_intent.take_profit = new_tp_dist
-            
-            # Update comment for audit
+            tp_dist = current_atr * optimized_rr
             trade_intent.comment += f"|OptRR:{optimized_rr:.2f}"
-        # ---------------------------------------------
+
+        # --- CRITICAL FIX: CONVERT DISTANCES TO ABSOLUTE PRICES ---
+        # MetaTrader 5 requires absolute prices for Limit Orders and SL/TP fields.
+        if trade_intent.action == "BUY":
+            trade_intent.stop_loss = bar.close - sl_dist
+            trade_intent.take_profit = bar.close + tp_dist
+        elif trade_intent.action == "SELL":
+            trade_intent.stop_loss = bar.close + sl_dist
+            trade_intent.take_profit = bar.close - tp_dist
 
         # --- PYRAMIDING LOGIC ---
         is_pyramid = signal.meta_data.get('pyramid', False)

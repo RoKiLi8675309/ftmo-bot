@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V10.2 (THRESHOLD FIX):
-# 1. GATES: Relaxed KER Threshold to allow optimization on noisy data.
-# 2. MODEL: Adaptive Random Forest (ARF) with ADWIN Drift Detection.
-# 3. GATES: Stricter Anti-Chop (Hurst < 0.45 Rejection).
+# PHOENIX STRATEGY V10.2 (INSTITUTIONAL LOGIC):
+# 1. LOGIC: Hurst-Based Regime Switching (Trend vs Mean Rev).
+# 2. GATES: High KER (>0.3) requirement for Signal validity.
+# 3. RISK: Volatility Detection (RVOL > 3.0).
 # =============================================================================
 import logging
 import pickle
@@ -80,7 +80,7 @@ class MultiAssetPredictor:
         self.labelers = {}
         self.optimized_params = {} # Cache for gates
         
-        # --- V10.0 MOMENTUM & GOLDEN TRIO BUFFERS ---
+        # --- V10.2 MOMENTUM & GOLDEN TRIO BUFFERS ---
         # We maintain local buffers to calculate Hurst, KER, and RVOL accurately on the fly
         self.window_size_trio = 100
         self.closes_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
@@ -147,7 +147,6 @@ class MultiAssetPredictor:
         self.active_signals = {s: deque() for s in symbols} 
         
         # V10.0: Daily Performance Tracking (Symbol Circuit Breaker)
-        # Structure: {symbol: {'date': date_obj, 'losses': int, 'pnl': float}}
         self.daily_performance = {s: {'date': None, 'losses': 0, 'pnl': 0.0} for s in symbols}
         self.daily_max_losses = 2 # Circuit Breaker Limit
         
@@ -162,9 +161,15 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V10.0 STRICT) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V10.2 STRICT) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        self.default_max_rvol = 8.0      
+        self.default_max_rvol = 8.0
+        
+        # V10.2 Logic Thresholds
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.30))
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.60))
+        self.hurst_mean_rev = float(phx_conf.get('hurst_mean_reversion_threshold', 0.40))
+        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
         
         # Friday Guard
         self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 16)
@@ -294,7 +299,8 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V10.0 Logic.
+        Executes the Learn-Predict Loop with Project Phoenix V10.2 Logic.
+        Implements strict Regime Switching and KER Gating.
         """
         if symbol not in self.symbols: return None
         
@@ -351,7 +357,7 @@ class MultiAssetPredictor:
         
         if features is None: return None
         
-        # --- V10.0: GOLDEN TRIO CALCULATION ---
+        # --- V10.2: GOLDEN TRIO CALCULATION ---
         hurst, ker_val, rvol_val = self._calculate_golden_trio(symbol)
         
         # Inject into features for model training
@@ -425,7 +431,7 @@ class MultiAssetPredictor:
                 
                 model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
                 if outcome_label != 0:
-                     model.learn_one(stored_feats, outcome_label, sample_weight=final_weight * 1.5)
+                      model.learn_one(stored_feats, outcome_label, sample_weight=final_weight * 1.5)
                 if outcome_label != 0:
                     meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
 
@@ -435,63 +441,34 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp(), parkinson_vol=parkinson)
 
         # ============================================================
-        # 4. PHOENIX V10.2: DEFENSIVE GATES (RELAXED)
+        # 4. PHOENIX V10.2: INSTITUTIONAL GATES & LOGIC MAPPING
         # ============================================================
-        
-        adx_val = features.get('adx', 0.0)
-        choppiness = features.get('choppiness', 50.0)
         
         phx = CONFIG.get('phoenix_strategy', {})
         max_rvol_thresh = float(phx.get('max_relative_volume', 8.0)) 
-        vol_gate_ratio = float(phx.get('volume_gate_ratio', 1.1)) 
-        
-        # V10 STRICT THRESHOLDS (Hardcoded Floors)
-        chop_threshold = 50.0 # Strict Cap
         
         # FRIDAY GUARD
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
              return Signal(symbol, "HOLD", 0.0, {"reason": "Friday Entry Guard"})
 
-        # G1: ANTI-CHOP (Hurst Filter)
-        # Hurst < 0.45 indicates Mean Reversion/Chop. We want Trend (>0.5).
-        if hurst < 0.45:
-            stats[f"Chop Regime (Hurst {hurst:.2f})"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": f"Chop Regime (Hurst {hurst:.2f})"})
-
-        # G2: FUEL GAUGE (RVOL)
-        if rvol_val < vol_gate_ratio:
-            stats[f"Low Fuel"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "Low Fuel"})
-
-        # G3: EXHAUSTION
-        if rvol_val > max_rvol_thresh:
-            stats[f"Volume Climax"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
-            
-        # G4: EFFICIENCY (KER) - FIX: Use Soft Floor 0.05
-        # Ensure KER is at least 0.05 regardless of config or drift
-        config_ker = float(phx.get('ker_trend_threshold', 0.05))
-        base_thresh = max(0.05, config_ker) 
-        effective_ker_thresh = max(0.05, base_thresh + self.dynamic_ker_offsets[symbol])
+        # G1: EFFICIENCY (KER) - STRICT (V10.2)
+        # Use config threshold (default 0.30)
+        # We reject immediately if price movement is noise.
+        base_thresh = self.ker_floor 
+        # Adapt slightly if drift detected, but never drop below 0.15 (hard floor for safety)
+        effective_ker_thresh = max(0.15, base_thresh + self.dynamic_ker_offsets[symbol])
 
         if ker_val < effective_ker_thresh:
             stats[f"Low Efficiency"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f})"})
 
-        # G5: TREND STRENGTH
-        if adx_val < 20.0:
-            stats[f"Weak Trend"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": f"Weak Trend (ADX {adx_val:.1f})"})
-
-        # --- MTF TREND CONTEXT (V10 ENABLED) ---
-        d1_ema = context_data.get('d1', {}).get('ema200', 0.0) if context_data else 0.0
+        # G2: REGIME IDENTIFICATION (Hurst)
+        # Map Market Physics to Bot Action
+        regime_label = "Neutral"
+        proposed_action = 0 # 0=Hold, 1=Buy, -1=Sell
         
-        proposed_action = 0
-        regime_label = "Chop"
-
-        # --- MOMENTUM BREAKOUT TRIGGER ---
+        # Check Bollinger Bands state for signals
         if len(self.bb_buffers[symbol]) < self.bb_window:
-            stats["Warming Up BB"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Warming Up BB"})
             
         bb_mu = np.mean(self.bb_buffers[symbol])
@@ -499,20 +476,44 @@ class MultiAssetPredictor:
         upper_bb = bb_mu + (self.bb_std * bb_std)
         lower_bb = bb_mu - (self.bb_std * bb_std)
         
-        rsi_val = features.get('rsi_norm', 0.5) * 100.0
-        
-        trigger_bull = (bar.close > upper_bb) and (rsi_val > 50)
-        trigger_bear = (bar.close < lower_bb) and (rsi_val < 50)
-
-        if trigger_bull:
-            proposed_action = 1
-            regime_label = "Breakout-Long"
-        elif trigger_bear:
-            proposed_action = -1
-            regime_label = "Breakout-Short"
+        # LOGIC MAPPING:
+        if hurst > self.hurst_breakout:
+            # TREND MODE -> Breakout Logic
+            regime_label = "TREND_BREAKOUT"
+            if bar.close > upper_bb:
+                proposed_action = 1 # Breakout Buy
+            elif bar.close < lower_bb:
+                proposed_action = -1 # Breakout Sell
+                
+        elif hurst < self.hurst_mean_rev:
+            # REVERSION MODE -> Bollinger Fades
+            regime_label = "MEAN_REVERSION"
+            if bar.close > upper_bb:
+                proposed_action = -1 # Fade Buy (Short the top)
+            elif bar.close < lower_bb:
+                proposed_action = 1 # Fade Sell (Long the bottom)
+                
         else:
-            stats["No Breakout"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "No Breakout"})
+            # NEUTRAL ZONE (0.4 - 0.6) -> Random Walk / Transition
+            # Institutional Logic: Do not trade random walks.
+            stats[f"Random Walk Regime (H={hurst:.2f})"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": f"Random Walk (Hurst {hurst:.2f})"})
+
+        if proposed_action == 0:
+            stats["No Trigger"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "No BB Trigger in Regime"})
+
+        # G3: EXHAUSTION
+        if rvol_val > max_rvol_thresh:
+            stats[f"Volume Climax"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
+            
+        # G4: TREND STRENGTH (ADX) - Only relevant for Trend Regime
+        if regime_label == "TREND_BREAKOUT":
+            adx_val = features.get('adx', 0.0)
+            if adx_val < 25.0: # Tightened per V10.2
+                stats[f"Weak Trend"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": f"Weak Trend (ADX {adx_val:.1f})"})
 
         # 5. ML Confirmation & Calibration
         pred_proba = model.predict_proba_one(features)
@@ -523,7 +524,7 @@ class MultiAssetPredictor:
         # Calibrate Probability
         confidence = self._calibrate_confidence(raw_confidence)
         
-        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.60) # V10 Strict
+        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.60) 
         is_profitable = meta_labeler.predict(features, proposed_action, threshold=meta_threshold)
 
         # --- EXECUTION WITH DYNAMIC CONFIDENCE (V10 Strict) ---
@@ -535,6 +536,7 @@ class MultiAssetPredictor:
 
         # --- SNIPER PROTOCOL: FINAL FILTER GATE (V10) ---
         # Checks D1 Trend Bias & RSI Extremes
+        d1_ema = context_data.get('d1', {}).get('ema200', 0.0) if context_data else 0.0
         if not self._check_sniper_filters(symbol, proposed_action, bar.close, d1_ema):
             stats["Sniper Reject (Trend/RSI)"] += 1
             return Signal(symbol, "HOLD", confidence, {"reason": "Sniper Filter Reject"})
@@ -554,6 +556,9 @@ class MultiAssetPredictor:
                 
                 opt_rr = self.labelers[symbol].reward_mult
                 opt_risk = self.optimized_params.get(symbol, {}).get('risk_per_trade_percent')
+                
+                # V10.2: Tighten Stops Logic (RVOL Trigger)
+                tighten_stops = (rvol_val > self.rvol_trigger)
 
                 return Signal(symbol, action_str, confidence, {
                     "meta_ok": True,
@@ -564,12 +569,12 @@ class MultiAssetPredictor:
                     "rvol": rvol_val,
                     "hurst": hurst,
                     "amihud": features.get('amihud', 0.0),
-                    "choppiness": choppiness,
                     "regime": regime_label,
                     "drivers": imp_feats,
                     "optimized_rr": opt_rr,
                     "risk_percent_override": opt_risk,
-                    "pyramid": False
+                    "pyramid": False,
+                    "tighten_stops": tighten_stops # NEW: Risk Manager Signal
                 })
         else:
             stats['Meta Rejected'] += 1
