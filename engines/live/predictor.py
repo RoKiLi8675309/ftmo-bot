@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V10.2 (INSTITUTIONAL LOGIC):
-# 1. LOGIC: Hurst-Based Regime Switching (Trend vs Mean Rev).
-# 2. GATES: High KER (>0.3) requirement for Signal validity.
-# 3. RISK: Volatility Detection (RVOL > 3.0).
+# PHOENIX STRATEGY V11.0 (AGGRESSOR PROTOCOL):
+# 1. LOGIC: Independent M5 Momentum (D1 Trend Filter Disabled).
+# 2. GATES: Slashed KER (>0.02) to maximize velocity.
+# 3. REGIME: Narrowed Neutral Zone (0.45-0.55).
 # =============================================================================
 import logging
 import pickle
@@ -75,12 +75,13 @@ class MultiAssetPredictor:
         tbm_conf = CONFIG['online_learning']['tbm']
         risk_conf = CONFIG.get('risk_management', {})
         
-        risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 2.0))
+        # V11.0: Tighter Stops/Targets for Scalping
+        risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 1.5))
         
         self.labelers = {}
         self.optimized_params = {} # Cache for gates
         
-        # --- V10.2 MOMENTUM & GOLDEN TRIO BUFFERS ---
+        # --- V11.0 MOMENTUM & GOLDEN TRIO BUFFERS ---
         # We maintain local buffers to calculate Hurst, KER, and RVOL accurately on the fly
         self.window_size_trio = 100
         self.closes_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
@@ -134,7 +135,7 @@ class MultiAssetPredictor:
         
         # 4. Warm-up State
         self.burn_in_counters = {s: 0 for s in symbols}
-        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 200)
+        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 100) # REDUCED for V11
         
         # 5. Forensic Stats
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
@@ -161,18 +162,19 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V10.2 STRICT) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V11.0 AGGRESSOR) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         self.default_max_rvol = 8.0
         
-        # V10.2 Logic Thresholds
-        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.30))
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.60))
-        self.hurst_mean_rev = float(phx_conf.get('hurst_mean_reversion_threshold', 0.40))
+        # V11.0 Logic Thresholds (Optimized for velocity)
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.02))
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.55))
+        self.hurst_mean_rev = float(phx_conf.get('hurst_mean_reversion_threshold', 0.45))
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
+        self.require_d1_trend = phx_conf.get('require_d1_trend', False)
         
         # Friday Guard
-        self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 16)
+        self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 18)
         
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
@@ -299,8 +301,8 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V10.2 Logic.
-        Implements strict Regime Switching and KER Gating.
+        Executes the Learn-Predict Loop with Project Phoenix V11.0 Logic.
+        Implements Aggressor Protocol (Relaxed Gates, Higher Velocity).
         """
         if symbol not in self.symbols: return None
         
@@ -357,7 +359,7 @@ class MultiAssetPredictor:
         
         if features is None: return None
         
-        # --- V10.2: GOLDEN TRIO CALCULATION ---
+        # --- V11.0: GOLDEN TRIO CALCULATION ---
         hurst, ker_val, rvol_val = self._calculate_golden_trio(symbol)
         
         # Inject into features for model training
@@ -441,7 +443,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp(), parkinson_vol=parkinson)
 
         # ============================================================
-        # 4. PHOENIX V10.2: INSTITUTIONAL GATES & LOGIC MAPPING
+        # 4. PHOENIX V11.0: AGGRESSOR GATES & LOGIC MAPPING
         # ============================================================
         
         phx = CONFIG.get('phoenix_strategy', {})
@@ -451,16 +453,16 @@ class MultiAssetPredictor:
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
              return Signal(symbol, "HOLD", 0.0, {"reason": "Friday Entry Guard"})
 
-        # G1: EFFICIENCY (KER) - STRICT (V10.2)
-        # Use config threshold (default 0.30)
-        # We reject immediately if price movement is noise.
+        # G1: EFFICIENCY (KER) - AGGRESSIVE (V11.0)
+        # Use config threshold (default 0.02)
+        # We reject only absolute flatlines.
         base_thresh = self.ker_floor 
-        # Adapt slightly if drift detected, but never drop below 0.15 (hard floor for safety)
-        effective_ker_thresh = max(0.15, base_thresh + self.dynamic_ker_offsets[symbol])
+        # Adapt slightly if drift detected, but never drop below 0.005 (Safety Floor)
+        effective_ker_thresh = max(0.005, base_thresh + self.dynamic_ker_offsets[symbol])
 
         if ker_val < effective_ker_thresh:
             stats[f"Low Efficiency"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f})"})
+            return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (KER {ker_val:.3f} < {effective_ker_thresh:.3f})"})
 
         # G2: REGIME IDENTIFICATION (Hurst)
         # Map Market Physics to Bot Action
@@ -476,7 +478,8 @@ class MultiAssetPredictor:
         upper_bb = bb_mu + (self.bb_std * bb_std)
         lower_bb = bb_mu - (self.bb_std * bb_std)
         
-        # LOGIC MAPPING:
+        # LOGIC MAPPING (V11: Tighter Neutral Zone):
+        # Breakout if > 0.55, MeanRev if < 0.45
         if hurst > self.hurst_breakout:
             # TREND MODE -> Breakout Logic
             regime_label = "TREND_BREAKOUT"
@@ -494,8 +497,7 @@ class MultiAssetPredictor:
                 proposed_action = 1 # Fade Sell (Long the bottom)
                 
         else:
-            # NEUTRAL ZONE (0.4 - 0.6) -> Random Walk / Transition
-            # Institutional Logic: Do not trade random walks.
+            # NEUTRAL ZONE (0.45 - 0.55) -> Random Walk / Transition
             stats[f"Random Walk Regime (H={hurst:.2f})"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Random Walk (Hurst {hurst:.2f})"})
 
@@ -511,7 +513,7 @@ class MultiAssetPredictor:
         # G4: TREND STRENGTH (ADX) - Only relevant for Trend Regime
         if regime_label == "TREND_BREAKOUT":
             adx_val = features.get('adx', 0.0)
-            if adx_val < 25.0: # Tightened per V10.2
+            if adx_val < 20.0: # RELAXED: Lowered to 20 for V11
                 stats[f"Weak Trend"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"Weak Trend (ADX {adx_val:.1f})"})
 
@@ -524,18 +526,18 @@ class MultiAssetPredictor:
         # Calibrate Probability
         confidence = self._calibrate_confidence(raw_confidence)
         
-        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.60) 
+        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.52) 
         is_profitable = meta_labeler.predict(features, proposed_action, threshold=meta_threshold)
 
-        # --- EXECUTION WITH DYNAMIC CONFIDENCE (V10 Strict) ---
-        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.60)
+        # --- EXECUTION WITH DYNAMIC CONFIDENCE (V11 Relaxed) ---
+        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.52)
         
         if confidence < min_prob:
             stats[f"ML Disagreement"] += 1
             return Signal(symbol, "HOLD", confidence, {"reason": f"ML Disagreement (Conf {confidence:.2f} < {min_prob:.2f})"})
 
-        # --- SNIPER PROTOCOL: FINAL FILTER GATE (V10) ---
-        # Checks D1 Trend Bias & RSI Extremes
+        # --- SNIPER PROTOCOL: FINAL FILTER GATE (V11) ---
+        # Checks D1 Trend Bias (If enabled) & RSI Extremes
         d1_ema = context_data.get('d1', {}).get('ema200', 0.0) if context_data else 0.0
         if not self._check_sniper_filters(symbol, proposed_action, bar.close, d1_ema):
             stats["Sniper Reject (Trend/RSI)"] += 1
@@ -589,8 +591,8 @@ class MultiAssetPredictor:
 
     def _check_sniper_filters(self, symbol: str, signal: int, price: float, d1_ema: float) -> bool:
         """
-        V10.0 SNIPER PROTOCOL (LIVE):
-        1. Trend Filter: Trade ONLY if price aligns with D1 EMA 200 (if available).
+        V11.0 SNIPER PROTOCOL (LIVE):
+        1. Trend Filter: D1 Alignment (DISABLED in V11 Aggressor Mode).
         2. RSI Guard: Strict Overbought (70) / Oversold (30) rejection.
         """
         closes = self.sniper_closes[symbol]
@@ -609,7 +611,7 @@ class MultiAssetPredictor:
 
         # 2. TREND FILTER (D1 Bias)
         trend_aligned = False
-        if d1_ema > 0: # If context available
+        if self.require_d1_trend and d1_ema > 0: # Check if Enabled in Config
             if signal == 1: # BUY
                 if price > d1_ema: trend_aligned = True
                 else: return False # Reject Counter-Trend
@@ -617,7 +619,7 @@ class MultiAssetPredictor:
                 if price < d1_ema: trend_aligned = True
                 else: return False # Reject Counter-Trend
         else:
-            trend_aligned = True # Pass if no D1 data (fallback)
+            trend_aligned = True # Pass if disabled or no data
 
         # 3. RSI EXTREME GUARD
         if signal == 1: # BUY

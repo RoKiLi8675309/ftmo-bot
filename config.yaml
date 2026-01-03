@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V10.2 (INSTITUTIONAL OPTIMIZATION)
-# STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE
+# config.yaml – PROJECT PHOENIX V11.0 (AGGRESSOR PROTOCOL)
+# STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGY UPDATE (V10.2 - AUDIT COMPLIANCE):
-# 1. LOGIC MAPPING: Enforced Hurst-based Regime Switching (Trend vs Mean Rev).
-# 2. GATES: Stricter KER (0.3) to reject "Noise/Chop".
-# 3. RISK: RVOL > 3.0 triggers volatility tightening.
+# STRATEGY OVERHAUL (V11.0):
+# 1. VELOCITY: Removed D1 Trend Filter. M5 signals are now independent.
+# 2. REGIME: Narrowed "Neutral Zone" (Hurst 0.45-0.55) to force more entries.
+# 3. GATES: Slashed KER to 0.02. If it moves, we trade.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -77,8 +77,8 @@ producer:
 # --- DATA SETTINGS (V10.1 TIBs) ---
 data:
   sampling_method: "imbalance" # Adaptive Imbalance Bars
-  volume_bar_threshold: 100    # LOWERED from 1000 to 100 to fix Cold Start
-  imbalance_alpha: 0.05        # EWMA Forgetting Factor for Threshold Adaptation
+  volume_bar_threshold: 100    # Low threshold for faster bars
+  imbalance_alpha: 0.05        # EWMA Forgetting Factor
   download_start_date: "2020-01-01"
   num_candles_producer: 50000
   num_candles_train: 4000000 
@@ -119,7 +119,7 @@ features:
   # New Regime Settings
   choppiness:
     period: 14
-    threshold: 50.0 # STRICT: Lowered to 50.0 to reject noise
+    threshold: 60.0 # RELAXED: Raised to 60.0 (Allow more activity)
   vortex:
     period: 14
   
@@ -136,34 +136,34 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 25 # STRICT: Raised to 25 to ensure trend strength
+    threshold: 20 # RELAXED: Lowered to 20 to catch early trends
   
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V10.2 OPTIMIZED) ---
+# --- PHOENIX STRATEGY PARAMETERS (V11.0 AGGRESSOR) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true        
-  require_d1_trend: true              # ENABLED: Must align with D1 EMA 200        
-  require_h4_alignment: false         # Still rely on ML for H4 nuance        
+  require_d1_trend: false             # DISABLED: M5 Trend is independent of D1       
+  require_h4_alignment: false         # Rely on ML for context        
   
   # --- LOGIC MAPPING THRESHOLDS ---
-  # See Table 2 in Audit Document
-  hurst_breakout_threshold: 0.60      # Persistent Trend -> Breakout Logic
-  hurst_mean_reversion_threshold: 0.40 # Mean Reversion -> Bollinger Fades
-  ker_trend_threshold: 0.30           # AUDIT FIX: Raised from 0.05 to 0.30 (Noise Block)
+  # Minimized "Dead Zone" to maximize signals
+  hurst_breakout_threshold: 0.55      # Trend Logic Trigger (>0.55)
+  hurst_mean_reversion_threshold: 0.45 # Mean Rev Logic Trigger (<0.45)
+  ker_trend_threshold: 0.02           # FLOOR: Only reject absolute flatlines
   
-  rvol_volatility_trigger: 3.0        # Liquidity Injection -> Tighten Stops
+  rvol_volatility_trigger: 3.0        # Liquidity Injection
   
   # --- FILTER THRESHOLDS ---
   max_relative_volume: 8.0        
   volume_gate_ratio: 1.1          # Min Relative Volume
   aggressor_threshold: 0.53        
-  ml_confirmation_threshold: 0.60 # STRICT: Raised for higher conviction
-  choppiness_threshold: 50.0      # STRICT: Hard Chop Gate
+  ml_confirmation_threshold: 0.52 # RELAXED: Take any probabilistic edge > 52%
+  choppiness_threshold: 60.0      # RELAXED
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -210,10 +210,10 @@ optimization_search_space:
     min: 1.0
     max: 2.0
   
-  # Strategy Execution - STRICTER LOWER BOUND
+  # Strategy Execution
   min_calibrated_probability:
-    min: 0.60 
-    max: 0.85
+    min: 0.52
+    max: 0.65
 
 # --- RISK MANAGEMENT (FTMO COMPLIANCE) ---
 risk_management:
@@ -222,39 +222,39 @@ risk_management:
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # SNIPER PROTOCOL: 0.5% Fixed Risk per Trade (Standard)
-  base_risk_per_trade_percent: 0.005 
+  # AGGRESSOR PROTOCOL: 0.75% Risk per Trade
+  base_risk_per_trade_percent: 0.0075 
   
   # LIMITS
   max_daily_loss_pct: 0.045       # 4.5% (Stay below FTMO 5%)
   max_total_loss_pct: 0.09        # 9.0% (Stay below FTMO 10%)
   
-  max_risk_percent: 1.5           # Max open risk at any time
-  max_open_trades: 3              
+  max_risk_percent: 2.5           # Allow more open risk
+  max_open_trades: 5              # Increased from 3
   
   max_leverage: 30.0
   max_lot_size: 50.0 
   min_lot_size: 0.01
   
-  # PROJECT PHOENIX EXIT LOGIC (SNIPER MODE)
-  stop_loss_atr_mult: 2.0            
-  take_profit_atr_mult: 3.0           
+  # PROJECT PHOENIX EXIT LOGIC (SCALPER MODE)
+  stop_loss_atr_mult: 1.5         # TIGHTER: Cut losers fast   
+  take_profit_atr_mult: 2.0       # TIGHTER: Bag wins fast    
   
   # ACTIVE TRAILING STOP
   trailing_stop:
     enabled: true        
     activation_r: 1.0    # Breakeven Trigger
-    trail_trigger_r: 1.5 # Trailing Trigger
+    trail_trigger_r: 1.2 # Trailing Trigger (Earlier)
     trail_dist_r: 0.5    # Distance behind price
   
   risk_timezone: "Europe/Prague"
-  friday_entry_cutoff_hour: 16        
+  friday_entry_cutoff_hour: 18        
   friday_liquidation_hour_server: 21  
   
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 5                 # STRICT: Reduced from 15 to 5 per symbol (Quality > Quantity)
+  max_trades_per_day: 20                # AGGRESSIVE: Allow high frequency
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
@@ -297,7 +297,7 @@ online_learning:
   max_features: 'sqrt'    
   metric: "LogLoss"        
   
-  burn_in_periods: 200    
+  burn_in_periods: 100    # REDUCED: Start trading faster
   
   # Volatility Gate
   volatility_gate:
@@ -307,26 +307,26 @@ online_learning:
   positive_class_weight: 1.5 
   negative_class_weight: 1.0
   
-  meta_labeling_threshold: 0.60 # STRICT: Raised from 0.55
+  meta_labeling_threshold: 0.52 # RELAXED: Take 52% edges
   
   tbm:
     horizon_minutes: 120      
     barrier_width: 3.0        
-    min_profit_pips: 10.0       
+    min_profit_pips: 5.0       
     drift_threshold: 1.5 
   
   learning_horizon_sec: 300
   
-  # SNIPER PROTOCOL: High Conviction Only
-  min_calibrated_probability: 0.60 # STRICT: Raised from 0.55
+  # AGGRESSOR PROTOCOL
+  min_calibrated_probability: 0.52 # RELAXED
 
 # --- NEWS FILTER ---
 news_filter:
   enabled: true
   primary_url: "http://nfs.faireconomy.media/ff_calendar_thisweek.xml"
   backup_url: "https://www.forexfactory.com/calendar"
-  buffer_minutes_before: 30 
-  buffer_minutes_after: 30
+  buffer_minutes_before: 15 # REDUCED: Don't sit out too long
+  buffer_minutes_after: 15
   restricted_events:
     USD: ["FOMC", "NFP", "CPI", "GDP", "Rate"]
     EUR: ["ECB", "CPI", "Rate"]
@@ -352,5 +352,5 @@ wfo:
   n_trials: 35
   train_years: 2
   test_months: 6
-  min_trades_optimization: 5 # LOWERED: Allow low-frequency Sniper strategies to pass
-  risk_per_trade_options: [0.005]
+  min_trades_optimization: 20 # INCREASED: Demand active strategies
+  risk_per_trade_options: [0.0075]
