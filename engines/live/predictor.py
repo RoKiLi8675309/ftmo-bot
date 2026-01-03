@@ -4,12 +4,12 @@
 # PATH: engines/live/predictor.py
 # DEPENDENCIES: shared, river, numpy
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
-# Feature Engineering, Labeling (Adaptive Triple Barrier), and Weighted Learning.
+# Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
 # PHOENIX STRATEGY V10.0 (DEFENSIVE PROTOCOL - LIVE):
-# 1. LOGIC: Re-enabled D1 Trend Filter (Bias) & RSI Extremes Guard.
-# 2. GATES: Stricter KER (0.25) & Anti-Chop (50.0) to filter noise.
-# 3. RISK: Per-Symbol Circuit Breaker (Max 2 Losses/Day).
+# 1. FEATURES: Implements Rolling Hurst, KER, and RVOL (The Golden Trio).
+# 2. MODEL: Adaptive Random Forest (ARF) with ADWIN Drift Detection.
+# 3. GATES: Stricter KER (>0.25) & Anti-Chop (Hurst < 0.45 Rejection).
 # =============================================================================
 import logging
 import pickle
@@ -80,7 +80,11 @@ class MultiAssetPredictor:
         self.labelers = {}
         self.optimized_params = {} # Cache for gates
         
-        # --- V10.0 MOMENTUM INDICATORS ---
+        # --- V10.0 MOMENTUM & GOLDEN TRIO BUFFERS ---
+        # We maintain local buffers to calculate Hurst, KER, and RVOL accurately on the fly
+        self.window_size_trio = 100
+        self.closes_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
+        self.volume_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         self.bb_window = 20
         self.bb_std = 2.0
         self.bb_buffers = {s: deque(maxlen=self.bb_window) for s in symbols}
@@ -156,7 +160,7 @@ class MultiAssetPredictor:
         
         # --- PHOENIX STRATEGY PARAMETERS (V10.0 STRICT) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        self.default_max_rvol = 8.0     
+        self.default_max_rvol = 8.0      
         
         # Friday Guard
         self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 16)
@@ -166,6 +170,7 @@ class MultiAssetPredictor:
         self.last_close_prices = {s: 0.0 for s in symbols}
         
         # Timezone for Guard
+        risk_conf = CONFIG.get('risk_management', {})
         tz_str = risk_conf.get('risk_timezone', 'Europe/Prague')
         try:
             self.server_tz = pytz.timezone(tz_str)
@@ -190,12 +195,15 @@ class MultiAssetPredictor:
     def _init_models(self):
         """
         Initializes the machine learning pipelines.
+        V10.0: Uses AdaptiveRandomForestClassifier with ADWIN drift detection.
         """
         conf = CONFIG['online_learning']
         metric_map = {"LogLoss": metrics.LogLoss(), "F1": metrics.F1(), "Accuracy": metrics.Accuracy(), "ROCAUC": metrics.ROCAUC()}
         selected_metric = metric_map.get(conf.get('metric', 'LogLoss'), metrics.LogLoss())
         
         for sym in self.symbols:
+            # V10.0 Upgrade: Adaptive Random Forest
+            # ARF handles concept drift internally better than standard BaggingClassifier
             base_clf = forest.ARFClassifier(
                 n_models=conf.get('n_models', 50),
                 grace_period=conf['grace_period'],
@@ -209,12 +217,79 @@ class MultiAssetPredictor:
                 drift_detector=drift.ADWIN(delta=conf['delta'])
             )
             
+            # Pipeline: Scaler -> Model
             self.models[sym] = compose.Pipeline(
                 preprocessing.StandardScaler(),
-                ensemble.ADWINBaggingClassifier(model=base_clf, n_models=5, seed=42)
+                base_clf
             )
             self.meta_labelers[sym] = MetaLabeler()
             self.calibrators[sym] = ProbabilityCalibrator()
+
+    def _calculate_golden_trio(self, symbol: str) -> Tuple[float, float, float]:
+        """
+        Calculates the "Golden Trio" of features locally using accurate buffers.
+        1. Hurst Exponent (Trend Persistence)
+        2. Kaufman Efficiency Ratio (KER) (Noise Filter)
+        3. Relative Volume (RVOL) (Liquidity Surge)
+        """
+        closes = self.closes_buffer[symbol]
+        vols = self.volume_buffer[symbol]
+        
+        # Defaults
+        hurst = 0.5
+        ker = 0.5
+        rvol = 1.0
+        
+        if len(closes) < 30:
+            return hurst, ker, rvol
+
+        prices = np.array(closes)
+        
+        # 1. Simple Hurst (Rescaled Range Proxy)
+        # Using a simplified approach for speed: StdDev of Diff / StdDev of Prices (approximation)
+        # Or standard R/S analysis on small window
+        try:
+            lags = range(2, 20)
+            tau = [np.std(np.subtract(prices[lag:], prices[:-lag])) for lag in lags]
+            poly = np.polyfit(np.log(lags), np.log(tau), 1)
+            hurst = poly[0] * 2.0 # Adjust scale
+            hurst = max(0.0, min(1.0, hurst))
+        except:
+            hurst = 0.5
+
+        # 2. KER (Efficiency Ratio)
+        # Abs(Net Change) / Sum(Abs Changes)
+        try:
+            diffs = np.diff(prices)
+            net_change = abs(prices[-1] - prices[0])
+            sum_changes = np.sum(np.abs(diffs))
+            if sum_changes > 0:
+                ker = net_change / sum_changes
+            else:
+                ker = 0.0
+        except:
+            ker = 0.0
+
+        # 3. RVOL
+        if len(vols) > 10:
+            curr_vol = vols[-1]
+            avg_vol = np.mean(list(vols)[:-1]) # Exclude current
+            if avg_vol > 0:
+                rvol = curr_vol / avg_vol
+            else:
+                rvol = 1.0
+        
+        return hurst, ker, rvol
+
+    def _calibrate_confidence(self, raw_conf: float) -> float:
+        """
+        Calibrates raw model probability to a more reliable confidence score.
+        Uses a sigmoid-like mapping to push weak signals down and strong signals up.
+        """
+        # Center around 0.5
+        x = (raw_conf - 0.5) * 10.0 
+        calibrated = 1 / (1 + np.exp(-x))
+        return calibrated
 
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
@@ -238,7 +313,9 @@ class MultiAssetPredictor:
         self.bar_counters[symbol] += 1
         self.last_close_prices[symbol] = bar.close
 
-        # --- UPDATE SNIPER BUFFERS ---
+        # --- UPDATE BUFFERS ---
+        self.closes_buffer[symbol].append(bar.close)
+        self.volume_buffer[symbol].append(bar.volume)
         self.sniper_closes[symbol].append(bar.close)
         if len(self.sniper_closes[symbol]) > 1:
             delta = self.sniper_closes[symbol][-1] - self.sniper_closes[symbol][-2]
@@ -249,7 +326,7 @@ class MultiAssetPredictor:
         buy_vol = getattr(bar, 'buy_vol', 0.0)
         sell_vol = getattr(bar, 'sell_vol', 0.0)
         
-        # Retail Fallback
+        # Retail Fallback (Tick Rule approximation if L2 missing)
         if buy_vol == 0 and sell_vol == 0:
             if not self.l2_missing_warned[symbol]:
                 logger.warning(f"⚠️ {symbol}: Zero Flow Detected. Using Local Tick Rule Fallback.")
@@ -260,7 +337,7 @@ class MultiAssetPredictor:
             elif bar.close < last_price: buy_vol = 0.0; sell_vol = bar.volume
             else: buy_vol = bar.volume / 2.0; sell_vol = bar.volume / 2.0
         
-        # 1. Feature Engineering
+        # 1. Feature Engineering (Standard)
         features = fe.update(
             price=bar.close,
             timestamp=bar.timestamp.timestamp(),
@@ -274,8 +351,15 @@ class MultiAssetPredictor:
         
         if features is None: return None
         
-        # Extract Key Features
-        ker_val = features.get('ker', 0.5)
+        # --- V10.0: GOLDEN TRIO CALCULATION ---
+        hurst, ker_val, rvol_val = self._calculate_golden_trio(symbol)
+        
+        # Inject into features for model training
+        features['hurst'] = hurst
+        features['ker'] = ker_val
+        features['rvol'] = rvol_val
+        
+        # Extract for Gates
         parkinson = features.get('parkinson_vol', 0.0)
 
         # --- REC 1: DYNAMIC GATE SCALING ---
@@ -285,8 +369,8 @@ class MultiAssetPredictor:
         else:
             self.dynamic_ker_offsets[symbol] = min(0.0, self.dynamic_ker_offsets[symbol] + 0.001)
 
-        feat_stats['avg_ker'] = (0.99) * feat_stats.get('avg_ker', 0.5) + 0.01 * features.get('ker', 0.5)
-        feat_stats['avg_rvol'] = (0.99) * feat_stats.get('avg_rvol', 1.0) + 0.01 * features.get('rvol', 1.0)
+        feat_stats['avg_ker'] = (0.99) * feat_stats.get('avg_ker', 0.5) + 0.01 * ker_val
+        feat_stats['avg_rvol'] = (0.99) * feat_stats.get('avg_rvol', 1.0) + 0.01 * rvol_val
         
         # --- WARM-UP GATE ---
         if self.burn_in_counters[symbol] < self.burn_in_limit:
@@ -333,6 +417,7 @@ class MultiAssetPredictor:
                 ret_scalar = math.log1p(abs(realized_ret) * 100.0)
                 ret_scalar = max(0.5, min(ret_scalar, 5.0))
                 
+                # Use Historical KER for weighting
                 hist_ker = stored_feats.get('ker', 0.5)
                 ker_weight = hist_ker * 2.0 
                 
@@ -353,7 +438,6 @@ class MultiAssetPredictor:
         # 4. PHOENIX V10.0: DEFENSIVE GATES
         # ============================================================
         
-        rvol = features.get('rvol', 1.0)
         adx_val = features.get('adx', 0.0)
         choppiness = features.get('choppiness', 50.0)
         
@@ -368,22 +452,23 @@ class MultiAssetPredictor:
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
              return Signal(symbol, "HOLD", 0.0, {"reason": "Friday Entry Guard"})
 
-        # G1: ANTI-CHOP
-        if choppiness > chop_threshold:
-            stats[f"Chop Regime (CHOP {choppiness:.1f})"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": f"Chop Regime (CHOP {choppiness:.1f})"})
+        # G1: ANTI-CHOP (Hurst Filter)
+        # Hurst < 0.45 indicates Mean Reversion/Chop. We want Trend (>0.5).
+        if hurst < 0.45:
+            stats[f"Chop Regime (Hurst {hurst:.2f})"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": f"Chop Regime (Hurst {hurst:.2f})"})
 
-        # G2: FUEL GAUGE
-        if rvol < vol_gate_ratio:
+        # G2: FUEL GAUGE (RVOL)
+        if rvol_val < vol_gate_ratio:
             stats[f"Low Fuel"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Low Fuel"})
 
         # G3: EXHAUSTION
-        if rvol > max_rvol_thresh:
+        if rvol_val > max_rvol_thresh:
             stats[f"Volume Climax"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
             
-        # G4: STRICT EFFICIENCY (V10)
+        # G4: STRICT EFFICIENCY (KER)
         # Ensure KER is at least 0.25 regardless of config or drift
         config_ker = float(phx.get('ker_trend_threshold', 0.10))
         base_thresh = max(0.25, config_ker) # Hard floor at 0.25
@@ -429,11 +514,14 @@ class MultiAssetPredictor:
             stats["No Breakout"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "No Breakout"})
 
-        # 5. ML Confirmation
+        # 5. ML Confirmation & Calibration
         pred_proba = model.predict_proba_one(features)
         prob_buy = pred_proba.get(1, 0.0)
         prob_sell = pred_proba.get(-1, 0.0)
-        confidence = prob_buy if proposed_action == 1 else prob_sell
+        raw_confidence = prob_buy if proposed_action == 1 else prob_sell
+        
+        # Calibrate Probability
+        confidence = self._calibrate_confidence(raw_confidence)
         
         meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.60) # V10 Strict
         is_profitable = meta_labeler.predict(features, proposed_action, threshold=meta_threshold)
@@ -443,7 +531,7 @@ class MultiAssetPredictor:
         
         if confidence < min_prob:
             stats[f"ML Disagreement"] += 1
-            return Signal(symbol, "HOLD", confidence, {"reason": f"ML Disagreement (Conf < {min_prob:.2f})"})
+            return Signal(symbol, "HOLD", confidence, {"reason": f"ML Disagreement (Conf {confidence:.2f} < {min_prob:.2f})"})
 
         # --- SNIPER PROTOCOL: FINAL FILTER GATE (V10) ---
         # Checks D1 Trend Bias & RSI Extremes
@@ -458,7 +546,8 @@ class MultiAssetPredictor:
                 
                 imp_feats = []
                 imp_feats.append(regime_label)
-                if rvol > 2.0: imp_feats.append('High_Fuel')
+                if rvol_val > 2.0: imp_feats.append('High_Fuel')
+                if hurst > 0.6: imp_feats.append('High_Hurst')
                 
                 for f in imp_feats:
                     self.feature_importance_counter[symbol][f] += 1
@@ -472,7 +561,8 @@ class MultiAssetPredictor:
                     "atr": current_atr,
                     "ker": ker_val,
                     "parkinson_vol": parkinson,
-                    "rvol": rvol,
+                    "rvol": rvol_val,
+                    "hurst": hurst,
                     "amihud": features.get('amihud', 0.0),
                     "choppiness": choppiness,
                     "regime": regime_label,

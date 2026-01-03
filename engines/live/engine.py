@@ -3,14 +3,15 @@
 # ENVIRONMENT: Linux/WSL2 (Python 3.11)
 # PATH: engines/live/engine.py
 # DEPENDENCIES: shared, engines.live.dispatcher, engines.live.predictor
-# DESCRIPTION: Core Event Loop. Ingests ticks, aggregates bars, generates signals.
+# DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
+# and generates signals via the Golden Trio Predictor.
 #
 # PHOENIX STRATEGY V10.0 (DEFENSIVE EXECUTION):
-# 1. CIRCUIT BREAKER: Tracks REALIZED daily losses. Locks symbol if:
+# 1. SAMPLING: Replaced Time/Volume Bars with Adaptive Tick Imbalance Bars (TIBs).
+# 2. ANCHOR: Enforces "Midnight Anchor" logic to respect daily High Water Mark.
+# 3. CIRCUIT BREAKER: Tracks REALIZED daily losses. Locks symbol if:
 #    - Trades Lost >= 2
 #    - Daily PnL < -1% of Equity
-# 2. GATES: Enforces Friday Liquidation (21:00) & Entry Cutoff (16:00).
-# 3. EXECUTION: Passes MTF Context (D1/H4) to Predictor for Trend Filtering.
 # =============================================================================
 import logging
 import time
@@ -45,7 +46,7 @@ from shared import (
     SessionGuard,
     FTMOComplianceGuard,
     NewsEventMonitor,
-    VolumeBarAggregator,
+    AdaptiveImbalanceBarGenerator, # V10.0: Replaced VolumeBarAggregator
     VolumeBar,
     Trade,
     RiskManager,
@@ -66,8 +67,8 @@ class LiveTradingEngine:
     """
     The Central Logic Unit for the Linux Consumer.
     1. Consumes Ticks from Redis.
-    2. Aggregates Ticks into Volume Bars.
-    3. Feeds Bars to Predictor (V10.0 Logic).
+    2. Aggregates Ticks into Adaptive Imbalance Bars (TIBs).
+    3. Feeds Bars to Golden Trio Predictor (V10.0 Logic).
     4. Enforces Execution Circuit Breakers (Realized PnL).
     5. Dispatches Orders to Windows.
     """
@@ -94,15 +95,24 @@ class LiveTradingEngine:
         self.session_guard = SessionGuard()
         self.news_monitor = NewsEventMonitor()
         
-        # 3. Data Aggregation (Volume Bars)
+        # 3. Data Aggregation (Adaptive Imbalance Bars)
+        # V10.0 Upgrade: Switched to AdaptiveImbalanceBarGenerator
         self.aggregators = {}
-        for sym in CONFIG['trading']['symbols']:
-            self.aggregators[sym] = VolumeBarAggregator(
-                symbol=sym,
-                threshold=CONFIG['data']['volume_bar_threshold']
-            )
+        
+        # Use Volume Threshold config as a proxy for Initial Imbalance Threshold
+        init_threshold = CONFIG['data'].get('volume_bar_threshold', 1000)
+        # Default alpha 0.05 if not in config
+        alpha = CONFIG['data'].get('imbalance_alpha', 0.05) 
 
-        # 4. AI Predictor (River Ensemble)
+        for sym in CONFIG['trading']['symbols']:
+            self.aggregators[sym] = AdaptiveImbalanceBarGenerator(
+                symbol=sym,
+                initial_threshold=init_threshold,
+                alpha=alpha
+            )
+            logger.info(f"Initialized TIB Generator for {sym} (Start: {init_threshold}, Alpha: {alpha})")
+
+        # 4. AI Predictor (Golden Trio / ARF)
         self.predictor = MultiAssetPredictor(symbols=CONFIG['trading']['symbols'])
         
         # 5. Execution Dispatcher
@@ -292,6 +302,7 @@ class LiveTradingEngine:
     def process_tick(self, tick_data: dict):
         """
         Handles a single raw tick from Redis.
+        Feeds the Adaptive Imbalance Bar Generator.
         """
         try:
             symbol = tick_data.get('symbol')
@@ -336,7 +347,8 @@ class LiveTradingEngine:
                 try: self.latest_context[symbol]['h4'] = json.loads(tick_data['ctx_h4'])
                 except: pass
 
-            # 1. Feed Aggregator
+            # 1. Feed Adaptive Aggregator
+            # Returns a VolumeBar (TIB) if imbalance threshold is met
             bar = self.aggregators[symbol].process_tick(
                 price=price, 
                 volume=volume, 
@@ -354,8 +366,8 @@ class LiveTradingEngine:
 
     def on_bar_complete(self, bar: VolumeBar):
         """
-        Triggered when a Volume Bar is closed.
-        Executes the Prediction and Dispatch logic with Dynamic R:R.
+        Triggered when a Tick Imbalance Bar (TIB) is closed.
+        Executes the Prediction and Dispatch logic.
         """
         # --- V10.0 EXECUTION CIRCUIT BREAKER ---
         if self._check_circuit_breaker(bar.symbol):
@@ -385,7 +397,7 @@ class LiveTradingEngine:
             'positions': open_positions
         }
         
-        # 3. Get Signal
+        # 3. Get Signal (Golden Trio / ARF)
         signal = self.predictor.process_bar(bar.symbol, bar, context_data=context_data)
         
         if not signal: return
@@ -433,7 +445,7 @@ class LiveTradingEngine:
                 return
 
         # 5. Check Risk & Compliance Gates
-        # Includes Section 8.2: Friday Entry Guard (checked inside SessionGuard logic)
+        # V10.0: Includes strict Midnight Anchor Check
         if not self._check_risk_gates(bar.symbol):
             return
 
@@ -456,10 +468,10 @@ class LiveTradingEngine:
         # Retrieve KER for Risk Scaling (Sniper Protocol)
         ker_val = signal.meta_data.get('ker', 1.0)
         
-        # --- NEW: CALCULATE SQN PERFORMANCE SCORE ---
+        # --- DYNAMIC SQN PERFORMANCE SCORE ---
         sqn_score = self._calculate_sqn(bar.symbol)
 
-        # Initial Context (R:R is informational here)
+        # Initial Context
         ctx = TradeContext(
             symbol=bar.symbol,
             price=bar.close,
@@ -482,7 +494,7 @@ class LiveTradingEngine:
             contract_size_override=None,
             ker=ker_val, # PASSED FOR SCALING
             risk_percent_override=risk_percent_override,
-            performance_score=sqn_score # NEW: Dynamic SQN Scaling
+            performance_score=sqn_score # Dynamic SQN Scaling
         )
 
         if trade_intent.volume <= 0:
@@ -491,7 +503,7 @@ class LiveTradingEngine:
 
         trade_intent.action = signal.action
 
-        # --- CRITICAL UPDATE: DYNAMIC R:R OVERRIDE ---
+        # --- DYNAMIC R:R OVERRIDE ---
         # Look for 'optimized_rr' in the signal (passed from Predictor)
         # and override the default Take Profit.
         optimized_rr = signal.meta_data.get('optimized_rr')
@@ -521,25 +533,40 @@ class LiveTradingEngine:
     def _check_risk_gates(self, symbol: str) -> bool:
         """
         Runs the gauntlet of safety checks.
+        V10.0: Includes strict Midnight Anchor and Freeze check.
         """
+        # 1. Midnight Freeze Check (Set by Windows Producer)
+        # This ensures we do not trade during the critical rollover period
+        # or if the daily high-water mark hasn't been established.
+        if self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['midnight_freeze']):
+            logger.warning(f"{LogSymbols.FROZEN} Midnight Freeze Active. Holding for Daily Anchor.")
+            return False
+
+        # 2. Daily Anchor Existence Check
+        # We must know the Starting Equity of the day to trade safely.
+        if not self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['daily_starting_equity']):
+            logger.warning(f"{LogSymbols.LOCK} Daily Anchor Missing. Waiting for Producer Sync.")
+            return False
+
+        # 3. FTMO Drawdown Guard
         if not self.ftmo_guard.can_trade():
             logger.warning(f"{LogSymbols.LOCK} FTMO Guard: Trading Halted (Drawdown).")
             return False
 
-        # General Market Hours
+        # 4. General Market Hours
         if not self.session_guard.is_trading_allowed():
             return False
             
-        # Section 8.2: Friday Entry Guard (No new trades after 16:00)
+        # 5. Friday Entry Guard (No new trades after 16:00)
         if self.session_guard.is_friday_afternoon():
-            # Only block NEW entries, not exits (dispatches handle action type)
-            # Since this flow is for Signal -> Entry, we block.
             return False
 
+        # 6. Penalty Box (Correlation/Volatility penalty)
         if self.portfolio_mgr.check_penalty_box(symbol):
             logger.warning(f"{LogSymbols.LOCK} {symbol} is in Penalty Box.")
             return False
 
+        # 7. News Check
         if not self.news_monitor.check_trade_permission(symbol):
              return False
 
@@ -549,7 +576,7 @@ class LiveTradingEngine:
         """
         Main Event Loop.
         """
-        logger.info(f"{LogSymbols.SUCCESS} Engine Loop Started. Waiting for data on '{CONFIG['redis']['price_data_stream']}'...")
+        logger.info(f"{LogSymbols.SUCCESS} Engine Loop Started. Waiting for Ticks on '{CONFIG['redis']['price_data_stream']}'...")
         self.is_warm = True
         
         stream_key = CONFIG['redis']['price_data_stream']
@@ -577,6 +604,7 @@ class LiveTradingEngine:
                             self.process_tick(data)
                             self.stream_mgr.r.xack(stream_key, group, message_id)
                 
+                # Sync Equity for Risk Guard
                 try:
                     cached_eq = self.stream_mgr.r.get(CONFIG['redis']['risk_keys']['current_equity'])
                     if cached_eq:

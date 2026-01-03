@@ -5,9 +5,10 @@
 # DEPENDENCIES: pandas, numpy, psycopg2 (optional), sqlalchemy
 # DESCRIPTION: Data loading with Adaptive Volume Normalization.
 #
-# PHOENIX STRATEGY V7.0 (DATA INTEGRITY):
-# 1. AGGRESSOR FLOWS: VolumeBarAggregator ensures precise Buy/Sell splitting.
-# 2. BACKTEST COMPATIBILITY: Lee-Ready fallback enables OFI testing on historical data.
+# PHOENIX STRATEGY V10.0 (TICK IMBALANCE PROTOCOL):
+# 1. DATA STRUCTURE: Implemented AdaptiveImbalanceBarGenerator (TIBs).
+# 2. LOGIC: Tick Rule + EWMA Thresholding for Information-Driven Sampling.
+# 3. COMPATIBILITY: Outputs standard VolumeBar objects for System integration.
 # =============================================================================
 from __future__ import annotations
 import warnings
@@ -94,10 +95,147 @@ class AdaptiveVolumeNormalizer:
         
         return float(threshold)
 
+class AdaptiveImbalanceBarGenerator:
+    """
+    V10.0 CORE UPGRADE: Generates Tick Imbalance Bars (TIBs).
+    Replaces time-based sampling with information-driven sampling.
+    Adjusts sampling threshold based on the EWMA of recent market activity.
+    """
+    def __init__(self, symbol: str, initial_threshold: float = 1000, alpha: float = 0.05):
+        self.symbol = symbol
+        
+        # State variables for the current bar
+        self.current_imbalance = 0.0
+        self.ticks_in_bar = 0
+        self.open_price = None
+        self.high_price = -float('inf')
+        self.low_price = float('inf')
+        self.close_price = None
+        self.volume_accum = 0.0
+        self.start_timestamp = None
+        
+        # Extended VPIN states
+        self.current_buy_vol = 0.0
+        self.current_sell_vol = 0.0
+        self.vwap_sum = 0.0
+
+        # State for Tick Rule (Aggressor Logic)
+        self.prev_price = None
+        self.prev_tick_rule = 1  # Default to Buy (1)
+
+        # Adaptive Threshold Logic (EWMA)
+        self.expected_imbalance = initial_threshold
+        self.alpha = alpha   # Forgetting factor for EWMA
+
+    def process_tick(self, price: float, volume: float, timestamp: float, 
+                     external_buy_vol: float = 0.0, external_sell_vol: float = 0.0) -> Optional[VolumeBar]:
+        """
+        Ingest a single tick and determine if a bar should be closed based on Imbalance.
+        """
+        # Initialize if first tick
+        if self.prev_price is None:
+            self.prev_price = price
+            self.open_price = price
+            self.start_timestamp = timestamp
+            return None
+
+        # 1. Apply Tick Rule (Infer Aggressor)
+        # If external L2 data is provided, use it. Otherwise, use Tick Rule.
+        if external_buy_vol > 0 or external_sell_vol > 0:
+            # Trusted L2 Data
+            tick_rule = 1 if external_buy_vol > external_sell_vol else -1
+            if external_buy_vol == external_sell_vol: tick_rule = 0
+            self.prev_tick_rule = tick_rule
+        else:
+            # Standard Tick Rule
+            price_change = price - self.prev_price
+            if price_change != 0:
+                tick_rule = np.sign(price_change)
+                self.prev_tick_rule = tick_rule
+            else:
+                tick_rule = self.prev_tick_rule
+
+        # 2. Update Accumulators
+        # Imbalance is Tick Direction (signed 1)
+        self.current_imbalance += tick_rule
+        
+        self.ticks_in_bar += 1
+        self.volume_accum += volume
+        self.vwap_sum += (price * volume)
+        
+        if self.open_price is None: self.open_price = price
+        self.high_price = max(self.high_price, price)
+        self.low_price = min(self.low_price, price)
+        self.close_price = price
+        self.prev_price = price
+
+        # Track flows for VPIN
+        if tick_rule == 1:
+            self.current_buy_vol += volume
+        elif tick_rule == -1:
+            self.current_sell_vol += volume
+        else:
+            self.current_buy_vol += (volume / 2)
+            self.current_sell_vol += (volume / 2)
+
+        # 3. Check Threshold Condition (Absolute Imbalance >= Expected)
+        if abs(self.current_imbalance) >= self.expected_imbalance:
+            return self._finalize_bar(timestamp, price)
+
+        return None
+
+    def _finalize_bar(self, timestamp: float, close_price: float) -> VolumeBar:
+        """Internal method to package the bar and update adaptive thresholds."""
+        
+        # Convert timestamp to datetime if float
+        if isinstance(timestamp, (float, int)):
+            dt_ts = datetime.fromtimestamp(timestamp, pytz.utc)
+        else:
+            dt_ts = timestamp
+
+        vwap = self.vwap_sum / self.volume_accum if self.volume_accum > 0 else close_price
+
+        bar = VolumeBar(
+            timestamp=dt_ts,
+            open=self.open_price,
+            high=self.high_price,
+            low=self.low_price,
+            close=close_price,
+            volume=self.volume_accum,
+            vwap=vwap,
+            tick_count=self.ticks_in_bar,
+            buy_vol=self.current_buy_vol,
+            sell_vol=self.current_sell_vol
+        )
+
+        # 4. Update Expectations (EWMA)
+        # We update the expected imbalance threshold based on the actual imbalance seen.
+        # This allows the sampling rate to speed up (lower threshold) or slow down.
+        current_abs_imb = abs(self.current_imbalance)
+        self.expected_imbalance = (self.alpha * current_abs_imb) + \
+                                  ((1 - self.alpha) * self.expected_imbalance)
+        
+        # Clamp threshold to avoid sampling every tick or never sampling
+        self.expected_imbalance = max(10.0, min(self.expected_imbalance, 10000.0))
+
+        # Reset State
+        self.current_imbalance = 0.0
+        self.ticks_in_bar = 0
+        self.open_price = None
+        self.high_price = -float('inf')
+        self.low_price = float('inf')
+        self.volume_accum = 0.0
+        self.vwap_sum = 0.0
+        self.current_buy_vol = 0.0
+        self.current_sell_vol = 0.0
+        self.start_timestamp = timestamp
+
+        return bar
+
 class VolumeBarAggregator:
     """
-    Aggregates raw ticks into Volume Bars based on a volume threshold.
-    Crucial for VPIN calculation and event-driven analysis.
+    LEGACY: Aggregates raw ticks into Volume Bars based on a static volume threshold.
+    Kept for backward compatibility with diagnose.py.
     """
     def __init__(self, symbol: str, threshold: float = 1000):
         self.symbol = symbol
@@ -124,10 +262,6 @@ class VolumeBarAggregator:
                      external_buy_vol: float = 0.0, external_sell_vol: float = 0.0) -> Optional[VolumeBar]:
         """
         Ingests a tick. Returns a VolumeBar if threshold reached, else None.
-        Handles overshoot via Carry-Over (Recursion for large block trades).
-        
-        AUDIT FIX: Accepts external_buy_vol/external_sell_vol from Producer.
-        If provided (>0), uses them. If not, falls back to Lee-Ready Tick Rule.
         """
         # 1. Update Prices
         if self.open_price is None:
@@ -139,42 +273,34 @@ class VolumeBarAggregator:
         self.last_ts = timestamp
         
         # --- VOLUME DIRECTION LOGIC ---
-        # Priority 1: External L2 Data (Producer)
         if external_buy_vol > 0 or external_sell_vol > 0:
             buy_v = external_buy_vol
             sell_v = external_sell_vol
-            
-            # Update Lee-Ready state for continuity even if we use L2 here
             if self.last_price is not None:
                 if price > self.last_price: self.last_tick_direction = 1
                 elif price < self.last_price: self.last_tick_direction = -1
-                
         else:
-            # Priority 2: Lee-Ready Tick Rule Fallback
             buy_v = 0.0
             sell_v = 0.0
             
             if self.last_price is not None:
                 if price > self.last_price:
-                    direction = 1  # Buy
+                    direction = 1 
                     self.last_tick_direction = 1
                 elif price < self.last_price:
-                    direction = -1  # Sell
+                    direction = -1 
                     self.last_tick_direction = -1
                 else:
-                    # Neutral: Continue previous direction
                     direction = self.last_tick_direction
             else:
-                direction = 0  # First tick
+                direction = 0 
                 self.last_tick_direction = 0
 
-            # Assign Flow
             if direction == 1:
                 buy_v = volume
             elif direction == -1:
                 sell_v = volume
             else:
-                # Should rarely happen with Lee-Ready, but fallback to 50/50
                 buy_v = volume / 2
                 sell_v = volume / 2
 
@@ -182,18 +308,12 @@ class VolumeBarAggregator:
         # -----------------------
 
         # 3. Handle Carry-Over Logic
-        # Calculate how much volume fits in the CURRENT bar
         remaining_capacity = self.threshold - self.current_volume
         
         if volume < remaining_capacity:
-            # Case A: Tick fits entirely in current bar
             self._accumulate(price, volume, buy_v, sell_v)
             return None
         else:
-            # Case B: Tick fills the bar and spills over
-            # We need to split the Buy/Sell volume proportionally
-            
-            # Fraction of this tick that completes the bar
             split_ratio = remaining_capacity / volume if volume > 0 else 0
             
             fill_buy = buy_v * split_ratio
@@ -202,13 +322,12 @@ class VolumeBarAggregator:
             rem_buy = buy_v - fill_buy
             rem_sell = sell_v - fill_sell
             
-            # 1. Fill the current bar
+            # 1. Fill current bar
             self._accumulate(price, remaining_capacity, fill_buy, fill_sell)
             
-            # 2. Create the Bar
+            # 2. Create Bar
             vwap = self.vwap_sum / self.current_volume if self.current_volume > 0 else price
             
-            # Timestamps must be datetime objects for Models
             if isinstance(self.last_ts, float) or isinstance(self.last_ts, int):
                 dt_ts = datetime.fromtimestamp(self.last_ts, pytz.utc)
             else:
@@ -223,32 +342,25 @@ class VolumeBarAggregator:
                 volume=self.current_volume,
                 vwap=vwap,
                 tick_count=self.ticks_in_bar,
-                # CRITICAL: Export Split Volume for VPIN/OFI
                 buy_vol=self.current_buy_vol,
                 sell_vol=self.current_sell_vol
             )
             
-            # 3. Calculate Spillover Volume
-            spillover_vol = volume - remaining_capacity
-            
-            # 4. Reset for the NEXT bar
+            # 4. Reset
             self._reset()
             
-            # 5. Apply Spillover (Start new bar logic)
-            # We initialize the new bar with the spillover data.
-            # Prices match the tick that caused the spillover.
+            # 5. Apply Spillover
             self.open_price = price
             self.high_price = price
             self.low_price = price
             self.close_price = price
             self.last_ts = timestamp
             
-            self._accumulate(price, spillover_vol, rem_buy, rem_sell)
+            self._accumulate(price, volume - remaining_capacity, rem_buy, rem_sell)
             
             return bar
 
     def _accumulate(self, price: float, volume: float, buy_vol: float, sell_vol: float):
-        """Helper to update internal counters."""
         self.current_volume += volume
         self.vwap_sum += (price * volume)
         self.ticks_in_bar += 1
@@ -259,12 +371,10 @@ class VolumeBarAggregator:
         self.current_volume = 0.0
         self.current_buy_vol = 0.0
         self.current_sell_vol = 0.0
-        
         self.open_price = None
         self.high_price = -float('inf')
         self.low_price = float('inf')
         self.close_price = None
-        
         self.vwap_sum = 0.0
         self.ticks_in_bar = 0
 
@@ -277,9 +387,6 @@ def load_real_data(
 ) -> pd.DataFrame:
     """
     Loads historical data from Postgres using SQLAlchemy for stability.
-    Raises ValueError if data is empty to prevent silent failures in Research.
-      
-    FIX: Enforces Data Mapping (Tick 'price' -> OHLC) and Sets Datetime Index.
     """
     if db_config is None:
         db_config = CONFIG.get('postgres')
@@ -290,14 +397,9 @@ def load_real_data(
     try:
         from sqlalchemy import create_engine, text
         
-        # Construct DSN for SQLAlchemy
-        # postgresql+psycopg2://user:password@host:port/dbname
         db_url = f"postgresql+psycopg2://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['db']}"
-        
         engine = create_engine(db_url)
         
-        # 1. Attempt TICKS Table Load (High Fidelity)
-        # Using parameterized text query for SQLAlchemy
         query_ticks = text("""
             SELECT time, bid, ask, (bid+ask)/2 as price, 
                    (ask-bid)*100000 as spread, 
@@ -312,12 +414,11 @@ def load_real_data(
         params = {"symbol": symbol, "days": f"{days} days", "limit": n_candles}
         
         try:
-            # We use a nested cursor/transaction to safely try/catch SQL errors
             with engine.connect() as conn:
                 df = pd.read_sql(query_ticks, conn, params=params)
         
         except Exception:
-            # 2. Fallback to OHLCV Table (Standard)
+            # Fallback to OHLCV
             query_ohlcv = text("""
                 SELECT time, close as price, close as bid, close as ask, volume 
                 FROM ohlcv 
@@ -335,16 +436,13 @@ def load_real_data(
                 if 'flags' not in df.columns:
                     df['flags'] = 0
 
-        # CRITICAL AUDIT FIX: Strict Check for Empty Data
         if df.empty:
             print(f"WARNING: Database query returned 0 rows for {symbol}. Check DB population!")
             return pd.DataFrame()
 
-        # Normalize
         tp = TemporalPipeline()
         df = tp.normalize_dates(df, 'time')
         
-        # Ensure numeric
         cols = ['price', 'bid', 'ask', 'spread', 'volume']
         for c in cols:
             if c in df.columns:
@@ -353,17 +451,13 @@ def load_real_data(
         if 'volume' not in df.columns:
             df['volume'] = 1.0
 
-        # --- DATA MAPPING FIX: Tick Data Compatibility ---
         if 'price' in df.columns:
             for col in ['open', 'high', 'low', 'close']:
                 if col not in df.columns:
                     df[col] = df['price']
-        # ------------------------------------------------
 
-        # --- INDEX FIX: Set Index to 'time' ---
         df.set_index('time', inplace=True, drop=False)
-        # --------------------------------------
-
+        
         return df
     except ImportError:
         print("ERROR: sqlalchemy/psycopg2 not installed. Cannot load real data.")
@@ -374,44 +468,29 @@ def load_real_data(
 
 def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 1000) -> List[Dict[str, Any]]:
     """
-    Offline batch processor for converting Tick DF to Volume Bar List.
-    FIX: Uses Lee-Ready Tick Rule for classification since offline data rarely has 'buy_vol' columns.
-    
-    NOTE: If volume_threshold is default (1000), it attempts to auto-calculate 
-    using AdaptiveVolumeNormalizer if possible.
+    Offline batch processor using AdaptiveImbalanceBarGenerator Logic.
     """
-    
-    # Auto-Adapt Threshold if using default and enough data exists
-    if volume_threshold == 1000 and len(tick_df) > 10000:
-        normalizer = AdaptiveVolumeNormalizer(target_bars_per_day=50)
-        try:
-            dynamic_thresh = normalizer.calculate_threshold(tick_df)
-            volume_threshold = dynamic_thresh
-        except Exception:
-            pass 
-
     bars = []
-    agg = VolumeBarAggregator(symbol="BATCH", threshold=volume_threshold)
+    # Use the new generator for batch processing to ensure training data matches live data
+    # Default alpha 0.05
+    gen = AdaptiveImbalanceBarGenerator(symbol="BATCH", initial_threshold=volume_threshold, alpha=0.05)
     
     for row in tick_df.itertuples():
         price = getattr(row, 'price', getattr(row, 'close', None))
         vol = getattr(row, 'volume', 1.0)
         ts = getattr(row, 'Index', getattr(row, 'time', None))
         
-        # If DB has pre-calculated flows (rare), use them
         b_vol = getattr(row, 'buy_vol', 0.0)
         s_vol = getattr(row, 'sell_vol', 0.0)
         
         if price is None: continue
         
-        # Convert TS to float if needed
         if isinstance(ts, (datetime, pd.Timestamp)):
             ts_val = ts.timestamp()
         else:
             ts_val = float(ts)
 
-        # Process via Aggregator logic (reusing strict logic)
-        bar = agg.process_tick(price, vol, ts_val, b_vol, s_vol)
+        bar = gen.process_tick(price, vol, ts_val, b_vol, s_vol)
         
         if bar:
             bars.append({
