@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V12.2 (ROBUST REGIME LOGIC):
-# 1. LOGIC: Implemented Priority Regime Detection (Trend > Reversion > Neutral).
-#    Ensures USDCAD/USDCHF are correctly identified as Mean Reversion despite 'USD'.
-# 2. RISK: Profit Buffer Scaling active.
+# PHOENIX STRATEGY V12.3 (FTMO SURVIVAL):
+# 1. REGIME: Implemented "SOFT" Enforcement (High Conf overrides Personality).
+# 2. RISK: Added Max Currency Exposure check (Portfolio Heat).
+# 3. LOGIC: Profit Buffer Scaling active via RiskManager.
 # =============================================================================
 import logging
 import sys
@@ -47,7 +47,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V12.0 Alpha Seeker Protocol.
+    Strictly implements the Phoenix V12.3 Alpha Seeker Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -64,6 +64,7 @@ class ResearchStrategy:
         self.risk_conf = params.get('risk_management', CONFIG.get('risk_management', {}))
         # V11.1: Tighter stops (1.5 ATR) by default
         self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 1.5))
+        self.max_currency_exposure = int(self.risk_conf.get('max_currency_exposure', 2))
         
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
@@ -134,7 +135,8 @@ class ResearchStrategy:
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
         
-        # V12.0 ASSET MAP
+        # V12.3: Regime Enforcement Mode (HARD vs SOFT)
+        self.regime_enforcement = phx_conf.get('regime_enforcement', 'HARD').upper()
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
         
         self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 1.1)) 
@@ -253,9 +255,39 @@ class ResearchStrategy:
         # Priority 3: Neutral (Default for EURUSD if defined as such)
         return "NEUTRAL"
 
+    def _check_currency_exposure(self, broker: BacktestBroker, symbol: str) -> bool:
+        """
+        V12.3: Enforces Portfolio Heat Limits.
+        Prevents stacking too much risk on one currency (e.g. max 2 USD pairs).
+        """
+        base_ccy = symbol[:3]
+        quote_ccy = symbol[3:]
+        
+        base_count = 0
+        quote_count = 0
+        
+        for pos in broker.open_positions:
+            pos_base = pos.symbol[:3]
+            pos_quote = pos.symbol[3:]
+            
+            if base_ccy == pos_base or base_ccy == pos_quote:
+                base_count += 1
+            if quote_ccy == pos_base or quote_ccy == pos_quote:
+                quote_count += 1
+        
+        if base_count >= self.max_currency_exposure:
+            self.rejection_stats[f"Max Exposure ({base_ccy})"] += 1
+            return False
+            
+        if quote_count >= self.max_currency_exposure:
+            self.rejection_stats[f"Max Exposure ({quote_ccy})"] += 1
+            return False
+            
+        return True
+
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (V12.0 Alpha Seeker).
+        Main Event Loop for the Strategy (V12.3 FTMO Survival Mode).
         """
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
@@ -314,7 +346,7 @@ class ResearchStrategy:
 
         self._update_streak_status(broker)
         self._manage_trailing_stops(broker, price, dt_ts)
-        self._manage_time_stops(broker, dt_ts) # V11.1 NEW: Force close stale trades
+        self._manage_time_stops(broker, dt_ts)
 
         # --- FRIDAY LOGIC ---
         if server_time.weekday() == 4 and server_time.hour >= self.friday_close_hour:
@@ -326,11 +358,10 @@ class ResearchStrategy:
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
             return 
 
-        # Flow Volumes
+        # Flow Volumes (Tick Rule Fallback)
         buy_vol = snapshot.get_price(self.symbol, 'buy_vol')
         sell_vol = snapshot.get_price(self.symbol, 'sell_vol')
         
-        # Retail Fallback
         if buy_vol == 0 and sell_vol == 0:
             if self.last_price > 0:
                 if price > self.last_price:
@@ -415,7 +446,7 @@ class ResearchStrategy:
             return 
 
         # ============================================================
-        # E. AGGRESSOR GATES & ASSET PERSONALITY (V12.0)
+        # E. AGGRESSOR GATES & ASSET PERSONALITY (V12.3 SOFT MODE)
         # ============================================================
         
         # G1: EFFICIENCY (KER) - AGGRESSIVE (V11.0)
@@ -426,12 +457,11 @@ class ResearchStrategy:
             self.rejection_stats[f"Low Efficiency (KER {ker_val:.3f} < {effective_ker_thresh:.3f})"] += 1
             return
 
-        # G2: REGIME IDENTIFICATION (Hurst)
-        # Determine Preferred Regime for this Asset
+        # G2: REGIME IDENTIFICATION
         preferred_regime = self._get_preferred_regime(self.symbol)
-        
         regime_label = "Neutral"
         proposed_action = 0 # 0=Hold, 1=Buy, -1=Sell
+        is_regime_clash = False
         
         # Check Bollinger Bands state
         if len(self.bb_buffer) < self.bb_window:
@@ -445,17 +475,14 @@ class ResearchStrategy:
         lower_bb = bb_mu - (bb_mult * bb_std)
         
         # --- V12.0 LOGIC MAPPING ---
-        # 1. DETECT PHYSICS
         is_trending = hurst > self.hurst_breakout
         is_reverting = hurst < self.hurst_mean_rev
         
-        # 2. FILTER BY PERSONALITY (Robust Match)
         if is_trending:
             if preferred_regime == "MEAN_REVERSION":
-                self.rejection_stats["Personality Clash (Trend on MeanRev Asset)"] += 1
-                return 
+                is_regime_clash = True
             
-            # Valid Trend Signal
+            # Trend Logic
             regime_label = "TREND_BREAKOUT"
             if price > upper_bb:
                 proposed_action = 1 # Breakout Buy
@@ -464,10 +491,9 @@ class ResearchStrategy:
                 
         elif is_reverting:
             if preferred_regime == "TREND_BREAKOUT":
-                self.rejection_stats["Personality Clash (MeanRev on Trend Asset)"] += 1
-                return
+                is_regime_clash = True
                 
-            # Valid Reversion Signal
+            # Reversion Logic
             regime_label = "MEAN_REVERSION"
             if price > upper_bb:
                 proposed_action = -1 # Fade Buy (Short the top)
@@ -482,6 +508,15 @@ class ResearchStrategy:
         if proposed_action == 0:
             self.rejection_stats["No Trigger"] += 1
             return
+            
+        # --- REGIME ENFORCEMENT (V12.3) ---
+        if is_regime_clash:
+            if self.regime_enforcement == "HARD":
+                self.rejection_stats[f"Personality Clash ({regime_label} on {preferred_regime})"] += 1
+                return
+            else:
+                # SOFT Mode: Mark for high confidence check later
+                pass 
 
         # G3: EXHAUSTION
         if rvol_val > self.max_rvol_thresh:
@@ -491,7 +526,7 @@ class ResearchStrategy:
         # G4: TREND STRENGTH (ADX) - Only for Trend Regime
         if regime_label == "TREND_BREAKOUT":
             adx_val = features.get('adx', 0.0)
-            if adx_val < self.adx_threshold: # Relaxed to 20.0
+            if adx_val < self.adx_threshold:
                 self.rejection_stats[f"Weak Trend"] += 1
                 return
 
@@ -517,14 +552,28 @@ class ResearchStrategy:
             if proposed_action != 0:
                 self.meta_label_events += 1
 
-            min_prob = float(self.params.get('min_calibrated_probability', 0.52))
-            if confidence < min_prob:
-                self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob:.2f})"] += 1
-                return
+            min_prob = float(self.params.get('min_calibrated_probability', 0.50))
+            
+            # V12.3: SOFT REGIME OVERRIDE LOGIC
+            if is_regime_clash:
+                # Require "God Mode" confidence to trade against personality
+                required_conf = 0.75 
+                if confidence < required_conf:
+                    self.rejection_stats[f"Regime Clash Low Conf ({confidence:.2f} < {required_conf})"] += 1
+                    return
+            else:
+                # Normal check
+                if confidence < min_prob:
+                    self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob:.2f})"] += 1
+                    return
 
             # --- SNIPER PROTOCOL ---
             if not self._check_sniper_filters(proposed_action, price):
                 self.rejection_stats["Sniper Reject"] += 1
+                return
+            
+            # --- PORTFOLIO HEAT (V12.3) ---
+            if not self._check_currency_exposure(broker, self.symbol):
                 return
 
             if is_profitable:

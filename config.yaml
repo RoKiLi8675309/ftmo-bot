@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V12.2 (EXPANDED PORTFOLIO)
+# config.yaml – PROJECT PHOENIX V12.3 (FTMO SURVIVAL MODE)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGY UPDATE (V12.2 - DIVERSIFICATION):
-# 1. PORTFOLIO: Added USDCAD, USDCHF, GBPJPY, EURJPY (Total 8 Pairs).
-# 2. LOGIC: Explicit Regime Mapping for new pairs.
-# 3. SAFETY: Strict enforcement of 20+ trades for Optimization.
+# STRATEGY UPDATE (V12.3 - RISK CALIBRATION):
+# 1. SIZING: Reduced Base Risk to 0.35% to contain Drawdown < 8%.
+# 2. LOGIC: "SOFT" Regime Enforcement (High confidence overrides personality).
+# 3. SAFETY: Stricter Daily Limits (4%).
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -143,18 +143,21 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V12.2 EXPANDED) ---
+# --- PHOENIX STRATEGY PARAMETERS (V12.3 SURVIVAL) ---
 phoenix_strategy:
-  # --- ASSET REGIME MAPPING (CRITICAL UPDATE) ---
-  # Forces specific logic paths based on asset characteristics
+  # --- ASSET REGIME MAPPING ---
+  # V12.3: Now used as a "Soft" filter. 
+  # High confidence (>0.75) permits trading against the map.
+  regime_enforcement: "SOFT" 
+  
   asset_regime_map:
     GBP: "TREND_BREAKOUT"   # GBP pairs favor momentum
     EUR: "NEUTRAL"          # EUR pairs allow both Trend & Reversion
     USD: "NEUTRAL"          # USD pairs allow both
     JPY: "TREND_BREAKOUT"   # JPY favors strong trends
     AUD: "MEAN_REVERSION"   # AUD often ranges
-    CAD: "MEAN_REVERSION"   # NEW: CAD tends to revert
-    CHF: "MEAN_REVERSION"   # NEW: CHF often ranges
+    CAD: "MEAN_REVERSION"   # CAD tends to revert
+    CHF: "MEAN_REVERSION"   # CHF often ranges
 
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true        
@@ -222,7 +225,7 @@ optimization_search_space:
   
   # Strategy Execution
   min_calibrated_probability:
-    min: 0.52
+    min: 0.50 # V12.3: Lowered to allow meta-labeler to decide
     max: 0.65
 
 # --- RISK MANAGEMENT (FTMO COMPLIANCE) ---
@@ -232,20 +235,24 @@ risk_management:
   # --- SIZING METHOD: PROFIT BUFFER SCALING ---
   sizing_method: "fixed_risk"
   
-  # INITIAL RISK: Conservative start (0.5%)
-  base_risk_per_trade_percent: 0.005 
+  # INITIAL RISK: V12.3 Calibrated for Survival
+  # 0.35% Base Risk. Survival first, then scale.
+  base_risk_per_trade_percent: 0.0035 
   
-  # PROFIT BUFFER LOGIC (NEW)
-  # Once daily profit exceeds 3%, scale risk to 1.0%
+  # PROFIT BUFFER LOGIC
+  # Once daily profit exceeds 3%, scale risk to 0.75% (was 1.0%)
   profit_buffer_threshold: 0.03
-  scaled_risk_percent: 0.010
+  scaled_risk_percent: 0.0075
   
-  # LIMITS
-  max_daily_loss_pct: 0.045        # 4.5% (Stay below FTMO 5%)
-  max_total_loss_pct: 0.09         # 9.0% (Stay below FTMO 10%)
+  # LIMITS (TIGHTENED)
+  max_daily_loss_pct: 0.040        # 4.0% (Buffer before FTMO 5%)
+  max_total_loss_pct: 0.080        # 8.0% (Buffer before FTMO 10%)
+  
+  # PORTFOLIO HEAT
+  max_currency_exposure: 2         # Max 2 positions per currency (e.g. 2 USD pairs)
   
   max_risk_percent: 2.5            # Allow more open risk
-  max_open_trades: 8               # UPDATED: Increased for 8 pairs
+  max_open_trades: 6               # REDUCED: Focus on quality
   
   max_leverage: 30.0
   max_lot_size: 50.0 
@@ -258,7 +265,7 @@ risk_management:
   # ACTIVE TRAILING STOP
   trailing_stop:
     enabled: true        
-    activation_r: 0.5      # AGGRESSIVE: Start trailing at 0.5R profit
+    activation_r: 0.5       # AGGRESSIVE: Start trailing at 0.5R profit
     trail_trigger_r: 0.75 # Trigger next step
     trail_dist_r: 0.3      # TIGHT: 0.3R Distance behind price
   
@@ -298,7 +305,7 @@ trading:
   
   # --- EXECUTION OPTIMIZATION ---
   limit_order_offset_pips: 0.2 
-  limit_order_ttl_seconds: 30      # TIGHTER: 60s -> 30s for intraday precision
+  limit_order_ttl_seconds: 30       # TIGHTER: 60s -> 30s for intraday precision
 
 # --- ONLINE LEARNING ---
 online_learning:
@@ -334,7 +341,7 @@ online_learning:
   learning_horizon_sec: 300
   
   # AGGRESSOR PROTOCOL
-  min_calibrated_probability: 0.52 
+  min_calibrated_probability: 0.50 
 
 # --- NEWS FILTER ---
 news_filter:
@@ -374,4 +381,4 @@ wfo:
   train_years: 2
   test_months: 6
   min_trades_optimization: 100 # STRICT: Minimum valid trades
-  risk_per_trade_options: [0.005, 0.010]
+  risk_per_trade_options: [0.0035, 0.0075] # Updated for V12.3 scaling

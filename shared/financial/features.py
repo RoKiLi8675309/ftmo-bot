@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 # 
-# PHOENIX STRATEGY V11.1 (ALPHA SEEKER):
-# 1. CORE UPDATE: Lowered BB Deviation default to 1.5 for Alpha Seeker Logic.
-# 2. FEATURE SET: Added 'bb_breakout', 'bb_width', 'bb_pct_b' to ML vector.
-# 3. LEGACY SUPPORT: Retained Aggressor/Flow features as secondary signals.
-# 4. CLEANUP: Optimized dependencies and error handling.
+# PHOENIX STRATEGY V12.3 (FTMO SURVIVAL):
+# 1. CORE UPDATE: Bollinger Bandwidth exposed for Volatility Compression detection.
+# 2. FEATURE SET: Full support for V12.3 Soft Regime logic.
+# 3. ROBUSTNESS: Optimized dependencies and error handling.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -119,9 +118,8 @@ class RecursiveEMA:
 
 class StreamingBollingerBands:
     """
-    V9.0 CORE LOGIC: Momentum Breakout Indicator.
-    Calculates Upper/Lower Bands and Width for Breakout Detection.
-    V11.1 Update: Default num_std lowered to 1.5 to catch earlier moves.
+    V12.3 UPDATE: Momentum Breakout Indicator.
+    Calculates Upper/Lower Bands and Width for Breakout & Squeeze Detection.
     """
     def __init__(self, window: int = 20, num_std: float = 1.5):
         self.window = window
@@ -147,10 +145,11 @@ class StreamingBollingerBands:
         
         upper = mu + (self.num_std * std)
         lower = mu - (self.num_std * std)
-        width = (upper - lower) / mu if mu > 0 else 0.0
+        width = (upper - lower) / mu if mu > 1e-9 else 0.0
         
         # Percent B: Where is price relative to bands? (0=Lower, 1=Upper)
-        pct_b = (price - lower) / (upper - lower) if (upper - lower) > 0 else 0.5
+        band_range = upper - lower
+        pct_b = (price - lower) / band_range if band_range > 1e-9 else 0.5
         
         # Breakout Signal: >0 if above upper, <0 if below lower
         breakout = 0.0

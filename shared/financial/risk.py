@@ -5,11 +5,11 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX STRATEGY V12.1 (FINE-TUNED):
-# 1. TOXIC FILTER: Relaxed SQN cutoff from -1.0 to -2.0 to prevent early "tilt" lockout.
-# 2. ALPHA SQUAD: Boosts risk by 10% for GBP/JPY pairs (Capitalize on Winners).
-# 3. PROFIT BUFFER: Scales Risk 0.5% -> 1.0% if Daily PnL > 3%.
-# 4. RESTORATION: Fixed missing HierarchicalRiskParity class.
+# PHOENIX STRATEGY V12.3 (FTMO SURVIVAL MODE):
+# 1. CALIBRATION: Base Risk reduced to 0.35% to prioritize survival.
+# 2. SCALING: Profit Buffer Scaling reduced to 0.75% (was 1.0%).
+# 3. SAFETY: Portfolio Heat checks integrated via correlation penalty.
+# 4. RESTORATION: HierarchicalRiskParity & PortfolioRiskManager preserved.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -152,7 +152,7 @@ class RiskManager:
         """
         Calculates position size using strict prop firm logic (Sniper Protocol).
         Includes SQN Scaling to cut losers and press winners.
-        V12.1 UPDATE: Relaxed Toxic Filter & Added Alpha Squad Boost.
+        V12.3 UPDATE: Risk calibrated for survival (0.35% Base).
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -200,10 +200,12 @@ class RiskManager:
         lots = 0.0
         calculated_risk_usd = 0.0
         
-        # --- V12.0: PROFIT BUFFER SCALING (The "Earn to Burn" Logic) ---
-        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.005)
+        # --- V12.3: PROFIT BUFFER SCALING (SURVIVAL MODE) ---
+        # Default lowered to 0.35% to prevent drawdown breaches
+        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.0035)
         buffer_threshold = risk_conf.get('profit_buffer_threshold', 0.03)
-        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.01)
+        # Scaled risk lowered to 0.75%
+        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.0075)
         
         scaling_comment = ""
         

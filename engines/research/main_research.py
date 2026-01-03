@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# PHOENIX STRATEGY V12.2 (DIVERSIFICATION & ROBUSTNESS):
-# 1. OPTIMIZATION: Implemented strict post-optimization filtering to reject
-#    trials with insufficient trade samples (prevent overfitting to low-N luck).
-# 2. SELECTION: Workers now scan all trials for the best *valid* candidate
-#    instead of blindly accepting study.best_params.
+# PHOENIX STRATEGY V12.3 (FTMO SURVIVAL MODE):
+# 1. OPTIMIZATION: Hard Drawdown Cap set to 8.0% (Safety Buffer).
+#    Any trial exceeding 8% DD is immediately disqualified (-10000 score).
+# 2. SELECTION: Workers scan for robust candidates with high trade counts.
 # =============================================================================
 import os
 import sys
@@ -85,9 +84,9 @@ class EmojiCallback:
         icon = "🔻"
         
         if attrs.get('blown', False):
-            icon = "💀" # Blown Account (>10% DD or Ruin)
+            icon = "💀" # Blown Account (>8% DD or Ruin)
             status = "BLOWN"
-        elif dd > 9.0: # UPDATED: 9.0% aligned with Config
+        elif dd > 8.0: # UPDATED: 8.0% Survival Cap
             icon = "⚠️" # High Risk
             status = "RISKY"
         elif attrs.get('pruned', False):
@@ -108,7 +107,7 @@ class EmojiCallback:
         # Structure: [ICON] STATUS | SYMBOL | ID | RISK | SCORE | PnL | DD | WR | TRADES
         msg = (
             f"{icon} {status:<6} | {symbol:<6} | Trial {trial.number:<3} | "
-            f"R: {risk_pct:>4.2f}% | "
+            f"R: {risk_pct:>4.3f}% | "
             f"🏆 {val:>8.1f} | "
             f"💰 ${pnl:>9,.0f} | " # Compacted PnL for space
             f"📉 {dd:>5.2f}% | "
@@ -265,9 +264,9 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
             
-            risk_options = CONFIG['wfo'].get('risk_per_trade_options', [0.25, 0.50, 0.75, 1.0])
+            risk_options = CONFIG['wfo'].get('risk_per_trade_options', [0.0035, 0.0075])
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
-            trial.set_user_attr("risk_pct", params['risk_per_trade_percent'])
+            trial.set_user_attr("risk_pct", params['risk_per_trade_percent'] * 100)
             
             pipeline_inst = ResearchPipeline()
             init_bal = CONFIG['env'].get('initial_balance', 100000.0)
@@ -302,7 +301,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("calmar", calmar)
 
-            if max_dd_pct > 0.09: 
+            # V12.3: HARD 8% DRAWDOWN LIMIT
+            if max_dd_pct > 0.08: 
                 trial.set_user_attr("blown", True)
                 return -10000.0 
             
@@ -407,7 +407,7 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 }
                 params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
                 
-                risk_options = CONFIG['wfo'].get('risk_per_trade_options', [0.25, 0.50, 0.75, 1.0])
+                risk_options = CONFIG['wfo'].get('risk_per_trade_options', [0.0035, 0.0075])
                 params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
                 
                 pipeline_inst = ResearchPipeline()
@@ -430,7 +430,8 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 safe_dd = max_dd_pct if max_dd_pct > 0.001 else 0.001
                 calmar = (total_return / 100000.0) / safe_dd
                 
-                if max_dd_pct > 0.09 or broker.is_blown: return -10000.0
+                # V12.3: HARD 8% DRAWDOWN LIMIT
+                if max_dd_pct > 0.08 or broker.is_blown: return -10000.0
                 if trades < 10: return 0.0 
                 
                 return total_return + (calmar * 100.0)
