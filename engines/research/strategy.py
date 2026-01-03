@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V12.3 (FTMO SURVIVAL):
-# 1. REGIME: Implemented "SOFT" Enforcement (High Conf overrides Personality).
-# 2. RISK: Added Max Currency Exposure check (Portfolio Heat).
-# 3. LOGIC: Profit Buffer Scaling active via RiskManager.
+# PHOENIX STRATEGY V12.4 (FTMO SNIPER):
+# 1. LOGIC: Implemented "Stalemate Exit" (4h) to fix Time Stop inefficiency.
+# 2. REGIME: "SOFT" Enforcement maintained.
+# 3. RISK: Portfolio Heat checks maintained.
 # =============================================================================
 import logging
 import sys
@@ -47,7 +47,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V12.3 Alpha Seeker Protocol.
+    Strictly implements the Phoenix V12.4 Alpha Seeker Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -287,7 +287,7 @@ class ResearchStrategy:
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (V12.3 FTMO Survival Mode).
+        Main Event Loop for the Strategy (V12.4 FTMO Sniper Mode).
         """
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
@@ -730,14 +730,18 @@ class ResearchStrategy:
 
     def _manage_time_stops(self, broker: BacktestBroker, current_time: datetime):
         """
-        V11.1 FEATURE: Time-Based Force Exit.
+        V12.4 FEATURE: Managed Time Exits.
+        1. Hard Time Stop (24h): Closes position regardless of PnL.
+        2. Stalemate Exit (4h): Closes position if it's stagnating (Break-even range).
         """
-        cutoff_seconds = 86400 
+        hard_stop_seconds = 86400  # 24 Hours
+        stalemate_seconds = 14400  # 4 Hours
         
         to_close = []
         for pos in broker.open_positions:
             if pos.symbol != self.symbol: continue
             
+            # Ensure time zone awareness
             if pos.timestamp_created.tzinfo is None:
                 pos_time = pos.timestamp_created.replace(tzinfo=pytz.utc)
             else:
@@ -750,16 +754,34 @@ class ResearchStrategy:
             
             duration = (curr_time_aware - pos_time).total_seconds()
             
-            if duration > cutoff_seconds:
-                to_close.append(pos)
+            # 1. Hard Time Stop (24h)
+            if duration > hard_stop_seconds:
+                to_close.append((pos, "Time Stop (24h)"))
+            
+            # 2. Stalemate Exit (4h)
+            elif duration > stalemate_seconds:
+                # Calculate current R-multiple performance
+                risk_dist = pos.metadata.get('initial_risk_dist', 0.0)
+                
+                if risk_dist > 0:
+                    if pos.side == 1: # BUY
+                        current_pnl_dist = self.last_price - pos.entry_price
+                    else: # SELL
+                        current_pnl_dist = pos.entry_price - self.last_price
+                    
+                    r_value = current_pnl_dist / risk_dist
+                    
+                    # If trade is stuck between -0.5R and +0.5R after 4 hours -> KILL IT
+                    if -0.5 <= r_value <= 0.5:
+                        to_close.append((pos, "Stalemate (4h)"))
         
-        for pos in to_close:
+        for pos, reason in to_close:
             broker._close_partial_position(
                 pos, 
                 pos.quantity, 
                 self.last_price, 
                 current_time, 
-                "Time Stop (24h)"
+                reason
             )
 
     def _manage_trailing_stops(self, broker: BacktestBroker, current_price: float, timestamp: datetime):

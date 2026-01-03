@@ -5,11 +5,11 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX STRATEGY V12.3 (FTMO SURVIVAL MODE):
-# 1. CALIBRATION: Base Risk reduced to 0.35% to prioritize survival.
-# 2. SCALING: Profit Buffer Scaling reduced to 0.75% (was 1.0%).
-# 3. SAFETY: Portfolio Heat checks integrated via correlation penalty.
-# 4. RESTORATION: HierarchicalRiskParity & PortfolioRiskManager preserved.
+# PHOENIX STRATEGY V12.4 (FTMO SNIPER MODE):
+# 1. CALIBRATION: Base Risk increased to 0.50% (Confidence High).
+# 2. SCALING: Profit Buffer Scaling bumped to 1.0% (Aggressive).
+# 3. ALPHA SQUAD: Specific boost for USDJPY & EURUSD (Confirmed Winners).
+# 4. SAFETY: Portfolio Heat checks integrated via correlation penalty.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -152,7 +152,7 @@ class RiskManager:
         """
         Calculates position size using strict prop firm logic (Sniper Protocol).
         Includes SQN Scaling to cut losers and press winners.
-        V12.3 UPDATE: Risk calibrated for survival (0.35% Base).
+        V13.0 UPDATE: Risk calibrated for Sniper Mode (0.50% Base).
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -200,12 +200,12 @@ class RiskManager:
         lots = 0.0
         calculated_risk_usd = 0.0
         
-        # --- V12.3: PROFIT BUFFER SCALING (SURVIVAL MODE) ---
-        # Default lowered to 0.35% to prevent drawdown breaches
-        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.0035)
+        # --- V13.0: PROFIT BUFFER SCALING (SNIPER MODE) ---
+        # Default increased to 0.50% as Drawdown was only ~3%
+        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.0050)
         buffer_threshold = risk_conf.get('profit_buffer_threshold', 0.03)
-        # Scaled risk lowered to 0.75%
-        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.0075)
+        # Scaled risk increased to 1.0% for aggression
+        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.010)
         
         scaling_comment = ""
         
@@ -228,20 +228,21 @@ class RiskManager:
                 return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, f"Toxic Asset (SQN {performance_score:.2f})"), 0.0
                 
             elif performance_score < 0.0:
-                # LOSING STREAK: Probe Size Only (0.1%)
-                risk_pct = 0.1
+                # LOSING STREAK: Probe Size Only (0.15%) - slightly higher probe
+                risk_pct = 0.15
                 scaling_comment += "|SQN:Low"
                 
             elif performance_score > 2.5:
                 # HOT HAND: Scale up slightly (1.25x)
-                risk_pct = min(risk_pct * 1.25, 1.0)
+                risk_pct = min(risk_pct * 1.25, 1.5)
                 scaling_comment += "|SQN:High"
         
-        # --- ALPHA SQUAD BOOST (FINE-TUNED) ---
-        # Capitalize on GBP/JPY Winners by boosting risk 10% (if not capped)
-        if "GBP" in symbol or "JPY" in symbol:
-            boosted_risk = risk_pct * 1.10
-            if boosted_risk <= 1.0: # Only boost if under hard cap
+        # --- ALPHA SQUAD BOOST (SNIPER MODE) ---
+        # Confirmed Winners: USDJPY and EURUSD
+        # Pruned: EURJPY, AUDUSD, USDCAD
+        if symbol in ["USDJPY", "EURUSD"]:
+            boosted_risk = risk_pct * 1.20 # 20% Boost for validated Alpha Assets
+            if boosted_risk <= 1.5: # Cap at 1.5%
                 risk_pct = boosted_risk
                 scaling_comment += "|AlphaBoost"
 

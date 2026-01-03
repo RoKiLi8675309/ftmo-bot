@@ -6,10 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX STRATEGY V12.3 (LIVE ENGINE):
-# 1. RISK: Integrated V12.3 Profit Buffer Scaling (daily_pnl_pct calculation).
-# 2. LOGIC: Supports Soft Regime Enforcement via Predictor.
-# 3. SAFETY: Strict adherence to V12.3 FTMO Limits.
+# PHOENIX STRATEGY V12.4 (LIVE ENGINE - SNIPER MODE):
+# 1. LOGIC: Added "Stalemate Exit" (4h) to active position management.
+# 2. RISK: Strict adherence to V12.4 FTMO Limits and 0.50% base risk.
+# 3. ASSETS: Optimized for High-Vol pairs (EURUSD, GBPUSD, JPY pairs).
 # =============================================================================
 import logging
 import time
@@ -66,8 +66,8 @@ class LiveTradingEngine:
     The Central Logic Unit for the Linux Consumer.
     1. Consumes Ticks from Redis.
     2. Aggregates Ticks into Adaptive Imbalance Bars (TIBs).
-    3. Feeds Bars to Golden Trio Predictor (V12.3 Logic).
-    4. Manages Active Positions (Time Stop / Trailing).
+    3. Feeds Bars to Golden Trio Predictor (V12.4 Logic).
+    4. Manages Active Positions (Time Stop / Stalemate / Trailing).
     5. Dispatches Orders to Windows.
     """
     def __init__(self):
@@ -97,7 +97,7 @@ class LiveTradingEngine:
         self.aggregators = {}
         
         # Use Volume Threshold config as a proxy for Initial Imbalance Threshold
-        init_threshold = CONFIG['data'].get('volume_bar_threshold', 100) # V10.1 Default
+        init_threshold = CONFIG['data'].get('volume_bar_threshold', 50) # V12.4 Default
         # Default alpha 0.05 if not in config
         alpha = CONFIG['data'].get('imbalance_alpha', 0.05) 
 
@@ -302,10 +302,13 @@ class LiveTradingEngine:
 
     def _manage_active_positions_loop(self):
         """
-        V11.1: Active Position Management Thread.
-        Enforces 24h Time Stop and 0.5R Trailing Logic.
+        V12.4: Active Position Management Thread.
+        Enforces:
+        1. 24h Time Stop (Hard Exit).
+        2. 4h Stalemate Exit (Exit if PnL between -0.5R and +0.5R).
+        3. 0.5R Trailing Stop.
         """
-        logger.info(f"{LogSymbols.INFO} Active Position Manager Started (Time-Stop: 24h, Trail: 0.5R).")
+        logger.info(f"{LogSymbols.INFO} Active Position Manager Started (Time-Stop: 24h, Stalemate: 4h, Trail: 0.5R).")
         while not self.shutdown_flag:
             try:
                 positions = self._get_open_positions_from_redis()
@@ -314,17 +317,45 @@ class LiveTradingEngine:
                     continue
 
                 now_utc = datetime.now(pytz.utc)
-                cutoff_seconds = 86400 # 24 hours
+                hard_stop_seconds = 86400 # 24 hours
+                stalemate_seconds = 14400 # 4 hours
 
                 for sym, pos in positions.items():
-                    # 1. Time Stop Check
+                    # --- TIME BASED EXITS ---
                     entry_ts = float(pos.get('time', 0))
                     if entry_ts > 0:
                         entry_dt = datetime.fromtimestamp(entry_ts, pytz.utc)
                         duration = (now_utc - entry_dt).total_seconds()
                         
-                        if duration > cutoff_seconds:
+                        exit_reason = None
+                        
+                        # 1. Hard Time Stop (24h)
+                        if duration > hard_stop_seconds:
+                            exit_reason = "Time Stop (24h)"
                             logger.warning(f"⌛ TIME STOP: {sym} held for {duration/3600:.1f}h. Closing.")
+                        
+                        # 2. Stalemate Exit (4h)
+                        elif duration > stalemate_seconds:
+                            current_price = self.latest_prices.get(sym, 0.0)
+                            entry_price = float(pos.get('entry_price', 0.0))
+                            sl_price = float(pos.get('sl', 0.0))
+                            
+                            if current_price > 0 and entry_price > 0 and sl_price > 0:
+                                risk_dist = abs(entry_price - sl_price)
+                                if risk_dist > 1e-5:
+                                    if pos.get('type') == "BUY":
+                                        pnl_dist = current_price - entry_price
+                                    else:
+                                        pnl_dist = entry_price - current_price
+                                    
+                                    r_val = pnl_dist / risk_dist
+                                    
+                                    # If stuck between -0.5R and +0.5R -> Kill it
+                                    if -0.5 <= r_val <= 0.5:
+                                        exit_reason = "Stalemate (4h)"
+                                        logger.info(f"⌛ STALEMATE: {sym} stuck at {r_val:.2f}R for {duration/3600:.1f}h. Freeing capital.")
+
+                        if exit_reason:
                             close_intent = Trade(
                                 symbol=sym,
                                 action="CLOSE_ALL",
@@ -332,12 +363,12 @@ class LiveTradingEngine:
                                 entry_price=0.0, 
                                 stop_loss=0.0, 
                                 take_profit=0.0, 
-                                comment="Time Stop (24h)"
+                                comment=exit_reason
                             )
                             self.dispatcher.send_order(close_intent, 0.0)
                             continue
 
-                    # 2. Trailing Stop Logic (0.5R)
+                    # --- TRAILING STOP LOGIC (0.5R) ---
                     current_price = self.latest_prices.get(sym, 0.0)
                     if current_price <= 0: continue
 

@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# PHOENIX STRATEGY V12.3 (FTMO SURVIVAL MODE):
-# 1. OPTIMIZATION: Hard Drawdown Cap set to 8.0% (Safety Buffer).
-#    Any trial exceeding 8% DD is immediately disqualified (-10000 score).
-# 2. SELECTION: Workers scan for robust candidates with high trade counts.
+# PHOENIX STRATEGY V12.4 (FTMO SNIPER MODE):
+# 1. HORIZON: Extended TBM optimization range to 24h (1440m) for swing trades.
+# 2. RISK: Updated search space to [0.50%, 0.75%] to match higher conviction.
+# 3. SAFETY: Hard Drawdown Cap at 8.0% maintained.
 # =============================================================================
 import os
 import sys
@@ -231,6 +231,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
     """
     ISOLATED WORKER FUNCTION: Runs in a separate process.
     Executes Global Optimization for a single symbol using "PROFIT IS KING" Logic.
+    V12.4: Optimized search space for Sniper Mode (Higher Risk, Longer Horizons).
     """
     os.environ["OMP_NUM_THREADS"] = "1"
     setup_logging(f"Worker_{symbol}")
@@ -258,13 +259,15 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             params['tbm'] = {
                 'barrier_width': trial.suggest_float('barrier_width', space['tbm_barrier_width']['min'], space['tbm_barrier_width']['max']),
-                'horizon_minutes': trial.suggest_int('horizon_minutes', space['tbm_horizon_minutes']['min'], space['tbm_horizon_minutes']['max'], step=space['tbm_horizon_minutes']['step']),
+                # V12.4: Extended Horizon for Swing Trades (up to 24h)
+                'horizon_minutes': trial.suggest_int('horizon_minutes', 60, 1440, step=60),
                 'drift_threshold': trial.suggest_float('drift_threshold', space['tbm_drift_threshold']['min'], space['tbm_drift_threshold']['max'])
             }
             
             params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
             
-            risk_options = CONFIG['wfo'].get('risk_per_trade_options', [0.0035, 0.0075])
+            # V12.4: Higher Risk Options for Sniper Conviction
+            risk_options = [0.0050, 0.0075] 
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             trial.set_user_attr("risk_pct", params['risk_per_trade_percent'] * 100)
             
@@ -555,7 +558,8 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
 
 class ResearchPipeline:
     def __init__(self):
-        self.symbols = CONFIG['trading']['symbols']
+        # V12.4: Safe Get for Symbols (Pruned list)
+        self.symbols = CONFIG['trading'].get('symbols', [])
         self.models_dir = Path("models")
         self.models_dir.mkdir(exist_ok=True)
         self.reports_dir = Path("reports")

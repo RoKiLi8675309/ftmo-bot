@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V12.3 (FTMO SURVIVAL MODE)
+# config.yaml – PROJECT PHOENIX V12.4 (FTMO SNIPER MODE)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGY UPDATE (V12.3 - RISK CALIBRATION):
-# 1. SIZING: Reduced Base Risk to 0.35% to contain Drawdown < 8%.
-# 2. LOGIC: "SOFT" Regime Enforcement (High confidence overrides personality).
-# 3. SAFETY: Stricter Daily Limits (4%).
+# STRATEGY UPDATE (V12.4 - ASSET PRUNING & HORIZON ALIGNMENT):
+# 1. ASSETS: Pruned Toxic Pairs (AUDUSD, USDCAD, EURJPY). Focus on High-Vol winners.
+# 2. ML: Extended TBM Horizon to 720m (12h) to match observed trade duration.
+# 3. RISK: Increased Base Risk to 0.50% (DD capacity allows aggression).
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -143,7 +143,7 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V12.3 SURVIVAL) ---
+# --- PHOENIX STRATEGY PARAMETERS (V12.4 SNIPER MODE) ---
 phoenix_strategy:
   # --- ASSET REGIME MAPPING ---
   # V12.3: Now used as a "Soft" filter. 
@@ -217,8 +217,8 @@ optimization_search_space:
     max: 6.0  
   tbm_horizon_minutes:
     min: 60
-    max: 240
-    step: 30
+    max: 1440 # Extended to 24h
+    step: 60
   tbm_drift_threshold:
     min: 1.0
     max: 2.0
@@ -235,9 +235,9 @@ risk_management:
   # --- SIZING METHOD: PROFIT BUFFER SCALING ---
   sizing_method: "fixed_risk"
   
-  # INITIAL RISK: V12.3 Calibrated for Survival
-  # 0.35% Base Risk. Survival first, then scale.
-  base_risk_per_trade_percent: 0.0035 
+  # INITIAL RISK: V12.4 Calibrated for Sniper Mode
+  # 0.50% Base Risk.
+  base_risk_per_trade_percent: 0.0050 
   
   # PROFIT BUFFER LOGIC
   # Once daily profit exceeds 3%, scale risk to 0.75% (was 1.0%)
@@ -259,13 +259,13 @@ risk_management:
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (SCALPER MODE)
-  stop_loss_atr_mult: 1.5         # TIGHTER: Cut losers fast    
-  take_profit_atr_mult: 2.0       # TIGHTER: Bag wins fast    
+  stop_loss_atr_mult: 1.5         # TIGHTER: Cut losers fast     
+  take_profit_atr_mult: 2.0       # TIGHTER: Bag wins fast     
   
   # ACTIVE TRAILING STOP
   trailing_stop:
     enabled: true        
-    activation_r: 0.5       # AGGRESSIVE: Start trailing at 0.5R profit
+    activation_r: 0.5        # AGGRESSIVE: Start trailing at 0.5R profit
     trail_trigger_r: 0.75 # Trigger next step
     trail_dist_r: 0.3      # TIGHT: 0.3R Distance behind price
   
@@ -282,18 +282,15 @@ risk_management:
   hard_stop_equity_usd: 80000.0
   min_stop_loss_pips: 3.0
 
-# --- TRADING PORTFOLIO (V12.2 EXPANDED) ---
+# --- TRADING PORTFOLIO (V12.4 SNIPER MODE) ---
 trading:
+  # PRUNED: AUDUSD, USDCAD, EURJPY (Low Volatility / Regime Mismatch)
   symbols:
     - "EURUSD"
     - "GBPUSD"
     - "USDJPY"
-    - "AUDUSD"
-    # NEW PAIRS (Diversification)
-    - "USDCAD"  # Mean Reversion
-    - "USDCHF"  # Mean Reversion
-    - "GBPJPY"  # Trend (Aggressor)
-    - "EURJPY"  # Cross Trend
+    - "USDCHF"
+    - "GBPJPY"
   
   auxiliary_symbols:
     - "NZDUSD"
@@ -305,7 +302,7 @@ trading:
   
   # --- EXECUTION OPTIMIZATION ---
   limit_order_offset_pips: 0.2 
-  limit_order_ttl_seconds: 30       # TIGHTER: 60s -> 30s for intraday precision
+  limit_order_ttl_seconds: 30        # TIGHTER: 60s -> 30s for intraday precision
 
 # --- ONLINE LEARNING ---
 online_learning:
@@ -333,7 +330,8 @@ online_learning:
   meta_labeling_threshold: 0.52 # RELAXED
   
   tbm:
-    horizon_minutes: 120        
+    # UPDATED: Extended horizon to 720m (12h) to align with observed swing behavior
+    horizon_minutes: 720        
     barrier_width: 3.0        
     min_profit_pips: 5.0        
     drift_threshold: 1.5 

@@ -6,9 +6,9 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V12.3 (LIVE PREDICTOR):
-# 1. LOGIC: Implemented "SOFT" Regime Enforcement (High Conf > 0.75 overrides).
-# 2. RISK: Added Portfolio Heat checks (Max Currency Exposure).
+# PHOENIX STRATEGY V12.4 (LIVE PREDICTOR - SNIPER MODE):
+# 1. LOGIC: Aligned TBM Horizon (720m) for Swing/Day holds.
+# 2. ASSETS: Optimized for High-Vol pairs only (Pruned toxic assets).
 # 3. GATES: Dynamic KER Scaling via ADWIN Drift Detection.
 # =============================================================================
 import logging
@@ -98,7 +98,8 @@ class MultiAssetPredictor:
             # Default from Config
             s_risk = risk_mult_conf
             s_reward = tbm_conf.get('barrier_width', 3.0)
-            s_horizon = tbm_conf.get('horizon_minutes', 120)
+            # V12.4: Default to 720m (12h) to match new config
+            s_horizon = tbm_conf.get('horizon_minutes', 720)
             
             # --- DYNAMIC PARAMETER LOADING ---
             params_path = self.models_dir / f"best_params_{s}.json"

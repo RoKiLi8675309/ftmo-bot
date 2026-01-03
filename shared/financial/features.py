@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 # 
-# PHOENIX STRATEGY V12.3 (FTMO SURVIVAL):
-# 1. CORE UPDATE: Bollinger Bandwidth exposed for Volatility Compression detection.
-# 2. FEATURE SET: Full support for V12.3 Soft Regime logic.
-# 3. ROBUSTNESS: Optimized dependencies and error handling.
+# PHOENIX STRATEGY V12.4 (FTMO SNIPER MODE):
+# 1. HORIZON ALIGNMENT: AdaptiveTripleBarrier default extended to 144 ticks (12h).
+# 2. CALIBRATION: Optimizes labeling for Swing-style winners (USDJPY/EURUSD).
+# 3. FEATURE SET: Full support for V12.4 Sniper Regime logic.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -118,7 +118,7 @@ class RecursiveEMA:
 
 class StreamingBollingerBands:
     """
-    V12.3 UPDATE: Momentum Breakout Indicator.
+    V12.4 UPDATE: Sniper Mode Breakout Indicator.
     Calculates Upper/Lower Bands and Width for Breakout & Squeeze Detection.
     """
     def __init__(self, window: int = 20, num_std: float = 1.5):
@@ -684,9 +684,11 @@ class StreamingIndicators:
 class AdaptiveTripleBarrier:
     """
     Labeling engine.
-    Updated to accept Parkinson Volatility for dynamic barrier adjustment.
+    Updated for FTMO Sniper Mode: Extended horizon to capture Swing moves.
     """
-    def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.75):
+    def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.75):
+        # V12.4 ALIGNMENT: Default horizon increased to ~12 hours (144 ticks @ M5)
+        # matches the winning "Alpha Asset" profile from backtesting.
         self.buffer = deque()
         self.time_limit = horizon_ticks
         self.risk_mult = risk_mult
@@ -875,8 +877,7 @@ class OnlineFeatureEngineer:
         self.rvol = StreamingRelativeVolume(window=20)
         self.aggressor = StreamingAggressorRatio()
         
-        # V9.0 MOMENTUM LOGIC: Bollinger Bands (Restored)
-        # V11.1 Update: Default num_std lowered to 1.5 to catch earlier moves.
+        # V12.4 MOMENTUM LOGIC: Bollinger Bands
         self.bb = StreamingBollingerBands(window=20, num_std=1.5)
 
         # Microstructure & Math Engines
