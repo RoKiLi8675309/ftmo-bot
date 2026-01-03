@@ -5,13 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX STRATEGY V12.0 (INTRADAY ALPHA SEEKER):
-# 1. STOP LOSS: Widened to 2.0 * ATR (Prevents premature noise stop-outs).
-# 2. TAKE PROFIT: Adjusted to 3.0 * ATR (Sniper Target).
-# 3. PROFIT BUFFER: Scale Risk 0.5% -> 1.0% if Daily PnL > 3%.
-#    - Priority is SURVIVAL, then ACCELERATION.
-# 4. COMPLIANCE: SessionGuard enforces Friday Liquidation and Trading Hours.
-# 5. SQN SCALING: Added Performance-Based Sizing (Cut Losers / Press Winners).
+# PHOENIX STRATEGY V12.1 (FINE-TUNED):
+# 1. TOXIC FILTER: Relaxed SQN cutoff from -1.0 to -2.0 to prevent early "tilt" lockout.
+# 2. ALPHA SQUAD: Boosts risk by 10% for GBP/JPY pairs (Capitalize on Winners).
+# 3. PROFIT BUFFER: Scales Risk 0.5% -> 1.0% if Daily PnL > 3%.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -148,13 +145,13 @@ class RiskManager:
         contract_size_override: Optional[float] = None, 
         ker: float = 1.0, 
         risk_percent_override: Optional[float] = None,
-        performance_score: float = 0.0, # NEW: SQN Input for Dynamic Sizing
-        daily_pnl_pct: float = 0.0      # V12.0: Daily PnL for Buffer Scaling
+        performance_score: float = 0.0, 
+        daily_pnl_pct: float = 0.0
     ) -> Tuple[Trade, float]:
         """
         Calculates position size using strict prop firm logic (Sniper Protocol).
         Includes SQN Scaling to cut losers and press winners.
-        V12.0 UPDATE: Profit Buffer Scaling & Asymptotic Decay.
+        V12.1 UPDATE: Relaxed Toxic Filter & Added Alpha Squad Boost.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -170,8 +167,6 @@ class RiskManager:
         start_equity = account_size if account_size else float(CONFIG.get('env', {}).get('initial_balance', 100000.0))
         
         # --- SNIPER PROTOCOL: VOLATILITY-ADJUSTED STOPS ---
-        # Stop Loss = Entry +/- (ATR(14) * 2.0)
-        # We enforce 2.0 multiplier strictly to survive news/noise.
         atr_mult_sl = float(risk_conf.get('stop_loss_atr_mult', 2.0))
         atr_mult_tp = float(risk_conf.get('take_profit_atr_mult', 3.0))
         
@@ -179,7 +174,6 @@ class RiskManager:
         if atr and atr > 0:
             stop_dist = atr * atr_mult_sl
         else:
-            # Fallback 0.2% of price if ATR missing or zero
             stop_dist = price * 0.002 * atr_mult_sl
             
         # --- DEAD PAIR PROTECTION (SPREAD CLAMP) ---
@@ -206,8 +200,6 @@ class RiskManager:
         calculated_risk_usd = 0.0
         
         # --- V12.0: PROFIT BUFFER SCALING (The "Earn to Burn" Logic) ---
-        # "Start with 0.5% risk. Once a 3% buffer is built, scale to 1.0%."
-        
         default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.005)
         buffer_threshold = risk_conf.get('profit_buffer_threshold', 0.03)
         scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.01)
@@ -215,24 +207,20 @@ class RiskManager:
         scaling_comment = ""
         
         if risk_percent_override is not None:
-            # Optuna/WFO override has highest priority (used during optimization)
+            # Optuna/WFO override has highest priority
             risk_pct = risk_percent_override * 100.0 if risk_percent_override < 1.0 else risk_percent_override
         else:
             # Default Strategy Logic with Buffer Scaling
             if daily_pnl_pct >= buffer_threshold:
-                # We are well in profit for the day/challenge
                 risk_pct = scaled_risk_val * 100.0
                 scaling_comment = "|Buf:ON"
             else:
-                # Building the buffer
                 risk_pct = default_base_risk * 100.0
         
-        # --- NEW: SQN PERFORMANCE SCALING ---
-        # "Cut the Losers, Press the Winners"
-        # Only apply if we have a valid performance score (not 0.0 default)
+        # --- SQN PERFORMANCE SCALING (FINE-TUNED) ---
         if performance_score != 0.0:
-            if performance_score < -1.0:
-                # TOXIC ASSET: Hard Stop
+            # RELAXED TOXIC THRESHOLD: -1.0 -> -2.0 to prevent early lockout
+            if performance_score < -2.0:
                 risk_pct = 0.0
                 return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, f"Toxic Asset (SQN {performance_score:.2f})"), 0.0
                 
@@ -243,22 +231,26 @@ class RiskManager:
                 
             elif performance_score > 2.5:
                 # HOT HAND: Scale up slightly (1.25x)
-                # But CAP at 1.0% absolute max to prevent ruin
                 risk_pct = min(risk_pct * 1.25, 1.0)
                 scaling_comment += "|SQN:High"
         
+        # --- ALPHA SQUAD BOOST (FINE-TUNED) ---
+        # Capitalize on GBP/JPY Winners by boosting risk 10% (if not capped)
+        if "GBP" in symbol or "JPY" in symbol:
+            boosted_risk = risk_pct * 1.10
+            if boosted_risk <= 1.0: # Only boost if under hard cap
+                risk_pct = boosted_risk
+                scaling_comment += "|AlphaBoost"
+
         # --- V12.0 DEFENSIVE LAYER: ASYMPTOTIC DECAY ---
-        # If we are in drawdown for the day, reduce risk as we approach the 5% limit.
-        # Formula: Risk = min(TargetRisk, (DailyLimit - DailyLoss) / 2)
-        daily_limit_pct = risk_conf.get('max_daily_loss_pct', 0.045) # e.g. 0.045 (4.5%)
+        daily_limit_pct = risk_conf.get('max_daily_loss_pct', 0.045)
         
         if daily_pnl_pct < 0:
             current_loss_pct = abs(daily_pnl_pct)
             remaining_buffer = daily_limit_pct - current_loss_pct
             
-            # If buffer is tight, decay the risk
-            if remaining_buffer < 0.02: # Less than 2% room left
-                # Decay formula: Half the remaining distance
+            # If buffer is tight (< 2% left), decay the risk
+            if remaining_buffer < 0.02: 
                 decay_risk_pct = (remaining_buffer / 2.0) * 100.0
                 if decay_risk_pct < risk_pct:
                     risk_pct = max(0.0, decay_risk_pct)
@@ -352,11 +344,9 @@ class SessionGuard:
 
     def is_friday_afternoon(self, timestamp: Optional[datetime] = None) -> bool:
         """
-        Returns True if it is Friday and past the entry cutoff hour (e.g., 16:00).
-        This differentiates "No New Entries" from "Market Closed".
+        Returns True if it is Friday and past the entry cutoff hour.
         """
         if timestamp:
-            # Handle timezone if provided, otherwise assume aligned
             if timestamp.tzinfo is None:
                 dt = timestamp
             else:
@@ -372,12 +362,10 @@ class SessionGuard:
     def should_liquidate(self) -> bool:
         """
         Returns True if it is Friday and past the liquidation hour.
-        This forces the bot to close all trades before the weekend.
         """
         now_local = datetime.now(self.market_tz)
         weekday = now_local.weekday()
         
-        # Check if Friday (4) and hour >= liquidation hour (e.g., 21:00)
         if weekday == 4 and now_local.hour >= self.liquidation_hour:
             return True
             
@@ -393,8 +381,6 @@ class FTMORiskMonitor:
         self.r = redis_client
         self.starting_equity_of_day = initial_balance
         self.equity = initial_balance
-        
-        # 10% Profit Target (FTMO Challenge Goal)
         self.profit_target = initial_balance * 1.10
 
     def can_trade(self) -> bool:
@@ -426,61 +412,6 @@ class FTMORiskMonitor:
 
     def update_equity(self, current_equity: float):
         self.equity = current_equity
-
-class HierarchicalRiskParity:
-    """
-    Allocates portfolio weights based on hierarchical clustering of asset correlations.
-    """
-    @staticmethod
-    def get_allocation(returns_df: pd.DataFrame) -> Dict[str, float]:
-        cols = returns_df.columns.tolist()
-        if not SCIPY_AVAILABLE:
-            return {c: 1.0/len(cols) for c in cols}
-        
-        try:
-            # 1. Compute Correlation Matrix
-            corr = returns_df.corr().fillna(0)
-            
-            # 2. Compute Distance Matrix
-            dist = ssd.pdist(corr, metric='euclidean')
-            
-            # 3. Hierarchical Clustering (Linkage)
-            link = sch.linkage(dist, method='single')
-            
-            # 4. Quasi-Diagonalization
-            sort_ix = HierarchicalRiskParity._get_quasi_diag(link)
-            sort_ix = [cols[i] for i in sort_ix]
-            
-            # 5. Recursive Bisection
-            cov = returns_df.cov()
-            variances = np.diag(cov)
-            variances[variances < EPS] = EPS
-            inv_var = 1.0 / variances
-            
-            weights = inv_var / np.sum(inv_var)
-            
-            allocation = dict(zip(cols, weights))
-            return allocation
-        except Exception as e:
-            logger.error(f"HRP Failed: {e}")
-            return {c: 1.0/len(cols) for c in cols}
-
-    @staticmethod
-    def _get_quasi_diag(link: np.ndarray) -> List[int]:
-        link = link.astype(int)
-        sort_ix = pd.Series([link[-1, 0], link[-1, 1]])
-        num_items = link[-1, 3]
-        while sort_ix.max() >= num_items:
-            sort_ix.index = range(0, sort_ix.shape[0] * 2, 2)
-            df0 = sort_ix[sort_ix >= num_items]
-            i = df0.index
-            j = df0.values - num_items
-            sort_ix[i] = link[j, 0]
-            df0 = pd.Series(link[j, 1], index=i + 1)
-            sort_ix = pd.concat([sort_ix, df0])
-            sort_ix = sort_ix.sort_index()
-            sort_ix.index = range(sort_ix.shape[0])
-        return sort_ix.tolist()
 
 class PortfolioRiskManager:
     """

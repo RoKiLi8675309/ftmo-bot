@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V12.0 (INTRADAY ALPHA SEEKER)
+# config.yaml – PROJECT PHOENIX V12.1 (FINE-TUNED)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGY UPDATE (V12.0 - IMPROVEMENT PLAN IMPLEMENTATION):
-# 1. PHILOSOPHY: Shift from generic swing to Asset-Specific Intraday.
-# 2. LOGIC: GBP = Trend Following | EUR = Mean Reversion.
-# 3. RISK: "Profit Buffer" Scaling (0.5% -> 1.0% after 3% gain).
+# STRATEGY UPDATE (V12.1 - FINE TUNING):
+# 1. FIX: EURUSD Regime set to NEUTRAL (Allow Trend & Reversion).
+# 2. DATA: Volume Threshold lowered to 50 for granular M5 data.
+# 3. ALPHA: GBP/JPY prioritized in Risk Logic.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -77,7 +77,7 @@ producer:
 # --- DATA SETTINGS (V10.1 TIBs) ---
 data:
   sampling_method: "imbalance" # Adaptive Imbalance Bars
-  volume_bar_threshold: 100    # Low threshold for faster bars
+  volume_bar_threshold: 50     # FINE-TUNED: Lowered from 100 to 50 for M5 stability
   imbalance_alpha: 0.05        # EWMA Forgetting Factor
   download_start_date: "2020-01-01"
   num_candles_producer: 50000
@@ -143,13 +143,13 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V12.0 ASSET SPECIFIC) ---
+# --- PHOENIX STRATEGY PARAMETERS (V12.1 ASSET SPECIFIC) ---
 phoenix_strategy:
   # --- ASSET REGIME MAPPING (CRITICAL UPDATE) ---
   # Forces specific logic paths based on asset characteristics
   asset_regime_map:
     GBP: "TREND_BREAKOUT"   # GBP pairs favor momentum
-    EUR: "MEAN_REVERSION"   # EUR pairs favor ranging
+    EUR: "NEUTRAL"          # FINE-TUNED: Changed to NEUTRAL to unblock EURUSD
     USD: "NEUTRAL"          # USD pairs allow both (Fallback)
     JPY: "TREND_BREAKOUT"   # JPY favors strong trends
 
@@ -275,10 +275,10 @@ risk_management:
 # --- TRADING PORTFOLIO (ALPHA SQUAD) ---
 trading:
   symbols:
-    - "EURUSD"  # TARGET: MEAN REVERSION
-    - "GBPUSD"  # TARGET: TREND BREAKOUT
-    - "USDJPY"  # TARGET: TREND BREAKOUT (Added)
-    - "AUDUSD"  # TARGET: MEAN REVERSION (Added)
+    - "EURUSD"  # TARGET: NEUTRAL (Fixed)
+    - "GBPUSD"  # TARGET: TREND BREAKOUT (Alpha)
+    - "USDJPY"  # TARGET: TREND BREAKOUT (Alpha)
+    - "AUDUSD"  # TARGET: MEAN REVERSION
     # Add other pairs here if you have data for them
   
   auxiliary_symbols:
@@ -361,7 +361,7 @@ forensic_audit:
 
 # --- WFO OPTIMIZATION ---
 wfo:
-  n_trials: 35
+  n_trials: 100
   train_years: 2
   test_months: 6
   min_trades_optimization: 20 

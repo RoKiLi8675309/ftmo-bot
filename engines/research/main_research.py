@@ -5,10 +5,9 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# PHOENIX STRATEGY V12.0 (INTRADAY ALPHA SEEKER):
-# 1. WFO: Implemented Rolling Window Walk-Forward Optimization.
-# 2. OBJECTIVE: "Profit Is King" (Total PnL + Calmar Tie-Breaker).
-# 3. GATES: Hard Deck & Min Trades enforcement in WFO loop.
+# PHOENIX STRATEGY V12.1 (FINE-TUNED):
+# 1. DATA: Relaxed minimum bar threshold in Auto-Calibration to allow M5 granularity.
+# 2. OPTIMIZATION: Updated parallel processing to respect new settings.
 # =============================================================================
 import os
 import sys
@@ -137,7 +136,7 @@ class EmojiCallback:
 def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     """
     Helper to Load Ticks -> Aggregate to Tick Imbalance Bars (TIBs) -> Return Clean DataFrame.
-    V10.1: Auto-Calibrates threshold to ensure sufficient training data.
+    V12.1: Less aggressive lower bound to ensure M5 data is captured.
     """
     # 1. Load Massive Amount of Ticks (To get sufficient Bars)
     raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2)
@@ -146,8 +145,8 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
         return pd.DataFrame()
 
     # 2. V10.1 AGGREGATION: ADAPTIVE IMBALANCE BARS WITH AUTO-CALIBRATION
-    # Fetch params from config
-    config_threshold = CONFIG['data'].get('volume_bar_threshold', 100) # Proxy for initial TIB threshold
+    # Fetch params from config (now defaults to 50 in V12.1)
+    config_threshold = CONFIG['data'].get('volume_bar_threshold', 50) 
     alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
     
     # --- AUTO-CALIBRATION LOOP ---
@@ -208,7 +207,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
         else:
             # Not enough bars, lower threshold
             attempts += 1
-            new_threshold = current_threshold * 0.5
+            new_threshold = max(10, current_threshold * 0.5) # Lower limit of 10
             log.warning(f"⚠️ {symbol}: Insufficient bars ({len(temp_bars)}). Retrying with threshold {new_threshold}...")
             current_threshold = new_threshold
             
@@ -352,7 +351,6 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
         test_months = CONFIG['wfo'].get('test_months', 6)
         
         # Create Sliding Windows
-        # Start date of data
         start_date = df.index.min()
         end_date = df.index.max()
         
@@ -380,9 +378,8 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
             log.info(f"🪟 Processing Window {window_id} (Train: {len(df_train)} bars, Test: {len(df_test)} bars)")
             
             # --- OPTIMIZATION STEP (IN-SAMPLE) ---
-            # We create a transient study for this window
             study_name = f"wfo_{symbol}_{window_id}"
-            storage_url = f"sqlite:///wfo_{symbol}.db" # Separate DB for WFO to avoid locking
+            storage_url = f"sqlite:///wfo_{symbol}.db" 
             
             try:
                 optuna.delete_study(study_name=study_name, storage=storage_url)
@@ -391,12 +388,9 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
             study = optuna.create_study(study_name=study_name, storage=storage_url, direction="maximize")
             
             def objective(trial):
-                # ... COPY OF THE PROFIT IS KING OBJECTIVE ...
-                # Needs to use df_train
                 space = CONFIG['optimization_search_space']
                 params = CONFIG['online_learning'].copy()
                 
-                # Params Mapping (Same as Global)
                 params['n_models'] = trial.suggest_int('n_models', space['n_models']['min'], space['n_models']['max'], step=space['n_models']['step'])
                 params['grace_period'] = trial.suggest_int('grace_period', space['grace_period']['min'], space['grace_period']['max'], step=space['grace_period']['step'])
                 params['delta'] = trial.suggest_float('delta', float(space['delta']['min']), float(space['delta']['max']), log=space['delta'].get('log', True))
@@ -428,7 +422,6 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 
                 metrics = pipeline_inst.calculate_performance_metrics(broker.trade_log, broker.initial_balance)
                 
-                # Objective
                 total_return = metrics['total_pnl']
                 max_dd_pct = metrics['max_dd_pct']
                 trades = metrics['total_trades']
@@ -436,18 +429,17 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 calmar = (total_return / 100000.0) / safe_dd
                 
                 if max_dd_pct > 0.09 or broker.is_blown: return -10000.0
-                if trades < 10: return 0.0 # Lower threshold for windows
+                if trades < 10: return 0.0 
                 
                 return total_return + (calmar * 100.0)
 
-            study.optimize(objective, n_trials=n_trials) # Silent execution
+            study.optimize(objective, n_trials=n_trials)
             
             # --- VALIDATION STEP (OUT-OF-SAMPLE) ---
             best_params = study.best_params
             final_params = CONFIG['online_learning'].copy()
             final_params.update(best_params)
             
-            # Run on df_test
             pipeline_inst = ResearchPipeline()
             broker_test = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
             model_test = pipeline_inst.get_fresh_model(final_params)
@@ -470,10 +462,8 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 'trades': test_metrics['total_trades']
             })
             
-            # Slide Window
             current_train_start += pd.DateOffset(months=test_months)
             
-        # Summary
         total_wfo_pnl = sum([r['pnl'] for r in wfo_results])
         log.info(f"🏆 WFO COMPLETE {symbol}: Total OOS PnL ${total_wfo_pnl:.2f}")
         
@@ -483,19 +473,15 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
 def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_dir: Path) -> None:
     """
     Trains the Final Production Model using the Best Params found.
-    Also needs logging setup for isolated execution.
     """
     os.environ["OMP_NUM_THREADS"] = "1"
     setup_logging(f"Worker_Final_{symbol}")
     log = logging.getLogger(f"Worker_Final_{symbol}")
     
     try:
-        # 1. Load & Aggregate Data (TIBs)
-        # Uses Auto-Calibration
         df = process_data_into_bars(symbol, n_ticks=4000000)
         if df.empty: return
 
-        # 2. Get Best Params
         study_name = f"study_{symbol}"
         study = optuna.load_study(study_name=study_name, storage=db_url)
         
@@ -505,12 +491,10 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
             
         best_params = study.best_params
         
-        # 3. Save Best Params
         params_path = models_dir / f"best_params_{symbol}.json"
         with open(params_path, "w") as f:
             json.dump(best_params, f, indent=4)
 
-        # 4. Final Training Run
         final_params = CONFIG['online_learning'].copy()
         final_params.update(best_params)
         
@@ -526,11 +510,9 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
             broker.process_pending(snapshot)
             strategy.on_data(snapshot, broker)
 
-        # 5. Save Artifacts
         with open(models_dir / f"river_pipeline_{symbol}.pkl", "wb") as f:
             pickle.dump(strategy.model, f)
         
-        # Save MetaLabeler and Calibrators
         with open(models_dir / f"meta_model_{symbol}.pkl", "wb") as f:
             pickle.dump(strategy.meta_labeler, f)
             
@@ -559,7 +541,6 @@ class ResearchPipeline:
         
         self.db_url = CONFIG['wfo'].get('db_url', 'sqlite:///optuna.db') # Add default fallback
         
-        # AUDIT FIX: Use (Logical - 4) for worker count
         log_cores = psutil.cpu_count(logical=True)
         self.total_cores = max(1, log_cores - 4) if log_cores else 10
 
@@ -567,7 +548,6 @@ class ResearchPipeline:
         if params is None:
             params = CONFIG['online_learning']
         
-        # Configure Metric
         metric_map = {
             "LogLoss": metrics.LogLoss(),
             "F1": metrics.F1(),
@@ -575,7 +555,6 @@ class ResearchPipeline:
         }
         selected_metric = metric_map.get(params.get('metric', 'LogLoss'), metrics.LogLoss())
 
-        # Base Classifier: ARF
         base_clf = forest.ARFClassifier(
             n_models=params.get('n_models', 30),
             seed=42,
@@ -590,7 +569,6 @@ class ResearchPipeline:
             drift_detector=drift.ADWIN(delta=params.get('delta', 1e-5))
         )
 
-        # ENSEMBLE: ADWIN Bagging
         return compose.Pipeline(
             preprocessing.StandardScaler(),
             ensemble.ADWINBaggingClassifier(
@@ -601,11 +579,6 @@ class ResearchPipeline:
         )
 
     def calculate_performance_metrics(self, trade_log: List[Dict], initial_capital=100000.0) -> Dict[str, float]:
-        """
-        Calculates Trade Metrics from the log.
-        AUDIT FIX: Computes Risk:Reward Ratio (Avg Win / Avg Loss).
-        IMPLEMENTATION UPDATE (Rec 5): Counts drawdown frequency events.
-        """
         metrics_out = {
             'risk_reward_ratio': 0.0,
             'total_pnl': 0.0,
@@ -625,16 +598,11 @@ class ResearchPipeline:
             return metrics_out
             
         df = pd.DataFrame(trade_log)
-        
-        # 1. Sort & Cleanup (FIX: Sort by Exit_Time for accurate Equity Curve)
         df['Entry_Time'] = pd.to_datetime(df['Entry_Time'])
         df['Exit_Time'] = pd.to_datetime(df['Exit_Time'])
-        df = df.sort_values('Exit_Time') # Changed from Entry_Time
-        
-        # Ensure PnL is numeric and handle NaNs
+        df = df.sort_values('Exit_Time') 
         df['Net_PnL'] = pd.to_numeric(df['Net_PnL'], errors='coerce').fillna(0.0)
         
-        # 2. Basic Trade Stats
         total_pnl = df['Net_PnL'].sum()
         metrics_out['total_pnl'] = total_pnl
         metrics_out['total_trades'] = len(df)
@@ -646,61 +614,42 @@ class ResearchPipeline:
         metrics_out['avg_win'] = winners['Net_PnL'].mean() if not winners.empty else 0.0
         metrics_out['avg_loss'] = losers['Net_PnL'].mean() if not losers.empty else 0.0
         
-        # --- RISK REWARD CALCULATION ---
         avg_loss_abs = abs(metrics_out['avg_loss'])
         if avg_loss_abs > 0:
             metrics_out['risk_reward_ratio'] = metrics_out['avg_win'] / avg_loss_abs
         else:
             if metrics_out['avg_win'] > 0:
-                metrics_out['risk_reward_ratio'] = 10.0 # Cap for Infinite R:R
+                metrics_out['risk_reward_ratio'] = 10.0
             else:
                 metrics_out['risk_reward_ratio'] = 0.0
-        # -------------------------------
 
-        # Profit Factor
         gross_profit = winners['Net_PnL'].sum()
         gross_loss = abs(losers['Net_PnL'].sum())
         metrics_out['profit_factor'] = gross_profit / gross_loss if gross_loss > 0 else 0.0
 
-        # SQN Calculation
         if len(df) > 1:
             pnl_std = df['Net_PnL'].std()
             if pnl_std > 1e-9:
                 metrics_out['sqn'] = np.sqrt(len(df)) * (df['Net_PnL'].mean() / pnl_std)
 
-        # 3. Time-Series Equity Curve
-        
-        # FIX: Sanity Check for Initial Capital to prevent 500% DD bugs
         if initial_capital <= 1000:
              log.warning(f"⚠️ SUSPICIOUS INITIAL CAPITAL: {initial_capital}. Defaulting to 100k.")
              initial_capital = 100000.0
 
-        # Calculate running equity to detect Drawdown events
-        # CRITICAL FIX: Ensure Peak respects initial capital to prevent fake drawdowns on first loss
         df['Equity'] = initial_capital + df['Net_PnL'].cumsum()
-        
-        # Peak Calculation needs to consider Initial Capital as the starting high water mark
         df['Peak'] = df['Equity'].cummax()
         df['Peak'] = df['Peak'].clip(lower=initial_capital)
-        
         df['Drawdown_USD'] = df['Equity'] - df['Peak']
-        
-        # --- UNIT FIX: Removed * 100.0 so this is a RATIO (0.05 for 5%) ---
         df['Drawdown_Pct'] = (df['Drawdown_USD'] / df['Peak']).abs()
         
         max_dd_pct = df['Drawdown_Pct'].max()
         metrics_out['max_dd_pct'] = max_dd_pct if not pd.isna(max_dd_pct) else 0.0
         
-        # --- REC 5: DRAWDOWN FREQUENCY ---
-        # Count number of trade closures where the account was in > 5% drawdown
-        # This penalizes lingering in the danger zone
         dd_events = len(df[df['Drawdown_Pct'] > 0.05])
         metrics_out['dd_events_gt_5'] = dd_events
 
-        # 4. Hourly Resampling for Sharpe/Sortino
         equity_df = pd.DataFrame({'time': df['Exit_Time'], 'pnl': df['Net_PnL']})
         equity_df.set_index('time', inplace=True)
-        
         hourly_pnl = equity_df['pnl'].resample('1H').sum().fillna(0)
         hourly_equity = initial_capital + hourly_pnl.cumsum()
         hourly_returns = hourly_equity.pct_change().dropna()
@@ -709,20 +658,16 @@ class ResearchPipeline:
             avg_ret = hourly_returns.mean()
             std_ret = hourly_returns.std()
             annual_factor = np.sqrt(252 * 24)
-            
             if std_ret > 1e-9:
                 metrics_out['sharpe'] = (avg_ret / std_ret) * annual_factor
-            
             downside_returns = hourly_returns[hourly_returns < 0]
             downside_std = downside_returns.std()
-            
             if downside_std > 1e-9:
                 metrics_out['sortino'] = (avg_ret / downside_std) * annual_factor
 
         return metrics_out
 
     def _get_sqn_rating(self, sqn: float) -> str:
-        """Categorizes System Quality Number based on Van Tharp's scale."""
         if sqn < 1.6: return "POOR 🛑"
         if sqn < 2.0: return "AVERAGE ⚠️"
         if sqn < 2.5: return "GOOD ✅"
@@ -751,7 +696,6 @@ class ResearchPipeline:
             except Exception as e:
                 log.warning(f"Study init warning {symbol}: {e}")
 
-        # Distribute Workers
         total_trials_per_symbol = CONFIG['wfo'].get('n_trials', 200)
         tasks = []
         workers_per_symbol = max(1, self.total_cores // len(self.symbols))
@@ -765,7 +709,6 @@ class ResearchPipeline:
         
         start_time = time.time()
         
-        # AUDIT FIX: Using 'loky' backend but with restricted OMP threads
         Parallel(n_jobs=self.total_cores, backend="loky")(
             delayed(_worker_optimize_task)(*t) for t in tasks
         )
@@ -785,16 +728,11 @@ class ResearchPipeline:
         log.info(f"{LogSymbols.SUCCESS} Training Pipeline Completed.")
 
     def run_wfo(self):
-        """
-        Executes Walk-Forward Optimization logic.
-        Uses _worker_wfo_task for rolling window analysis.
-        """
         log.info(f"{LogSymbols.TIME} STARTING WALK-FORWARD OPTIMIZATION (WFO)...")
         log.info(f"OBJECTIVE: PROFIT IS KING (Rolling Window Validation)")
         
         n_trials = CONFIG['wfo'].get('n_trials', 50)
         
-        # We process symbols in parallel, but WFO itself is sequential per symbol
         Parallel(n_jobs=len(self.symbols), backend="loky")(
             delayed(_worker_wfo_task)(
                 sym,
@@ -819,9 +757,6 @@ class ResearchPipeline:
 
     def _run_backtest_symbol(self, symbol: str) -> List[Dict]:
         try:
-            # --- CRITICAL DATA ALIGNMENT FIX ---
-            # Use TIB generator to ensure Volume Bars are identical to training phase.
-            # V10.1: This now includes auto-calibration logic
             df = process_data_into_bars(symbol, n_ticks=self.train_candles)
             if df.empty: return []
 
@@ -872,21 +807,16 @@ class ResearchPipeline:
         df = pd.DataFrame(trade_log)
         initial_capital = CONFIG['env'].get('initial_balance', 100000.0)
         
-        # 1. Equity & Drawdown Calculations
         df['Entry_Time'] = pd.to_datetime(df['Entry_Time'])
         df['Exit_Time'] = pd.to_datetime(df['Exit_Time'])
-        df = df.sort_values('Exit_Time') # Match metric calc logic
+        df = df.sort_values('Exit_Time')
         
         df['Equity'] = initial_capital + df['Net_PnL'].cumsum()
-        
-        # CRITICAL FIX for BACKTEST REPORT: ensure Peak is correctly initialized
         df['Peak'] = df['Equity'].cummax()
         df['Peak'] = df['Peak'].clip(lower=initial_capital)
-        
         df['Drawdown_USD'] = df['Equity'] - df['Peak']
         df['Drawdown_Pct'] = (df['Drawdown_USD'] / df['Peak']).abs() * 100.0
         
-        # 2. Core Metrics
         total_trades = len(df)
         net_pnl = df['Net_PnL'].sum()
         win_count = len(df[df['Net_PnL'] > 0])
@@ -901,15 +831,10 @@ class ResearchPipeline:
         avg_loss = df[df['Net_PnL'] <= 0]['Net_PnL'].mean() if loss_count > 0 else 0.0
         rr_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else 0.0
         
-        # Expectancy
         expectancy = (win_rate/100 * avg_win) + ((1 - win_rate/100) * avg_loss)
-        
         max_dd_pct = df['Drawdown_Pct'].max()
         max_dd_usd = df['Drawdown_USD'].min()
         
-        # 3. Advanced Metrics (SQN, Sharpe)
-        # Re-using the robust calculation from calculate_performance_metrics
-        # Construct hourly equity curve for Sharpe
         equity_series = pd.Series(df['Net_PnL'].values, index=pd.to_datetime(df['Exit_Time'])).resample('1H').sum().fillna(0)
         hourly_equity = initial_capital + equity_series.cumsum()
         hourly_ret = hourly_equity.pct_change().dropna()
@@ -921,11 +846,8 @@ class ResearchPipeline:
         returns_std = df['Net_PnL'].std()
         sqn = (math.sqrt(total_trades) * (df['Net_PnL'].mean() / returns_std)) if returns_std > 0 else 0.0
         sqn_rating = self._get_sqn_rating(sqn)
-        
-        # 4. Duration
         avg_duration = df['Duration_Min'].mean()
         
-        # 5. CONSOLE OUTPUT REPORT
         log.info("="*60)
         log.info(f"PHOENIX RESEARCH ENGINE - BACKTEST REPORT")
         log.info("="*60)
@@ -999,7 +921,6 @@ def main():
     pipeline = ResearchPipeline()
     
     if args.wfo:
-        # ENABLED: Call the WFO logic
         pipeline.run_wfo()
     elif args.train:
         pipeline.run_training(fresh_start=args.fresh_start)
