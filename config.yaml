@@ -1,9 +1,9 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V10.0 (DEFENSIVE PROTOCOL)
+# config.yaml – PROJECT PHOENIX V10.1 (DATA SCARCITY FIX)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE
 #
-# STRATEGY UPDATE (V10.0 - DEFENSIVE PROTOCOL):
-# 1. SAMPLING: Adaptive Tick Imbalance Bars (TIBs).
+# STRATEGY UPDATE (V10.1 - DATA FIX):
+# 1. DATA: Lowered Imbalance Threshold (1000 -> 100) to fix "Cold Start".
 # 2. GATES: Stricter KER (0.25) & Anti-Chop (50.0) to filter noise.
 # 3. RISK: Midnight Anchor Protocol & Hard Deck Liquidation.
 # =============================================================================
@@ -74,10 +74,10 @@ producer:
   midnight_freeze_seconds: 300
   d1_update_interval: 60
 
-# --- DATA SETTINGS (V10.0 TIBs) ---
+# --- DATA SETTINGS (V10.1 TIBs) ---
 data:
   sampling_method: "imbalance" # Adaptive Imbalance Bars
-  volume_bar_threshold: 1000   # Used as Initial Threshold for Imbalance
+  volume_bar_threshold: 100    # LOWERED from 1000 to 100 to fix Cold Start
   imbalance_alpha: 0.05        # EWMA Forgetting Factor for Threshold Adaptation
   download_start_date: "2020-01-01"
   num_candles_producer: 50000
@@ -345,5 +345,5 @@ wfo:
   n_trials: 35
   train_years: 2
   test_months: 6
-  min_trades_optimization: 12 
+  min_trades_optimization: 5 # LOWERED: Allow low-frequency Sniper strategies to pass
   risk_per_trade_options: [0.005]

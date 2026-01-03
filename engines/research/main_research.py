@@ -5,8 +5,8 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# PHOENIX STRATEGY V10.0 (RESEARCH PARITY):
-# 1. DATA: Generates Adaptive Tick Imbalance Bars (TIBs) for training.
+# PHOENIX STRATEGY V10.1 (DATA SCARCITY FIX):
+# 1. DATA: Auto-Calibration logic for Imbalance Bars to prevent Cold Start.
 # 2. MODEL: Trains Adaptive Random Forest (ARF) with Golden Trio features.
 # 3. OBJECTIVE: "Profit Is King" with Hard Deck constraints.
 # =============================================================================
@@ -137,7 +137,7 @@ class EmojiCallback:
 def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     """
     Helper to Load Ticks -> Aggregate to Tick Imbalance Bars (TIBs) -> Return Clean DataFrame.
-    V10.0: Replaced static Volume Bars with Adaptive Imbalance Bars.
+    V10.1: Auto-Calibrates threshold to ensure sufficient training data.
     """
     # 1. Load Massive Amount of Ticks (To get sufficient Bars)
     raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2)
@@ -145,57 +145,75 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     if raw_ticks.empty:
         return pd.DataFrame()
 
-    # 2. V10.0 AGGREGATION: ADAPTIVE IMBALANCE BARS
+    # 2. V10.1 AGGREGATION: ADAPTIVE IMBALANCE BARS WITH AUTO-CALIBRATION
     # Fetch params from config
-    initial_threshold = CONFIG['data'].get('volume_bar_threshold', 1000) # Proxy for initial TIB threshold
+    config_threshold = CONFIG['data'].get('volume_bar_threshold', 100) # Proxy for initial TIB threshold
     alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
     
-    gen = AdaptiveImbalanceBarGenerator(
-        symbol=symbol,
-        initial_threshold=initial_threshold,
-        alpha=alpha
-    )
-    
+    # --- AUTO-CALIBRATION LOOP ---
+    # Try successively lower thresholds until we get enough bars (at least 500)
+    current_threshold = config_threshold
     bars_list = []
+    min_bars_needed = 500
+    attempts = 0
+    max_attempts = 4
     
-    # Iterate through ticks efficiently
-    # Raw ticks DF has columns: time, price, volume, bid, ask
-    # We need to pass them to the generator
-    for row in raw_ticks.itertuples():
-        price = getattr(row, 'price', getattr(row, 'close', None))
-        vol = getattr(row, 'volume', 1.0)
+    while attempts < max_attempts:
+        gen = AdaptiveImbalanceBarGenerator(
+            symbol=symbol,
+            initial_threshold=current_threshold,
+            alpha=alpha
+        )
         
-        # Handle timestamp (might be Index or 'time' col)
-        ts = getattr(row, 'Index', getattr(row, 'time', None))
-        if isinstance(ts, (datetime, pd.Timestamp)):
-            ts_val = ts.timestamp()
-        else:
-            ts_val = float(ts)
+        temp_bars = []
+        # Iterate through ticks efficiently
+        for row in raw_ticks.itertuples():
+            price = getattr(row, 'price', getattr(row, 'close', None))
+            vol = getattr(row, 'volume', 1.0)
             
-        # L2 Data if available (rare in historical backfill, usually 0)
-        b_vol = 0.0
-        s_vol = 0.0
-        
-        if price is None: continue
+            # Handle timestamp (might be Index or 'time' col)
+            ts = getattr(row, 'Index', getattr(row, 'time', None))
+            if isinstance(ts, (datetime, pd.Timestamp)):
+                ts_val = ts.timestamp()
+            else:
+                ts_val = float(ts)
+                
+            # L2 Data if available (rare in historical backfill, usually 0)
+            b_vol = 0.0
+            s_vol = 0.0
+            
+            if price is None: continue
 
-        bar = gen.process_tick(price, vol, ts_val, b_vol, s_vol)
+            bar = gen.process_tick(price, vol, ts_val, b_vol, s_vol)
+            
+            if bar:
+                temp_bars.append({
+                    'timestamp': bar.timestamp,
+                    'open': bar.open,
+                    'high': bar.high,
+                    'low': bar.low,
+                    'close': bar.close,
+                    'volume': bar.volume,
+                    'vwap': bar.vwap,
+                    'tick_count': bar.tick_count,
+                    'buy_vol': bar.buy_vol,
+                    'sell_vol': bar.sell_vol
+                })
         
-        if bar:
-            bars_list.append({
-                'timestamp': bar.timestamp,
-                'open': bar.open,
-                'high': bar.high,
-                'low': bar.low,
-                'close': bar.close,
-                'volume': bar.volume,
-                'vwap': bar.vwap,
-                'tick_count': bar.tick_count,
-                'buy_vol': bar.buy_vol,
-                'sell_vol': bar.sell_vol
-            })
+        if len(temp_bars) >= min_bars_needed:
+            bars_list = temp_bars
+            if attempts > 0:
+                log.info(f"✅ {symbol}: Auto-Calibrated Threshold to {current_threshold} (Generated {len(bars_list)} bars)")
+            break
+        else:
+            # Not enough bars, lower threshold
+            attempts += 1
+            new_threshold = current_threshold * 0.5
+            log.warning(f"⚠️ {symbol}: Insufficient bars ({len(temp_bars)}). Retrying with threshold {new_threshold}...")
+            current_threshold = new_threshold
             
     if not bars_list:
-        log.warning(f"⚠️ {symbol}: Not enough imbalance to generate bars from {len(raw_ticks)} ticks.")
+        log.warning(f"❌ {symbol}: Failed to generate enough bars even after calibration.")
         return pd.DataFrame()
 
     # 3. Convert to DataFrame
@@ -226,6 +244,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
     
     try:
         # 1. Load & Aggregate Data (TIBs)
+        # Uses the new Auto-Calibration logic
         df = process_data_into_bars(symbol, n_ticks=4000000)
         
         if df.empty:
@@ -388,6 +407,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
     
     try:
         # 1. Load & Aggregate Data (TIBs)
+        # Uses Auto-Calibration
         df = process_data_into_bars(symbol, n_ticks=4000000)
         if df.empty: return
 
@@ -471,7 +491,7 @@ class ResearchPipeline:
         }
         selected_metric = metric_map.get(params.get('metric', 'LogLoss'), metrics.LogLoss())
 
-        # V10.0: Adaptive Random Forest with ADWIN
+        # Base Classifier: ARF
         base_clf = forest.ARFClassifier(
             n_models=params.get('n_models', 30),
             seed=42,
@@ -479,17 +499,21 @@ class ResearchPipeline:
             delta=params.get('delta', 1e-5),
             split_criterion='gini',
             leaf_prediction='mc',
-            max_features=params.get('max_features', 'sqrt'),
+            max_features=params.get('max_features', 'log2'),
             lambda_value=params.get('lambda_value', 10),
             metric=selected_metric,
             warning_detector=drift.ADWIN(delta=params.get('warning_delta', 0.001)),
             drift_detector=drift.ADWIN(delta=params.get('delta', 1e-5))
         )
 
-        # Pipeline
+        # ENSEMBLE: ADWIN Bagging
         return compose.Pipeline(
             preprocessing.StandardScaler(),
-            base_clf # ARF handles bagging internally better than external wrapper
+            ensemble.ADWINBaggingClassifier(
+                model=base_clf,
+                n_models=5,
+                seed=42
+            )
         )
 
     def calculate_performance_metrics(self, trade_log: List[Dict], initial_capital=100000.0) -> Dict[str, float]:
@@ -693,6 +717,7 @@ class ResearchPipeline:
         try:
             # --- CRITICAL DATA ALIGNMENT FIX ---
             # Use TIB generator to ensure Volume Bars are identical to training phase.
+            # V10.1: This now includes auto-calibration logic
             df = process_data_into_bars(symbol, n_ticks=self.train_candles)
             if df.empty: return []
 
