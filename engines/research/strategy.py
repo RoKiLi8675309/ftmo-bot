@@ -3,12 +3,11 @@
 # ENVIRONMENT: Linux/WSL2 (Python 3.11)
 # PATH: engines/research/strategy.py
 # DEPENDENCIES: shared, river, engines.research.backtester
-# DESCRIPTION: The Adaptive Strategy Kernel (Research/Backtest Version).
+# DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V10.0 (RESEARCH PARITY):
-# 1. PARITY: Implements _calculate_golden_trio to match Live Predictor.
-# 2. LOGIC: Enforces strict V10.0 Anti-Chop (Hurst) and Efficiency (KER) gates.
-# 3. MODEL: Aligned with Adaptive Random Forest (ARF) signal generation.
+# PHOENIX STRATEGY V10.2 (THRESHOLD FIX):
+# 1. GATES: Removed Hard KER Floor (0.25) to allow optimization on noisy data.
+# 2. PARITY: Matches Live Predictor logic.
 # =============================================================================
 import logging
 import sys
@@ -129,9 +128,10 @@ class ResearchStrategy:
         # 1. Trend Filter: ENABLED (V10 Requirement)
         self.require_d1_trend = True 
         
-        # 2. Efficiency Filter: STRICT (V10 Requirement)
-        config_ker = float(phx_conf.get('ker_trend_threshold', 0.10))
-        self.ker_thresh = max(0.25, config_ker) # Hard floor at 0.25
+        # 2. Efficiency Filter: RELAXED FOR OPTIMIZATION
+        # AUDIT FIX: Removed hard floor of 0.25. Now respects config (default 0.05).
+        config_ker = float(phx_conf.get('ker_trend_threshold', 0.05))
+        self.ker_thresh = config_ker 
         
         self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 1.1)) 
         self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 8.0))
@@ -401,9 +401,9 @@ class ResearchStrategy:
             self.rejection_stats[f"Volume Climax"] += 1
             return 
         
-        # G4: STRICT EFFICIENCY (KER)
-        base_thresh = max(0.25, self.ker_thresh)
-        effective_ker_thresh = max(0.25, base_thresh + self.dynamic_ker_offset)
+        # G4: EFFICIENCY (KER) - FIX: Use Soft Floor 0.05
+        base_thresh = max(0.05, self.ker_thresh)
+        effective_ker_thresh = max(0.05, base_thresh + self.dynamic_ker_offset)
             
         if ker_val < effective_ker_thresh:
             self.rejection_stats[f"Low Efficiency (KER {ker_val:.2f})"] += 1

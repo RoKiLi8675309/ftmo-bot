@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V10.0 (DEFENSIVE PROTOCOL - LIVE):
-# 1. FEATURES: Implements Rolling Hurst, KER, and RVOL (The Golden Trio).
+# PHOENIX STRATEGY V10.2 (THRESHOLD FIX):
+# 1. GATES: Relaxed KER Threshold to allow optimization on noisy data.
 # 2. MODEL: Adaptive Random Forest (ARF) with ADWIN Drift Detection.
-# 3. GATES: Stricter KER (>0.25) & Anti-Chop (Hurst < 0.45 Rejection).
+# 3. GATES: Stricter Anti-Chop (Hurst < 0.45 Rejection).
 # =============================================================================
 import logging
 import pickle
@@ -89,6 +89,10 @@ class MultiAssetPredictor:
         self.bb_std = 2.0
         self.bb_buffers = {s: deque(maxlen=self.bb_window) for s in symbols}
         
+        # --- SNIPER PROTOCOL BUFFERS ---
+        self.sniper_closes = {s: deque(maxlen=200) for s in symbols} # For SMA 200
+        self.sniper_rsi = {s: deque(maxlen=15) for s in symbols}     # For RSI 14
+
         for s in symbols:
             # Default from Config
             s_risk = risk_mult_conf
@@ -180,10 +184,6 @@ class MultiAssetPredictor:
         # --- REC 1: Dynamic Gate Scaling State ---
         self.ker_drift_detectors = {s: drift.ADWIN(delta=0.01) for s in symbols}
         self.dynamic_ker_offsets = {s: 0.0 for s in symbols}
-
-        # --- SNIPER PROTOCOL BUFFERS ---
-        self.sniper_closes = {s: deque(maxlen=200) for s in symbols} # For SMA 200
-        self.sniper_rsi = {s: deque(maxlen=15) for s in symbols}     # For RSI 14
 
         # Inject Default Data 
         self._inject_auxiliary_data()
@@ -435,7 +435,7 @@ class MultiAssetPredictor:
         labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp(), parkinson_vol=parkinson)
 
         # ============================================================
-        # 4. PHOENIX V10.0: DEFENSIVE GATES
+        # 4. PHOENIX V10.2: DEFENSIVE GATES (RELAXED)
         # ============================================================
         
         adx_val = features.get('adx', 0.0)
@@ -468,11 +468,11 @@ class MultiAssetPredictor:
             stats[f"Volume Climax"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
             
-        # G4: STRICT EFFICIENCY (KER)
-        # Ensure KER is at least 0.25 regardless of config or drift
-        config_ker = float(phx.get('ker_trend_threshold', 0.10))
-        base_thresh = max(0.25, config_ker) # Hard floor at 0.25
-        effective_ker_thresh = max(0.25, base_thresh + self.dynamic_ker_offsets[symbol])
+        # G4: EFFICIENCY (KER) - FIX: Use Soft Floor 0.05
+        # Ensure KER is at least 0.05 regardless of config or drift
+        config_ker = float(phx.get('ker_trend_threshold', 0.05))
+        base_thresh = max(0.05, config_ker) 
+        effective_ker_thresh = max(0.05, base_thresh + self.dynamic_ker_offsets[symbol])
 
         if ker_val < effective_ker_thresh:
             stats[f"Low Efficiency"] += 1

@@ -4,7 +4,7 @@
 #
 # STRATEGY UPDATE (V10.1 - DATA FIX):
 # 1. DATA: Lowered Imbalance Threshold (1000 -> 100) to fix "Cold Start".
-# 2. GATES: Stricter KER (0.25) & Anti-Chop (50.0) to filter noise.
+# 2. GATES: Stricter KER (0.05) & Anti-Chop (50.0) to filter noise.
 # 3. RISK: Midnight Anchor Protocol & Hard Deck Liquidation.
 # =============================================================================
 
@@ -152,7 +152,7 @@ phoenix_strategy:
   
   # --- FILTER THRESHOLDS (TIGHTENED) ---
   max_relative_volume: 8.0        
-  ker_trend_threshold: 0.25       # STRICT: Raised from 0.10 to 0.25 (Clean Moves Only)
+  ker_trend_threshold: 0.05       # LOWERED: Changed from 0.25 to 0.05 to learn from standard volatility
   volume_gate_ratio: 1.1          # Min Relative Volume
   aggressor_threshold: 0.53        
   ml_confirmation_threshold: 0.60 # STRICT: Raised for higher conviction
@@ -230,8 +230,8 @@ risk_management:
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (SNIPER MODE)
-  stop_loss_atr_mult: 2.0           
-  take_profit_atr_mult: 3.0         
+  stop_loss_atr_mult: 2.0            
+  take_profit_atr_mult: 3.0          
   
   # ACTIVE TRAILING STOP
   trailing_stop:
@@ -283,9 +283,9 @@ online_learning:
   
   # CONFIGURATION
   n_models: 50        
-  grace_period: 200    
-  delta: 0.00001      
-  warning_delta: 0.001    
+  grace_period: 200     
+  delta: 0.00001       
+  warning_delta: 0.001     
   lambda_value: 10        
   max_features: 'sqrt'    
   metric: "LogLoss"        
