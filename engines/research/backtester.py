@@ -6,19 +6,20 @@
 # DESCRIPTION: Event-Driven Backtesting Broker. Simulates execution, spread,
 # commissions, and PnL tracking for strategy validation.
 #
-# PHOENIX STRATEGY V7.5 (SNIPER PROTOCOL BACKTESTER):
-# 1. METADATA: Enhanced logging to capture 'Regime' (Aggressor/Sniper).
-# 2. COSTS: Strict spread and commission application to verify edge.
-# 3. METRICS: Native support for Risk:Reward Ratio tracking.
+# PHOENIX STRATEGY V10.0 (RESEARCH PARITY):
+# 1. HARD DECK: Enforces Daily Loss Limit (Midnight Anchor) during backtest.
+# 2. METADATA: Enhanced logging to capture 'Regime' (Aggressor/Sniper).
+# 3. COSTS: Strict spread and commission application to verify edge.
 # =============================================================================
 from __future__ import annotations
 import pandas as pd
 import numpy as np
 import logging
 from collections import deque
-from datetime import datetime
+from datetime import datetime, time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Generator, Any
+import pytz
 
 # Shared Imports
 from shared.financial.risk import RiskManager
@@ -110,6 +111,7 @@ class BacktestBroker:
     - Order Execution (Immediate Fill for research, spread simulation)
     - PnL Tracking (Equity/Balance)
     - Margin Checks (simplified)
+    - V10.0: Daily Hard Deck Enforcement
     """
     def __init__(self, initial_balance: float = 100000.0):
         self.initial_balance = initial_balance
@@ -122,7 +124,7 @@ class BacktestBroker:
         
         self.equity_curve: List[Tuple[datetime, float]] = []
         self.orders_history: List[Dict] = []
-        self.trade_log: List[Dict] = [] # For reporting
+        self.trade_log: List[Dict] = [] 
         
         self.ticket_counter = 1
         self.last_snapshot: Optional[MarketSnapshot] = None
@@ -138,13 +140,24 @@ class BacktestBroker:
 
         # Pre-populate price map to prevent initial warnings
         self._inject_aux_data()
+        
+        # --- V10.0 DAILY ANCHOR TRACKING ---
+        self.daily_start_equity = initial_balance
+        self.current_day_date = None
+        # Max Daily Loss Pct (e.g., 0.045 for 4.5%)
+        self.max_daily_loss_pct = CONFIG['risk_management'].get('max_daily_loss_pct', 0.045)
+        
+        # Timezone for Midnight Reset
+        tz_str = CONFIG['risk_management'].get('risk_timezone', 'Europe/Prague')
+        try:
+            self.market_tz = pytz.timezone(tz_str)
+        except:
+            self.market_tz = pytz.timezone('Europe/Prague')
 
     @property
     def positions(self) -> Dict[str, BacktestOrder]:
         """
         COMPATIBILITY LAYER: Exposes open positions as a dictionary {symbol: trade}.
-        This fixes the AttributeError in ResearchStrategy.
-        Assumes one trade per symbol (Hedging disabled in this view).
         """
         pos_map = {}
         for p in self.open_positions:
@@ -153,17 +166,11 @@ class BacktestBroker:
 
     def _inject_aux_data(self):
         """
-        Injects synthetic cross-rates into the price map to prevent
-        RiskManager from logging warnings when running single-symbol backtests.
+        Injects synthetic cross-rates into the price map.
         """
         defaults = {
-            "USDJPY": 150.0,
-            "GBPUSD": 1.25,
-            "EURUSD": 1.08,
-            "USDCAD": 1.35,
-            "USDCHF": 0.90,
-            "AUDUSD": 0.65,
-            "NZDUSD": 0.60
+            "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
+            "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60
         }
         for sym, price in defaults.items():
             if sym not in self.last_price_map:
@@ -173,36 +180,50 @@ class BacktestBroker:
         """
         Robust wrapper for RiskManager.get_conversion_rate.
         """
-        # 1. Try Official Logic
         rate = RiskManager.get_conversion_rate(symbol, current_price, self.last_price_map)
         if rate > 0: return rate
         
-        # 2. Simulation Fallback (Should rarely be reached now due to injection)
         s = symbol.upper()
-        if "JPY" in s: return 0.0065 # ~150 JPY/USD
+        if "JPY" in s: return 0.0065
         if "GBP" in s: return 1.25
         if "EUR" in s: return 1.08
         if "AUD" in s: return 0.65
         return 1.0
 
     def process_pending(self, snapshot: MarketSnapshot):
-        """ Alias for process_snapshot to match Live Engine nomenclature if needed """
+        """ Alias for process_snapshot """
         self.process_snapshot(snapshot)
 
     def process_snapshot(self, snapshot: MarketSnapshot):
         """
         Updates the state of the broker based on a new market tick/bar.
         Updates Equity, Checks SL/TP, Updates Price Map.
+        Enforces Hard Deck.
         """
         self.last_snapshot = snapshot
         
-        # 1. Update Price Map for Risk Calc
-        # Handle both flat structure (Symbol_Close) and multi-index
+        # Handle Timezone for Midnight Anchor
+        ts = snapshot.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=pytz.utc)
+        server_time = ts.astimezone(self.market_tz)
+        current_date = server_time.date()
+        
+        # --- MIDNIGHT ANCHOR LOGIC ---
+        if self.current_day_date is None:
+            self.current_day_date = current_date
+            self.daily_start_equity = self.equity # Anchor established
+        elif current_date > self.current_day_date:
+            # New Day Rollover: Reset Anchor
+            self.current_day_date = current_date
+            self.daily_start_equity = self.equity # New Anchor
+            
+        # 1. Update Price Map
         for col in snapshot.data.index:
             if "_close" in col:
                 sym = col.replace("_close", "")
                 self.last_price_map[sym] = float(snapshot.data[col])
-            elif "_" not in col and len(col) == 6: # Assumption: Pure symbol name index
+            elif "_" not in col and len(col) == 6:
                  self.last_price_map[col] = float(snapshot.data[col])
 
         # 2. Check Open Positions
@@ -212,13 +233,11 @@ class BacktestBroker:
         for trade in self.open_positions:
             current_price = snapshot.get_price(trade.symbol, 'close')
             
-            # Skip if no price update
             if current_price <= 0:
                 active_positions.append(trade)
                 continue
 
             # --- Update MAE/MFE ---
-            # Calculate pips from entry
             pip_size = 0.01 if "JPY" in trade.symbol else 0.0001
             dist = (current_price - trade.entry_price) / pip_size
             if trade.action == "SELL": dist = -dist
@@ -231,32 +250,26 @@ class BacktestBroker:
             exit_reason = ""
             close_price = 0.0
 
-            # High/Low checks for more realistic backtesting (Hit SL/TP within bar)
             bar_high = snapshot.get_high(trade.symbol)
             bar_low = snapshot.get_low(trade.symbol)
             
-            # If High/Low unavailable, use Close
             if bar_high == 0: bar_high = current_price
             if bar_low == 0: bar_low = current_price
 
             if trade.action == "BUY":
-                # Check SL (Low)
                 if trade.stop_loss > 0 and bar_low <= trade.stop_loss:
                     closed = True
                     exit_reason = "SL_HIT"
                     close_price = trade.stop_loss
-                # Check TP (High)
                 elif trade.take_profit > 0 and bar_high >= trade.take_profit:
                     closed = True
                     exit_reason = "TP_HIT"
                     close_price = trade.take_profit
             elif trade.action == "SELL":
-                # Check SL (High)
                 if trade.stop_loss > 0 and bar_high >= trade.stop_loss:
                     closed = True
                     exit_reason = "SL_HIT"
                     close_price = trade.stop_loss
-                # Check TP (Low)
                 elif trade.take_profit > 0 and bar_low <= trade.take_profit:
                     closed = True
                     exit_reason = "TP_HIT"
@@ -266,16 +279,11 @@ class BacktestBroker:
                 self._finalize_trade(trade, close_price, snapshot.timestamp, exit_reason)
             else:
                 # Update Floating PnL
-                # Standard Lot = 100,000 units (Project assumption)
                 contract_size = 100000
                 raw_pnl = (current_price - trade.entry_price) * (trade.quantity * contract_size)
                 if trade.action == "SELL": raw_pnl = -raw_pnl
                 
-                # Convert to Account Currency (USD)
                 rate = self._get_simulation_conversion_rate(trade.symbol, current_price)
-                
-                # AUDIT FIX: Use Consistent Commission from Config
-                # Deduct commission from floating equity to show realistic drawdown
                 comm_drag = trade.quantity * self.commission_per_lot 
                 
                 floating_pnl += (raw_pnl * rate) - comm_drag
@@ -287,8 +295,25 @@ class BacktestBroker:
         self.equity = self.balance + floating_pnl
         self.equity_curve.append((snapshot.timestamp, self.equity))
         
-        # 4. Margin Call / Blowout Check
-        if self.equity < (self.initial_balance * 0.90): # 10% Max Drawdown Hard Limit
+        # 4. HARD DECK ENFORCEMENT (V10.0)
+        # Check Daily Drawdown relative to Anchor
+        if self.daily_start_equity > 0:
+            daily_loss_amount = self.daily_start_equity - self.equity
+            daily_loss_limit = self.daily_start_equity * self.max_daily_loss_pct
+            
+            if daily_loss_amount > daily_loss_limit:
+                logger.warning(f"💀 HARD DECK BREACHED (Sim): Start {self.daily_start_equity:.2f} -> Curr {self.equity:.2f}")
+                self.is_blown = True # Mark as blown for optimizer
+                
+                # Liquidate all open positions instantly at current price
+                # This simulates the "Liquidation" action
+                for trade in list(self.open_positions):
+                    curr_p = snapshot.get_price(trade.symbol, 'close')
+                    self._finalize_trade(trade, curr_p, snapshot.timestamp, "HARD_DECK_LIQ")
+                self.open_positions = [] # Clear
+
+        # 5. Margin Call / Blowout Check (Total)
+        if self.equity < (self.initial_balance * 0.90): 
              self.is_blown = True
 
     def submit_order(self, order: BacktestOrder) -> Optional[int]:
@@ -296,52 +321,36 @@ class BacktestBroker:
         Public API called by ResearchStrategy.
         """
         if order.quantity <= 0: return None
+        if self.is_blown: return None # No trades if blown
         
-        # Assign Ticket
         order.ticket = self.ticket_counter
         self.ticket_counter += 1
         
-        # Simulate Fill (Market Order Logic)
-        
-        # Ensure Entry Price is set
         if order.entry_price <= 0:
-             # Try to get from last snapshot
              if self.last_snapshot:
                  order.entry_price = self.last_snapshot.get_price(order.symbol)
         
-        # AUDIT FIX: Dynamic Spread Simulation based on Symbol
-        # BUY: Ask = Price + Spread/2
-        # SELL: Bid = Price - Spread/2
-        # We simulate paying the FULL spread on entry for simplicity (conservative)
+        # Spread Simulation
         pip = 0.01 if "JPY" in order.symbol else 0.0001
-        
-        # Fetch spread from config or default
         spread_pips = self.spread_map.get(order.symbol, self.default_spread)
         slippage_cost = spread_pips * pip
         
         order.entry_price = order.entry_price + slippage_cost if order.action == "BUY" else order.entry_price - slippage_cost
-        
-        # AUDIT FIX: Use Configured Commission
         order.commission = order.quantity * self.commission_per_lot
         
         self.open_positions.append(order)
         return order.ticket
 
     def get_position(self, symbol: str) -> Optional[BacktestOrder]:
-        """Returns the first active position for a symbol (Hedging disabled for this check)."""
         for p in self.open_positions:
             if p.symbol == symbol:
                 return p
         return None
 
     def _close_partial_position(self, trade: BacktestOrder, qty: float, price: float, time: datetime, reason: str):
-        """Simulates a partial or full close."""
         self._finalize_trade(trade, price, time, reason)
 
     def _finalize_trade(self, trade: BacktestOrder, close_price: float, close_time: datetime, reason: str):
-        """
-        Closes a trade, calculates final PnL, updates Balance.
-        """
         # 1. Calculate Raw PnL
         raw_diff = (close_price - trade.entry_price)
         if trade.action == "SELL": raw_diff = -raw_diff
@@ -368,7 +377,7 @@ class BacktestBroker:
         
         self.closed_positions.append(trade)
         
-        # 6. Log to Trade Log (For DataFrame construction)
+        # 6. Log to Trade Log
         self.trade_log.append({
             'Entry_Time': trade.timestamp_created,
             'Exit_Time': close_time,
@@ -389,14 +398,12 @@ class BacktestBroker:
             'Confidence': trade.metadata.get('confidence', 0.0)
         })
         
-        # Log it
         symbol_icon = "🟢" if net_pnl > 0 else "🔴"
         logger.debug(f"{symbol_icon} CLOSED {trade.symbol} {trade.action}: ${net_pnl:.2f} ({reason})")
 
     def get_stats(self) -> Dict[str, Any]:
         """
         Generates comprehensive performance statistics for the backtest.
-        Includes Max Drawdown, Sharpe, Sortino, Win Rate, Expectancy, and Risk:Reward.
         """
         stats = {
             "initial_balance": self.initial_balance,
@@ -413,12 +420,11 @@ class BacktestBroker:
             "expectancy": 0.0,
             "avg_win": 0.0,
             "avg_loss": 0.0,
-            "risk_reward_ratio": 0.0, # NATIVE SUPPORT ADDED
+            "risk_reward_ratio": 0.0, 
             "largest_win": 0.0,
             "largest_loss": 0.0
         }
 
-        # 1. Trade-based Stats
         if self.closed_positions:
             pnls = [t.net_pnl for t in self.closed_positions]
             wins = [p for p in pnls if p > 0]
@@ -436,30 +442,25 @@ class BacktestBroker:
             stats["largest_win"] = max(wins) if wins else 0.0
             stats["largest_loss"] = min(losses) if losses else 0.0
             
-            # Risk:Reward Ratio (Avg Win / Avg Loss)
             avg_loss_abs = abs(stats["avg_loss"])
             if avg_loss_abs > 0:
                 stats["risk_reward_ratio"] = stats["avg_win"] / avg_loss_abs
             else:
                 stats["risk_reward_ratio"] = 10.0 if stats["avg_win"] > 0 else 0.0
             
-            # Expectancy = (Win% * AvgWin) - (Loss% * AvgLoss)
             win_pct = len(wins) / len(pnls)
             loss_pct = len(losses) / len(pnls)
             stats["expectancy"] = (win_pct * stats["avg_win"]) + (loss_pct * stats["avg_loss"])
             
-            # SQN = sqrt(N) * (Expectancy / Stdev(PnL))
             if len(pnls) > 1:
                 std_pnl = np.std(pnls)
                 if std_pnl > 0:
                     stats["sqn"] = np.sqrt(len(pnls)) * (np.mean(pnls) / std_pnl)
 
-        # 2. Time-series Stats (Drawdown, Sharpe)
         if len(self.equity_curve) > 1:
             df = pd.DataFrame(self.equity_curve, columns=['time', 'equity'])
             df.set_index('time', inplace=True)
             
-            # Drawdown Calculation
             df['peak'] = df['equity'].cummax()
             df['dd'] = df['equity'] - df['peak']
             df['dd_pct'] = (df['dd'] / df['peak']) * 100
@@ -467,8 +468,6 @@ class BacktestBroker:
             stats["max_drawdown"] = df['dd'].min()
             stats["max_drawdown_pct"] = df['dd_pct'].min()
             
-            # Returns Calculation for Sharpe/Sortino
-            # Resample to hourly to standardize volatility
             try:
                 hourly_equity = df['equity'].resample('1H').last().ffill()
                 returns = hourly_equity.pct_change().dropna()
@@ -476,15 +475,11 @@ class BacktestBroker:
                 if len(returns) > 1:
                     avg_ret = returns.mean()
                     std_ret = returns.std()
-                    
-                    # Annualize (Assume 24/5 trading = ~6000 hours/year)
-                    # This is an approximation for Forex
                     annualization_factor = np.sqrt(252 * 24)
                     
                     if std_ret > 0:
                         stats["sharpe_ratio"] = (avg_ret / std_ret) * annualization_factor
                     
-                    # Sortino (Downside deviation only)
                     downside_returns = returns[returns < 0]
                     if len(downside_returns) > 0:
                         downside_std = downside_returns.std()

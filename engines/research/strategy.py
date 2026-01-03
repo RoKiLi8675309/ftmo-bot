@@ -3,13 +3,12 @@
 # ENVIRONMENT: Linux/WSL2 (Python 3.11)
 # PATH: engines/research/strategy.py
 # DEPENDENCIES: shared, river, engines.research.backtester
-# DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
+# DESCRIPTION: The Adaptive Strategy Kernel (Research/Backtest Version).
 # 
-# PHOENIX STRATEGY V10.0 (DEFENSIVE PROTOCOL):
-# 1. TREND FILTER: Re-enabled D1 EMA 200 Bias. (Buy > EMA, Sell < EMA).
-# 2. NOISE FILTER: KER Threshold raised to 0.25 (Strict Efficiency).
-# 3. CIRCUIT BREAKER: Per-symbol daily lockout after 2 losses or 1% drop.
-# 4. RSI GUARD: Block entries at extremes (Buy < 70, Sell > 30).
+# PHOENIX STRATEGY V10.0 (RESEARCH PARITY):
+# 1. PARITY: Implements _calculate_golden_trio to match Live Predictor.
+# 2. LOGIC: Enforces strict V10.0 Anti-Chop (Hurst) and Efficiency (KER) gates.
+# 3. MODEL: Aligned with Adaptive Random Forest (ARF) signal generation.
 # =============================================================================
 import logging
 import sys
@@ -17,8 +16,9 @@ import numpy as np
 import random
 import math
 import pytz
+import json
 from collections import deque, defaultdict, Counter
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime
 
 # Third-Party Imports
@@ -47,7 +47,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V10.0 Defensive System.
+    Strictly implements the Phoenix V10.0 Defensive System for Research Parity.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -62,7 +62,6 @@ class ResearchStrategy:
         
         # --- RISK CONFIGURATION ---
         self.risk_conf = params.get('risk_management', CONFIG.get('risk_management', {}))
-        
         self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 2.0))
         
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
@@ -97,16 +96,21 @@ class ResearchStrategy:
         self.bars_processed = 0
         self.consecutive_losses = 0 
         
+        # --- V10.0 GOLDEN TRIO BUFFERS (Research Parity) ---
+        self.window_size_trio = 100
+        self.closes_buffer = deque(maxlen=self.window_size_trio)
+        self.volume_buffer = deque(maxlen=self.window_size_trio)
+        
         # MTF Simulation State
         self.h4_buffer = deque(maxlen=200) 
         self.d1_buffer = deque(maxlen=200) 
         self.last_h4_idx = -1
         self.last_d1_idx = -1
-        self.current_d1_ema = 0.0 # Store D1 EMA for Trend Filter
+        self.current_d1_ema = 0.0 
         
         # --- SNIPER PROTOCOL INDICATORS ---
-        self.closes = deque(maxlen=200)     
-        self.rsi_buffer = deque(maxlen=15)  
+        self.sniper_closes = deque(maxlen=200)     
+        self.sniper_rsi = deque(maxlen=15)  
         
         # --- V10.0 MOMENTUM INDICATORS ---
         self.bb_window = 20
@@ -126,13 +130,12 @@ class ResearchStrategy:
         self.require_d1_trend = True 
         
         # 2. Efficiency Filter: STRICT (V10 Requirement)
-        # We override config if it's too loose.
         config_ker = float(phx_conf.get('ker_trend_threshold', 0.10))
         self.ker_thresh = max(0.25, config_ker) # Hard floor at 0.25
         
         self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 1.1)) 
         self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 8.0))
-        self.chop_threshold = float(phx_conf.get('choppiness_threshold', 50.0)) # Hardened Default
+        self.chop_threshold = float(phx_conf.get('choppiness_threshold', 50.0)) 
         
         adx_cfg = CONFIG.get('features', {}).get('adx', {})
         self.adx_threshold = float(params.get('adx_threshold', adx_cfg.get('threshold', 20.0)))
@@ -156,13 +159,70 @@ class ResearchStrategy:
 
         # --- REC 3: Daily Circuit Breaker State ---
         self.daily_max_losses = 2
-        self.daily_max_loss_pct = 0.01 # 1% of account balance
+        self.daily_max_loss_pct = 0.01 
+
+    def _calculate_golden_trio(self) -> Tuple[float, float, float]:
+        """
+        Calculates the "Golden Trio" of features locally using accurate buffers.
+        Replicates Live Predictor logic exactly.
+        """
+        closes = self.closes_buffer
+        vols = self.volume_buffer
+        
+        hurst = 0.5
+        ker = 0.5
+        rvol = 1.0
+        
+        if len(closes) < 30:
+            return hurst, ker, rvol
+
+        prices = np.array(closes)
+        
+        # 1. Simple Hurst
+        try:
+            lags = range(2, 20)
+            tau = [np.std(np.subtract(prices[lag:], prices[:-lag])) for lag in lags]
+            poly = np.polyfit(np.log(lags), np.log(tau), 1)
+            hurst = poly[0] * 2.0 
+            hurst = max(0.0, min(1.0, hurst))
+        except:
+            hurst = 0.5
+
+        # 2. KER
+        try:
+            diffs = np.diff(prices)
+            net_change = abs(prices[-1] - prices[0])
+            sum_changes = np.sum(np.abs(diffs))
+            if sum_changes > 0:
+                ker = net_change / sum_changes
+            else:
+                ker = 0.0
+        except:
+            ker = 0.0
+
+        # 3. RVOL
+        if len(vols) > 10:
+            curr_vol = vols[-1]
+            avg_vol = np.mean(list(vols)[:-1]) 
+            if avg_vol > 0:
+                rvol = curr_vol / avg_vol
+            else:
+                rvol = 1.0
+        
+        return hurst, ker, rvol
+
+    def _calibrate_confidence(self, raw_conf: float) -> float:
+        """
+        Calibrates raw model probability to a more reliable confidence score.
+        """
+        x = (raw_conf - 0.5) * 10.0 
+        calibrated = 1 / (1 + np.exp(-x))
+        return calibrated
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (V10.0).
+        Main Event Loop for the Strategy (V10.0 Research).
         """
-        # Data Extraction
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
         low = snapshot.get_low(self.symbol)
@@ -175,11 +235,14 @@ class ResearchStrategy:
         if self.symbol not in self.last_price_map:
             self.last_price_map[self.symbol] = price
 
-        # Update Buffers
-        self.closes.append(price)
-        if len(self.closes) > 1:
-            delta = self.closes[-1] - self.closes[-2]
-            self.rsi_buffer.append(delta)
+        # Update Buffers (Golden Trio + Sniper)
+        self.closes_buffer.append(price)
+        self.volume_buffer.append(volume)
+        
+        self.sniper_closes.append(price)
+        if len(self.sniper_closes) > 1:
+            delta = self.sniper_closes[-1] - self.sniper_closes[-2]
+            self.sniper_rsi.append(delta)
         self.bb_buffer.append(price)
 
         # Inject Aux Data
@@ -201,9 +264,8 @@ class ResearchStrategy:
             dt_ts = dt_ts.replace(tzinfo=pytz.utc)
         server_time = dt_ts.astimezone(self.server_tz)
 
-        # --- UPDATE MTF CONTEXT (Calculate D1 EMA) ---
+        # --- UPDATE MTF CONTEXT ---
         context_data = self._simulate_mtf_context(price, server_time)
-        # Store D1 EMA for Sniper Filter
         self.current_d1_ema = context_data.get('d1', {}).get('ema200', 0.0)
 
         # --- GLOBAL ACCOUNT GUARD ---
@@ -211,7 +273,7 @@ class ResearchStrategy:
             self.rejection_stats["Account Daily Limit Hit"] += 1
             return
 
-        # --- V10.0 SYMBOL CIRCUIT BREAKER (Per-Symbol Defense) ---
+        # --- SYMBOL CIRCUIT BREAKER ---
         if self._check_symbol_circuit_breaker(broker, server_time):
             self.rejection_stats["Symbol Circuit Breaker (Loss Limit)"] += 1
             return
@@ -229,7 +291,7 @@ class ResearchStrategy:
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
             return 
 
-        # Flow Volumes (L2 Proxies)
+        # Flow Volumes
         buy_vol = snapshot.get_price(self.symbol, 'buy_vol')
         sell_vol = snapshot.get_price(self.symbol, 'sell_vol')
         
@@ -260,6 +322,13 @@ class ResearchStrategy:
         
         if features is None: return
 
+        # --- V10.0: GOLDEN TRIO INJECTION ---
+        hurst, ker_val, rvol_val = self._calculate_golden_trio()
+        
+        features['hurst'] = hurst
+        features['ker'] = ker_val
+        features['rvol'] = rvol_val
+        
         self.last_features = features
         
         if self.burn_in_counter < self.burn_in_limit:
@@ -271,9 +340,7 @@ class ResearchStrategy:
         self.bars_processed += 1
 
         # Drift Detection
-        ker_val = features.get('ker', 0.5)
         self.ker_drift_detector.update(ker_val)
-        
         if self.ker_drift_detector.drift_detected:
             self.dynamic_ker_offset = max(-0.10, self.dynamic_ker_offset - 0.05)
         else:
@@ -288,7 +355,7 @@ class ResearchStrategy:
                 base_weight = w_pos if outcome_label != 0 else w_neg
                 
                 ret_scalar = math.log1p(abs(realized_ret) * 100.0)
-                ret_scalar = max(0.5, ret_scalar)
+                ret_scalar = max(0.5, min(ret_scalar, 5.0))
                 
                 hist_ker = stored_feats.get('ker', 0.5)
                 ker_weight = hist_ker * 2.0 
@@ -305,7 +372,6 @@ class ResearchStrategy:
 
         # C. Add Trade Opportunity
         parkinson = features.get('parkinson_vol', 0.0)
-        features['parkinson_vol'] = parkinson 
         current_atr = features.get('atr', 0.001)
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp, parkinson_vol=parkinson)
 
@@ -314,46 +380,44 @@ class ResearchStrategy:
             return 
 
         # ============================================================
-        # E. ENTRY LOGIC GATES (V10.0)
+        # E. ENTRY LOGIC GATES (V10.0 DEFENSIVE)
         # ============================================================
         
-        rvol = features.get('rvol', 1.0)
         adx_val = features.get('adx', 0.0)
         choppiness = features.get('choppiness', 50.0)
         
-        # G1: ANTI-CHOP
-        if choppiness > self.chop_threshold:
-            self.rejection_stats[f"Chop Regime (CHOP {choppiness:.1f} > {self.chop_threshold})"] += 1
-            return
-            
-        # G2: FUEL GAUGE
-        if rvol < self.vol_gate_ratio:
-            self.rejection_stats[f"Low Fuel (RVol {rvol:.2f} < {self.vol_gate_ratio})"] += 1
+        # G1: ANTI-CHOP (Hurst Filter)
+        if hurst < 0.45:
+            self.rejection_stats[f"Chop Regime (Hurst {hurst:.2f})"] += 1
             return
 
-        # G3: VOLUME EXHAUSTION
-        if rvol > self.max_rvol_thresh:
-            self.rejection_stats[f"Volume Climax (RVol {rvol:.2f} > {self.max_rvol_thresh})"] += 1
+        # G2: FUEL GAUGE
+        if rvol_val < self.vol_gate_ratio:
+            self.rejection_stats[f"Low Fuel (RVol {rvol_val:.2f})"] += 1
+            return
+
+        # G3: EXHAUSTION
+        if rvol_val > self.max_rvol_thresh:
+            self.rejection_stats[f"Volume Climax"] += 1
             return 
         
-        # G4: STRICT EFFICIENCY (V10 Hardening)
-        # Ensure KER is at least 0.25 regardless of config or drift
+        # G4: STRICT EFFICIENCY (KER)
         base_thresh = max(0.25, self.ker_thresh)
         effective_ker_thresh = max(0.25, base_thresh + self.dynamic_ker_offset)
             
         if ker_val < effective_ker_thresh:
-            self.rejection_stats[f"Low Efficiency (KER {ker_val:.2f} < {effective_ker_thresh:.2f})"] += 1
+            self.rejection_stats[f"Low Efficiency (KER {ker_val:.2f})"] += 1
             return
 
         # G5: TREND STRENGTH
         if adx_val < self.adx_threshold:
-            self.rejection_stats[f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
+            self.rejection_stats[f"Weak Trend"] += 1
             return
 
         proposed_action = 0 
         regime_label = "Trend"
 
-        # --- MOMENTUM BREAKOUT LOGIC ---
+        # --- MOMENTUM BREAKOUT TRIGGER ---
         if len(self.bb_buffer) < self.bb_window:
             self.rejection_stats["Warming Up BB"] += 1
             return
@@ -363,7 +427,6 @@ class ResearchStrategy:
         upper_bb = bb_mu + (self.bb_std * bb_std)
         lower_bb = bb_mu - (self.bb_std * bb_std)
         
-        # Normalized RSI (0-100)
         rsi_val = features.get('rsi_norm', 0.5) * 100.0
         
         trigger_bull = (price > upper_bb) and (rsi_val > 50)
@@ -387,7 +450,10 @@ class ResearchStrategy:
             pred_proba = self.model.predict_proba_one(features)
             prob_buy = pred_proba.get(1, 0.0)
             prob_sell = pred_proba.get(-1, 0.0)
-            confidence = prob_buy if proposed_action == 1 else prob_sell
+            raw_confidence = prob_buy if proposed_action == 1 else prob_sell
+            
+            # Calibrate
+            confidence = self._calibrate_confidence(raw_confidence)
             
             is_profitable = self.meta_labeler.predict(
                 features, 
@@ -403,12 +469,10 @@ class ResearchStrategy:
                 self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob:.2f})"] += 1
                 return
 
-            # --- V10.0 SNIPER GATES ---
-            # 1. D1 Trend Filter (Bias)
-            # 2. RSI Extremes Guard
+            # --- SNIPER PROTOCOL ---
             if not self._check_sniper_filters(proposed_action, price):
+                self.rejection_stats["Sniper Reject"] += 1
                 return
-            # --------------------------
 
             if is_profitable:
                 self._execute_entry(confidence, price, features, broker, dt_ts, proposed_action, regime_label)
@@ -518,7 +582,6 @@ class ResearchStrategy:
         imp_feats = []
         imp_feats.append(regime)
         if features.get('rvol', 0) > 2.0: imp_feats.append('High_Fuel')
-        if features.get('mtf_alignment', 0) == 1.0: imp_feats.append('MTF_Aligned')
         
         for f in imp_feats:
             self.feature_importance_counter[f] += 1
@@ -529,7 +592,6 @@ class ResearchStrategy:
             'price': price,
             'conf': confidence,
             'rvol': features.get('rvol', 0),
-            'parkinson': features.get('parkinson_vol', 0),
             'ker': current_ker,
             'atr': current_atr,
             'regime': regime,
@@ -607,22 +669,16 @@ class ResearchStrategy:
     def _check_symbol_circuit_breaker(self, broker: BacktestBroker, server_time: datetime) -> bool:
         """
         V10.0 FEATURE: Per-Symbol Daily Circuit Breaker.
-        Stops trading on this symbol if:
-        1. Realized Daily Loss > 1% of Equity
-        2. Daily Loss Count >= 2
         """
         today_losses = 0
         today_pnl = 0.0
         
-        # Determine start of day timestamp
         current_day_start = server_time.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         
         for trade in broker.closed_positions:
             if trade.symbol != self.symbol:
                 continue
             
-            # Use exit time to determine if trade happened "today"
-            # Assuming trade.exit_time is a timestamp float
             exit_ts = trade.exit_time if hasattr(trade, 'exit_time') else 0.0
             
             if exit_ts >= current_day_start:
@@ -630,12 +686,9 @@ class ResearchStrategy:
                 if trade.net_pnl < 0:
                     today_losses += 1
         
-        # Check Rules
-        # 1. Max Trades Lost Rule
         if today_losses >= self.daily_max_losses:
             return True
             
-        # 2. Max % PnL Rule (1% Limit)
         loss_limit_usd = broker.initial_balance * self.daily_max_loss_pct
         if today_pnl < -loss_limit_usd:
             return True
@@ -712,49 +765,42 @@ class ResearchStrategy:
         2. RSI Guard: Block Buy if RSI > 70, Block Sell if RSI < 30.
         """
         # 1. RSI CALCULATION (M5 Extension)
-        if len(self.rsi_buffer) < 14:
-            rsi = 50.0 # Neutral if warming up
+        if len(self.sniper_rsi) < 14:
+            rsi = 50.0 
         else:
-            gains = [x for x in self.rsi_buffer if x > 0]
-            losses = [abs(x) for x in self.rsi_buffer if x < 0]
+            gains = [x for x in self.sniper_rsi if x > 0]
+            losses = [abs(x) for x in self.sniper_rsi if x < 0]
             avg_gain = sum(gains) / 14 if gains else 0
             avg_loss = sum(losses) / 14 if losses else 1e-9
             rs = avg_gain / avg_loss
             rsi = 100 - (100 / (1 + rs))
 
         # 2. TREND FILTER (D1 Bias)
-        # Access self.current_d1_ema (updated in on_data)
         d1_ema = self.current_d1_ema
         trend_aligned = False
         
-        # If D1 buffer is not full, we might want to skip or be lenient.
-        # But for strictness, if D1 EMA is 0 (not ready), we assume NO TREND -> REJECT
         if d1_ema == 0:
             self.rejection_stats['Trend_Filter_Warmup'] += 1
             return False
 
         if signal == 1: # BUY Signal
-            # Trend Check: Price > D1 EMA
             if price > d1_ema:
                 trend_aligned = True
             else:
                 self.rejection_stats['Counter_Trend_D1_EMA'] += 1
                 return False
                 
-            # RSI Guard: Prevent Buying Tops
             if rsi > 70:
                 self.rejection_stats['Overbought_RSI_>70'] += 1
                 return False
                 
         elif signal == -1: # SELL Signal
-            # Trend Check: Price < D1 EMA
             if price < d1_ema:
                 trend_aligned = True
             else:
                 self.rejection_stats['Counter_Trend_D1_EMA'] += 1
                 return False
                 
-            # RSI Guard: Prevent Selling Bottoms
             if rsi < 30:
                 self.rejection_stats['Oversold_RSI_<30'] += 1
                 return False
@@ -762,7 +808,6 @@ class ResearchStrategy:
         return True
 
     def _inject_auxiliary_data(self):
-        """Injects static approximations ONLY if missing."""
         defaults = {
             "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
             "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
@@ -773,9 +818,6 @@ class ResearchStrategy:
                 self.last_price_map[sym] = price
 
     def generate_autopsy(self) -> str:
-        """
-        Generates a text report explaining WHY the strategy behaved this way.
-        """
         if not self.trade_events:
             sorted_rejects = sorted(self.rejection_stats.items(), key=lambda item: item[1], reverse=True)
             reject_str = ", ".join([f"{k}: {v}" for k, v in sorted_rejects[:5]])
