@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V12.4 (FTMO SNIPER - AGGRESSOR PROTOCOL):
-# 1. LOGIC: Implemented "Stalemate Exit" (4h) to fix Time Stop inefficiency.
-# 2. RSI: Disabled Overbought/Oversold filters for JPY pairs (Trend Runners).
-# 3. RISK: Portfolio Heat checks maintained.
+# PHOENIX STRATEGY V12.6 (UNSHACKLED PROTOCOL):
+# 1. LOGIC: Regime Enforcement Bypass logic added.
+# 2. LOGIC: "Stalemate Exit" (4h) maintained.
+# 3. RSI: JPY Bypass maintained.
 # =============================================================================
 import logging
 import sys
@@ -47,7 +47,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V12.4 Alpha Seeker Protocol.
+    Strictly implements the Phoenix V12.6 Alpha Seeker Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -527,6 +527,9 @@ class ResearchStrategy:
             if self.regime_enforcement == "HARD":
                 self.rejection_stats[f"Personality Clash ({regime_label} on {preferred_regime})"] += 1
                 return
+            elif self.regime_enforcement == "DISABLED":
+                 # V12.6 UNSHACKLED: Bypass clash flag to allow full adaptability
+                 is_regime_clash = False 
             else:
                 # SOFT Mode: Mark for high confidence check later
                 pass 

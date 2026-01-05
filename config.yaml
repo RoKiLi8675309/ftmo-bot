@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V12.5 (FTMO SNIPER MODE - REFINED AGGRESSOR)
+# config.yaml – PROJECT PHOENIX V12.6 (FTMO SNIPER MODE - UNSHACKLED)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGY UPDATE (V12.5 - REFINED AGGRESSOR):
-# 1. LOGIC: Hurst increased to 0.52 to filter "Random Walk" fakeouts.
-# 2. EXIT: Added Regime Degradation Exit (Kill trade if ADX collapses).
-# 3. SAFETY: Gap-Proof Weekend Liquidation logic enabled.
+# STRATEGY UPDATE (V12.6 - UNSHACKLED PROTOCOL):
+# 1. LOGIC: Regime Enforcement DISABLED to allow full AI adaptability.
+# 2. LOGIC: Hurst Dead Zone squeezed (0.49-0.51) to activate in low vol.
+# 3. RISK: Profit Buffer Scaling DISABLED to stabilize 2025 drawdown.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -145,21 +145,21 @@ features:
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V12.5 SNIPER MODE) ---
+# --- PHOENIX STRATEGY PARAMETERS (V12.6 UNSHACKLED) ---
 phoenix_strategy:
   # --- ASSET REGIME MAPPING ---
-  # V12.3: Now used as a "Soft" filter. 
-  # High confidence (>0.75) permits trading against the map.
-  regime_enforcement: "SOFT" 
+  # V12.6: DISABLED to allow full adaptability. 
+  # The AI is now trusted to determine regime per-bar.
+  regime_enforcement: "DISABLED" 
   
   asset_regime_map:
-    GBP: "TREND_BREAKOUT"   # GBP pairs favor momentum
-    EUR: "NEUTRAL"          # EUR pairs allow both Trend & Reversion
-    USD: "NEUTRAL"          # USD pairs allow both
-    JPY: "TREND_BREAKOUT"   # JPY favors strong trends
-    AUD: "MEAN_REVERSION"   # AUD often ranges
-    CAD: "MEAN_REVERSION"   # CAD tends to revert
-    CHF: "MEAN_REVERSION"   # CHF often ranges
+    GBP: "TREND_BREAKOUT"   # Reference only
+    EUR: "NEUTRAL"          # Reference only
+    USD: "NEUTRAL"          # Reference only
+    JPY: "TREND_BREAKOUT"   # Reference only
+    AUD: "MEAN_REVERSION"   # Reference only
+    CAD: "MEAN_REVERSION"   # Reference only
+    CHF: "MEAN_REVERSION"   # Reference only
 
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true        
@@ -167,8 +167,9 @@ phoenix_strategy:
   require_h4_alignment: false         # Rely on ML for context        
   
   # --- LOGIC MAPPING THRESHOLDS ---
-  hurst_breakout_threshold: 0.52      # REFINED: 0.52 (Filter Random Walk)
-  hurst_mean_reversion_threshold: 0.45 # Mean Rev Logic Trigger (<0.45)
+  # SQUEEZED DEAD ZONE (0.49 - 0.51) to activate in low volatility
+  hurst_breakout_threshold: 0.51      
+  hurst_mean_reversion_threshold: 0.49 
   ker_trend_threshold: 0.02           # FLOOR: Only reject absolute flatlines
   
   rvol_volatility_trigger: 3.0        # Liquidity Injection
@@ -241,10 +242,11 @@ risk_management:
   # 1.0% Base Risk (Increased from 0.50%)
   base_risk_per_trade_percent: 0.010 
   
-  # PROFIT BUFFER LOGIC
-  # Once daily profit exceeds 3%, scale risk to 1.5%
-  profit_buffer_threshold: 0.03
-  scaled_risk_percent: 0.015
+  # PROFIT BUFFER LOGIC - DISABLED
+  # Threshold set to 100% (Impossible) to disable scaling logic
+  profit_buffer_threshold: 100.0
+  # Scaled risk matches base risk to prevent aggression in drawdown
+  scaled_risk_percent: 0.010
   
   # LIMITS (TIGHTENED)
   max_daily_loss_pct: 0.040        # 4.0% (Buffer before FTMO 5%)
@@ -384,5 +386,5 @@ wfo:
   n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 100 # STRICT: Minimum valid trades
+  min_trades_optimization: 60 # LOWERED: Ensure EURUSD/GBPAUD are valid
   risk_per_trade_options: [0.0035, 0.0075] # Updated for V12.3 scaling

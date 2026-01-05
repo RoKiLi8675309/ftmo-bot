@@ -6,11 +6,11 @@
 # DESCRIPTION: Event-Driven Backtesting Broker. Simulates execution, spread,
 # commissions, and PnL tracking for strategy validation.
 #
-# PHOENIX STRATEGY V12.0 (RESEARCH PARITY):
+# PHOENIX STRATEGY V12.6 (UNSHACKLED PARITY):
 # 1. HARD DECK: Enforces Daily Loss Limit (Midnight Anchor) during backtest.
-# 2. METADATA: Enhanced logging to capture 'Regime' (Aggressor/Sniper).
+# 2. METADATA: Enhanced logging to capture 'Regime' (Aggressor/Sniper/Unshackled).
 # 3. COSTS: Strict spread and commission application to verify edge.
-# 4. BUFFER SCALING: Added support for Daily PnL tracking.
+# 4. BUFFER SCALING: Added support for Daily PnL tracking (Used by Strategy).
 # =============================================================================
 from __future__ import annotations
 import pandas as pd
@@ -389,7 +389,7 @@ class BacktestBroker:
         
         self.closed_positions.append(trade)
         
-        # 6. Log to Trade Log
+        # 6. Log to Trade Log (Enhanced Metadata for V12.6)
         self.trade_log.append({
             'Entry_Time': trade.timestamp_created,
             'Exit_Time': close_time,
@@ -407,7 +407,8 @@ class BacktestBroker:
             'MAE_Pips': trade.max_adverse_excursion,
             'Duration_Min': (close_time - trade.timestamp_created).total_seconds() / 60,
             'Regime': trade.metadata.get('regime', 'Unknown'),
-            'Confidence': trade.metadata.get('confidence', 0.0)
+            'Confidence': trade.metadata.get('confidence', 0.0),
+            'Tighten_Stops': trade.metadata.get('tighten_stops', False) # New for V12.6
         })
         
         symbol_icon = "🟢" if net_pnl > 0 else "🔴"

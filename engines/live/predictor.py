@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V12.5 (LIVE PREDICTOR - REFINED AGGRESSOR):
-# 1. LOGIC: Aligned TBM Horizon (720m) for Swing/Day holds.
-# 2. RSI: JPY Pairs bypass Overbought/Oversold filters (Trend Runners).
-# 3. GATES: Dynamic KER Scaling via ADWIN Drift Detection.
+# PHOENIX STRATEGY V12.6 (LIVE PREDICTOR - UNSHACKLED):
+# 1. LOGIC: Regime Enforcement Bypass logic added (Unshackled Protocol).
+# 2. LOGIC: Aligned TBM Horizon (720m) for Swing/Day holds.
+# 3. RSI: JPY Pairs bypass Overbought/Oversold filters (Trend Runners).
 # =============================================================================
 import logging
 import pickle
@@ -322,6 +322,7 @@ class MultiAssetPredictor:
         if "MEAN_REVERSION" in regimes_found:
             return "MEAN_REVERSION"
             
+        # Priority 3: Neutral (Default for EURUSD if defined as such)
         return "NEUTRAL"
 
     def _check_currency_exposure(self, symbol: str, open_positions: Dict[str, Any]) -> bool:
@@ -574,12 +575,16 @@ class MultiAssetPredictor:
             return Signal(symbol, "HOLD", 0.0, {"reason": "No BB Trigger in Regime"})
             
         # --- REGIME ENFORCEMENT (V12.3) ---
-        regime_mode = phx.get('regime_enforcement', 'HARD').upper()
         if is_regime_clash:
-            if regime_mode == "HARD":
+            if self.regime_enforcement == "HARD":
                 stats["Personality Clash (Hard Block)"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "Asset Personality Clash"})
-            # If SOFT, we proceed but require high confidence later
+            elif self.regime_enforcement == "DISABLED":
+                 # V12.6 UNSHACKLED: Bypass clash flag to allow full adaptability
+                 is_regime_clash = False 
+            else:
+                # SOFT Mode: Mark for high confidence check later
+                pass 
 
         # G3: EXHAUSTION
         if rvol_val > max_rvol_thresh:
