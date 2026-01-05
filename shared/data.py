@@ -216,7 +216,6 @@ class AdaptiveImbalanceBarGenerator:
                                   ((1 - self.alpha) * self.expected_imbalance)
         
         # Clamp threshold to avoid sampling every tick or never sampling
-        # SNIPER UPDATE: Min threshold raised to 50.0 to filter low-liquidity noise
         self.expected_imbalance = max(10.0, min(self.expected_imbalance, 10000.0))
 
         # Reset State
