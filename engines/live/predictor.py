@@ -6,10 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V12.4 (LIVE PREDICTOR - SNIPER MODE):
+# PHOENIX STRATEGY V12.4 (LIVE PREDICTOR - AGGRESSOR PROTOCOL):
 # 1. LOGIC: Aligned TBM Horizon (720m) for Swing/Day holds.
 # 2. ASSETS: Optimized for High-Vol pairs only (Pruned toxic assets).
 # 3. GATES: Dynamic KER Scaling via ADWIN Drift Detection.
+# 4. RSI: JPY Pairs bypass Overbought/Oversold filters (Trend Runners).
 # =============================================================================
 import logging
 import pickle
@@ -466,6 +467,7 @@ class MultiAssetPredictor:
                     # Count as loss if realized return is negative (slippage included)
                     if realized_ret < 0:
                         self.daily_performance[symbol]['losses'] += 1
+                        logger.info(f"📉 LOSS DETECTED {symbol}: ${realized_ret:.2f} | Daily Losses: {self.daily_performance[symbol]['losses']}")
                 
                 # --- STREAK BREAKER UPDATE ---
                 if self.active_signals[symbol]:
@@ -680,6 +682,9 @@ class MultiAssetPredictor:
         V11.0 SNIPER PROTOCOL (LIVE):
         1. Trend Filter: D1 Alignment (DISABLED in V11 Aggressor Mode).
         2. RSI Guard: Strict Overbought (70) / Oversold (30) rejection.
+        
+        V12.4 AGGRESSOR UPDATE:
+        - JPY pairs (GBPJPY, USDJPY) bypass RSI filters to capture runaway trends.
         """
         # 1. RSI CALCULATION (M5 Extension)
         if len(self.sniper_rsi[symbol]) < 14:
@@ -706,10 +711,14 @@ class MultiAssetPredictor:
             trend_aligned = True # Pass if disabled or no data
 
         # 3. RSI EXTREME GUARD
-        if signal == 1: # BUY
-            if rsi > 70: return False # Reject Overbought
-        elif signal == -1: # SELL
-            if rsi < 30: return False # Reject Oversold
+        # AGGRESSOR PROTOCOL: Bypass RSI filter for JPY pairs
+        if "JPY" in symbol:
+            pass # JPY pairs trend hard, ignore RSI extremes
+        else:
+            if signal == 1: # BUY
+                if rsi > 70: return False # Reject Overbought
+            elif signal == -1: # SELL
+                if rsi < 30: return False # Reject Oversold
                 
         return True
 
@@ -718,7 +727,8 @@ class MultiAssetPredictor:
         defaults = {
             "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
             "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
-            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0
+            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0,
+            "GBPAUD": 1.95 # Added for V12.4
         }
         for sym, price in defaults.items():
             if sym not in self.last_close_prices or self.last_close_prices[sym] == 0:

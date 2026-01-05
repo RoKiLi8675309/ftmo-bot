@@ -5,9 +5,9 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# PHOENIX STRATEGY V12.4 (FTMO SNIPER MODE):
-# 1. HORIZON: Extended TBM optimization range to 24h (1440m) for swing trades.
-# 2. RISK: Updated search space to [0.50%, 0.75%] to match higher conviction.
+# PHOENIX STRATEGY V12.4 (RESEARCH - AGGRESSOR PROTOCOL):
+# 1. OPTIMIZATION: Updated Risk Search Space to [0.5%, 1.0%, 1.5%] to validate Aggressor sizing.
+# 2. HORIZON: Extended TBM optimization range to 24h (1440m) for swing trades.
 # 3. SAFETY: Hard Drawdown Cap at 8.0% maintained.
 # =============================================================================
 import os
@@ -266,8 +266,9 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
             
-            # V12.4: Higher Risk Options for Sniper Conviction
-            risk_options = [0.0050, 0.0075] 
+            # V12.4 AGGRESSOR PROTOCOL: Updated Risk Search Space
+            # Includes 1.0% (Base) and 1.5% (Scaled) options
+            risk_options = [0.0050, 0.010, 0.015] 
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             trial.set_user_attr("risk_pct", params['risk_per_trade_percent'] * 100)
             
@@ -410,7 +411,8 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 }
                 params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
                 
-                risk_options = CONFIG['wfo'].get('risk_per_trade_options', [0.0035, 0.0075])
+                # V12.4 AGGRESSOR: Updated Risk Search for WFO
+                risk_options = [0.0050, 0.010, 0.015]
                 params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
                 
                 pipeline_inst = ResearchPipeline()

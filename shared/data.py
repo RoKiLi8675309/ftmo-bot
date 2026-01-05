@@ -216,6 +216,7 @@ class AdaptiveImbalanceBarGenerator:
                                   ((1 - self.alpha) * self.expected_imbalance)
         
         # Clamp threshold to avoid sampling every tick or never sampling
+        # V12.4: Lower bound raised to 10.0 to filter micro-noise
         self.expected_imbalance = max(10.0, min(self.expected_imbalance, 10000.0))
 
         # Reset State

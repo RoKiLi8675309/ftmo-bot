@@ -120,6 +120,7 @@ class StreamingBollingerBands:
     """
     V12.4 UPDATE: Sniper Mode Breakout Indicator.
     Calculates Upper/Lower Bands and Width for Breakout & Squeeze Detection.
+    Defaults adjusted to 1.5 Std Dev for Aggressor entries.
     """
     def __init__(self, window: int = 20, num_std: float = 1.5):
         self.window = window

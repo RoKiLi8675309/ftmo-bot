@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V12.4 (FTMO SNIPER MODE)
+# config.yaml – PROJECT PHOENIX V12.4 (FTMO SNIPER MODE - AGGRESSOR PROTOCOL)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGY UPDATE (V12.4 - ASSET PRUNING & HORIZON ALIGNMENT):
-# 1. ASSETS: Pruned Toxic Pairs (AUDUSD, USDCAD, EURJPY). Focus on High-Vol winners.
-# 2. ML: Extended TBM Horizon to 720m (12h) to match observed trade duration.
-# 3. RISK: Increased Base Risk to 0.50% (DD capacity allows aggression).
+# STRATEGY UPDATE (V12.4 - AGGRESSOR PROTOCOL):
+# 1. ASSETS: Pruned Toxic Pairs (USDCHF). Added High-Beta (EURJPY, GBPAUD).
+# 2. LOGIC: Lowered Hurst to 0.50 to capture momentum bursts.
+# 3. RISK: Increased Base Risk to 1.0% (Velocity Focused).
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -165,7 +165,7 @@ phoenix_strategy:
   require_h4_alignment: false         # Rely on ML for context        
   
   # --- LOGIC MAPPING THRESHOLDS ---
-  hurst_breakout_threshold: 0.55      # Trend Logic Trigger (>0.55)
+  hurst_breakout_threshold: 0.50      # AGGRESSOR: Lowered to 0.50 (Kill Grey Zone)
   hurst_mean_reversion_threshold: 0.45 # Mean Rev Logic Trigger (<0.45)
   ker_trend_threshold: 0.02           # FLOOR: Only reject absolute flatlines
   
@@ -235,14 +235,14 @@ risk_management:
   # --- SIZING METHOD: PROFIT BUFFER SCALING ---
   sizing_method: "fixed_risk"
   
-  # INITIAL RISK: V12.4 Calibrated for Sniper Mode
-  # 0.50% Base Risk.
-  base_risk_per_trade_percent: 0.0050 
+  # INITIAL RISK: V12.4 AGGRESSOR PROTOCOL
+  # 1.0% Base Risk (Increased from 0.50%)
+  base_risk_per_trade_percent: 0.010 
   
   # PROFIT BUFFER LOGIC
-  # Once daily profit exceeds 3%, scale risk to 0.75% (was 1.0%)
+  # Once daily profit exceeds 3%, scale risk to 1.5%
   profit_buffer_threshold: 0.03
-  scaled_risk_percent: 0.0075
+  scaled_risk_percent: 0.015
   
   # LIMITS (TIGHTENED)
   max_daily_loss_pct: 0.040        # 4.0% (Buffer before FTMO 5%)
@@ -259,8 +259,8 @@ risk_management:
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (SCALPER MODE)
-  stop_loss_atr_mult: 1.5         # TIGHTER: Cut losers fast     
-  take_profit_atr_mult: 2.0       # TIGHTER: Bag wins fast     
+  stop_loss_atr_mult: 1.5         # TIGHTER: Cut losers fast      
+  take_profit_atr_mult: 2.0       # TIGHTER: Bag wins fast      
   
   # ACTIVE TRAILING STOP
   trailing_stop:
@@ -284,13 +284,16 @@ risk_management:
 
 # --- TRADING PORTFOLIO (V12.4 SNIPER MODE) ---
 trading:
-  # PRUNED: AUDUSD, USDCAD, EURJPY (Low Volatility / Regime Mismatch)
+  # AGGRESSOR PORTFOLIO ROTATION:
+  # REMOVED: USDCHF (Toxic)
+  # ADDED: EURJPY, GBPAUD (High Velocity)
   symbols:
     - "EURUSD"
     - "GBPUSD"
     - "USDJPY"
-    - "USDCHF"
     - "GBPJPY"
+    - "EURJPY"
+    - "GBPAUD"
   
   auxiliary_symbols:
     - "NZDUSD"
@@ -372,6 +375,7 @@ forensic_audit:
     EURUSD: 1.2
     USDCAD: 1.8
     USDCHF: 1.6
+    GBPAUD: 2.5 # Added for V12.4
 
 # --- WFO OPTIMIZATION ---
 wfo:

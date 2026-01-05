@@ -6,10 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX STRATEGY V12.4 (LIVE ENGINE - SNIPER MODE):
-# 1. LOGIC: Added "Stalemate Exit" (4h) to active position management.
-# 2. RISK: Strict adherence to V12.4 FTMO Limits and 0.50% base risk.
-# 3. ASSETS: Optimized for High-Vol pairs (EURUSD, GBPUSD, JPY pairs).
+# PHOENIX STRATEGY V12.4 (LIVE ENGINE - AGGRESSOR PROTOCOL):
+# 1. LOGIC: "Stalemate Exit" (4h) active to recycle capital from low-volatility stagnation.
+# 2. RISK: Enforces 1.0% Base Risk and 8% Hard Drawdown Cap.
+# 3. ASSETS: Configured for High-Velocity pairs (EURJPY, GBPAUD).
 # =============================================================================
 import logging
 import time
@@ -615,7 +615,7 @@ class LiveTradingEngine:
             stop_loss_price=0.0,
             account_equity=self.ftmo_guard.equity,
             account_currency="USD",
-            win_rate=0.45,
+            win_rate=0.45, 
             risk_reward_ratio=2.0 
         )
 

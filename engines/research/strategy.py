@@ -5,9 +5,9 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V12.4 (FTMO SNIPER):
+# PHOENIX STRATEGY V12.4 (FTMO SNIPER - AGGRESSOR PROTOCOL):
 # 1. LOGIC: Implemented "Stalemate Exit" (4h) to fix Time Stop inefficiency.
-# 2. REGIME: "SOFT" Enforcement maintained.
+# 2. RSI: Disabled Overbought/Oversold filters for JPY pairs (Trend Runners).
 # 3. RISK: Portfolio Heat checks maintained.
 # =============================================================================
 import logging
@@ -112,7 +112,7 @@ class ResearchStrategy:
         
         # --- SNIPER PROTOCOL INDICATORS ---
         self.sniper_closes = deque(maxlen=200)      
-        self.sniper_rsi = deque(maxlen=15)   
+        self.sniper_rsi = deque(maxlen=15)    
         
         # --- V11.1 MOMENTUM INDICATORS ---
         self.bb_window = 20
@@ -933,6 +933,9 @@ class ResearchStrategy:
         1. Trend Filter: Trade ONLY if price aligns with D1 EMA 200.
            (DISABLED in V11 Aggressor Mode if require_d1_trend is False)
         2. RSI Guard: Block Buy if RSI > 70, Block Sell if RSI < 30.
+        
+        V12.4 AGGRESSOR UPDATE:
+        - Jettison RSI filters for JPY pairs to capture runaway trends.
         """
         # 1. RSI CALCULATION (M5 Extension)
         if len(self.sniper_rsi) < 14:
@@ -964,14 +967,18 @@ class ResearchStrategy:
             trend_aligned = True 
 
         # 3. RSI EXTREME GUARD
-        if signal == 1: # BUY
-            if rsi > 70:
-                self.rejection_stats['Overbought_RSI_>70'] += 1
-                return False
-        elif signal == -1: # SELL
-            if rsi < 30:
-                self.rejection_stats['Oversold_RSI_<30'] += 1
-                return False
+        # AGGRESSOR PROTOCOL: Bypass RSI filter for JPY pairs (e.g. GBPJPY, USDJPY)
+        if "JPY" in self.symbol:
+            pass # Explicit bypass for Yen crosses
+        else:
+            if signal == 1: # BUY
+                if rsi > 70:
+                    self.rejection_stats['Overbought_RSI_>70'] += 1
+                    return False
+            elif signal == -1: # SELL
+                if rsi < 30:
+                    self.rejection_stats['Oversold_RSI_<30'] += 1
+                    return False
         
         return True
 
@@ -979,7 +986,8 @@ class ResearchStrategy:
         defaults = {
             "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
             "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
-            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0
+            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0,
+            "GBPAUD": 1.95 # Added for V12.4
         }
         for sym, price in defaults.items():
             if sym not in self.last_price_map:
