@@ -5,10 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX STRATEGY V12.5 (FTMO SNIPER MODE - REFINED AGGRESSOR):
+# PHOENIX STRATEGY V12.7 (FTMO SNIPER MODE - UNSHACKLED):
 # 1. SAFETY: SessionGuard now enforces Gap-Proof Weekend Liquidation (Sat/Sun).
 # 2. CALIBRATION: 1.0% Base Risk / 1.5% Scaled Risk maintained.
-# 3. ALPHA SQUAD: EURJPY and GBPAUD included in boost logic.
+# 3. SIZING: Confidence Scaling DISABLED (Binary Pass/Fail Logic).
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -153,6 +153,7 @@ class RiskManager:
         Calculates position size using strict prop firm logic (Sniper Protocol).
         Includes SQN Scaling to cut losers and press winners.
         V13.0 UPDATE: Risk calibrated for Aggressor Mode (1.0% Base).
+        V12.7 UPDATE: Removed Confidence Scaling (Binary Gate).
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -266,9 +267,9 @@ class RiskManager:
         ker_scalar = max(0.8, min(ker, 1.0))
         calculated_risk_usd *= ker_scalar
         
-        # Confidence Scaling
-        conf_scalar = min(1.0, max(0.5, conf / 0.8))
-        calculated_risk_usd *= conf_scalar
+        # Confidence Scaling - DISABLED (V12.7 UNSHACKLED)
+        # We trust the binary output of Meta-Labeling.
+        calculated_risk_usd *= 1.0
 
         # Calculate Lots
         if loss_per_lot_usd > 0:

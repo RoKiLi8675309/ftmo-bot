@@ -5,9 +5,9 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V12.6 (UNSHACKLED PROTOCOL):
+# PHOENIX STRATEGY V12.7 (UNSHACKLED PROTOCOL):
 # 1. LOGIC: Regime Enforcement Bypass logic added.
-# 2. LOGIC: "Stalemate Exit" (4h) maintained.
+# 2. LOGIC: "Stalemate Exit" (4h) REMOVED to align with Live Engine.
 # 3. RSI: JPY Bypass maintained.
 # =============================================================================
 import logging
@@ -47,7 +47,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V12.6 Alpha Seeker Protocol.
+    Strictly implements the Phoenix V12.7 Alpha Seeker Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -111,7 +111,7 @@ class ResearchStrategy:
         self.current_d1_ema = 0.0 
         
         # --- SNIPER PROTOCOL INDICATORS ---
-        self.sniper_closes = deque(maxlen=200)      
+        self.sniper_closes = deque(maxlen=200)       
         self.sniper_rsi = deque(maxlen=15)    
         
         # --- V11.1 MOMENTUM INDICATORS ---
@@ -144,7 +144,7 @@ class ResearchStrategy:
         self.chop_threshold = float(phx_conf.get('choppiness_threshold', 60.0)) # Relaxed
         
         adx_cfg = CONFIG.get('features', {}).get('adx', {})
-        # Relaxed ADX to 20.0
+        # Relaxed ADX to 20.0 (or config override)
         self.adx_threshold = float(params.get('adx_threshold', adx_cfg.get('threshold', 20.0))) 
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
@@ -287,7 +287,7 @@ class ResearchStrategy:
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (V12.4 FTMO Sniper Mode).
+        Main Event Loop for the Strategy (V12.7 FTMO Sniper Mode).
         """
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
@@ -543,7 +543,8 @@ class ResearchStrategy:
         if regime_label == "TREND_BREAKOUT":
             adx_val = features.get('adx', 0.0)
             if adx_val < self.adx_threshold:
-                self.rejection_stats[f"Weak Trend"] += 1
+                # V12.7 REFACTOR: Log specific failure values
+                self.rejection_stats[f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
                 return
 
         # ============================================================
@@ -554,10 +555,11 @@ class ResearchStrategy:
             pred_proba = self.model.predict_proba_one(features)
             prob_buy = pred_proba.get(1, 0.0)
             prob_sell = pred_proba.get(-1, 0.0)
-            raw_confidence = prob_buy if proposed_action == 1 else prob_sell
+            # raw_confidence = prob_buy if proposed_action == 1 else prob_sell
             
-            # Calibrate
-            confidence = self._calibrate_confidence(raw_confidence)
+            # V12.7 UNSHACKLED: Bypass Calibration/Confidence Check
+            # We trust the Meta Labeler and Regime Filters entirely.
+            confidence = 1.0 # Force max confidence to bypass filters
             
             is_profitable = self.meta_labeler.predict(
                 features, 
@@ -568,7 +570,7 @@ class ResearchStrategy:
             if proposed_action != 0:
                 self.meta_label_events += 1
 
-            min_prob = float(self.params.get('min_calibrated_probability', 0.50))
+            # min_prob = float(self.params.get('min_calibrated_probability', 0.50))
             
             # V12.3: SOFT REGIME OVERRIDE LOGIC
             if is_regime_clash:
@@ -578,10 +580,8 @@ class ResearchStrategy:
                     self.rejection_stats[f"Regime Clash Low Conf ({confidence:.2f} < {required_conf})"] += 1
                     return
             else:
-                # Normal check
-                if confidence < min_prob:
-                    self.rejection_stats[f"Low Confidence ({confidence:.2f} < {min_prob:.2f})"] += 1
-                    return
+                # Normal check removed in V12.7
+                pass
 
             # --- SNIPER PROTOCOL ---
             if not self._check_sniper_filters(proposed_action, price):
@@ -748,10 +748,9 @@ class ResearchStrategy:
         """
         V12.4 FEATURE: Managed Time Exits.
         1. Hard Time Stop (24h): Closes position regardless of PnL.
-        2. Stalemate Exit (4h): Closes position if it's stagnating (Break-even range).
+        2. Stalemate Exit (4h): REMOVED IN V12.7.
         """
         hard_stop_seconds = 86400  # 24 Hours
-        stalemate_seconds = 14400  # 4 Hours
         
         to_close = []
         for pos in broker.open_positions:
@@ -774,22 +773,7 @@ class ResearchStrategy:
             if duration > hard_stop_seconds:
                 to_close.append((pos, "Time Stop (24h)"))
             
-            # 2. Stalemate Exit (4h)
-            elif duration > stalemate_seconds:
-                # Calculate current R-multiple performance
-                risk_dist = pos.metadata.get('initial_risk_dist', 0.0)
-                
-                if risk_dist > 0:
-                    if pos.side == 1: # BUY
-                        current_pnl_dist = self.last_price - pos.entry_price
-                    else: # SELL
-                        current_pnl_dist = pos.entry_price - self.last_price
-                    
-                    r_value = current_pnl_dist / risk_dist
-                    
-                    # If trade is stuck between -0.5R and +0.5R after 4 hours -> KILL IT
-                    if -0.5 <= r_value <= 0.5:
-                        to_close.append((pos, "Stalemate (4h)"))
+            # Stalemate logic removed
         
         for pos, reason in to_close:
             broker._close_partial_position(

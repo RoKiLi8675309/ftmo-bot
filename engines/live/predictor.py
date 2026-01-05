@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V12.6 (LIVE PREDICTOR - UNSHACKLED):
+# PHOENIX STRATEGY V12.7 (LIVE PREDICTOR - UNSHACKLED):
 # 1. LOGIC: Regime Enforcement Bypass logic added (Unshackled Protocol).
-# 2. LOGIC: Aligned TBM Horizon (720m) for Swing/Day holds.
-# 3. RSI: JPY Pairs bypass Overbought/Oversold filters (Trend Runners).
+# 2. FILTER: Removed "Confidence" gating. We trust Meta-Labeling and Regimes.
+# 3. REPORTING: Enhanced ADX rejection logging for tuning.
 # =============================================================================
 import logging
 import pickle
@@ -92,7 +92,7 @@ class MultiAssetPredictor:
         
         # --- SNIPER PROTOCOL BUFFERS ---
         self.sniper_closes = {s: deque(maxlen=200) for s in symbols} # For SMA 200
-        self.sniper_rsi = {s: deque(maxlen=15) for s in symbols}     # For RSI 14
+        self.sniper_rsi = {s: deque(maxlen=15) for s in symbols}      # For RSI 14
 
         for s in symbols:
             # Default from Config
@@ -174,6 +174,10 @@ class MultiAssetPredictor:
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
         
+        # V12.7: ADX Threshold (Cached for Logging)
+        adx_cfg = CONFIG.get('features', {}).get('adx', {})
+        self.adx_threshold = float(adx_cfg.get('threshold', 20.0))
+
         # V12.3: Regime Enforcement Mode (HARD vs SOFT)
         self.regime_enforcement = phx_conf.get('regime_enforcement', 'HARD').upper()
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
@@ -594,35 +598,38 @@ class MultiAssetPredictor:
         # G4: TREND STRENGTH (ADX) - Only relevant for Trend Regime
         if regime_label == "TREND_BREAKOUT":
             adx_val = features.get('adx', 0.0)
-            if adx_val < 20.0: 
-                stats[f"Weak Trend"] += 1
+            if adx_val < self.adx_threshold: 
+                # V12.7 REFACTOR: Log specific failure values
+                stats[f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"Weak Trend (ADX {adx_val:.1f})"})
 
         # 5. ML Confirmation & Calibration
         pred_proba = model.predict_proba_one(features)
         prob_buy = pred_proba.get(1, 0.0)
         prob_sell = pred_proba.get(-1, 0.0)
-        raw_confidence = prob_buy if proposed_action == 1 else prob_sell
+        # raw_confidence = prob_buy if proposed_action == 1 else prob_sell
         
-        # Calibrate Probability
-        confidence = self._calibrate_confidence(raw_confidence)
+        # V12.7 UNSHACKLED: Bypass Calibration/Confidence Check
+        # We trust the Meta Labeler and Regime Filters entirely.
+        confidence = 1.0 # Force max confidence to bypass filters
         
         meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.52) 
         is_profitable = meta_labeler.predict(features, proposed_action, threshold=meta_threshold)
 
         # --- EXECUTION WITH DYNAMIC CONFIDENCE (V12.3 SOFT MODE) ---
-        min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.52)
+        # REMOVED IN V12.7: min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.52)
         
         if is_regime_clash:
             # SOFT Override: Require "God Mode" confidence (>0.75)
+            # Since confidence is now forced to 1.0, this will pass unless we change logic.
+            # Keeping block for structural integrity if we revert.
             if confidence < 0.75:
                 stats["Regime Clash Low Conf"] += 1
                 return Signal(symbol, "HOLD", confidence, {"reason": f"Regime Clash Conf ({confidence:.2f} < 0.75)"})
         else:
             # Standard Entry
-            if confidence < min_prob:
-                stats[f"ML Disagreement"] += 1
-                return Signal(symbol, "HOLD", confidence, {"reason": f"ML Disagreement (Conf {confidence:.2f} < {min_prob:.2f})"})
+            # V12.7: REMOVED confidence check
+            pass
 
         # --- SNIPER PROTOCOL: FINAL FILTER GATE (V11) ---
         # Checks D1 Trend Bias (If enabled) & RSI Extremes

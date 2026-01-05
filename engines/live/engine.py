@@ -6,9 +6,9 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX STRATEGY V12.5 (LIVE ENGINE - REFINED AGGRESSOR):
-# 1. SAFETY: Implemented "Gap-Proof" Weekend Liquidation (Sat/Sun + Fri Late).
-# 2. LOGIC: "Stalemate Exit" (4h) active to recycle capital.
+# PHOENIX STRATEGY V12.7 (LIVE ENGINE - REFACTOR):
+# 1. LOGIC: Removed "Stalemate Exit" (4h) to allow winners to run.
+# 2. SAFETY: "Gap-Proof" Weekend Liquidation (Sat/Sun + Fri Late) active.
 # 3. RISK: 1.0% Base Risk / 8% Hard Drawdown Cap.
 # =============================================================================
 import logging
@@ -67,7 +67,7 @@ class LiveTradingEngine:
     1. Consumes Ticks from Redis.
     2. Aggregates Ticks into Adaptive Imbalance Bars (TIBs).
     3. Feeds Bars to Golden Trio Predictor (V12.4 Logic).
-    4. Manages Active Positions (Time Stop / Stalemate / Trailing).
+    4. Manages Active Positions (Time Stop / Trailing).
     5. Dispatches Orders to Windows.
     """
     def __init__(self):
@@ -302,13 +302,13 @@ class LiveTradingEngine:
 
     def _manage_active_positions_loop(self):
         """
-        V12.4: Active Position Management Thread.
+        V12.7 REFACTOR: Active Position Management Thread.
         Enforces:
         1. 24h Time Stop (Hard Exit).
-        2. 4h Stalemate Exit (Exit if PnL between -0.5R and +0.5R).
-        3. 0.5R Trailing Stop.
+        2. 0.5R Trailing Stop.
+        REMOVED: Stalemate Exit (4h) to let winners run.
         """
-        logger.info(f"{LogSymbols.INFO} Active Position Manager Started (Time-Stop: 24h, Stalemate: 4h, Trail: 0.5R).")
+        logger.info(f"{LogSymbols.INFO} Active Position Manager Started (Time-Stop: 24h, Trail: 0.5R).")
         while not self.shutdown_flag:
             try:
                 positions = self._get_open_positions_from_redis()
@@ -318,7 +318,6 @@ class LiveTradingEngine:
 
                 now_utc = datetime.now(pytz.utc)
                 hard_stop_seconds = 86400 # 24 hours
-                stalemate_seconds = 14400 # 4 hours
 
                 for sym, pos in positions.items():
                     # --- TIME BASED EXITS ---
@@ -334,26 +333,7 @@ class LiveTradingEngine:
                             exit_reason = "Time Stop (24h)"
                             logger.warning(f"⌛ TIME STOP: {sym} held for {duration/3600:.1f}h. Closing.")
                         
-                        # 2. Stalemate Exit (4h)
-                        elif duration > stalemate_seconds:
-                            current_price = self.latest_prices.get(sym, 0.0)
-                            entry_price = float(pos.get('entry_price', 0.0))
-                            sl_price = float(pos.get('sl', 0.0))
-                            
-                            if current_price > 0 and entry_price > 0 and sl_price > 0:
-                                risk_dist = abs(entry_price - sl_price)
-                                if risk_dist > 1e-5:
-                                    if pos.get('type') == "BUY":
-                                        pnl_dist = current_price - entry_price
-                                    else:
-                                        pnl_dist = entry_price - current_price
-                                    
-                                    r_val = pnl_dist / risk_dist
-                                    
-                                    # If stuck between -0.5R and +0.5R -> Kill it
-                                    if -0.5 <= r_val <= 0.5:
-                                        exit_reason = "Stalemate (4h)"
-                                        logger.info(f"⌛ STALEMATE: {sym} stuck at {r_val:.2f}R for {duration/3600:.1f}h. Freeing capital.")
+                        # STALEMATE EXIT REMOVED IN V12.7
 
                         if exit_reason:
                             close_intent = Trade(
