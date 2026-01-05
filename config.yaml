@@ -77,13 +77,15 @@ producer:
 # --- DATA SETTINGS (V10.1 TIBs) ---
 data:
   sampling_method: "imbalance" # Adaptive Imbalance Bars
-  volume_bar_threshold: 50     # FINE-TUNED: Lowered from 100 to 50 for M5 stability
+  # FINE-TUNED: Lowered to 10.0 to eliminate "Insufficient bars" bottleneck 
+  # and capture high-resolution market structure immediately.
+  volume_bar_threshold: 10.0     
   imbalance_alpha: 0.05        # EWMA Forgetting Factor
   download_start_date: "2020-01-01"
   num_candles_producer: 50000
-  num_candles_train: 4000000 
+  num_candles_train: 10000000  # INCREASED: 10M Ticks for deep learning
   num_candles_wfo: 10000
-  num_candles_backtest: 200000
+  num_candles_backtest: 1000000 # INCREASED: 1M Ticks for robust backtest
 
 # --- FEATURE ENGINEERING ---
 features:

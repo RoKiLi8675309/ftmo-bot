@@ -8,7 +8,7 @@
 # PHOENIX STRATEGY V12.4 (RESEARCH - AGGRESSOR PROTOCOL):
 # 1. OPTIMIZATION: Updated Risk Search Space to [0.5%, 1.0%, 1.5%] to validate Aggressor sizing.
 # 2. HORIZON: Extended TBM optimization range to 24h (1440m) for swing trades.
-# 3. SAFETY: Hard Drawdown Cap at 8.0% maintained.
+# 3. DATA: Dynamic history loading (10M ticks) to eliminate "Insufficient bars" bottleneck.
 # =============================================================================
 import os
 import sys
@@ -239,7 +239,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
     optuna.logging.set_verbosity(optuna.logging.WARN)
     
     try:
-        df = process_data_into_bars(symbol, n_ticks=4000000)
+        # Use dynamic train_candles passed from pipeline
+        df = process_data_into_bars(symbol, n_ticks=train_candles)
         if df.empty: return
         log.info(f"📥 {symbol}: Generated {len(df)} Imbalance Bars for training.")
 
@@ -348,8 +349,9 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
     optuna.logging.set_verbosity(optuna.logging.WARN)
     
     try:
-        # 1. Load All Data
-        df = process_data_into_bars(symbol, n_ticks=4000000)
+        # 1. Load All Data - Dynamic config load
+        train_ticks = CONFIG['data'].get('num_candles_train', 4000000)
+        df = process_data_into_bars(symbol, n_ticks=train_ticks)
         if df.empty: return
         
         # 2. Define Window Params (e.g. Train 2 Years, Test 6 Months)
@@ -488,7 +490,8 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
     log = logging.getLogger(f"Worker_Final_{symbol}")
     
     try:
-        df = process_data_into_bars(symbol, n_ticks=4000000)
+        # Use dynamic train_candles
+        df = process_data_into_bars(symbol, n_ticks=train_candles)
         if df.empty: return
 
         study_name = f"study_{symbol}"
