@@ -6,11 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V12.4 (LIVE PREDICTOR - AGGRESSOR PROTOCOL):
+# PHOENIX STRATEGY V12.5 (LIVE PREDICTOR - REFINED AGGRESSOR):
 # 1. LOGIC: Aligned TBM Horizon (720m) for Swing/Day holds.
-# 2. ASSETS: Optimized for High-Vol pairs only (Pruned toxic assets).
+# 2. RSI: JPY Pairs bypass Overbought/Oversold filters (Trend Runners).
 # 3. GATES: Dynamic KER Scaling via ADWIN Drift Detection.
-# 4. RSI: JPY Pairs bypass Overbought/Oversold filters (Trend Runners).
 # =============================================================================
 import logging
 import pickle

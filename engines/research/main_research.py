@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# PHOENIX STRATEGY V12.4 (RESEARCH - AGGRESSOR PROTOCOL):
-# 1. OPTIMIZATION: Updated Risk Search Space to [0.5%, 1.0%, 1.5%] to validate Aggressor sizing.
-# 2. HORIZON: Extended TBM optimization range to 24h (1440m) for swing trades.
-# 3. DATA: Dynamic history loading (10M ticks) to eliminate "Insufficient bars" bottleneck.
+# PHOENIX STRATEGY V12.5 (RESEARCH - REFINED AGGRESSOR):
+# 1. DATA: Dynamic loading of 10M ticks for high-resolution deep learning.
+# 2. OPTIMIZATION: Updated search space to validate 1.0% Risk Aggressor sizing.
+# 3. REPORTING: Enhanced EmojiCallback for Regime & Drawdown tracking.
 # =============================================================================
 import os
 import sys
@@ -51,7 +51,6 @@ if project_root not in sys.path:
 try:
     from engines.research.backtester import BacktestBroker, MarketSnapshot
     from engines.research.strategy import ResearchStrategy
-    # V10.0: Import AdaptiveImbalanceBarGenerator
     from shared import CONFIG, setup_logging, load_real_data, LogSymbols, AdaptiveImbalanceBarGenerator
 except ImportError as e:
     print(f"CRITICAL: Failed to import dependencies. Ensure you are running from the project root or 'shared' is accessible.\nError: {e}")
@@ -86,7 +85,7 @@ class EmojiCallback:
         if attrs.get('blown', False):
             icon = "💀" # Blown Account (>8% DD or Ruin)
             status = "BLOWN"
-        elif dd > 8.0: # UPDATED: 8.0% Survival Cap
+        elif dd > 8.0: # HARD LIMIT: 8.0%
             icon = "⚠️" # High Risk
             status = "RISKY"
         elif attrs.get('pruned', False):
@@ -120,10 +119,9 @@ class EmojiCallback:
         log.info(msg.strip())
         
         # 5. Detailed Analysis (Victory Lap OR Autopsy)
-        # UPDATED LOGIC: Always print Autopsy if PnL is negative, trades are 0, or account is blown.
         if 'autopsy' in attrs:
             # Victory Lap for significant profit
-            if pnl > 1000.0:
+            if pnl > 1000.0 and not attrs.get('blown', False):
                 report_type = "🏁 VICTORY LAP"
                 report_msg = f"\n{report_type} (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
                 log.info(report_msg)
@@ -137,7 +135,6 @@ class EmojiCallback:
 def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     """
     Helper to Load Ticks -> Aggregate to Tick Imbalance Bars (TIBs) -> Return Clean DataFrame.
-    V12.1: Less aggressive lower bound to ensure M5 data is captured.
     """
     # 1. Load Massive Amount of Ticks (To get sufficient Bars)
     raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2)
@@ -146,12 +143,11 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
         return pd.DataFrame()
 
     # 2. V10.1 AGGREGATION: ADAPTIVE IMBALANCE BARS WITH AUTO-CALIBRATION
-    # Fetch params from config (now defaults to 50 in V12.1)
-    config_threshold = CONFIG['data'].get('volume_bar_threshold', 50) 
+    # Fetch params from config (now defaults to 10 in V12.5)
+    config_threshold = CONFIG['data'].get('volume_bar_threshold', 10) 
     alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
     
     # --- AUTO-CALIBRATION LOOP ---
-    # Try successively lower thresholds until we get enough bars (at least 500)
     current_threshold = config_threshold
     bars_list = []
     min_bars_needed = 500
@@ -171,14 +167,14 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
             price = getattr(row, 'price', getattr(row, 'close', None))
             vol = getattr(row, 'volume', 1.0)
             
-            # Handle timestamp (might be Index or 'time' col)
+            # Handle timestamp
             ts = getattr(row, 'Index', getattr(row, 'time', None))
             if isinstance(ts, (datetime, pd.Timestamp)):
                 ts_val = ts.timestamp()
             else:
                 ts_val = float(ts)
                 
-            # L2 Data if available (rare in historical backfill, usually 0)
+            # L2 Data
             b_vol = 0.0
             s_vol = 0.0
             
@@ -208,7 +204,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
         else:
             # Not enough bars, lower threshold
             attempts += 1
-            new_threshold = max(10, current_threshold * 0.5) # Lower limit of 10
+            new_threshold = max(5.0, current_threshold * 0.5) # Lower limit
             log.warning(f"⚠️ {symbol}: Insufficient bars ({len(temp_bars)}). Retrying with threshold {new_threshold}...")
             current_threshold = new_threshold
             
@@ -230,8 +226,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
 def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url: str) -> None:
     """
     ISOLATED WORKER FUNCTION: Runs in a separate process.
-    Executes Global Optimization for a single symbol using "PROFIT IS KING" Logic.
-    V12.4: Optimized search space for Sniper Mode (Higher Risk, Longer Horizons).
+    Executes Global Optimization using "PROFIT IS KING" Logic.
     """
     os.environ["OMP_NUM_THREADS"] = "1"
     setup_logging(f"Worker_{symbol}")
@@ -260,8 +255,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             params['tbm'] = {
                 'barrier_width': trial.suggest_float('barrier_width', space['tbm_barrier_width']['min'], space['tbm_barrier_width']['max']),
-                # V12.4: Extended Horizon for Swing Trades (up to 24h)
-                'horizon_minutes': trial.suggest_int('horizon_minutes', 60, 1440, step=60),
+                'horizon_minutes': trial.suggest_int('horizon_minutes', space['tbm_horizon_minutes']['min'], space['tbm_horizon_minutes']['max'], step=space['tbm_horizon_minutes']['step']),
                 'drift_threshold': trial.suggest_float('drift_threshold', space['tbm_drift_threshold']['min'], space['tbm_drift_threshold']['max'])
             }
             
@@ -341,7 +335,6 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
 def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
     """
     ISOLATED WORKER FUNCTION: Runs Walk-Forward Optimization.
-    Slices data into Train/Test windows and optimizes each independently.
     """
     os.environ["OMP_NUM_THREADS"] = "1"
     setup_logging(f"WFO_{symbol}")
@@ -350,11 +343,11 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
     
     try:
         # 1. Load All Data - Dynamic config load
-        train_ticks = CONFIG['data'].get('num_candles_train', 4000000)
+        train_ticks = CONFIG['data'].get('num_candles_train', 10000000)
         df = process_data_into_bars(symbol, n_ticks=train_ticks)
         if df.empty: return
         
-        # 2. Define Window Params (e.g. Train 2 Years, Test 6 Months)
+        # 2. Define Window Params
         train_months = CONFIG['wfo'].get('train_years', 2) * 12
         test_months = CONFIG['wfo'].get('test_months', 6)
         
@@ -490,7 +483,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
     log = logging.getLogger(f"Worker_Final_{symbol}")
     
     try:
-        # Use dynamic train_candles
+        # Use dynamic train_candles passed from pipeline
         df = process_data_into_bars(symbol, n_ticks=train_candles)
         if df.empty: return
 
@@ -570,10 +563,11 @@ class ResearchPipeline:
         self.reports_dir = Path("reports")
         self.reports_dir.mkdir(exist_ok=True)
         
-        self.train_candles = CONFIG['data'].get('num_candles_train', 4000000)
-        self.backtest_candles = CONFIG['data'].get('num_candles_backtest', 500000)
+        # DYNAMIC CONFIG LOADING FOR MASSIVE DATASETS
+        self.train_candles = CONFIG['data'].get('num_candles_train', 10000000)
+        self.backtest_candles = CONFIG['data'].get('num_candles_backtest', 1000000)
         
-        self.db_url = CONFIG['wfo'].get('db_url', 'sqlite:///optuna.db') # Add default fallback
+        self.db_url = CONFIG['wfo'].get('db_url', 'sqlite:///optuna.db') 
         
         log_cores = psutil.cpu_count(logical=True)
         self.total_cores = max(1, log_cores - 4) if log_cores else 10
@@ -871,11 +865,11 @@ class ResearchPipeline:
         
         equity_series = pd.Series(df['Net_PnL'].values, index=pd.to_datetime(df['Exit_Time'])).resample('1H').sum().fillna(0)
         hourly_equity = initial_capital + equity_series.cumsum()
-        hourly_ret = hourly_equity.pct_change().dropna()
+        hourly_returns = hourly_equity.pct_change().dropna()
         
         sharpe = 0.0
-        if hourly_ret.std() > 1e-9:
-            sharpe = (hourly_ret.mean() / hourly_ret.std()) * np.sqrt(252 * 24)
+        if hourly_returns.std() > 1e-9:
+            sharpe = (hourly_returns.mean() / hourly_returns.std()) * np.sqrt(252 * 24)
 
         returns_std = df['Net_PnL'].std()
         sqn = (math.sqrt(total_trades) * (df['Net_PnL'].mean() / returns_std)) if returns_std > 0 else 0.0

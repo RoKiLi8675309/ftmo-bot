@@ -6,10 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX STRATEGY V12.4 (LIVE ENGINE - AGGRESSOR PROTOCOL):
-# 1. LOGIC: "Stalemate Exit" (4h) active to recycle capital from low-volatility stagnation.
-# 2. RISK: Enforces 1.0% Base Risk and 8% Hard Drawdown Cap.
-# 3. ASSETS: Configured for High-Velocity pairs (EURJPY, GBPAUD).
+# PHOENIX STRATEGY V12.5 (LIVE ENGINE - REFINED AGGRESSOR):
+# 1. SAFETY: Implemented "Gap-Proof" Weekend Liquidation (Sat/Sun + Fri Late).
+# 2. LOGIC: "Stalemate Exit" (4h) active to recycle capital.
+# 3. RISK: 1.0% Base Risk / 8% Hard Drawdown Cap.
 # =============================================================================
 import logging
 import time
@@ -522,6 +522,46 @@ class LiveTradingEngine:
         except Exception as e:
             logger.error(f"Portfolio Update Error: {e}")
         
+        # --- V12.5 GAP-PROOF WEEKEND LIQUIDATION ---
+        # Get Bar Timestamp in Server Time
+        if bar.timestamp.tzinfo is None:
+            bar_ts_aware = bar.timestamp.replace(tzinfo=pytz.utc)
+        else:
+            bar_ts_aware = bar.timestamp
+            
+        server_time = bar_ts_aware.astimezone(self.server_tz)
+        
+        # Check for Weekend or Late Friday
+        is_weekend_hold = (server_time.weekday() > 4) # Sat=5, Sun=6
+        
+        # Get Friday Close Hour from Risk config (default 21)
+        friday_close_hour = CONFIG.get('risk_management', {}).get('friday_liquidation_hour_server', 21)
+        is_friday_close = (server_time.weekday() == 4 and server_time.hour >= friday_close_hour)
+
+        if is_weekend_hold or is_friday_close:
+            # If we are in the danger zone, do not generate signals.
+            # Liquidation is handled by the Active Position loop, but we must ensure
+            # we don't open *new* trades here.
+            # Also, trigger a liquidation if not already done for this symbol today.
+            if not self.liquidation_triggered_map[bar.symbol]:
+                logger.warning(f"{LogSymbols.CLOSE} WEEKEND/FRIDAY GAP GUARD: Closing {bar.symbol}.")
+                close_intent = Trade(
+                    symbol=bar.symbol, 
+                    action="CLOSE_ALL", 
+                    volume=0.0, 
+                    entry_price=0.0, 
+                    stop_loss=0.0, 
+                    take_profit=0.0, 
+                    comment="Gap-Proof Liquidation"
+                )
+                self.dispatcher.send_order(close_intent, 0.0)
+                self.liquidation_triggered_map[bar.symbol] = True
+            return # Stop processing
+        else:
+            # Reset trigger if we are back in safe hours
+            if self.liquidation_triggered_map[bar.symbol]:
+                self.liquidation_triggered_map[bar.symbol] = False
+        
         # 2. Prepare Context
         current_sentiment = self.global_sentiment.get('GLOBAL', 0.0)
         mt5_context = self.latest_context.get(bar.symbol, {})
@@ -538,27 +578,6 @@ class LiveTradingEngine:
         signal = self.predictor.process_bar(bar.symbol, bar, context_data=context_data)
         
         if not signal: return
-
-        # --- SECTION 9: FRIDAY LIQUIDATION CHECK ---
-        # Hard Close at 21:00 Server Time
-        if self.session_guard.should_liquidate():
-            if not self.liquidation_triggered_map[bar.symbol]:
-                logger.warning(f"{LogSymbols.CLOSE} FRIDAY LIQUIDATION: Closing all {bar.symbol} trades.")
-                close_intent = Trade(
-                    symbol=bar.symbol, 
-                    action="CLOSE_ALL", 
-                    volume=0.0, 
-                    entry_price=0.0, 
-                    stop_loss=0.0, 
-                    take_profit=0.0, 
-                    comment="Friday Liquidation"
-                )
-                self.dispatcher.send_order(close_intent, 0.0)
-                self.liquidation_triggered_map[bar.symbol] = True
-            return 
-        else:
-            if self.liquidation_triggered_map[bar.symbol]:
-                self.liquidation_triggered_map[bar.symbol] = False
 
         # --- PHASE 2: WARM-UP GATE ---
         if signal.action == "WARMUP":

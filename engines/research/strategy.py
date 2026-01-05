@@ -348,13 +348,26 @@ class ResearchStrategy:
         self._manage_trailing_stops(broker, price, dt_ts)
         self._manage_time_stops(broker, dt_ts)
 
-        # --- FRIDAY LOGIC ---
-        if server_time.weekday() == 4 and server_time.hour >= self.friday_close_hour:
-            if self.symbol in broker.positions:
-                pos = broker.positions[self.symbol]
-                broker._close_partial_position(pos, pos.quantity, price, dt_ts, "Friday Liquidation")
-            return 
+        # --- GAP-PROOF WEEKEND LIQUIDATION (V12.5) ---
+        # Explicit check for Saturday/Sunday OR Friday late hours
+        # Sat=5, Sun=6 in Python weekday()
+        is_weekend_hold = (server_time.weekday() > 4) 
+        is_friday_close = (server_time.weekday() == 4 and server_time.hour >= self.friday_close_hour)
 
+        if is_weekend_hold or is_friday_close:
+            # Force close if we have an open position
+            pos = broker.get_position(self.symbol)
+            if pos:
+                 broker._close_partial_position(
+                    pos, 
+                    pos.quantity, 
+                    price, 
+                    dt_ts, 
+                    "Weekend/Friday Liquidation"
+                )
+            return # Stop processing
+        
+        # Friday Entry Guard (No new trades after cutoff)
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
             return 
 
@@ -929,10 +942,9 @@ class ResearchStrategy:
 
     def _check_sniper_filters(self, signal: int, price: float) -> bool:
         """
-        V11.0 SNIPER PROTOCOL:
-        1. Trend Filter: Trade ONLY if price aligns with D1 EMA 200.
-           (DISABLED in V11 Aggressor Mode if require_d1_trend is False)
-        2. RSI Guard: Block Buy if RSI > 70, Block Sell if RSI < 30.
+        V11.0 SNIPER PROTOCOL (LIVE):
+        1. Trend Filter: D1 Alignment (DISABLED in V11 Aggressor Mode).
+        2. RSI Guard: Strict Overbought (70) / Oversold (30) rejection.
         
         V12.4 AGGRESSOR UPDATE:
         - Jettison RSI filters for JPY pairs to capture runaway trends.
@@ -952,7 +964,7 @@ class ResearchStrategy:
         trend_aligned = False
         d1_ema = self.current_d1_ema
         
-        if self.require_d1_trend and d1_ema > 0:
+        if self.require_d1_trend and d1_ema > 0: # Check if Enabled in Config
             if signal == 1: # BUY Signal
                 if price > d1_ema: trend_aligned = True
                 else:

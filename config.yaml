@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V12.4 (FTMO SNIPER MODE - AGGRESSOR PROTOCOL)
+# config.yaml – PROJECT PHOENIX V12.5 (FTMO SNIPER MODE - REFINED AGGRESSOR)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGY UPDATE (V12.4 - AGGRESSOR PROTOCOL):
-# 1. ASSETS: Pruned Toxic Pairs (USDCHF). Added High-Beta (EURJPY, GBPAUD).
-# 2. LOGIC: Lowered Hurst to 0.50 to capture momentum bursts.
-# 3. RISK: Increased Base Risk to 1.0% (Velocity Focused).
+# STRATEGY UPDATE (V12.5 - REFINED AGGRESSOR):
+# 1. LOGIC: Hurst increased to 0.52 to filter "Random Walk" fakeouts.
+# 2. EXIT: Added Regime Degradation Exit (Kill trade if ADX collapses).
+# 3. SAFETY: Gap-Proof Weekend Liquidation logic enabled.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -138,14 +138,14 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 20 # RELAXED
+    threshold: 25.0 # TIGHTENED: Demand stronger trends (20 -> 25)
   
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V12.4 SNIPER MODE) ---
+# --- PHOENIX STRATEGY PARAMETERS (V12.5 SNIPER MODE) ---
 phoenix_strategy:
   # --- ASSET REGIME MAPPING ---
   # V12.3: Now used as a "Soft" filter. 
@@ -167,7 +167,7 @@ phoenix_strategy:
   require_h4_alignment: false         # Rely on ML for context        
   
   # --- LOGIC MAPPING THRESHOLDS ---
-  hurst_breakout_threshold: 0.50      # AGGRESSOR: Lowered to 0.50 (Kill Grey Zone)
+  hurst_breakout_threshold: 0.52      # REFINED: 0.52 (Filter Random Walk)
   hurst_mean_reversion_threshold: 0.45 # Mean Rev Logic Trigger (<0.45)
   ker_trend_threshold: 0.02           # FLOOR: Only reject absolute flatlines
   

@@ -5,11 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX STRATEGY V12.4 (FTMO SNIPER MODE - AGGRESSOR PROTOCOL):
-# 1. CALIBRATION: Base Risk increased to 1.0% (Velocity Focused).
-# 2. SCALING: Profit Buffer Scaling bumped to 1.5% (Aggressive).
-# 3. ALPHA SQUAD: Added EURJPY and GBPAUD to Boost List.
-# 4. SAFETY: Portfolio Heat checks integrated via correlation penalty.
+# PHOENIX STRATEGY V12.5 (FTMO SNIPER MODE - REFINED AGGRESSOR):
+# 1. SAFETY: SessionGuard now enforces Gap-Proof Weekend Liquidation (Sat/Sun).
+# 2. CALIBRATION: 1.0% Base Risk / 1.5% Scaled Risk maintained.
+# 3. ALPHA SQUAD: EURJPY and GBPAUD included in boost logic.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -365,11 +364,17 @@ class SessionGuard:
 
     def should_liquidate(self) -> bool:
         """
-        Returns True if it is Friday and past the liquidation hour.
+        Returns True if it is Friday past liquidation hour OR ANY WEEKEND DAY.
+        Gap-Proof: Ensures trades don't survive Saturday/Sunday even if Friday tick was missed.
         """
         now_local = datetime.now(self.market_tz)
         weekday = now_local.weekday()
         
+        # V12.5 GAP-PROOF: Liquidate on Saturday (5) or Sunday (6)
+        if weekday > 4:
+            return True
+
+        # Standard Friday (4) Close
         if weekday == 4 and now_local.hour >= self.liquidation_hour:
             return True
             
