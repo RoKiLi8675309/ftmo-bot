@@ -6,9 +6,9 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V12.7 (LIVE PREDICTOR - UNSHACKLED):
-# 1. LOGIC: Regime Enforcement Bypass logic added (Unshackled Protocol).
-# 2. LOGIC: "Stalemate Exit" (4h) REMOVED to align with Live Engine.
+# PHOENIX STRATEGY V12.9 (LIVE PREDICTOR - FLOW REPAIR):
+# 1. FIX: Added Synthetic Flow Injection (Volume Floor) for "Zero Flow" bars.
+# 2. LOGIC: Corrected Tick Rule Fallback order (Prev Close capture).
 # 3. REGIME: MEAN_REVERSION Purged. Trend Only.
 # 4. CONFIDENCE: Gating removed (Set to 1.0).
 # =============================================================================
@@ -381,6 +381,9 @@ class MultiAssetPredictor:
         feat_stats = self.feature_stats[symbol]
         
         self.bar_counters[symbol] += 1
+        
+        # Capture previous close before updating with current bar
+        prev_close = self.last_close_prices.get(symbol, bar.close)
         self.last_close_prices[symbol] = bar.close
 
         # --- UPDATE BUFFERS ---
@@ -397,15 +400,24 @@ class MultiAssetPredictor:
         sell_vol = getattr(bar, 'sell_vol', 0.0)
         
         # Retail Fallback (Tick Rule approximation if L2 missing)
+        # Updated Logic: Handles Zero Volume gracefully by enforcing a floor
         if buy_vol == 0 and sell_vol == 0:
             if not self.l2_missing_warned[symbol]:
                 logger.warning(f"⚠️ {symbol}: Zero Flow Detected. Using Local Tick Rule Fallback.")
                 self.l2_missing_warned[symbol] = True
             
-            last_price = self.last_close_prices.get(symbol, bar.close)
-            if bar.close > last_price: buy_vol = bar.volume; sell_vol = 0.0
-            elif bar.close < last_price: buy_vol = 0.0; sell_vol = bar.volume
-            else: buy_vol = bar.volume / 2.0; sell_vol = bar.volume / 2.0
+            # Synthetic Volume Floor: Ensure we have at least 1.0 unit to split
+            effective_vol = bar.volume if bar.volume > 0 else 1.0
+            
+            if bar.close > prev_close: 
+                buy_vol = effective_vol
+                sell_vol = 0.0
+            elif bar.close < prev_close: 
+                buy_vol = 0.0
+                sell_vol = effective_vol
+            else: 
+                buy_vol = effective_vol / 2.0
+                sell_vol = effective_vol / 2.0
         
         # 1. Feature Engineering (Standard)
         features = fe.update(

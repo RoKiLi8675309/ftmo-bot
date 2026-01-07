@@ -6,11 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX STRATEGY V12.8 (LIVE ENGINE - DEDUPLICATION FIX):
-# 1. FIX: Added Strict Tick Deduplication to prevent "Zero Tick Rule" loop.
-# 2. LOGIC: Removed "Stalemate Exit" (4h) to allow winners to run.
-# 3. SAFETY: "Gap-Proof" Weekend Liquidation (Sat/Sun + Fri Late) active.
-# 4. RISK: Circuit Breaker relaxed to 4 losses.
+# PHOENIX STRATEGY V12.9 (LIVE ENGINE - VOLUME REPAIR):
+# 1. FIX: Enforced Minimum Volume Floor (1.0) to cure "Zero Flow" blindness.
+# 2. LOGIC: Synthetic Flow Injection for empty L2 data.
+# 3. SAFETY: "Gap-Proof" Weekend Liquidation active.
 # =============================================================================
 import logging
 import time
@@ -147,8 +146,7 @@ class LiveTradingEngine:
         self.latest_prices = {}
         self.liquidation_triggered_map = {sym: False for sym in CONFIG['trading']['symbols']}
         
-        # --- FIX: TICK DEDUPLICATION STATE ---
-        # Tracks the timestamp of the last processed tick to prevent processing duplicates
+        # --- TICK DEDUPLICATION STATE ---
         self.processed_ticks = defaultdict(float)
 
         # --- CONTEXT CACHE (D1/H4 from Windows) ---
@@ -427,38 +425,21 @@ class LiveTradingEngine:
         """
         Handles a single raw tick from Redis.
         Feeds the Adaptive Imbalance Bar Generator.
-        Includes Strict Deduplication to prevent "Zero Tick Rule" loops.
+        Includes Strict Deduplication and VOLUME REPAIR.
         """
         try:
             symbol = tick_data.get('symbol')
             if symbol not in self.aggregators: return
             
-            # --- FIX: TIMESTAMP NORMALIZATION (MS -> SEC) ---
+            # --- TIMESTAMP DEDUPLICATION ---
             tick_ts = float(tick_data.get('time', 0.0))
-            
-            # Heuristic: If timestamp is > 100 billion, it's likely milliseconds
             if tick_ts > 100_000_000_000:
                 tick_ts /= 1000.0
             
-            # --- CRITICAL FIX: TICK DEDUPLICATION ---
-            # If we have seen this timestamp before for this symbol, discard it.
-            # This prevents the "Zero Tick Rule" loop caused by Producer spam.
             last_ts = self.processed_ticks.get(symbol, 0.0)
             if tick_ts <= last_ts:
-                return # Skip duplicate or out-of-order tick
-            
-            # Update last processed timestamp
+                return # Skip duplicate
             self.processed_ticks[symbol] = tick_ts
-
-            # Check latency only on NEW ticks
-            now_ts = time.time()
-            latency = now_ts - tick_ts
-            
-            if abs(latency) > MAX_TICK_LATENCY_SEC:
-                logger.warning(
-                    f"{LogSymbols.TIME} CLOCK SKEW DETECTED: {symbol} Tick Drift {latency:.2f}s "
-                    f"(Threshold: {MAX_TICK_LATENCY_SEC}s). Verify NTP sync."
-                )
 
             # --- DATA INTEGRITY ---
             bid = float(tick_data.get('bid', 0.0))
@@ -470,12 +451,22 @@ class LiveTradingEngine:
                 price = (bid + ask) / 2.0
             else:
                 price = 0.0
-                
+            
             if price <= 0: return
 
-            volume = float(tick_data.get('volume', 1.0))
+            # --- CRITICAL FIX: FORCE VOLUME FLOOR (Synthetic Tick Rule) ---
+            # If MT5 sends 0 volume (common in Forex/CFD ticks), we default to 1.0.
+            # This ensures bars are generated and VPIN/OFI math doesn't div-by-zero.
+            raw_vol = float(tick_data.get('volume', 0.0))
+            volume = raw_vol if raw_vol > 0 else 1.0
+
             bid_vol = float(tick_data.get('bid_vol', 0.0))
             ask_vol = float(tick_data.get('ask_vol', 0.0))
+
+            # If volumes were 0 upstream, inject synthetic split
+            if bid_vol == 0 and ask_vol == 0:
+                bid_vol = volume / 2.0
+                ask_vol = volume / 2.0
 
             self.latest_prices[symbol] = price
             
@@ -489,7 +480,7 @@ class LiveTradingEngine:
                 except: pass
 
             # 1. Feed Adaptive Aggregator
-            # Returns a VolumeBar (TIB) if imbalance threshold is met
+            # Now guarantees non-zero volume/flow
             bar = self.aggregators[symbol].process_tick(
                 price=price, 
                 volume=volume, 
@@ -542,10 +533,6 @@ class LiveTradingEngine:
         is_friday_close = (server_time.weekday() == 4 and server_time.hour >= friday_close_hour)
 
         if is_weekend_hold or is_friday_close:
-            # If we are in the danger zone, do not generate signals.
-            # Liquidation is handled by the Active Position loop, but we must ensure
-            # we don't open *new* trades here.
-            # Also, trigger a liquidation if not already done for this symbol today.
             if not self.liquidation_triggered_map[symbol]:
                 logger.warning(f"{LogSymbols.CLOSE} WEEKEND/FRIDAY GAP GUARD: Closing {symbol}.")
                 close_intent = Trade(
@@ -559,9 +546,8 @@ class LiveTradingEngine:
                 )
                 self.dispatcher.send_order(close_intent, 0.0)
                 self.liquidation_triggered_map[symbol] = True
-            return # Stop processing
+            return 
         else:
-            # Reset trigger if we are back in safe hours
             if self.liquidation_triggered_map[symbol]:
                 self.liquidation_triggered_map[symbol] = False
         
@@ -604,7 +590,6 @@ class LiveTradingEngine:
                 return
 
         # 5. Check Risk & Compliance Gates
-        # V10.0: Includes strict Midnight Anchor Check
         if not self._check_risk_gates(symbol):
             return
 
@@ -717,35 +702,28 @@ class LiveTradingEngine:
         Runs the gauntlet of safety checks.
         V10.0: Includes strict Midnight Anchor and Freeze check.
         """
-        # 1. Midnight Freeze Check
         if self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['midnight_freeze']):
             logger.warning(f"{LogSymbols.FROZEN} Midnight Freeze Active. Holding for Daily Anchor.")
             return False
 
-        # 2. Daily Anchor Existence Check
         if not self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['daily_starting_equity']):
             logger.warning(f"{LogSymbols.LOCK} Daily Anchor Missing. Waiting for Producer Sync.")
             return False
 
-        # 3. FTMO Drawdown Guard
         if not self.ftmo_guard.can_trade():
             logger.warning(f"{LogSymbols.LOCK} FTMO Guard: Trading Halted (Drawdown).")
             return False
 
-        # 4. General Market Hours
         if not self.session_guard.is_trading_allowed():
             return False
             
-        # 5. Friday Entry Guard (No new trades after 16:00)
         if self.session_guard.is_friday_afternoon():
             return False
 
-        # 6. Penalty Box (Correlation/Volatility penalty)
         if self.portfolio_mgr.check_penalty_box(symbol):
             logger.warning(f"{LogSymbols.LOCK} {symbol} is in Penalty Box.")
             return False
 
-        # 7. News Check
         if not self.news_monitor.check_trade_permission(symbol):
              return False
 
