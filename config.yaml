@@ -290,14 +290,13 @@ risk_management:
 trading:
   # AGGRESSOR PORTFOLIO ROTATION:
   # REMOVED: USDCHF (Toxic)
-  # ADDED: EURJPY, GBPAUD (High Velocity)
+  # ADDED: EURJPY
   symbols:
     - "EURUSD"
     - "GBPUSD"
     - "USDJPY"
     - "GBPJPY"
     - "EURJPY"
-    - "GBPAUD"
   
   auxiliary_symbols:
     - "NZDUSD"
@@ -379,7 +378,6 @@ forensic_audit:
     EURUSD: 1.2
     USDCAD: 1.8
     USDCHF: 1.6
-    GBPAUD: 2.5 # Added for V12.4
 
 # --- WFO OPTIMIZATION ---
 wfo:
