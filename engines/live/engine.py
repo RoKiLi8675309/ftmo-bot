@@ -6,10 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX STRATEGY V12.7 (LIVE ENGINE - REFACTOR):
+# PHOENIX STRATEGY V12.7 (LIVE ENGINE - UNSHACKLED):
 # 1. LOGIC: Removed "Stalemate Exit" (4h) to allow winners to run.
 # 2. SAFETY: "Gap-Proof" Weekend Liquidation (Sat/Sun + Fri Late) active.
-# 3. RISK: 1.0% Base Risk / 8% Hard Drawdown Cap.
+# 3. RISK: Circuit Breaker relaxed to 4 losses (Matches 1% Risk / 4% Daily Limit).
 # =============================================================================
 import logging
 import time
@@ -134,7 +134,9 @@ class LiveTradingEngine:
         # V10.0: Daily Circuit Breaker State (Realized Execution)
         # {symbol: {'date': date_obj, 'losses': int, 'pnl': float}}
         self.daily_execution_stats = defaultdict(lambda: {'date': None, 'losses': 0, 'pnl': 0.0})
-        self.max_daily_losses_per_symbol = 2
+        
+        # V12.7 UNSHACKLED: Increased from 2 to 4 to align with 1% Risk and 4% Daily Buffer
+        self.max_daily_losses_per_symbol = 4 
         
         self.perf_thread = threading.Thread(target=self.fetch_performance_loop, daemon=True)
         self.perf_thread.start()
@@ -265,7 +267,7 @@ class LiveTradingEngine:
             self.daily_execution_stats[symbol] = {'date': now_server, 'losses': 0, 'pnl': 0.0}
             return False
             
-        # Rule 1: Max 2 Losses per day
+        # Rule 1: Max Losses per day (Updated to 4 for Unshackled)
         if stats['losses'] >= self.max_daily_losses_per_symbol:
             return True
             

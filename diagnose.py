@@ -5,9 +5,8 @@
 # DEPENDENCIES: unittest, numpy, shared
 # DESCRIPTION: Pre-Flight Forensic Diagnostics. Validates Math Kernels & Config.
 # Updates:
-# - Added Configuration Integrity Check (Unshackled Protocol Verification).
-# - Validates Risk Parameters (1.0% Base, 1.5% Scaled).
-# - Validates Regime Settings (DISABLED).
+# - FIXED: Removed invalid LogSymbols.SEARCH reference.
+# - CHECK: Verifies 1.0% Risk and Disabled Regime settings.
 # CRITICAL: Must pass (Exit Code 0) before 'run_pipeline.sh' proceeds.
 # =============================================================================
 import unittest
@@ -185,5 +184,6 @@ class TestRiskCalculations(unittest.TestCase):
         self.assertEqual(digits, 2, "Crypto heuristic should work")
 
 if __name__ == '__main__':
-    print(f"\n{LogSymbols.SEARCH} RUNNING PHOENIX V12.7 PRE-FLIGHT DIAGNOSTICS...")
+    # Fixed LogSymbols usage
+    print(f"\n🔍 RUNNING PHOENIX V12.7 PRE-FLIGHT DIAGNOSTICS...")
     unittest.main(verbosity=2)
