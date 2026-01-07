@@ -5,10 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX STRATEGY V12.7 (FTMO SNIPER MODE - UNSHACKLED):
-# 1. SAFETY: SessionGuard now enforces Gap-Proof Weekend Liquidation (Sat/Sun).
-# 2. CALIBRATION: 1.0% Base Risk / 1.5% Scaled Risk maintained.
-# 3. SIZING: Confidence Scaling DISABLED (Binary Pass/Fail Logic).
+# PHOENIX STRATEGY V12.14 (RISK LOGIC HARDENING):
+# 1. FIX: Dynamic Asymptotic Decay threshold (reads config instead of hardcoded).
+# 2. DATA: Updated static conversion rate fallbacks to 2025 levels.
+# 3. SAFETY: Strict Zero-Balance guards in sizing logic.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -84,8 +84,8 @@ class RiskManager:
             if s == "USDJPY" and price > 0: return 1.0 / price
             
             if market_prices is not None:
-                logger.warning(f"⚠️ RISK MISMATCH: Missing USDJPY price for {symbol} conversion. Using static 150.0 fallback.")
-            return 0.00666 # Fallback ~150.0
+                logger.warning(f"⚠️ RISK MISMATCH: Missing USDJPY price for {symbol} conversion. Using static 155.0 fallback.")
+            return 0.00645 # Fallback ~155.0
         
         # GBP Pairs (Quote = GBP). Need GBP->USD (GBPUSD).
         if s.endswith("GBP"):
@@ -103,8 +103,8 @@ class RiskManager:
             if s == "USDCAD" and price > 0: return 1.0 / price
             
             if market_prices is not None:
-                logger.warning(f"⚠️ RISK MISMATCH: Missing USDCAD price for {symbol}. Using static 0.75 fallback.")
-            return 0.75
+                logger.warning(f"⚠️ RISK MISMATCH: Missing USDCAD price for {symbol}. Using static 0.73 fallback.")
+            return 0.73 # ~1.37
 
         # CHF Pairs (Quote = CHF). Need CHF->USD (1 / USDCHF).
         if s.endswith("CHF"):
@@ -121,15 +121,15 @@ class RiskManager:
             if s == "AUDUSD" and price > 0: return price
             
             if market_prices is not None:
-                logger.warning(f"⚠️ RISK MISMATCH: Missing AUDUSD price for {symbol}. Using static 0.65 fallback.")
-            return 0.65
+                logger.warning(f"⚠️ RISK MISMATCH: Missing AUDUSD price for {symbol}. Using static 0.63 fallback.")
+            return 0.63
 
         # NZD Pairs
         if s.endswith("NZD"):
             nzdusd = get_price("NZDUSD")
             if nzdusd: return nzdusd
             if s == "NZDUSD" and price > 0: return price
-            return 0.60
+            return 0.58
             
         # Default fallback
         return 1.0
@@ -160,6 +160,10 @@ class RiskManager:
         balance = context.account_equity
         price = context.price
         
+        # Safety: Zero Balance Check
+        if balance <= 0:
+             return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, "Zero Balance"), 0.0
+
         # 1. Retrieve Config Parameters
         risk_conf = CONFIG.get('risk_management', {})
         
@@ -248,6 +252,7 @@ class RiskManager:
                 scaling_comment += "|AlphaBoost"
 
         # --- V12.0 DEFENSIVE LAYER: ASYMPTOTIC DECAY ---
+        # FIX: Read dynamic limit from config (0.045 default)
         daily_limit_pct = risk_conf.get('max_daily_loss_pct', 0.045)
         
         if daily_pnl_pct < 0:
@@ -289,7 +294,7 @@ class RiskManager:
         
         # 1. Leverage Cap
         notional_value = lots * c_size * price * conversion_rate
-        if notional_value > 0:
+        if notional_value > 0 and balance > 0:
             current_leverage = notional_value / balance
             if current_leverage > max_lev:
                 lots = (balance * max_lev) / (c_size * price * conversion_rate)
@@ -386,9 +391,11 @@ class SessionGuard:
 class FTMORiskMonitor:
     """
     Monitors account health against FTMO's strict drawdown limits.
+    V12.12 Update: Added detailed failure reporting for audit logs.
     """
     def __init__(self, initial_balance: float, max_daily_loss_pct: float, redis_client):
         self.initial_balance = initial_balance
+        self.max_daily_loss_pct = max_daily_loss_pct
         self.max_daily_loss = initial_balance * max_daily_loss_pct
         self.r = redis_client
         self.starting_equity_of_day = initial_balance
@@ -396,12 +403,28 @@ class FTMORiskMonitor:
         self.profit_target = initial_balance * 1.10
 
     def can_trade(self) -> bool:
+        """
+        Boolean check for trading permission.
+        Prevents trading if any circuit breaker is tripped.
+        """
+        # Safety Check: If equity is 0 (uninitialized), block trading but allow sync.
+        if self.equity <= 0:
+            return False
+
         # 1. Total Drawdown Check (10% Max)
-        if self.equity < (self.initial_balance * 0.90): return False
+        # 10% from Initial Balance (Account Size)
+        total_dd_limit = self.initial_balance * 0.90
+        if self.equity < total_dd_limit: 
+            return False
         
-        # 2. Daily Drawdown Check (5% Max)
+        # 2. Daily Drawdown Check (Default 5% Max)
+        # Calculated from the 'starting_equity_of_day' (Anchor)
         current_daily_loss = self.starting_equity_of_day - self.equity
-        if current_daily_loss >= self.max_daily_loss: return False
+        # Ensure daily limit is recalculated based on config (handle sync updates)
+        current_daily_limit = self.initial_balance * self.max_daily_loss_pct
+        
+        if current_daily_loss >= current_daily_limit: 
+            return False
         
         # 3. Circuit Breaker: Profit Target Reached
         if self.equity >= self.profit_target:
@@ -410,15 +433,32 @@ class FTMORiskMonitor:
         return True
 
     def _check_constraints(self, risk_to_add: float):
+        # Legacy placeholder kept for compatibility
         pass
         
     def check_circuit_breakers(self) -> str:
-        if self.equity < (self.initial_balance * 0.90): return "Total Drawdown Breach"
+        """
+        V12.12: Returns a detailed string explaining WHY trading is halted.
+        Used for logging transparency.
+        """
+        if self.equity <= 0:
+            return "Equity Uninitialized (0.0). Waiting for Producer Sync."
+
+        # 1. Total Drawdown
+        total_limit = self.initial_balance * 0.90
+        if self.equity < total_limit:
+            return f"Total Drawdown Breach: Equity {self.equity:.2f} < Limit {total_limit:.2f} (10%)"
         
+        # 2. Daily Drawdown
         current_daily_loss = self.starting_equity_of_day - self.equity
-        if current_daily_loss >= self.max_daily_loss: return "Daily Drawdown Breach"
+        daily_limit = self.initial_balance * self.max_daily_loss_pct
         
-        if self.equity >= self.profit_target: return "Profit Target Reached (Victory Lap)"
+        if current_daily_loss >= daily_limit:
+            return f"Daily Drawdown Breach: Loss -${current_daily_loss:.2f} >= Limit ${daily_limit:.2f} (Anchor: {self.starting_equity_of_day:.2f})"
+        
+        # 3. Profit Target
+        if self.equity >= self.profit_target:
+            return "Profit Target Reached (Victory Lap)"
         
         return "OK"
 

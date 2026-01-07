@@ -1,12 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V12.7 (FTMO SNIPER MODE - UNSHACKLED)
+# config.yaml – PROJECT PHOENIX V12.12 (FTMO SNIPER MODE - UNSHACKLED)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGY UPDATE (V12.7 - UNSHACKLED PROTOCOL):
-# 1. LOGIC: Regime Enforcement DISABLED to allow full AI adaptability.
-# 2. LOGIC: Logic Gates Widened (Hurst 0.51, ADX 15.0, RVOL 12.0).
-# 3. RISK: Confidence Scaling Removed. 1.0% Base Risk.
-# 4. REGIME: MEAN_REVERSION Purged. Trend Only.
+# UPDATE LOG (V12.12):
+# 1. RISK: Base Risk 1.0% / Scaled 1.5% (Confirmed).
+# 2. SPREAD: Relaxed Forensic Audit assumptions to match raw spreads (FTMO).
+# 3. SYNC: Added keys for Risk State Synchronization.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -363,21 +362,23 @@ news_filter:
     CHF: ["SNB", "CPI", "Rate"]
     AUD: ["RBA", "CPI", "Rate"]
 
-# --- FORENSIC AUDIT ASSUMPTIONS ---
+# --- FORENSIC AUDIT ASSUMPTIONS (RELAXED FOR RAW SPREADS) ---
+# These values are used by the Volatility Gate to ensure the market is "alive".
+# Lower values mean the bot will trade in lower volatility (fewer rejections).
 forensic_audit:
   enforce_spread: true
   max_slippage_pips: 2.0
   commission_per_lot: 5.0
   spread_pips:
-    default: 1.5
-    GBPJPY: 2.5
-    USDJPY: 1.5
-    EURJPY: 2.0 
-    AUDJPY: 2.5 
-    GBPUSD: 1.8
-    EURUSD: 1.2
-    USDCAD: 1.8
-    USDCHF: 1.6
+    default: 0.8  # Relaxed from 1.5
+    GBPJPY: 1.5   # Relaxed from 2.5
+    USDJPY: 0.8   # Relaxed from 1.5
+    EURJPY: 1.0   # Relaxed from 2.0
+    AUDJPY: 1.2   # Relaxed from 2.5
+    GBPUSD: 1.0   # Relaxed from 1.8
+    EURUSD: 0.5   # Relaxed from 1.2 (Raw spreads are often 0.1-0.3)
+    USDCAD: 1.2   # Relaxed from 1.8
+    USDCHF: 1.0   # Relaxed from 1.6
 
 # --- WFO OPTIMIZATION ---
 wfo:

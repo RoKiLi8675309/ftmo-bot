@@ -5,6 +5,10 @@
 # DEPENDENCIES: requests, lxml, cloudscraper (optional)
 # DESCRIPTION: Fetches Economic News and enforces FTMO trading blackouts.
 # CRITICAL: Python 3.9 Compatible. Implements Fail-Safe locking.
+#
+# PHOENIX V12.13 COMPLIANCE UPDATE:
+# 1. FAIL-SAFE: Guard now explicitly blocks trading on "CRITICAL" events.
+# 2. ROBUSTNESS: Error handling for missing dependencies.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -171,15 +175,24 @@ class FTMOComplianceGuard:
     def _build_blackout_windows(self) -> None:
         """
         Pre-calculates time windows where trading is forbidden.
+        V12.13 FIX: Explicitly handles FAIL-SAFE/CRITICAL events.
         """
         for event in self.events:
-            # Check if this currency is in our restricted list
-            if event.country not in self.restricted_map:
-                continue
+            is_restricted = False
             
-            # Check keywords (e.g., "FOMC", "CPI")
-            keywords = self.restricted_map[event.country]
-            is_restricted = any(k.lower() in event.title.lower() for k in keywords)
+            # 1. Fail-Safe Override (Crucial fix)
+            # If the Feed failed, we generate a fake event with "CRITICAL" in title.
+            # We MUST treat this as a restricted event regardless of country/keywords.
+            if "CRITICAL" in event.title or "FAIL-SAFE" in event.title:
+                is_restricted = True
+            else:
+                # 2. Standard Checks
+                if event.country not in self.restricted_map:
+                    continue
+                
+                # Check keywords (e.g., "FOMC", "CPI")
+                keywords = self.restricted_map[event.country]
+                is_restricted = any(k.lower() in event.title.lower() for k in keywords)
             
             if is_restricted:
                 start = event.time_utc - timedelta(minutes=self.buffer_pre)
@@ -204,7 +217,8 @@ class FTMOComplianceGuard:
         
         for window in self.blackout_windows:
             # If the restricted currency is in the symbol (e.g. "USD" in "EURUSD")
-            if window['currency'] in symbol:
+            # OR if it's a critical system-wide failure (currency often defaults to USD or GLOBAL)
+            if window['currency'] in symbol or "CRITICAL" in window['reason']:
                 if window['start'] <= now_utc <= window['end']:
                     self.logger.warning(f"{symbol} Trade HALTED. Blackout: {window['reason']} ({window['start'].strftime('%H:%M')} - {window['end'].strftime('%H:%M')})")
                     return False

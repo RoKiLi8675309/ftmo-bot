@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 # 
-# PHOENIX STRATEGY V12.4 (FTMO SNIPER MODE):
-# 1. HORIZON ALIGNMENT: AdaptiveTripleBarrier default extended to 144 ticks (12h).
-# 2. CALIBRATION: Optimizes labeling for Swing-style winners (USDJPY/EURUSD).
-# 3. FEATURE SET: Full support for V12.4 Sniper Regime logic.
+# PHOENIX STRATEGY V12.14 (MATH HARDENING):
+# 1. HMM: Added robust variance checks and 'Hard Reset' logic for convergence failures.
+# 2. MATH: Zero-division guards for Choppiness and Hurst (Flat bar protection).
+# 3. PERF: Suppressed hmmlearn IO during fitting to reduce GIL contention.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -183,6 +183,9 @@ class StreamingParkinsonVolatility:
         
         try:
             # Raw Parkinson Variance for this bar
+            # Guard against flat bar log(1) = 0
+            if high == low: return self.ema.get()
+
             log_hl = math.log(high / low)
             variance = self.factor * (log_hl ** 2)
             vol = math.sqrt(variance)
@@ -369,6 +372,7 @@ class FractalDimensionIndex:
 class RegimeDetector:
     """
     Online Hidden Markov Model (HMM) for regime classification.
+    Robust against convergence failures (Hard Reset Logic).
     """
     def __init__(self, n_states: int = 2, window: int = 100):
         self.n_states = n_states
@@ -410,35 +414,46 @@ class RegimeDetector:
             
         try:
             data = np.array(self.returns).reshape(-1, 1)
+            
+            # MATH HARDENING: Check variance. If data is flat, HMM will crash.
+            if np.var(data) < 1e-9 or np.isnan(data).any():
+                return self.last_regime
+
+            # Retrain periodically or early on
             should_fit = (self.fit_counter % 50 == 0) or (self.fit_counter < 200)
+            
             if should_fit:
-                if np.var(data) < 1e-6 or np.isnan(data).any():
-                    return self.last_regime
+                # HARD RESET LOGIC: If model fails to converge repeatedly, scramble it.
                 if self.fit_failures > 5:
-                    self.model.init_params = "stmc"
+                    self.model.init_params = "stmc" # Re-init weights
                     self.fit_failures = 0
                 elif hasattr(self.model, 'startprob_'):
-                    self.model.init_params = ""
+                    self.model.init_params = "" # Keep weights, refine them
                 
+                # Suppress Stdout/Stderr from C-level HMM code
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
                         self.model.fit(data)
                 
                 if self.model.monitor_.converged:
+                    # Sort states by Variance (Low Var = 0 = Quiet, High Var = 1 = Volatile)
                     variances = np.array([np.mean(np.diag(c)) for c in self.model.covars_])
                     sort_order = np.argsort(variances)
                     self.state_map = {old: new for new, old in enumerate(sort_order)}
                     self.fit_failures = 0
                 else:
                     self.fit_failures += 1
+                    # Fallback Identity map
                     self.state_map = {i: i for i in range(self.n_states)}
             
+            # Predict current state
             raw_state = int(self.model.predict(data[-1].reshape(1, -1))[0])
             mapped_state = self.state_map.get(raw_state, raw_state)
             
             self.last_regime = mapped_state
             return mapped_state
+            
         except Exception:
             self.fit_failures += 1
             return self.last_regime
@@ -546,7 +561,10 @@ class StreamingChoppiness:
             
         try:
             # 100 * Log10(SumTR / Range) / Log10(n)
-            numerator = math.log10(sum_tr / rng)
+            ratio = sum_tr / rng
+            if ratio <= 0: return 50.0 # Guard log domain error
+            
+            numerator = math.log10(ratio)
             denominator = math.log10(self.period)
             chop = 100.0 * (numerator / denominator)
             return max(0.0, min(100.0, chop))
@@ -1239,6 +1257,7 @@ class VolatilityMonitor:
 def calculate_hurst(ts):
     n = len(ts)
     if n < 20: return 0.5
+    # Strict Variance Check to prevent log(0)
     if np.std(ts) < 1e-9: return 0.5
     
     lags = np.arange(2, 20)
@@ -1252,12 +1271,20 @@ def calculate_hurst(ts):
         else:
             tau[i] = std_diff
     
+    # Safe Log
+    tau = np.maximum(tau, 1e-9)
+    
     x = np.log(lags.astype(np.float64))
     y = np.log(tau)
+    
+    # Linear Regression using Least Squares
     A = np.column_stack((x, np.ones(len(x))))
-    m, c = np.linalg.lstsq(A, y)[0]
-    hurst = m * 2.0
-    return max(0.0, min(1.0, hurst))
+    try:
+        m, c = np.linalg.lstsq(A, y)[0]
+        hurst = m * 2.0
+        return max(0.0, min(1.0, hurst))
+    except:
+        return 0.5
 
 def enrich_with_d1_data(features: Dict[str, float], d1_data: Dict[str, float], current_price: float) -> Dict[str, float]:
     if not d1_data: return features

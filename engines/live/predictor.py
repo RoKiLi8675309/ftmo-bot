@@ -6,11 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V12.9 (LIVE PREDICTOR - FLOW REPAIR):
-# 1. FIX: Added Synthetic Flow Injection (Volume Floor) for "Zero Flow" bars.
-# 2. LOGIC: Corrected Tick Rule Fallback order (Prev Close capture).
-# 3. REGIME: MEAN_REVERSION Purged. Trend Only.
-# 4. CONFIDENCE: Gating removed (Set to 1.0).
+# PHOENIX STRATEGY V12.14 (LIVE PREDICTOR - DATA INTEGRITY):
+# 1. LOGIC: "Mean Reversion" regime purged (Trend Only Protocol).
+# 2. MATH: Robust Golden Trio calculation (safe log/variance).
+# 3. FILTERS: JPY Pairs strictly bypass RSI Overbought/Oversold checks.
+# 4. FLOW: Explicit propagation of buy/sell volume from Bar to Features.
 # =============================================================================
 import logging
 import pickle
@@ -247,6 +247,7 @@ class MultiAssetPredictor:
     def _calculate_golden_trio(self, symbol: str) -> Tuple[float, float, float]:
         """
         Calculates the "Golden Trio" of features locally using accurate buffers.
+        Includes robust math guards against zero-division and log(0).
         """
         closes = self.closes_buffer[symbol]
         vols = self.volume_buffer[symbol]
@@ -263,11 +264,21 @@ class MultiAssetPredictor:
         
         # 1. Simple Hurst (Rescaled Range Proxy)
         try:
-            lags = range(2, 20)
-            tau = [np.std(np.subtract(prices[lag:], prices[:-lag])) for lag in lags]
-            poly = np.polyfit(np.log(lags), np.log(tau), 1)
-            hurst = poly[0] * 2.0 # Adjust scale
-            hurst = max(0.0, min(1.0, hurst))
+            # Math Guard: Variance check
+            if np.var(prices) < 1e-9:
+                hurst = 0.5
+            else:
+                lags = range(2, 20)
+                tau = []
+                for lag in lags:
+                    diff = np.subtract(prices[lag:], prices[:-lag])
+                    std = np.std(diff)
+                    tau.append(std if std > 1e-9 else 1e-9)
+                
+                # Polyfit on log-log
+                poly = np.polyfit(np.log(lags), np.log(tau), 1)
+                hurst = poly[0] * 2.0 # Adjust scale
+                hurst = max(0.0, min(1.0, hurst))
         except:
             hurst = 0.5
 
@@ -276,7 +287,7 @@ class MultiAssetPredictor:
             diffs = np.diff(prices)
             net_change = abs(prices[-1] - prices[0])
             sum_changes = np.sum(np.abs(diffs))
-            if sum_changes > 0:
+            if sum_changes > 1e-9:
                 ker = net_change / sum_changes
             else:
                 ker = 0.0
@@ -287,7 +298,7 @@ class MultiAssetPredictor:
         if len(vols) > 10:
             curr_vol = vols[-1]
             avg_vol = np.mean(list(vols)[:-1]) # Exclude current
-            if avg_vol > 0:
+            if avg_vol > 1e-9:
                 rvol = curr_vol / avg_vol
             else:
                 rvol = 1.0
@@ -395,18 +406,17 @@ class MultiAssetPredictor:
             self.sniper_rsi[symbol].append(delta)
         self.bb_buffers[symbol].append(bar.close)
 
-        # Extract Flows 
+        # Extract Flows (Ensuring they are populated from Engine)
         buy_vol = getattr(bar, 'buy_vol', 0.0)
         sell_vol = getattr(bar, 'sell_vol', 0.0)
         
-        # Retail Fallback (Tick Rule approximation if L2 missing)
-        # Updated Logic: Handles Zero Volume gracefully by enforcing a floor
+        # Retail Fallback (Tick Rule approximation if L2 missing or zero)
         if buy_vol == 0 and sell_vol == 0:
             if not self.l2_missing_warned[symbol]:
-                logger.warning(f"⚠️ {symbol}: Zero Flow Detected. Using Local Tick Rule Fallback.")
+                logger.warning(f"⚠️ {symbol}: Zero Flow Detected in Bar. Using Local Tick Rule.")
                 self.l2_missing_warned[symbol] = True
             
-            # Synthetic Volume Floor: Ensure we have at least 1.0 unit to split
+            # Synthetic Volume Floor
             effective_vol = bar.volume if bar.volume > 0 else 1.0
             
             if bar.close > prev_close: 
@@ -558,7 +568,7 @@ class MultiAssetPredictor:
         
         # --- V12.7 LOGIC MAPPING: TREND ONLY ---
         is_trending = hurst > self.hurst_breakout
-        # REVERSION LOGIC REMOVED
+        # REVERSION LOGIC REMOVED (PURGED)
         
         if is_trending:
             if preferred_regime == "MEAN_REVERSION":
@@ -607,8 +617,6 @@ class MultiAssetPredictor:
 
         # 5. ML Confirmation & Calibration
         pred_proba = model.predict_proba_one(features)
-        # prob_buy = pred_proba.get(1, 0.0)
-        # prob_sell = pred_proba.get(-1, 0.0)
         
         # V12.7 UNSHACKLED: Bypass Calibration/Confidence Check
         # We trust the Meta Labeler and Regime Filters entirely.

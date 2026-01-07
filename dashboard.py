@@ -5,10 +5,8 @@
 # DEPENDENCIES: streamlit, pandas, redis, shared
 # DESCRIPTION: Real-time GUI for monitoring the Algorithmic Trading System.
 #
-# PHOENIX V12.8 UPDATE (DASHBOARD FIXES):
-# 1. VISUALIZATION: Replaced raw stream tail with "Market Watch" (Unique Symbol Snapshot).
-# 2. DEDUPLICATION: Added logic to filter duplicate consecutive ticks in the Tape view.
-# 3. ROBUSTNESS: Enhanced Redis error handling and "Hard Kill" visibility.
+# PHOENIX V12.12 UPDATE (SPREAD FIX):
+# 1. FIX: Corrected JPY Pip Multiplier (100 vs 10000) for accurate spread display.
 # =============================================================================
 import streamlit as st
 import pandas as pd
@@ -218,12 +216,19 @@ with tab_market:
 
             # SNAPSHOT LOGIC: Only take the first (latest) occurrence of each symbol
             if sym and sym not in seen_symbols:
+                ask = float(payload.get('ask', 0))
+                bid = float(payload.get('bid', 0))
+                
+                # --- SPREAD CALCULATION FIX ---
+                multiplier = 100 if 'JPY' in sym else 10000
+                spread_pips = (ask - bid) * multiplier
+                
                 snapshot_data[sym] = {
                     "Symbol": sym,
                     "Time": dt_str,
-                    "Bid": float(payload.get('bid', 0)),
-                    "Ask": float(payload.get('ask', 0)),
-                    "Spread": (float(payload.get('ask', 0)) - float(payload.get('bid', 0))) * 10000 if 'JPY' in sym else (float(payload.get('ask', 0)) - float(payload.get('bid', 0))) * 10000, # Rough pip calc
+                    "Bid": bid,
+                    "Ask": ask,
+                    "Spread": round(spread_pips, 1), 
                     "Vol": float(payload.get('volume', 0)),
                     "Bid Vol": float(payload.get('bid_vol', 0)),
                     "Ask Vol": float(payload.get('ask_vol', 0)),

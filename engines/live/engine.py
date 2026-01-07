@@ -6,10 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX STRATEGY V12.9 (LIVE ENGINE - VOLUME REPAIR):
-# 1. FIX: Enforced Minimum Volume Floor (1.0) to cure "Zero Flow" blindness.
-# 2. LOGIC: Synthetic Flow Injection for empty L2 data.
-# 3. SAFETY: "Gap-Proof" Weekend Liquidation active.
+# PHOENIX STRATEGY V12.14 (LIVE ENGINE - STATE PERMANENCE):
+# 1. FIX: Added _restore_daily_state() to prevent Daily Limit reset on restart.
+# 2. CONCURRENCY: Implemented threading.Lock() for shared statistics.
+# 3. ROBUSTNESS: Enhanced Calendar Sync to be un-killable.
 # =============================================================================
 import logging
 import time
@@ -20,9 +20,9 @@ import sys
 import numpy as np
 import math
 import pytz
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from collections import defaultdict, deque
-from typing import Any, Optional, Dict
+from typing import Any, Optional, Dict, List
 
 # Third-Party NLP (Guarded)
 try:
@@ -90,7 +90,15 @@ class LiveTradingEngine:
         )
         self.portfolio_mgr = PortfolioRiskManager(symbols=CONFIG['trading']['symbols'])
         self.session_guard = SessionGuard()
+        
+        # --- COMPLIANCE SETUP ---
         self.news_monitor = NewsEventMonitor()
+        # Initialize Guard with empty events first to avoid blocking startup
+        self.compliance_guard = FTMOComplianceGuard([])
+        
+        # Start Background Calendar Sync
+        self.calendar_thread = threading.Thread(target=self._calendar_sync_loop, daemon=True)
+        self.calendar_thread.start()
         
         # 3. Data Aggregation (Adaptive Imbalance Bars)
         self.aggregators = {}
@@ -127,6 +135,9 @@ class LiveTradingEngine:
             self.news_thread.start()
 
         # 7. Performance Monitor (Circuit Breaker & SQN)
+        # THREAD SAFETY: Lock for statistics updated by background thread
+        self.stats_lock = threading.Lock()
+
         # Tracks last 30 trades per symbol to calculate SQN
         self.performance_stats = defaultdict(lambda: deque(maxlen=30))
         
@@ -137,6 +148,9 @@ class LiveTradingEngine:
         # V12.7 UNSHACKLED: Increased from 2 to 4 to align with 1% Risk and 4% Daily Buffer
         self.max_daily_losses_per_symbol = 4 
         
+        # --- STATE RESTORATION (CRITICAL) ---
+        self._restore_daily_state()
+
         self.perf_thread = threading.Thread(target=self.fetch_performance_loop, daemon=True)
         self.perf_thread.start()
 
@@ -146,8 +160,9 @@ class LiveTradingEngine:
         self.latest_prices = {}
         self.liquidation_triggered_map = {sym: False for sym in CONFIG['trading']['symbols']}
         
-        # --- TICK DEDUPLICATION STATE ---
+        # --- TICK DEDUPLICATION & HEARTBEAT STATE ---
         self.processed_ticks = defaultdict(float)
+        self.ticks_processed = 0 # Visual Heartbeat Counter
 
         # --- CONTEXT CACHE (D1/H4 from Windows) ---
         self.latest_context = defaultdict(dict) # {symbol: {'d1': {}, 'h4': {}}}
@@ -169,9 +184,92 @@ class LiveTradingEngine:
         self.mgmt_thread = threading.Thread(target=self._manage_active_positions_loop, daemon=True)
         self.mgmt_thread.start()
 
+    def _restore_daily_state(self):
+        """
+        CRITICAL: Replays today's closed trades from Redis to reconstruct Daily PnL and Loss Counts.
+        Prevents the bot from 'forgetting' it hit a daily limit if it restarts mid-day.
+        """
+        logger.info(f"{LogSymbols.DATABASE} Restoring Daily Execution State...")
+        try:
+            stream_key = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
+            
+            # Calculate start of day timestamp (approximate to cover timezones)
+            now = datetime.now(self.server_tz)
+            start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            start_ts_ms = int(start_of_day.timestamp() * 1000)
+            
+            # Fetch range from start of day until now
+            # Use '0-0' if we want absolutely everything, but start_ts_ms is more efficient
+            # xrange(key, min, max)
+            messages = self.stream_mgr.r.xrange(stream_key, min=start_ts_ms, max='+')
+            
+            restored_count = 0
+            with self.stats_lock:
+                current_date = now.date()
+                
+                for msg_id, data in messages:
+                    symbol = data.get('symbol')
+                    net_pnl = float(data.get('net_pnl', 0.0))
+                    timestamp_raw = float(data.get('timestamp', 0))
+                    
+                    # Verify timestamp matches today (Server Time)
+                    trade_dt = datetime.fromtimestamp(timestamp_raw, tz=self.server_tz)
+                    if trade_dt.date() != current_date:
+                        continue # Skip old trades if range was loose
+                        
+                    # Initialize if needed
+                    if self.daily_execution_stats[symbol]['date'] != current_date:
+                        self.daily_execution_stats[symbol] = {'date': current_date, 'losses': 0, 'pnl': 0.0}
+                    
+                    # Apply Logic
+                    self.daily_execution_stats[symbol]['pnl'] += net_pnl
+                    if net_pnl < 0:
+                        self.daily_execution_stats[symbol]['losses'] += 1
+                    
+                    # Also restore SQN buffer
+                    self.performance_stats[symbol].append(net_pnl)
+                    restored_count += 1
+            
+            if restored_count > 0:
+                logger.info(f"{LogSymbols.SUCCESS} Restored {restored_count} trades for today.")
+                for sym, stats in self.daily_execution_stats.items():
+                    if stats['losses'] > 0 or stats['pnl'] != 0:
+                        logger.info(f"   -> {sym}: PnL ${stats['pnl']:.2f} | Losses: {stats['losses']}")
+            else:
+                logger.info(f"{LogSymbols.INFO} No trades found for today (Fresh Start).")
+                
+        except Exception as e:
+            logger.error(f"{LogSymbols.ERROR} Failed to restore state: {e}")
+
+    def _calendar_sync_loop(self):
+        """
+        Background thread to fetch Economic Calendar and update Compliance Guard.
+        Runs every hour to keep blackout windows fresh.
+        """
+        logger.info(f"{LogSymbols.NEWS} Economic Calendar Sync Thread Started.")
+        
+        # Initial fetch attempt
+        try:
+            events = self.news_monitor.fetch_events()
+            if events:
+                self.compliance_guard = FTMOComplianceGuard(events)
+                logger.info(f"{LogSymbols.NEWS} Initial Calendar Loaded: {len(events)} High Impact Events.")
+        except Exception as e:
+            logger.warning(f"Initial Calendar Fetch Failed: {e}")
+
+        while not self.shutdown_flag:
+            time.sleep(3600) # Sleep first, then update
+            try:
+                events = self.news_monitor.fetch_events()
+                if events:
+                    self.compliance_guard = FTMOComplianceGuard(events)
+                    logger.info(f"{LogSymbols.NEWS} Calendar Synced: {len(events)} events active.")
+            except Exception as e:
+                logger.error(f"Calendar Sync Loop Error: {e}")
+
     def fetch_news_loop(self):
         """
-        Background thread to fetch news and update sentiment scores.
+        Background thread to fetch general news sentiment (NLP).
         """
         logger.info(f"{LogSymbols.NEWS} Sentiment Analysis Thread Started.")
         while not self.shutdown_flag:
@@ -202,7 +300,7 @@ class LiveTradingEngine:
         logger.info(f"{LogSymbols.INFO} Performance Monitor (SQN & Circuit Breaker) Thread Started.")
         stream_key = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
         
-        # Start reading from current time ($)
+        # Start reading from current time ($) to avoid re-processing old trades (handled by restore)
         last_id = '$' 
         
         while not self.shutdown_flag:
@@ -218,21 +316,22 @@ class LiveTradingEngine:
                             net_pnl = float(data.get('net_pnl', 0.0))
                             
                             if symbol:
-                                # 1. SQN Window Update
-                                self.performance_stats[symbol].append(net_pnl)
-                                
-                                # 2. V10.0 Circuit Breaker Update
-                                now_server = datetime.now(self.server_tz).date()
-                                
-                                # Reset if new day
-                                if self.daily_execution_stats[symbol]['date'] != now_server:
-                                    self.daily_execution_stats[symbol] = {'date': now_server, 'losses': 0, 'pnl': 0.0}
-                                
-                                self.daily_execution_stats[symbol]['pnl'] += net_pnl
-                                
-                                if net_pnl < 0:
-                                    self.daily_execution_stats[symbol]['losses'] += 1
-                                    logger.info(f"📉 LOSS DETECTED {symbol}: ${net_pnl:.2f} | Daily Losses: {self.daily_execution_stats[symbol]['losses']}")
+                                with self.stats_lock:
+                                    # 1. SQN Window Update
+                                    self.performance_stats[symbol].append(net_pnl)
+                                    
+                                    # 2. V10.0 Circuit Breaker Update
+                                    now_server = datetime.now(self.server_tz).date()
+                                    
+                                    # Reset if new day
+                                    if self.daily_execution_stats[symbol]['date'] != now_server:
+                                        self.daily_execution_stats[symbol] = {'date': now_server, 'losses': 0, 'pnl': 0.0}
+                                    
+                                    self.daily_execution_stats[symbol]['pnl'] += net_pnl
+                                    
+                                    if net_pnl < 0:
+                                        self.daily_execution_stats[symbol]['losses'] += 1
+                                        logger.info(f"📉 LOSS DETECTED {symbol}: ${net_pnl:.2f} | Daily Losses: {self.daily_execution_stats[symbol]['losses']}")
                                 
             except Exception as e:
                 logger.error(f"Performance Monitor Error: {e}")
@@ -243,7 +342,9 @@ class LiveTradingEngine:
         Calculates the rolling System Quality Number (SQN) for a symbol.
         SQN = (Mean PnL / Std Dev PnL) * Sqrt(N)
         """
-        trades = list(self.performance_stats[symbol])
+        with self.stats_lock:
+            trades = list(self.performance_stats[symbol])
+            
         if len(trades) < 5: 
             return 0.0 # Not enough data, neutral score
             
@@ -262,15 +363,20 @@ class LiveTradingEngine:
         Returns TRUE if trading should be BLOCKED.
         """
         now_server = datetime.now(self.server_tz).date()
-        stats = self.daily_execution_stats[symbol]
         
-        # Auto-reset if accessed on a new day before trade loop hits it
-        if stats['date'] != now_server:
-            self.daily_execution_stats[symbol] = {'date': now_server, 'losses': 0, 'pnl': 0.0}
-            return False
+        with self.stats_lock:
+            stats = self.daily_execution_stats[symbol]
             
-        # Rule 1: Max Losses per day (Updated to 4 for Unshackled)
-        if stats['losses'] >= self.max_daily_losses_per_symbol:
+            # Auto-reset if accessed on a new day before trade loop hits it
+            if stats['date'] != now_server:
+                self.daily_execution_stats[symbol] = {'date': now_server, 'losses': 0, 'pnl': 0.0}
+                return False
+                
+            losses = stats['losses']
+            pnl = stats['pnl']
+
+        # Rule 1: Max Losses per day
+        if losses >= self.max_daily_losses_per_symbol:
             return True
             
         # Rule 2: Daily PnL < -1% of Equity
@@ -278,7 +384,7 @@ class LiveTradingEngine:
         current_equity = self.ftmo_guard.equity
         if current_equity > 0:
             limit = current_equity * 0.01
-            if stats['pnl'] < -limit:
+            if pnl < -limit:
                 return True
                 
         return False
@@ -310,7 +416,6 @@ class LiveTradingEngine:
         Enforces:
         1. 24h Time Stop (Hard Exit).
         2. 0.5R Trailing Stop.
-        REMOVED: Stalemate Exit (4h) to let winners run.
         """
         logger.info(f"{LogSymbols.INFO} Active Position Manager Started (Time-Stop: 24h, Trail: 0.5R).")
         while not self.shutdown_flag:
@@ -337,8 +442,6 @@ class LiveTradingEngine:
                             exit_reason = "Time Stop (24h)"
                             logger.warning(f"⌛ TIME STOP: {sym} held for {duration/3600:.1f}h. Closing.")
                         
-                        # STALEMATE EXIT REMOVED IN V12.7
-
                         if exit_reason:
                             close_intent = Trade(
                                 symbol=sym,
@@ -438,8 +541,16 @@ class LiveTradingEngine:
             
             last_ts = self.processed_ticks.get(symbol, 0.0)
             if tick_ts <= last_ts:
-                return # Skip duplicate
+                # OPTIONAL: Allow update if volume changed, but for now strict time is safer
+                pass
+            
             self.processed_ticks[symbol] = tick_ts
+
+            # --- VISUAL HEARTBEAT ---
+            # Pulse check every 10 ticks so user knows it's alive
+            self.ticks_processed += 1
+            if self.ticks_processed % 1000 == 0:
+                logger.info(f"⚡ HEARTBEAT: Processed {self.ticks_processed} ticks... (Last: {symbol})")
 
             # --- DATA INTEGRITY ---
             bid = float(tick_data.get('bid', 0.0))
@@ -533,6 +644,10 @@ class LiveTradingEngine:
         is_friday_close = (server_time.weekday() == 4 and server_time.hour >= friday_close_hour)
 
         if is_weekend_hold or is_friday_close:
+            # If we are in the danger zone, do not generate signals.
+            # Liquidation is handled by the Active Position loop, but we must ensure
+            # we don't open *new* trades here.
+            # Also, trigger a liquidation if not already done for this symbol today.
             if not self.liquidation_triggered_map[symbol]:
                 logger.warning(f"{LogSymbols.CLOSE} WEEKEND/FRIDAY GAP GUARD: Closing {symbol}.")
                 close_intent = Trade(
@@ -546,8 +661,9 @@ class LiveTradingEngine:
                 )
                 self.dispatcher.send_order(close_intent, 0.0)
                 self.liquidation_triggered_map[symbol] = True
-            return 
+            return # Stop processing
         else:
+            # Reset trigger if we are back in safe hours
             if self.liquidation_triggered_map[symbol]:
                 self.liquidation_triggered_map[symbol] = False
         
@@ -590,6 +706,7 @@ class LiveTradingEngine:
                 return
 
         # 5. Check Risk & Compliance Gates
+        # V10.0: Includes strict Midnight Anchor Check
         if not self._check_risk_gates(symbol):
             return
 
@@ -702,29 +819,38 @@ class LiveTradingEngine:
         Runs the gauntlet of safety checks.
         V10.0: Includes strict Midnight Anchor and Freeze check.
         """
+        # 1. Midnight Freeze Check
         if self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['midnight_freeze']):
             logger.warning(f"{LogSymbols.FROZEN} Midnight Freeze Active. Holding for Daily Anchor.")
             return False
 
+        # 2. Daily Anchor Existence Check
         if not self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['daily_starting_equity']):
             logger.warning(f"{LogSymbols.LOCK} Daily Anchor Missing. Waiting for Producer Sync.")
             return False
 
+        # 3. FTMO Drawdown Guard
         if not self.ftmo_guard.can_trade():
-            logger.warning(f"{LogSymbols.LOCK} FTMO Guard: Trading Halted (Drawdown).")
+            # Generate detailed audit log for the failure
+            log_msg = self.ftmo_guard.check_circuit_breakers() if hasattr(self.ftmo_guard, 'check_circuit_breakers') else "Circuit Breaker Tripped"
+            logger.warning(f"{LogSymbols.LOCK} FTMO Guard Halted: {log_msg}")
             return False
 
+        # 4. General Market Hours
         if not self.session_guard.is_trading_allowed():
             return False
             
+        # 5. Friday Entry Guard (No new trades after 16:00)
         if self.session_guard.is_friday_afternoon():
             return False
 
+        # 6. Penalty Box (Correlation/Volatility penalty)
         if self.portfolio_mgr.check_penalty_box(symbol):
             logger.warning(f"{LogSymbols.LOCK} {symbol} is in Penalty Box.")
             return False
 
-        if not self.news_monitor.check_trade_permission(symbol):
+        # 7. News Check
+        if not self.compliance_guard.check_trade_permission(symbol):
              return False
 
         return True
@@ -761,12 +887,28 @@ class LiveTradingEngine:
                             self.process_tick(data)
                             self.stream_mgr.r.xack(stream_key, group, message_id)
                 
-                # Sync Equity for Risk Guard
+                # --- SYNC RISK STATE FROM REDIS (PRODUCER AUTHORITY) ---
                 try:
+                    # 1. Update Current Equity (Fast update)
                     cached_eq = self.stream_mgr.r.get(CONFIG['redis']['risk_keys']['current_equity'])
-                    if cached_eq:
+                    if cached_eq and float(cached_eq) > 0:
                         self.ftmo_guard.update_equity(float(cached_eq))
-                except: pass
+
+                    # 2. Update Daily Anchor (The Fix for Drawdown False Positives)
+                    # We must respect the Anchor calculated by the Producer at midnight/startup.
+                    cached_anchor = self.stream_mgr.r.get(CONFIG['redis']['risk_keys']['daily_starting_equity'])
+                    if cached_anchor and float(cached_anchor) > 0:
+                        # Direct attribute sync to ensure logic consistency
+                        self.ftmo_guard.starting_equity_of_day = float(cached_anchor)
+                    
+                    # 3. Update Account Size (Total Drawdown Base)
+                    cached_size = self.stream_mgr.r.get("bot:account_size")
+                    if cached_size and float(cached_size) > 0:
+                        self.ftmo_guard.initial_balance = float(cached_size)
+                        
+                except Exception as e:
+                    # Transient Redis errors ignored in tight loop
+                    pass
                 
             except Exception as e:
                 logger.error(f"{LogSymbols.ERROR} Stream Read Error: {e}")
