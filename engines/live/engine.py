@@ -6,11 +6,11 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX STRATEGY V12.7 (LIVE ENGINE - UNSHACKLED):
-# 1. LOGIC: Removed "Stalemate Exit" (4h) to allow winners to run.
-# 2. SAFETY: "Gap-Proof" Weekend Liquidation (Sat/Sun + Fri Late) active.
-# 3. RISK: Circuit Breaker relaxed to 4 losses.
-# 4. FIX: Removed illegal attribute assignment to VolumeBar. Passed 'symbol' explicitly.
+# PHOENIX STRATEGY V12.8 (LIVE ENGINE - DEDUPLICATION FIX):
+# 1. FIX: Added Strict Tick Deduplication to prevent "Zero Tick Rule" loop.
+# 2. LOGIC: Removed "Stalemate Exit" (4h) to allow winners to run.
+# 3. SAFETY: "Gap-Proof" Weekend Liquidation (Sat/Sun + Fri Late) active.
+# 4. RISK: Circuit Breaker relaxed to 4 losses.
 # =============================================================================
 import logging
 import time
@@ -60,7 +60,7 @@ setup_logging("LiveEngine")
 logger = logging.getLogger("LiveEngine")
 
 # CONSTANTS
-MAX_TICK_LATENCY_SEC = 30.0  # RELAXED: Increased to 30s to prevent spam during catch-up
+MAX_TICK_LATENCY_SEC = 45.0  # RELAXED: Increased to accommodate network jitter
 
 class LiveTradingEngine:
     """
@@ -75,7 +75,6 @@ class LiveTradingEngine:
         self.shutdown_flag = False
         
         # 1. Infrastructure
-        # FIX: Removed 'decode_responses=True' as it is handled internally by RedisStreamManager
         self.stream_mgr = RedisStreamManager(
             host=CONFIG['redis']['host'],
             port=CONFIG['redis']['port'],
@@ -148,6 +147,10 @@ class LiveTradingEngine:
         self.latest_prices = {}
         self.liquidation_triggered_map = {sym: False for sym in CONFIG['trading']['symbols']}
         
+        # --- FIX: TICK DEDUPLICATION STATE ---
+        # Tracks the timestamp of the last processed tick to prevent processing duplicates
+        self.processed_ticks = defaultdict(float)
+
         # --- CONTEXT CACHE (D1/H4 from Windows) ---
         self.latest_context = defaultdict(dict) # {symbol: {'d1': {}, 'h4': {}}}
 
@@ -424,6 +427,7 @@ class LiveTradingEngine:
         """
         Handles a single raw tick from Redis.
         Feeds the Adaptive Imbalance Bar Generator.
+        Includes Strict Deduplication to prevent "Zero Tick Rule" loops.
         """
         try:
             symbol = tick_data.get('symbol')
@@ -436,6 +440,17 @@ class LiveTradingEngine:
             if tick_ts > 100_000_000_000:
                 tick_ts /= 1000.0
             
+            # --- CRITICAL FIX: TICK DEDUPLICATION ---
+            # If we have seen this timestamp before for this symbol, discard it.
+            # This prevents the "Zero Tick Rule" loop caused by Producer spam.
+            last_ts = self.processed_ticks.get(symbol, 0.0)
+            if tick_ts <= last_ts:
+                return # Skip duplicate or out-of-order tick
+            
+            # Update last processed timestamp
+            self.processed_ticks[symbol] = tick_ts
+
+            # Check latency only on NEW ticks
             now_ts = time.time()
             latency = now_ts - tick_ts
             
@@ -485,7 +500,6 @@ class LiveTradingEngine:
             
             # 2. If Bar Complete -> Predict
             if bar:
-                # FIX: Pass symbol explicitly to prevent 'VolumeBar object has no attribute symbol' error
                 self.on_bar_complete(bar, symbol)
                 
         except Exception as e:
