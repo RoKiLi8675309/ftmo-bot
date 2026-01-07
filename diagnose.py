@@ -184,6 +184,6 @@ class TestRiskCalculations(unittest.TestCase):
         self.assertEqual(digits, 2, "Crypto heuristic should work")
 
 if __name__ == '__main__':
-    # Fixed LogSymbols usage
+    # Fixed LogSymbols usage: Use explicit emoji or existing symbol
     print(f"\n🔍 RUNNING PHOENIX V12.7 PRE-FLIGHT DIAGNOSTICS...")
     unittest.main(verbosity=2)

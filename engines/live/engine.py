@@ -9,7 +9,8 @@
 # PHOENIX STRATEGY V12.7 (LIVE ENGINE - UNSHACKLED):
 # 1. LOGIC: Removed "Stalemate Exit" (4h) to allow winners to run.
 # 2. SAFETY: "Gap-Proof" Weekend Liquidation (Sat/Sun + Fri Late) active.
-# 3. RISK: Circuit Breaker relaxed to 4 losses (Matches 1% Risk / 4% Daily Limit).
+# 3. RISK: Circuit Breaker relaxed to 4 losses.
+# 4. FIX: Removed illegal attribute assignment to VolumeBar. Passed 'symbol' explicitly.
 # =============================================================================
 import logging
 import time
@@ -59,7 +60,7 @@ setup_logging("LiveEngine")
 logger = logging.getLogger("LiveEngine")
 
 # CONSTANTS
-MAX_TICK_LATENCY_SEC = 3.0  # Threshold for warning about NTP/Clock drift
+MAX_TICK_LATENCY_SEC = 30.0  # RELAXED: Increased to 30s to prevent spam during catch-up
 
 class LiveTradingEngine:
     """
@@ -74,11 +75,11 @@ class LiveTradingEngine:
         self.shutdown_flag = False
         
         # 1. Infrastructure
+        # FIX: Removed 'decode_responses=True' as it is handled internally by RedisStreamManager
         self.stream_mgr = RedisStreamManager(
             host=CONFIG['redis']['host'],
             port=CONFIG['redis']['port'],
-            db=0,
-            decode_responses=True
+            db=0
         )
         self.stream_mgr.ensure_group()
 
@@ -428,8 +429,13 @@ class LiveTradingEngine:
             symbol = tick_data.get('symbol')
             if symbol not in self.aggregators: return
             
-            # --- CLOCK SKEW CHECK ---
+            # --- FIX: TIMESTAMP NORMALIZATION (MS -> SEC) ---
             tick_ts = float(tick_data.get('time', 0.0))
+            
+            # Heuristic: If timestamp is > 100 billion, it's likely milliseconds
+            if tick_ts > 100_000_000_000:
+                tick_ts /= 1000.0
+            
             now_ts = time.time()
             latency = now_ts - tick_ts
             
@@ -479,24 +485,25 @@ class LiveTradingEngine:
             
             # 2. If Bar Complete -> Predict
             if bar:
-                self.on_bar_complete(bar)
+                # FIX: Pass symbol explicitly to prevent 'VolumeBar object has no attribute symbol' error
+                self.on_bar_complete(bar, symbol)
                 
         except Exception as e:
             logger.error(f"Tick Processing Error: {e}")
 
-    def on_bar_complete(self, bar: VolumeBar):
+    def on_bar_complete(self, bar: VolumeBar, symbol: str):
         """
         Triggered when a Tick Imbalance Bar (TIB) is closed.
         Executes the Prediction and Dispatch logic.
         """
         # --- V10.0 EXECUTION CIRCUIT BREAKER ---
-        if self._check_circuit_breaker(bar.symbol):
+        if self._check_circuit_breaker(symbol):
             return
 
         # 1. Update Portfolio Risk State
         try:
             ret = (bar.close - bar.open) / bar.open if bar.open > 0 else 0.0
-            self.portfolio_mgr.update_returns(bar.symbol, ret)
+            self.portfolio_mgr.update_returns(symbol, ret)
             
             if time.time() - self.last_corr_update > 60:
                 self.portfolio_mgr.update_correlation_matrix()
@@ -525,10 +532,10 @@ class LiveTradingEngine:
             # Liquidation is handled by the Active Position loop, but we must ensure
             # we don't open *new* trades here.
             # Also, trigger a liquidation if not already done for this symbol today.
-            if not self.liquidation_triggered_map[bar.symbol]:
-                logger.warning(f"{LogSymbols.CLOSE} WEEKEND/FRIDAY GAP GUARD: Closing {bar.symbol}.")
+            if not self.liquidation_triggered_map[symbol]:
+                logger.warning(f"{LogSymbols.CLOSE} WEEKEND/FRIDAY GAP GUARD: Closing {symbol}.")
                 close_intent = Trade(
-                    symbol=bar.symbol, 
+                    symbol=symbol, 
                     action="CLOSE_ALL", 
                     volume=0.0, 
                     entry_price=0.0, 
@@ -537,16 +544,16 @@ class LiveTradingEngine:
                     comment="Gap-Proof Liquidation"
                 )
                 self.dispatcher.send_order(close_intent, 0.0)
-                self.liquidation_triggered_map[bar.symbol] = True
+                self.liquidation_triggered_map[symbol] = True
             return # Stop processing
         else:
             # Reset trigger if we are back in safe hours
-            if self.liquidation_triggered_map[bar.symbol]:
-                self.liquidation_triggered_map[bar.symbol] = False
+            if self.liquidation_triggered_map[symbol]:
+                self.liquidation_triggered_map[symbol] = False
         
         # 2. Prepare Context
         current_sentiment = self.global_sentiment.get('GLOBAL', 0.0)
-        mt5_context = self.latest_context.get(bar.symbol, {})
+        mt5_context = self.latest_context.get(symbol, {})
         open_positions = self._get_open_positions_from_redis()
         
         context_data = {
@@ -557,7 +564,7 @@ class LiveTradingEngine:
         }
         
         # 3. Get Signal (Golden Trio / ARF)
-        signal = self.predictor.process_bar(bar.symbol, bar, context_data=context_data)
+        signal = self.predictor.process_bar(symbol, bar, context_data=context_data)
         
         if not signal: return
 
@@ -569,28 +576,28 @@ class LiveTradingEngine:
         if signal.action == "HOLD":
             return
             
-        logger.info(f"{LogSymbols.SIGNAL} SIGNAL: {signal.action} {bar.symbol} (Conf: {signal.confidence:.2f})")
+        logger.info(f"{LogSymbols.SIGNAL} SIGNAL: {signal.action} {symbol} (Conf: {signal.confidence:.2f})")
 
         # --- VOLATILITY GATE ---
         current_atr = signal.meta_data.get('atr', 0.0)
         if self.use_vol_gate:
-            pip_size, _ = RiskManager.get_pip_info(bar.symbol)
-            spread_pips = self.spread_map.get(bar.symbol, 1.5)
+            pip_size, _ = RiskManager.get_pip_info(symbol)
+            spread_pips = self.spread_map.get(symbol, 1.5)
             spread_cost = spread_pips * pip_size
             
             if current_atr < (spread_cost * self.min_atr_spread_ratio):
-                logger.warning(f"{LogSymbols.LOCK} Vol Gate: {bar.symbol} Rejected. Low Volatility.")
+                logger.warning(f"{LogSymbols.LOCK} Vol Gate: {symbol} Rejected. Low Volatility.")
                 return
 
         # 5. Check Risk & Compliance Gates
         # V10.0: Includes strict Midnight Anchor Check
-        if not self._check_risk_gates(bar.symbol):
+        if not self._check_risk_gates(symbol):
             return
 
         # 6. Calculate Size (Fixed Risk Mode)
         volatility = signal.meta_data.get('volatility', 0.001)
         active_corrs = self.portfolio_mgr.get_correlation_count(
-            bar.symbol, 
+            symbol, 
             threshold=CONFIG['risk_management']['correlation_penalty_threshold']
         )
 
@@ -607,11 +614,11 @@ class LiveTradingEngine:
         ker_val = signal.meta_data.get('ker', 1.0)
         
         # --- DYNAMIC SQN PERFORMANCE SCORE ---
-        sqn_score = self._calculate_sqn(bar.symbol)
+        sqn_score = self._calculate_sqn(symbol)
 
         # Initial Context
         ctx = TradeContext(
-            symbol=bar.symbol,
+            symbol=symbol,
             price=bar.close,
             stop_loss_price=0.0,
             account_equity=self.ftmo_guard.equity,
@@ -647,7 +654,7 @@ class LiveTradingEngine:
         )
 
         if trade_intent.volume <= 0:
-            logger.warning(f"Trade Size 0 for {bar.symbol} (Risk Constraints: {trade_intent.comment}).")
+            logger.warning(f"Trade Size 0 for {symbol} (Risk Constraints: {trade_intent.comment}).")
             return
 
         trade_intent.action = signal.action
@@ -662,7 +669,7 @@ class LiveTradingEngine:
         if tighten:
             sl_dist *= 0.75 # Compress Stop by 25%
             trade_intent.comment += "|Tightened"
-            logger.info(f"🛡️ STOP TIGHTENED: {bar.symbol} (High Volatility) -> SL Dist {sl_dist:.5f}")
+            logger.info(f"🛡️ STOP TIGHTENED: {symbol} (High Volatility) -> SL Dist {sl_dist:.5f}")
 
         # --- DYNAMIC R:R OVERRIDE ---
         optimized_rr = signal.meta_data.get('optimized_rr')
