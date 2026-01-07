@@ -8,8 +8,9 @@
 #
 # PHOENIX STRATEGY V12.7 (LIVE PREDICTOR - UNSHACKLED):
 # 1. LOGIC: Regime Enforcement Bypass logic added (Unshackled Protocol).
-# 2. FILTER: Removed "Confidence" gating. We trust Meta-Labeling and Regimes.
-# 3. REPORTING: Enhanced ADX rejection logging for tuning.
+# 2. LOGIC: "Stalemate Exit" (4h) REMOVED to align with Live Engine.
+# 3. REGIME: MEAN_REVERSION Purged. Trend Only.
+# 4. CONFIDENCE: Gating removed (Set to 1.0).
 # =============================================================================
 import logging
 import pickle
@@ -170,7 +171,7 @@ class MultiAssetPredictor:
         # V12.0 Logic Thresholds (Optimized for velocity)
         self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.02))
         self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.55))
-        self.hurst_mean_rev = float(phx_conf.get('hurst_mean_reversion_threshold', 0.45))
+        # Mean Reversion Threshold Ignored in V12.7
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
         
@@ -510,7 +511,7 @@ class MultiAssetPredictor:
             return 
 
         # ============================================================
-        # 4. PHOENIX V12.3: AGGRESSOR GATES & SOFT REGIME
+        # 4. PHOENIX V12.7: UNSHACKLED PROTOCOL (TREND ONLY)
         # ============================================================
         
         phx = CONFIG.get('phoenix_strategy', {})
@@ -543,9 +544,9 @@ class MultiAssetPredictor:
         upper_bb = bb_mu + (self.bb_std * bb_std)
         lower_bb = bb_mu - (self.bb_std * bb_std)
         
-        # --- V12.0 LOGIC MAPPING ---
+        # --- V12.7 LOGIC MAPPING: TREND ONLY ---
         is_trending = hurst > self.hurst_breakout
-        is_reverting = hurst < self.hurst_mean_rev
+        # REVERSION LOGIC REMOVED
         
         if is_trending:
             if preferred_regime == "MEAN_REVERSION":
@@ -557,17 +558,6 @@ class MultiAssetPredictor:
                 proposed_action = 1 # Breakout Buy
             elif bar.close < lower_bb:
                 proposed_action = -1 # Breakout Sell
-                
-        elif is_reverting:
-            if preferred_regime == "TREND_BREAKOUT":
-                is_regime_clash = True
-                
-            # Valid Reversion Signal
-            regime_label = "MEAN_REVERSION"
-            if bar.close > upper_bb:
-                proposed_action = -1 # Fade Buy (Short the top)
-            elif bar.close < lower_bb:
-                proposed_action = 1 # Fade Sell (Long the bottom)
                 
         else:
             # NEUTRAL ZONE
@@ -584,7 +574,7 @@ class MultiAssetPredictor:
                 stats["Personality Clash (Hard Block)"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "Asset Personality Clash"})
             elif self.regime_enforcement == "DISABLED":
-                 # V12.6 UNSHACKLED: Bypass clash flag to allow full adaptability
+                 # V12.7 UNSHACKLED: Bypass clash flag to allow full adaptability
                  is_regime_clash = False 
             else:
                 # SOFT Mode: Mark for high confidence check later
@@ -605,34 +595,24 @@ class MultiAssetPredictor:
 
         # 5. ML Confirmation & Calibration
         pred_proba = model.predict_proba_one(features)
-        prob_buy = pred_proba.get(1, 0.0)
-        prob_sell = pred_proba.get(-1, 0.0)
-        # raw_confidence = prob_buy if proposed_action == 1 else prob_sell
+        # prob_buy = pred_proba.get(1, 0.0)
+        # prob_sell = pred_proba.get(-1, 0.0)
         
         # V12.7 UNSHACKLED: Bypass Calibration/Confidence Check
         # We trust the Meta Labeler and Regime Filters entirely.
         confidence = 1.0 # Force max confidence to bypass filters
         
-        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.52) 
+        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.50) 
         is_profitable = meta_labeler.predict(features, proposed_action, threshold=meta_threshold)
 
-        # --- EXECUTION WITH DYNAMIC CONFIDENCE (V12.3 SOFT MODE) ---
-        # REMOVED IN V12.7: min_prob = CONFIG['online_learning'].get('min_calibrated_probability', 0.52)
+        # --- EXECUTION WITH DYNAMIC CONFIDENCE ---
+        # REMOVED IN V12.7: min_prob gating.
         
         if is_regime_clash:
-            # SOFT Override: Require "God Mode" confidence (>0.75)
-            # Since confidence is now forced to 1.0, this will pass unless we change logic.
-            # Keeping block for structural integrity if we revert.
-            if confidence < 0.75:
-                stats["Regime Clash Low Conf"] += 1
-                return Signal(symbol, "HOLD", confidence, {"reason": f"Regime Clash Conf ({confidence:.2f} < 0.75)"})
-        else:
-            # Standard Entry
-            # V12.7: REMOVED confidence check
-            pass
+            # SOFT Override logic technically bypassed if Disabled, keeping for safety
+            pass 
 
         # --- SNIPER PROTOCOL: FINAL FILTER GATE (V11) ---
-        # Checks D1 Trend Bias (If enabled) & RSI Extremes
         d1_ema = context_data.get('d1', {}).get('ema200', 0.0) if context_data else 0.0
         if not self._check_sniper_filters(symbol, proposed_action, bar.close, d1_ema):
             stats["Sniper Reject (Trend/RSI)"] += 1
@@ -730,7 +710,7 @@ class MultiAssetPredictor:
                 if rsi > 70: return False # Reject Overbought
             elif signal == -1: # SELL
                 if rsi < 30: return False # Reject Oversold
-                
+        
         return True
 
     def _inject_auxiliary_data(self):

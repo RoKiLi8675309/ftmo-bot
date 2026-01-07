@@ -6,6 +6,7 @@
 # 1. LOGIC: Regime Enforcement DISABLED to allow full AI adaptability.
 # 2. LOGIC: Logic Gates Widened (Hurst 0.51, ADX 15.0, RVOL 12.0).
 # 3. RISK: Confidence Scaling Removed. 1.0% Base Risk.
+# 4. REGIME: MEAN_REVERSION Purged. Trend Only.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -98,10 +99,10 @@ features:
   use_log_returns: true
   
   # Project Phoenix L1 Proxies
-  use_parkinson_vol: true         
+  use_parkinson_vol: true          
   use_amihud_liquidity: true 
-  use_relative_volume: true         
-  use_aggressor_ratio: true         
+  use_relative_volume: true          
+  use_aggressor_ratio: true          
   
   # NEW: Regime Filters (Anti-Chop)
   use_choppiness: true
@@ -149,37 +150,37 @@ features:
 phoenix_strategy:
   # --- ASSET REGIME MAPPING ---
   # V12.7: DISABLED to allow full adaptability. 
-  # The AI is now trusted to determine regime per-bar.
+  # MEAN_REVERSION REMOVED - TREND ONLY
   regime_enforcement: "DISABLED" 
   
   asset_regime_map:
-    GBP: "TREND_BREAKOUT"   # Reference only
-    EUR: "NEUTRAL"          # Reference only
-    USD: "NEUTRAL"          # Reference only
-    JPY: "TREND_BREAKOUT"   # Reference only
-    AUD: "MEAN_REVERSION"   # Reference only
-    CAD: "MEAN_REVERSION"   # Reference only
-    CHF: "MEAN_REVERSION"   # Reference only
+    GBP: "TREND_BREAKOUT"   
+    EUR: "TREND_BREAKOUT"          
+    USD: "TREND_BREAKOUT"          
+    JPY: "TREND_BREAKOUT"   
+    AUD: "NEUTRAL"   
+    CAD: "NEUTRAL"   
+    CHF: "NEUTRAL"   
 
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true        
-  require_d1_trend: false             # DISABLED: M5 Trend is independent         
+  enable_regime_a_entries: true       
+  require_d1_trend: false             # DISABLED: M5 Trend is independent          
   require_h4_alignment: false         # Rely on ML for context        
   
   # --- LOGIC MAPPING THRESHOLDS ---
   # V12.7: WIDENED BREAKOUT THRESHOLD (0.55 -> 0.51)
-  hurst_breakout_threshold: 0.51       
-  hurst_mean_reversion_threshold: 0.49 
-  ker_trend_threshold: 0.02           # FLOOR: Only reject absolute flatlines
+  hurst_breakout_threshold: 0.51        
+  hurst_mean_reversion_threshold: 0.00  # DISABLED (Set to 0 to prevent trigger)
+  ker_trend_threshold: 0.02             # FLOOR: Only reject absolute flatlines
   
   rvol_volatility_trigger: 3.0        # Liquidity Injection
   
   # --- FILTER THRESHOLDS ---
   max_relative_volume: 12.0        # V12.7 INCREASED: 8.0 -> 12.0 (Catch News Events)
-  volume_gate_ratio: 1.1          # Min Relative Volume
+  volume_gate_ratio: 1.1           # Min Relative Volume
   aggressor_threshold: 0.53        
-  ml_confirmation_threshold: 0.52 # RELAXED: Take any probabilistic edge > 52%
-  choppiness_threshold: 60.0      # RELAXED
+  ml_confirmation_threshold: 0.50  # STANDARD BINARY (50%)
+  choppiness_threshold: 60.0       # RELAXED
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -228,8 +229,8 @@ optimization_search_space:
   
   # Strategy Execution
   min_calibrated_probability:
-    min: 0.50 # V12.3: Lowered to allow meta-labeler to decide
-    max: 0.65
+    min: 0.00 # REMOVED CONFIDENCE GATING
+    max: 0.01
 
 # --- RISK MANAGEMENT (FTMO COMPLIANCE) ---
 risk_management:
@@ -239,14 +240,13 @@ risk_management:
   sizing_method: "fixed_risk"
   
   # INITIAL RISK: V12.7 AGGRESSOR PROTOCOL
-  # 1.0% Base Risk (Increased from 0.50%)
+  # 1.0% Base Risk (Increased per instructions)
   base_risk_per_trade_percent: 0.010 
   
-  # PROFIT BUFFER LOGIC - DISABLED
-  # Threshold set to 100% (Impossible) to disable scaling logic
-  profit_buffer_threshold: 100.0
-  # Scaled risk matches base risk to prevent aggression in drawdown
-  scaled_risk_percent: 0.010
+  # PROFIT BUFFER LOGIC
+  profit_buffer_threshold: 0.03
+  # Scaled risk set to 1.5% to maintain aggressive growth logic
+  scaled_risk_percent: 0.015
   
   # LIMITS (TIGHTENED)
   max_daily_loss_pct: 0.040        # 4.0% (Buffer before FTMO 5%)
@@ -263,15 +263,15 @@ risk_management:
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (SCALPER MODE)
-  stop_loss_atr_mult: 1.5         # TIGHTER: Cut losers fast       
-  take_profit_atr_mult: 2.0       # TIGHTER: Bag wins fast       
+  stop_loss_atr_mult: 1.5         # TIGHTER: Cut losers fast        
+  take_profit_atr_mult: 2.0       # TIGHTER: Bag wins fast        
   
   # ACTIVE TRAILING STOP
   trailing_stop:
     enabled: true        
     activation_r: 0.5        # AGGRESSIVE: Start trailing at 0.5R profit
     trail_trigger_r: 0.75 # Trigger next step
-    trail_dist_r: 0.3      # TIGHT: 0.3R Distance behind price
+    trail_dist_r: 0.3       # TIGHT: 0.3R Distance behind price
   
   risk_timezone: "Europe/Prague"
   friday_entry_cutoff_hour: 18        
@@ -309,7 +309,7 @@ trading:
   
   # --- EXECUTION OPTIMIZATION ---
   limit_order_offset_pips: 0.2 
-  limit_order_ttl_seconds: 30        # TIGHTER: 60s -> 30s for intraday precision
+  limit_order_ttl_seconds: 30         # TIGHTER: 60s -> 30s for intraday precision
 
 # --- ONLINE LEARNING ---
 online_learning:
@@ -334,7 +334,7 @@ online_learning:
   positive_class_weight: 1.5 
   negative_class_weight: 1.0
   
-  meta_labeling_threshold: 0.52 # RELAXED
+  meta_labeling_threshold: 0.50 # BINARY PASS/FAIL
   
   tbm:
     # UPDATED: Extended horizon to 720m (12h) to align with observed swing behavior
@@ -346,7 +346,7 @@ online_learning:
   learning_horizon_sec: 300
   
   # AGGRESSOR PROTOCOL
-  min_calibrated_probability: 0.50 
+  min_calibrated_probability: 0.00 # GATING DISABLED
 
 # --- NEWS FILTER ---
 news_filter:
@@ -387,4 +387,4 @@ wfo:
   train_years: 2
   test_months: 6
   min_trades_optimization: 60 # LOWERED: Ensure EURUSD/GBPAUD are valid
-  risk_per_trade_options: [0.0035, 0.0075] # Updated for V12.3 scaling
+  risk_per_trade_options: [0.010, 0.015] # Updated for V12.7 1% Base

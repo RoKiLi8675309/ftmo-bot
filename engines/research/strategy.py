@@ -9,6 +9,7 @@
 # 1. LOGIC: Regime Enforcement Bypass logic added.
 # 2. LOGIC: "Stalemate Exit" (4h) REMOVED to align with Live Engine.
 # 3. RSI: JPY Bypass maintained.
+# 4. REGIME: MEAN_REVERSION Purged. Trend Only.
 # =============================================================================
 import logging
 import sys
@@ -111,7 +112,7 @@ class ResearchStrategy:
         self.current_d1_ema = 0.0 
         
         # --- SNIPER PROTOCOL INDICATORS ---
-        self.sniper_closes = deque(maxlen=200)       
+        self.sniper_closes = deque(maxlen=200)        
         self.sniper_rsi = deque(maxlen=15)    
         
         # --- V11.1 MOMENTUM INDICATORS ---
@@ -131,7 +132,7 @@ class ResearchStrategy:
         # V12.0 Logic Thresholds
         self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.02)) 
         self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.55))
-        self.hurst_mean_rev = float(phx_conf.get('hurst_mean_reversion_threshold', 0.45))
+        # Mean Reversion Threshold ignored in V12.7 (Logic Removed)
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
         
@@ -459,10 +460,10 @@ class ResearchStrategy:
             return 
 
         # ============================================================
-        # E. AGGRESSOR GATES & ASSET PERSONALITY (V12.3 SOFT MODE)
+        # E. AGGRESSOR GATES & ASSET PERSONALITY (V12.7 UNSHACKLED)
         # ============================================================
         
-        # G1: EFFICIENCY (KER) - AGGRESSIVE (V11.0)
+        # G1: EFFICIENCY (KER) - AGGRESSIVE
         base_thresh = self.ker_floor 
         effective_ker_thresh = max(0.005, base_thresh + self.dynamic_ker_offset)
             
@@ -487,9 +488,8 @@ class ResearchStrategy:
         upper_bb = bb_mu + (bb_mult * bb_std)
         lower_bb = bb_mu - (bb_mult * bb_std)
         
-        # --- V12.0 LOGIC MAPPING ---
+        # --- V12.7 LOGIC MAPPING: TREND ONLY ---
         is_trending = hurst > self.hurst_breakout
-        is_reverting = hurst < self.hurst_mean_rev
         
         if is_trending:
             if preferred_regime == "MEAN_REVERSION":
@@ -502,19 +502,8 @@ class ResearchStrategy:
             elif price < lower_bb:
                 proposed_action = -1 # Breakout Sell
                 
-        elif is_reverting:
-            if preferred_regime == "TREND_BREAKOUT":
-                is_regime_clash = True
-                
-            # Reversion Logic
-            regime_label = "MEAN_REVERSION"
-            if price > upper_bb:
-                proposed_action = -1 # Fade Buy (Short the top)
-            elif price < lower_bb:
-                proposed_action = 1 # Fade Sell (Long the bottom)
-                
         else:
-            # NEUTRAL ZONE
+            # NEUTRAL ZONE (Also catches Reversion since logic removed)
             self.rejection_stats[f"Random Walk Regime (H={hurst:.2f})"] += 1
             return
 
@@ -522,13 +511,13 @@ class ResearchStrategy:
             self.rejection_stats["No Trigger"] += 1
             return
             
-        # --- REGIME ENFORCEMENT (V12.3) ---
+        # --- REGIME ENFORCEMENT (V12.7) ---
         if is_regime_clash:
             if self.regime_enforcement == "HARD":
                 self.rejection_stats[f"Personality Clash ({regime_label} on {preferred_regime})"] += 1
                 return
             elif self.regime_enforcement == "DISABLED":
-                 # V12.6 UNSHACKLED: Bypass clash flag to allow full adaptability
+                 # V12.7 UNSHACKLED: Bypass clash flag to allow full adaptability
                  is_regime_clash = False 
             else:
                 # SOFT Mode: Mark for high confidence check later
@@ -543,7 +532,6 @@ class ResearchStrategy:
         if regime_label == "TREND_BREAKOUT":
             adx_val = features.get('adx', 0.0)
             if adx_val < self.adx_threshold:
-                # V12.7 REFACTOR: Log specific failure values
                 self.rejection_stats[f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
                 return
 
@@ -553,9 +541,8 @@ class ResearchStrategy:
         
         try:
             pred_proba = self.model.predict_proba_one(features)
-            prob_buy = pred_proba.get(1, 0.0)
-            prob_sell = pred_proba.get(-1, 0.0)
-            # raw_confidence = prob_buy if proposed_action == 1 else prob_sell
+            # prob_buy = pred_proba.get(1, 0.0)
+            # prob_sell = pred_proba.get(-1, 0.0)
             
             # V12.7 UNSHACKLED: Bypass Calibration/Confidence Check
             # We trust the Meta Labeler and Regime Filters entirely.
@@ -564,24 +551,16 @@ class ResearchStrategy:
             is_profitable = self.meta_labeler.predict(
                 features, 
                 proposed_action, 
-                threshold=float(self.params.get('meta_labeling_threshold', 0.52))
+                threshold=float(self.params.get('meta_labeling_threshold', 0.50))
             )
             
             if proposed_action != 0:
                 self.meta_label_events += 1
 
-            # min_prob = float(self.params.get('min_calibrated_probability', 0.50))
-            
-            # V12.3: SOFT REGIME OVERRIDE LOGIC
+            # V12.7: SOFT REGIME OVERRIDE LOGIC REMOVED/DISABLED
             if is_regime_clash:
-                # Require "God Mode" confidence to trade against personality
-                required_conf = 0.75 
-                if confidence < required_conf:
-                    self.rejection_stats[f"Regime Clash Low Conf ({confidence:.2f} < {required_conf})"] += 1
-                    return
-            else:
-                # Normal check removed in V12.7
-                pass
+               # If clashing was allowed by DISABLED config, we treat as normal
+               pass
 
             # --- SNIPER PROTOCOL ---
             if not self._check_sniper_filters(proposed_action, price):
@@ -639,8 +618,6 @@ class ResearchStrategy:
             effective_sqn = sqn_score
 
         # V12.0: CALCULATE DAILY PNL PCT FOR BUFFER SCALING
-        # (Start Equity - Current Equity) / Start Equity = Drawdown
-        # Current Equity - Start Equity = Profit
         daily_pnl_val = broker.equity - broker.daily_start_equity
         daily_pnl_pct = daily_pnl_val / broker.daily_start_equity if broker.daily_start_equity > 0 else 0.0
 
@@ -748,7 +725,6 @@ class ResearchStrategy:
         """
         V12.4 FEATURE: Managed Time Exits.
         1. Hard Time Stop (24h): Closes position regardless of PnL.
-        2. Stalemate Exit (4h): REMOVED IN V12.7.
         """
         hard_stop_seconds = 86400  # 24 Hours
         
@@ -773,8 +749,6 @@ class ResearchStrategy:
             if duration > hard_stop_seconds:
                 to_close.append((pos, "Time Stop (24h)"))
             
-            # Stalemate logic removed
-        
         for pos, reason in to_close:
             broker._close_partial_position(
                 pos, 

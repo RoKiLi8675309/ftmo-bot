@@ -152,8 +152,9 @@ class RiskManager:
         """
         Calculates position size using strict prop firm logic (Sniper Protocol).
         Includes SQN Scaling to cut losers and press winners.
-        V13.0 UPDATE: Risk calibrated for Aggressor Mode (1.0% Base).
-        V12.7 UPDATE: Removed Confidence Scaling (Binary Gate).
+        V12.7 UNSHACKLED: 
+        - 1.0% Base Risk.
+        - Confidence scaling removed (Binary).
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -169,7 +170,7 @@ class RiskManager:
         start_equity = account_size if account_size else float(CONFIG.get('env', {}).get('initial_balance', 100000.0))
         
         # --- SNIPER PROTOCOL: VOLATILITY-ADJUSTED STOPS ---
-        atr_mult_sl = float(risk_conf.get('stop_loss_atr_mult', 2.0))
+        atr_mult_sl = float(risk_conf.get('stop_loss_atr_mult', 1.5)) # Updated default 1.5
         atr_mult_tp = float(risk_conf.get('take_profit_atr_mult', 3.0))
         
         # ATR Fallback Logic
@@ -201,11 +202,11 @@ class RiskManager:
         lots = 0.0
         calculated_risk_usd = 0.0
         
-        # --- V13.0: PROFIT BUFFER SCALING (AGGRESSOR MODE) ---
-        # Base Risk increased to 1.0% (0.010)
+        # --- V12.7: UNSHACKLED RISK PARAMETERS ---
+        # Base Risk: 1.0% (0.010)
         default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.010)
         buffer_threshold = risk_conf.get('profit_buffer_threshold', 0.03)
-        # Scaled risk increased to 1.5% for aggression
+        # Scaled Risk: 1.5% (0.015)
         scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.015)
         
         scaling_comment = ""
@@ -229,8 +230,8 @@ class RiskManager:
                 return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, f"Toxic Asset (SQN {performance_score:.2f})"), 0.0
                 
             elif performance_score < 0.0:
-                # LOSING STREAK: Probe Size Only (0.15%)
-                risk_pct = 0.15
+                # LOSING STREAK: Probe Size Only (0.25%)
+                risk_pct = 0.25
                 scaling_comment += "|SQN:Low"
                 
             elif performance_score > 2.5:
@@ -267,9 +268,10 @@ class RiskManager:
         ker_scalar = max(0.8, min(ker, 1.0))
         calculated_risk_usd *= ker_scalar
         
-        # Confidence Scaling - DISABLED (V12.7 UNSHACKLED)
-        # We trust the binary output of Meta-Labeling.
-        calculated_risk_usd *= 1.0
+        # --- V12.7 UNSHACKLED: CONFIDENCE SCALING DISABLED ---
+        # We assume Binary Gate from Meta-Labeler. 
+        # If we are here, we take the trade at configured risk.
+        calculated_risk_usd *= 1.0 
 
         # Calculate Lots
         if loss_per_lot_usd > 0:
