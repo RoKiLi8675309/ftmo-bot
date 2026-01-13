@@ -1,18 +1,17 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V12.32 (FTMO SNIPER MODE - EMERGENCY HARDENING)
+# config.yaml – PROJECT PHOENIX V12.33 (FTMO UNSHACKLED - RESEARCH MODE)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# UPDATE LOG (V12.32):
-# 1. RISK: Emergency Cut to 0.5% Base Risk to halt drawdown.
-# 2. LOGIC: Hurst Threshold -> 0.60 (Strict Trend Only).
-# 3. GATES: ADX -> 25.0 (Strong Trend Only).
-# 4. SAFETY: Max Trades -> 3.
+# UPDATE LOG (V12.33):
+# 1. MODE: Reverted to RESEARCH/UNSHACKLED settings for Fresh Training.
+# 2. RISK: Restored Base Risk to 1.0% (Confirmed by Optuna).
+# 3. LOGIC: Disabled Regime Enforcement to allow full AI adaptability.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
 env:
   initial_balance: 100000.0
-  mode: "LIVE" # Options: RESEARCH, PAPER, LIVE
+  mode: "RESEARCH" # Options: RESEARCH, PAPER, LIVE
 
 # --- LOGGING CONFIGURATION ---
 logging:
@@ -139,18 +138,18 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 25.0 # V12.32 TIGHTENED: 15.0 -> 25.0 (Strong Trend Only)
+    threshold: 15.0 # V12.33 RESEARCH: Relaxed to 15.0 to allow ML to decide
   
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V12.32 SNIPER MODE) ---
+# --- PHOENIX STRATEGY PARAMETERS (V12.33 RESEARCH MODE) ---
 phoenix_strategy:
   # --- ASSET REGIME MAPPING ---
-  # V12.32: ENABLED "HARD" to force discipline.
-  regime_enforcement: "HARD" 
+  # V12.33: DISABLED to allow full AI adaptability during training.
+  regime_enforcement: "DISABLED" 
   
   asset_regime_map:
     GBP: "TREND_BREAKOUT"   
@@ -167,16 +166,15 @@ phoenix_strategy:
   require_h4_alignment: false         # Rely on ML for context        
   
   # --- LOGIC MAPPING THRESHOLDS ---
-  # V12.32: HURST CALIBRATED. 
-  # Now that the x2 bug is gone, 0.5 is random. We need 0.60 for a real trend.
-  hurst_breakout_threshold: 0.60        
+  # V12.33: Calibrated Hurst thresholds for corrected math.
+  hurst_breakout_threshold: 0.55        
   hurst_mean_reversion_threshold: 0.00  # DISABLED 
   ker_trend_threshold: 0.02             # FLOOR: Only reject absolute flatlines
   
   rvol_volatility_trigger: 3.0        # Liquidity Injection
   
   # --- FILTER THRESHOLDS ---
-  max_relative_volume: 8.0         # V12.32 REDUCED: 12.0 -> 8.0 (Avoid Blow-off Tops)
+  max_relative_volume: 12.0        # V12.33 RESEARCH: Relaxed to 12.0
   volume_gate_ratio: 1.1           # Min Relative Volume
   aggressor_threshold: 0.53        
   ml_confirmation_threshold: 0.50  # STANDARD BINARY (50%)
@@ -239,14 +237,13 @@ risk_management:
   # --- SIZING METHOD: PROFIT BUFFER SCALING ---
   sizing_method: "fixed_risk"
   
-  # INITIAL RISK: V12.32 EMERGENCY REDUCTION
-  # 0.5% Base Risk until positive expectancy is restored.
-  base_risk_per_trade_percent: 0.005 
+  # V12.33 RESEARCH: 1.0% Base Risk
+  base_risk_per_trade_percent: 0.010 
   
   # PROFIT BUFFER LOGIC
   profit_buffer_threshold: 0.03
-  # Scaled risk 1.0% max
-  scaled_risk_percent: 0.010
+  # Scaled risk 1.5% max
+  scaled_risk_percent: 0.015
   
   # LIMITS (TIGHTENED)
   max_daily_loss_pct: 0.040        # 4.0% (Buffer before FTMO 5%)
@@ -256,7 +253,7 @@ risk_management:
   max_currency_exposure: 2         # Max 2 positions per currency (e.g. 2 USD pairs)
   
   max_risk_percent: 2.5            # Allow more open risk
-  max_open_trades: 3               # V12.32 REDUCED: 6 -> 3
+  max_open_trades: 6               # V12.33 RESEARCH: 6
   
   max_leverage: 30.0
   max_lot_size: 50.0 
