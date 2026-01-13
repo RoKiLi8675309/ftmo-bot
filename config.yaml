@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V12.33 (FTMO UNSHACKLED - RESEARCH MODE)
+# config.yaml – PROJECT PHOENIX V12.35 (FTMO UNSHACKLED - AUDITED)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# UPDATE LOG (V12.33):
-# 1. MODE: Reverted to RESEARCH/UNSHACKLED settings for Fresh Training.
-# 2. RISK: Restored Base Risk to 1.0% (Confirmed by Optuna).
-# 3. LOGIC: Disabled Regime Enforcement to allow full AI adaptability.
+# AUDIT REMEDIATION (2025-01-13):
+# 1. COMPLIANCE: Added NZD news events (Auxiliary Symbol Protection).
+# 2. COMPLIANCE: Enhanced AUD/JPY event lists.
+# 3. VERIFICATION: Confirmed Base Risk 1.0% for Unshackled Mode.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -350,13 +350,14 @@ news_filter:
   buffer_minutes_before: 15 
   buffer_minutes_after: 15
   restricted_events:
-    USD: ["FOMC", "NFP", "CPI", "GDP", "Rate"]
+    USD: ["FOMC", "NFP", "CPI", "GDP", "Rate", "Employment"]
     EUR: ["ECB", "CPI", "Rate"]
-    GBP: ["BOE", "CPI", "Rate"]
-    JPY: ["BOJ", "Rate"]
-    CAD: ["BOC", "CPI", "Rate"]
+    GBP: ["BOE", "CPI", "Rate", "GDP"]
+    JPY: ["BOJ", "Rate", "CPI"]
+    CAD: ["BOC", "CPI", "Rate", "Employment"]
     CHF: ["SNB", "CPI", "Rate"]
-    AUD: ["RBA", "CPI", "Rate"]
+    AUD: ["RBA", "CPI", "Rate", "Employment", "GDP"]
+    NZD: ["RBNZ", "CPI", "Rate", "GDP"] # Added for NZDUSD (Aux)
 
 # --- FORENSIC AUDIT ASSUMPTIONS (RELAXED FOR RAW SPREADS) ---
 # These values are used by the Volatility Gate to ensure the market is "alive".

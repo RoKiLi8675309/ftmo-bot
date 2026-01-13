@@ -6,11 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX V12.32 CRITICAL FIX (HURST CALIBRATION):
-# 1. MATH FIX: Removed erroneous '* 2.0' scalar from Hurst Calculation.
-#    - PREVIOUS: Random Walk (0.5) -> Scaled to 1.0 (False Positive Trend).
-#    - NOW: Random Walk (0.5) -> Remains 0.5 (Correctly rejected by Gate 0.51).
-# 2. LOGIC: This stops the bot from "Buying the Top" in choppy/ranging markets.
+# PHOENIX V12.41 (HURST FIX PARITY):
+# 1. MATH FIX: Removed '* 2.0' from Hurst calculation in Live Engine.
+#    - REASON: Aligns with Shared Library and Research Engine.
+#    - IMPACT: Prevents "Buy the Top" in ranging markets by correctly identifying H ~ 0.5.
 # =============================================================================
 import logging
 import pickle
@@ -276,7 +275,7 @@ class MultiAssetPredictor:
                     tau.append(std if std > 1e-9 else 1e-9)
                 
                 # Polyfit on log-log
-                # V12.32 FIX: Removed '* 2.0' which was forcing False Positive Trends
+                # V12.41 FIX: Removed '* 2.0' scalar. Slope = H.
                 poly = np.polyfit(np.log(lags), np.log(tau), 1)
                 hurst = poly[0] 
                 hurst = max(0.0, min(1.0, hurst))
@@ -608,7 +607,7 @@ class MultiAssetPredictor:
             stats[f"Volume Climax"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
             
-        # G4: TREND STRENGTH (ADX) - Only relevant for Trend Regime
+        # G4: TREND STRENGTH (ADX) - Only for Trend Regime
         if regime_label == "TREND_BREAKOUT":
             adx_val = features.get('adx', 0.0)
             if adx_val < self.adx_threshold: 

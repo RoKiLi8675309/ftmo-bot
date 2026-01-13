@@ -5,10 +5,12 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 # 
-# PHOENIX STRATEGY V12.14 (MATH HARDENING):
-# 1. HMM: Added robust variance checks and 'Hard Reset' logic for convergence failures.
-# 2. MATH: Zero-division guards for Choppiness and Hurst (Flat bar protection).
-# 3. PERF: Suppressed hmmlearn IO during fitting to reduce GIL contention.
+# PHOENIX STRATEGY V12.38 (MATH HARDENING):
+# 1. HURST FIX: Removed erroneous scalar (* 2.0) from Hurst Calculation.
+#    - REASON: Slope of log(std) vs log(lag) IS the Hurst exponent (H).
+#    - PREVIOUS: Random Walk (0.5) -> Reported as 1.0 (Trend).
+#    - NOW: Random Walk (0.5) -> Reported as 0.5 (Correctly rejected).
+# 2. ROBUSTNESS: Preserved HMM variance checks and zero-division guards.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -1281,7 +1283,9 @@ def calculate_hurst(ts):
     A = np.column_stack((x, np.ones(len(x))))
     try:
         m, c = np.linalg.lstsq(A, y)[0]
-        hurst = m * 2.0
+        # V12.38 FIX: REMOVED * 2.0 SCALAR
+        # In std deviation method, H = m.
+        hurst = m 
         return max(0.0, min(1.0, hurst))
     except:
         return 0.5

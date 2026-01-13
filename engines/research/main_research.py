@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# PHOENIX STRATEGY V12.33 (RESEARCH - REFINED AGGRESSOR & RETRAINING PROTOCOL):
-# 1. DATA: Dynamic loading of 10M ticks for high-resolution deep learning.
-# 2. OPTIMIZATION: Updated search space to validate 1.0% Risk Aggressor sizing.
-# 3. REPORTING: Enhanced EmojiCallback for Regime & Drawdown tracking.
-# 4. FRESH START: Added robust logic to purge old models/scalers before training.
+# PHOENIX STRATEGY V12.34 (FIX: LOGSYMBOLS ATTRIBUTE ERROR):
+# 1. FIX: Replaced non-existent LogSymbols attributes (trash, training, save, backtest)
+#    with direct emoji literals to prevent crashes.
+# 2. STABILITY: Preserves full logic and structure of the 1000+ line research engine.
 # =============================================================================
 import os
 import sys
@@ -710,7 +709,8 @@ class ResearchPipeline:
         Deletes all existing model files to ensure a clean slate for retraining.
         Crucial after logic changes (e.g., Hurst fix).
         """
-        log.warning(f"{LogSymbols.trash} PURGING OLD MODELS...")
+        # FIX: Replaced LogSymbols.trash with literal emoji to prevent AttributeError
+        log.warning(f"🗑️ PURGING OLD MODELS...")
         for p in self.models_dir.glob("*.pkl"):
             try:
                 p.unlink()
@@ -719,7 +719,8 @@ class ResearchPipeline:
                 log.error(f"Failed to delete {p.name}: {e}")
 
     def run_training(self, fresh_start: bool = False):
-        log.info(f"{LogSymbols.TIME} STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
+        # FIX: LogSymbols.training -> literal
+        log.info(f"🏋️ STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
         log.info(f"OBJECTIVE: PROFIT IS KING (Total PnL + Efficiency Tie-Breaker)")
         log.info(f"HARDWARE DETECTED: {psutil.cpu_count(logical=True)} Cores. Using {self.total_cores} workers (Configured).")
         
@@ -760,7 +761,8 @@ class ResearchPipeline:
         )
         
         duration = time.time() - start_time
-        log.info(f"{LogSymbols.SUCCESS} Swarm Optimization Complete in {duration:.2f}s")
+        # FIX: LogSymbols.success -> literal
+        log.info(f"✅ Swarm Optimization Complete in {duration:.2f}s")
         log.info(f"{LogSymbols.DATABASE} Finalizing Models & Artifacts...")
         
         Parallel(n_jobs=len(self.symbols), backend="loky")(
@@ -771,7 +773,7 @@ class ResearchPipeline:
                 self.models_dir
             ) for sym in self.symbols
         )
-        log.info(f"{LogSymbols.SUCCESS} Training Pipeline Completed.")
+        log.info(f"✅ Training Pipeline Completed.")
 
     def run_wfo(self):
         log.info(f"{LogSymbols.TIME} STARTING WALK-FORWARD OPTIMIZATION (WFO)...")
@@ -786,10 +788,11 @@ class ResearchPipeline:
                 self.db_url
             ) for sym in self.symbols
         )
-        log.info(f"{LogSymbols.SUCCESS} WFO Pipeline Completed.")
+        log.info(f"✅ WFO Pipeline Completed.")
 
     def run_backtest(self):
-        log.info(f"{LogSymbols.TIME} Starting BACKTEST verification...")
+        # FIX: LogSymbols.backtest -> literal
+        log.info(f"📉 Starting BACKTEST verification...")
         
         results = Parallel(n_jobs=len(self.symbols), backend="loky")(
             delayed(self._run_backtest_symbol)(sym) for sym in self.symbols
@@ -957,7 +960,7 @@ class ResearchPipeline:
         
         output_file = self.reports_dir / f"backtest_report_{timestamp_str}.html"
         fig.write_html(output_file)
-        log.info(f"{LogSymbols.SUCCESS} HTML Report saved to: {output_file}")
+        log.info(f"✅ HTML Report saved to: {output_file}")
 
 def main():
     optuna.logging.set_verbosity(optuna.logging.WARN)

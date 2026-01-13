@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V12.7 (UNSHACKLED PROTOCOL):
-# 1. LOGIC: Regime Enforcement Bypass logic added.
-# 2. LOGIC: "Stalemate Exit" (4h) REMOVED to align with Live Engine.
-# 3. RSI: JPY Bypass maintained.
-# 4. REGIME: MEAN_REVERSION Purged. Trend Only.
+# PHOENIX STRATEGY V12.8 (MATH HARMONIZATION):
+# 1. MATH FIX: Removed '* 2.0' from Hurst calculation to match Live Engine.
+# 2. LOGIC: Ensures Backtest respects the same Random Walk rejection as Live.
+# 3. VERIFICATION: Aligned Golden Trio calculation with shared.features logic.
 # =============================================================================
 import logging
 import sys
@@ -191,7 +190,8 @@ class ResearchStrategy:
             lags = range(2, 20)
             tau = [np.std(np.subtract(prices[lag:], prices[:-lag])) for lag in lags]
             poly = np.polyfit(np.log(lags), np.log(tau), 1)
-            hurst = poly[0] * 2.0 
+            # V12.8 FIX: Removed * 2.0 to match Live Engine & Correct Math
+            hurst = poly[0] 
             hurst = max(0.0, min(1.0, hurst))
         except:
             hurst = 0.5

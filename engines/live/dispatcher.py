@@ -5,10 +5,11 @@
 # DEPENDENCIES: shared
 # DESCRIPTION: Outbound Trade Router. Formats and pushes execution requests to Redis.
 # CRITICAL: Ensures strict compatibility with Windows Producer (Py3.9).
-# AUDIT REMEDIATION:
-#   - IC-1: Added Stale Order Cleanup (TTL) to prevent 'Pending' deadlocks.
-#   - 2025-12-20 Audit: Enforced maxlen on xadd to prevent memory leaks.
-#   - V12.19 Fix: Added 'price' and 'type' keys to payload for Producer V12.19 compliance.
+# 
+# PHOENIX V12.39 FIX (MARKET ORDER SAFETY):
+# 1. FIX: Force 'price' to "0.0" if type is "MARKET".
+# 2. REASON: Prevents Producer from misinterpreting Market orders as Pending/Limit
+#    orders when a snapshot price is inadvertently passed.
 # =============================================================================
 import logging
 import json
@@ -65,6 +66,15 @@ class TradeDispatcher:
             if trade.comment:
                 comment = f"{comment}_{trade.comment}"[:31]
 
+            # V12.39 FIX: MARKET ORDER PRICE SAFETY
+            # If it's a MARKET order, we MUST send price="0.0" to force Instant Execution.
+            # Sending a specific price (e.g. 1.0500) might trigger Pending Limit logic in Producer.
+            entry_type = str(trade.entry_type).upper()
+            final_price = str(trade.entry_price)
+            
+            if "MARKET" in entry_type:
+                final_price = "0.0"
+
             payload = {
                 "id": str(order_id),
                 "uuid": str(order_id),  # CRITICAL for Producer Deduplication
@@ -74,8 +84,8 @@ class TradeDispatcher:
                 
                 # V12.19 FIX: Send both legacy 'entry_price' and new 'price' keys
                 # The Producer looks for 'price' to enable Limit Order logic.
-                "entry_price": str(trade.entry_price),
-                "price": str(trade.entry_price), 
+                "entry_price": final_price,
+                "price": final_price, 
                 
                 "stop_loss": str(trade.stop_loss),
                 "take_profit": str(trade.take_profit),
@@ -84,7 +94,7 @@ class TradeDispatcher:
                 "timestamp": str(time.time()),  # ZOMBIE CHECK: High precision time
                 
                 # V12.19 FIX: Respect trade.entry_type (LIMIT vs MARKET)
-                "type": str(trade.entry_type).upper() 
+                "type": entry_type
             }
 
             # 4. Transmit to Redis
@@ -93,7 +103,7 @@ class TradeDispatcher:
             
             logger.info(
                 f"{LogSymbols.UPLOAD} DISPATCH SENT: {trade.action} {trade.symbol} "
-                f"| Vol: {trade.volume:.2f} | Price: {trade.entry_price} | Type: {trade.entry_type} | Risk: ${estimated_risk_usd:.2f}"
+                f"| Vol: {trade.volume:.2f} | Price: {final_price} | Type: {entry_type} | Risk: ${estimated_risk_usd:.2f}"
             )
         except Exception as e:
             logger.error(f"{LogSymbols.ERROR} Dispatch Failed for {trade.symbol}: {e}")
