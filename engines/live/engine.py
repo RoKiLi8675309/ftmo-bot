@@ -6,10 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX STRATEGY V12.14 (LIVE ENGINE - STATE PERMANENCE):
-# 1. FIX: Added _restore_daily_state() to prevent Daily Limit reset on restart.
-# 2. CONCURRENCY: Implemented threading.Lock() for shared statistics.
-# 3. ROBUSTNESS: Enhanced Calendar Sync to be un-killable.
+# PHOENIX V12.31 FIX (TRADE RESTORATION DEDUPLICATION):
+# 1. FIX: Added 'tickets' set to daily_execution_stats to track unique deal IDs.
+# 2. LOGIC: Checks 'if ticket in seen' before counting a loss/win.
+# 3. REASON: Prevents double-counting if Producer restarts and re-sends closed trades.
 # =============================================================================
 import logging
 import time
@@ -141,13 +141,20 @@ class LiveTradingEngine:
         # Tracks last 30 trades per symbol to calculate SQN
         self.performance_stats = defaultdict(lambda: deque(maxlen=30))
         
-        # V10.0: Daily Circuit Breaker State (Realized Execution)
-        # {symbol: {'date': date_obj, 'losses': int, 'pnl': float}}
-        self.daily_execution_stats = defaultdict(lambda: {'date': None, 'losses': 0, 'pnl': 0.0})
+        # V12.31: Daily Circuit Breaker State (Realized Execution)
+        # Added 'tickets' set to track unique deal IDs and prevent double counting
+        self.daily_execution_stats = defaultdict(lambda: {'date': None, 'losses': 0, 'pnl': 0.0, 'tickets': set()})
         
         # V12.7 UNSHACKLED: Increased from 2 to 4 to align with 1% Risk and 4% Daily Buffer
         self.max_daily_losses_per_symbol = 4 
         
+        # --- TIMEZONE INIT (MOVED UP FOR V12.20 FIX) ---
+        tz_str = CONFIG['risk_management'].get('risk_timezone', 'Europe/Prague')
+        try:
+            self.server_tz = pytz.timezone(tz_str)
+        except Exception:
+            self.server_tz = pytz.timezone('Europe/Prague')
+
         # --- STATE RESTORATION (CRITICAL) ---
         self._restore_daily_state()
 
@@ -172,13 +179,6 @@ class LiveTradingEngine:
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
         self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.5)
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
-        
-        # Timezone for Circuit Breaker Reset
-        tz_str = CONFIG['risk_management'].get('risk_timezone', 'Europe/Prague')
-        try:
-            self.server_tz = pytz.timezone(tz_str)
-        except Exception:
-            self.server_tz = pytz.timezone('Europe/Prague')
 
         # V11.1: Active Position Management Thread
         self.mgmt_thread = threading.Thread(target=self._manage_active_positions_loop, daemon=True)
@@ -188,6 +188,7 @@ class LiveTradingEngine:
         """
         CRITICAL: Replays today's closed trades from Redis to reconstruct Daily PnL and Loss Counts.
         Prevents the bot from 'forgetting' it hit a daily limit if it restarts mid-day.
+        V12.31: Implements Ticket Deduplication to fix double-counting.
         """
         logger.info(f"{LogSymbols.DATABASE} Restoring Daily Execution State...")
         try:
@@ -211,6 +212,7 @@ class LiveTradingEngine:
                     symbol = data.get('symbol')
                     net_pnl = float(data.get('net_pnl', 0.0))
                     timestamp_raw = float(data.get('timestamp', 0))
+                    ticket = str(data.get('ticket', '')) # Ticket for dedup
                     
                     # Verify timestamp matches today (Server Time)
                     trade_dt = datetime.fromtimestamp(timestamp_raw, tz=self.server_tz)
@@ -219,19 +221,28 @@ class LiveTradingEngine:
                         
                     # Initialize if needed
                     if self.daily_execution_stats[symbol]['date'] != current_date:
-                        self.daily_execution_stats[symbol] = {'date': current_date, 'losses': 0, 'pnl': 0.0}
+                        self.daily_execution_stats[symbol] = {'date': current_date, 'losses': 0, 'pnl': 0.0, 'tickets': set()}
                     
+                    # --- DEDUPLICATION CHECK ---
+                    if ticket and ticket in self.daily_execution_stats[symbol]['tickets']:
+                        # Skip processing if we already saw this ticket today
+                        continue
+
                     # Apply Logic
                     self.daily_execution_stats[symbol]['pnl'] += net_pnl
                     if net_pnl < 0:
                         self.daily_execution_stats[symbol]['losses'] += 1
+                    
+                    # Mark ticket as seen
+                    if ticket:
+                        self.daily_execution_stats[symbol]['tickets'].add(ticket)
                     
                     # Also restore SQN buffer
                     self.performance_stats[symbol].append(net_pnl)
                     restored_count += 1
             
             if restored_count > 0:
-                logger.info(f"{LogSymbols.SUCCESS} Restored {restored_count} trades for today.")
+                logger.info(f"{LogSymbols.SUCCESS} Restored {restored_count} unique trades for today.")
                 for sym, stats in self.daily_execution_stats.items():
                     if stats['losses'] > 0 or stats['pnl'] != 0:
                         logger.info(f"   -> {sym}: PnL ${stats['pnl']:.2f} | Losses: {stats['losses']}")
@@ -296,6 +307,7 @@ class LiveTradingEngine:
         Background thread to listen for CLOSED trades.
         1. Updates SQN stats (performance sizing).
         2. Updates Daily Circuit Breaker (stops trading on bad days).
+        V12.31: Applies deduplication for live monitoring as well.
         """
         logger.info(f"{LogSymbols.INFO} Performance Monitor (SQN & Circuit Breaker) Thread Started.")
         stream_key = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
@@ -314,6 +326,7 @@ class LiveTradingEngine:
                             last_id = msg_id
                             symbol = data.get('symbol')
                             net_pnl = float(data.get('net_pnl', 0.0))
+                            ticket = str(data.get('ticket', ''))
                             
                             if symbol:
                                 with self.stats_lock:
@@ -325,13 +338,21 @@ class LiveTradingEngine:
                                     
                                     # Reset if new day
                                     if self.daily_execution_stats[symbol]['date'] != now_server:
-                                        self.daily_execution_stats[symbol] = {'date': now_server, 'losses': 0, 'pnl': 0.0}
+                                        self.daily_execution_stats[symbol] = {'date': now_server, 'losses': 0, 'pnl': 0.0, 'tickets': set()}
                                     
+                                    # --- DEDUPLICATION CHECK ---
+                                    if ticket and ticket in self.daily_execution_stats[symbol]['tickets']:
+                                        logger.warning(f"Duplicate Trade Ignored in Monitor: {ticket}")
+                                        continue
+
                                     self.daily_execution_stats[symbol]['pnl'] += net_pnl
                                     
                                     if net_pnl < 0:
                                         self.daily_execution_stats[symbol]['losses'] += 1
                                         logger.info(f"📉 LOSS DETECTED {symbol}: ${net_pnl:.2f} | Daily Losses: {self.daily_execution_stats[symbol]['losses']}")
+                                    
+                                    if ticket:
+                                        self.daily_execution_stats[symbol]['tickets'].add(ticket)
                                 
             except Exception as e:
                 logger.error(f"Performance Monitor Error: {e}")
@@ -369,7 +390,7 @@ class LiveTradingEngine:
             
             # Auto-reset if accessed on a new day before trade loop hits it
             if stats['date'] != now_server:
-                self.daily_execution_stats[symbol] = {'date': now_server, 'losses': 0, 'pnl': 0.0}
+                self.daily_execution_stats[symbol] = {'date': now_server, 'losses': 0, 'pnl': 0.0, 'tickets': set()}
                 return False
                 
             losses = stats['losses']
@@ -444,9 +465,9 @@ class LiveTradingEngine:
                         
                         if exit_reason:
                             close_intent = Trade(
-                                symbol=sym,
-                                action="CLOSE_ALL",
-                                volume=0.0,
+                                symbol=sym, 
+                                action="CLOSE_ALL", 
+                                volume=0.0, 
                                 entry_price=0.0, 
                                 stop_loss=0.0, 
                                 take_profit=0.0, 
@@ -706,8 +727,23 @@ class LiveTradingEngine:
                 return
 
         # 5. Check Risk & Compliance Gates
-        # V10.0: Includes strict Midnight Anchor Check
+        # V10.0: Includes strict Midnight Anchor and Freeze check
         if not self._check_risk_gates(symbol):
+            return
+
+        # --- V12.24 ANTI-STACKING GUARD ---
+        # Ensure we don't fire if a trade is currently pending dispatch or waiting at broker
+        is_pending_execution = False
+        with self.lock:
+            # self.pending_orders is {uuid: {symbol: 'EURUSD', ...}}
+            for oid, p_data in self.pending_orders.items():
+                if p_data.get('symbol') == symbol:
+                    is_pending_execution = True
+                    break
+        
+        if is_pending_execution:
+            # Silently ignore to prevent log spam, or debug log
+            # logger.debug(f"Skipping {symbol} signal - Order already pending.")
             return
 
         # 6. Calculate Size (Fixed Risk Mode)

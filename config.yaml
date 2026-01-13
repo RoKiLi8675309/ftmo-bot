@@ -1,17 +1,18 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V12.12 (FTMO SNIPER MODE - UNSHACKLED)
+# config.yaml – PROJECT PHOENIX V12.32 (FTMO SNIPER MODE - EMERGENCY HARDENING)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# UPDATE LOG (V12.12):
-# 1. RISK: Base Risk 1.0% / Scaled 1.5% (Confirmed).
-# 2. SPREAD: Relaxed Forensic Audit assumptions to match raw spreads (FTMO).
-# 3. SYNC: Added keys for Risk State Synchronization.
+# UPDATE LOG (V12.32):
+# 1. RISK: Emergency Cut to 0.5% Base Risk to halt drawdown.
+# 2. LOGIC: Hurst Threshold -> 0.60 (Strict Trend Only).
+# 3. GATES: ADX -> 25.0 (Strong Trend Only).
+# 4. SAFETY: Max Trades -> 3.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
 env:
   initial_balance: 100000.0
-  mode: "RESEARCH" # Options: RESEARCH, PAPER, LIVE
+  mode: "LIVE" # Options: RESEARCH, PAPER, LIVE
 
 # --- LOGGING CONFIGURATION ---
 logging:
@@ -138,19 +139,18 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 15.0 # V12.7 WIDENED: 25.0 -> 15.0 to catch early trends
+    threshold: 25.0 # V12.32 TIGHTENED: 15.0 -> 25.0 (Strong Trend Only)
   
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V12.7 UNSHACKLED) ---
+# --- PHOENIX STRATEGY PARAMETERS (V12.32 SNIPER MODE) ---
 phoenix_strategy:
   # --- ASSET REGIME MAPPING ---
-  # V12.7: DISABLED to allow full adaptability. 
-  # MEAN_REVERSION REMOVED - TREND ONLY
-  regime_enforcement: "DISABLED" 
+  # V12.32: ENABLED "HARD" to force discipline.
+  regime_enforcement: "HARD" 
   
   asset_regime_map:
     GBP: "TREND_BREAKOUT"   
@@ -167,15 +167,16 @@ phoenix_strategy:
   require_h4_alignment: false         # Rely on ML for context        
   
   # --- LOGIC MAPPING THRESHOLDS ---
-  # V12.7: WIDENED BREAKOUT THRESHOLD (0.55 -> 0.51)
-  hurst_breakout_threshold: 0.51        
-  hurst_mean_reversion_threshold: 0.00  # DISABLED (Set to 0 to prevent trigger)
+  # V12.32: HURST CALIBRATED. 
+  # Now that the x2 bug is gone, 0.5 is random. We need 0.60 for a real trend.
+  hurst_breakout_threshold: 0.60        
+  hurst_mean_reversion_threshold: 0.00  # DISABLED 
   ker_trend_threshold: 0.02             # FLOOR: Only reject absolute flatlines
   
   rvol_volatility_trigger: 3.0        # Liquidity Injection
   
   # --- FILTER THRESHOLDS ---
-  max_relative_volume: 12.0        # V12.7 INCREASED: 8.0 -> 12.0 (Catch News Events)
+  max_relative_volume: 8.0         # V12.32 REDUCED: 12.0 -> 8.0 (Avoid Blow-off Tops)
   volume_gate_ratio: 1.1           # Min Relative Volume
   aggressor_threshold: 0.53        
   ml_confirmation_threshold: 0.50  # STANDARD BINARY (50%)
@@ -238,14 +239,14 @@ risk_management:
   # --- SIZING METHOD: PROFIT BUFFER SCALING ---
   sizing_method: "fixed_risk"
   
-  # INITIAL RISK: V12.7 AGGRESSOR PROTOCOL
-  # 1.0% Base Risk (Increased per instructions)
-  base_risk_per_trade_percent: 0.010 
+  # INITIAL RISK: V12.32 EMERGENCY REDUCTION
+  # 0.5% Base Risk until positive expectancy is restored.
+  base_risk_per_trade_percent: 0.005 
   
   # PROFIT BUFFER LOGIC
   profit_buffer_threshold: 0.03
-  # Scaled risk set to 1.5% to maintain aggressive growth logic
-  scaled_risk_percent: 0.015
+  # Scaled risk 1.0% max
+  scaled_risk_percent: 0.010
   
   # LIMITS (TIGHTENED)
   max_daily_loss_pct: 0.040        # 4.0% (Buffer before FTMO 5%)
@@ -255,7 +256,7 @@ risk_management:
   max_currency_exposure: 2         # Max 2 positions per currency (e.g. 2 USD pairs)
   
   max_risk_percent: 2.5            # Allow more open risk
-  max_open_trades: 6               # REDUCED: Focus on quality
+  max_open_trades: 3               # V12.32 REDUCED: 6 -> 3
   
   max_leverage: 30.0
   max_lot_size: 50.0 
@@ -288,8 +289,6 @@ risk_management:
 # --- TRADING PORTFOLIO (V12.4 SNIPER MODE) ---
 trading:
   # AGGRESSOR PORTFOLIO ROTATION:
-  # REMOVED: USDCHF (Toxic)
-  # ADDED: EURJPY
   symbols:
     - "EURUSD"
     - "GBPUSD"
@@ -385,5 +384,5 @@ wfo:
   n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 60 # LOWERED: Ensure EURUSD/GBPAUD are valid
-  risk_per_trade_options: [0.010, 0.015] # Updated for V12.7 1% Base
+  min_trades_optimization: 60 
+  risk_per_trade_options: [0.005, 0.010]

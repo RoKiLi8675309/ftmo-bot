@@ -5,10 +5,11 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# PHOENIX STRATEGY V12.5 (RESEARCH - REFINED AGGRESSOR):
+# PHOENIX STRATEGY V12.33 (RESEARCH - REFINED AGGRESSOR & RETRAINING PROTOCOL):
 # 1. DATA: Dynamic loading of 10M ticks for high-resolution deep learning.
 # 2. OPTIMIZATION: Updated search space to validate 1.0% Risk Aggressor sizing.
 # 3. REPORTING: Enhanced EmojiCallback for Regime & Drawdown tracking.
+# 4. FRESH START: Added robust logic to purge old models/scalers before training.
 # =============================================================================
 import os
 import sys
@@ -51,7 +52,7 @@ if project_root not in sys.path:
 try:
     from engines.research.backtester import BacktestBroker, MarketSnapshot
     from engines.research.strategy import ResearchStrategy
-    from shared import CONFIG, setup_logging, load_real_data, LogSymbols, AdaptiveImbalanceBarGenerator
+    from shared import CONFIG, setup_logging, load_real_data, LogSymbols, AdaptiveImbalanceBarGenerator, RiskManager
 except ImportError as e:
     print(f"CRITICAL: Failed to import dependencies. Ensure you are running from the project root or 'shared' is accessible.\nError: {e}")
     sys.exit(1)
@@ -704,11 +705,28 @@ class ResearchPipeline:
         if sqn < 7.0: return "HOLY GRAIL? 🦄"
         return "GOD MODE ⚡"
 
+    def _purge_models(self):
+        """
+        Deletes all existing model files to ensure a clean slate for retraining.
+        Crucial after logic changes (e.g., Hurst fix).
+        """
+        log.warning(f"{LogSymbols.trash} PURGING OLD MODELS...")
+        for p in self.models_dir.glob("*.pkl"):
+            try:
+                p.unlink()
+                log.info(f"Deleted: {p.name}")
+            except Exception as e:
+                log.error(f"Failed to delete {p.name}: {e}")
+
     def run_training(self, fresh_start: bool = False):
         log.info(f"{LogSymbols.TIME} STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
         log.info(f"OBJECTIVE: PROFIT IS KING (Total PnL + Efficiency Tie-Breaker)")
         log.info(f"HARDWARE DETECTED: {psutil.cpu_count(logical=True)} Cores. Using {self.total_cores} workers (Configured).")
         
+        # --- V12.33: FRESH START LOGIC ---
+        if fresh_start:
+            self._purge_models()
+
         for symbol in self.symbols:
             study_name = f"study_{symbol}"
             if fresh_start:
@@ -874,6 +892,12 @@ class ResearchPipeline:
         returns_std = df['Net_PnL'].std()
         sqn = (math.sqrt(total_trades) * (df['Net_PnL'].mean() / returns_std)) if returns_std > 0 else 0.0
         sqn_rating = self._get_sqn_rating(sqn)
+        
+        # Correctly calculate duration in minutes
+        # Ensure Duration_Min exists or calculate it
+        if 'Duration_Min' not in df.columns:
+             df['Duration_Min'] = (df['Exit_Time'] - df['Entry_Time']).dt.total_seconds() / 60.0
+        
         avg_duration = df['Duration_Min'].mean()
         
         log.info("="*60)
@@ -955,12 +979,17 @@ def main():
     elif args.backtest:
         pipeline.run_backtest()
     else:
-        pipeline.run_training(fresh_start=args.fresh_start)
+        # Default behavior if no flags: Train then Backtest
+        log.info("No flags provided. Defaulting to FRESH TRAIN + BACKTEST.")
+        pipeline.run_training(fresh_start=True)
         pipeline.run_backtest()
 
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        log.info("Research process interrupted.")
+        sys.exit(0)
     except Exception as e:
-        log.critical(f"FATAL crash: {e}")
-        input("Press Enter to exit...")
+        log.critical(f"Research Pipeline Failed: {e}", exc_info=True)
+        sys.exit(1)

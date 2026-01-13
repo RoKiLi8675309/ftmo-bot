@@ -8,6 +8,7 @@
 # AUDIT REMEDIATION:
 #   - IC-1: Added Stale Order Cleanup (TTL) to prevent 'Pending' deadlocks.
 #   - 2025-12-20 Audit: Enforced maxlen on xadd to prevent memory leaks.
+#   - V12.19 Fix: Added 'price' and 'type' keys to payload for Producer V12.19 compliance.
 # =============================================================================
 import logging
 import json
@@ -70,13 +71,20 @@ class TradeDispatcher:
                 "symbol": str(trade.symbol),
                 "action": str(trade.action),  # "BUY" or "SELL"
                 "volume": "{:.2f}".format(float(trade.volume)),  # Explicit float formatting
+                
+                # V12.19 FIX: Send both legacy 'entry_price' and new 'price' keys
+                # The Producer looks for 'price' to enable Limit Order logic.
                 "entry_price": str(trade.entry_price),
+                "price": str(trade.entry_price), 
+                
                 "stop_loss": str(trade.stop_loss),
                 "take_profit": str(trade.take_profit),
                 "magic_number": str(self.magic_number),
                 "comment": comment,
                 "timestamp": str(time.time()),  # ZOMBIE CHECK: High precision time
-                "type": "MARKET" 
+                
+                # V12.19 FIX: Respect trade.entry_type (LIMIT vs MARKET)
+                "type": str(trade.entry_type).upper() 
             }
 
             # 4. Transmit to Redis
@@ -85,7 +93,7 @@ class TradeDispatcher:
             
             logger.info(
                 f"{LogSymbols.UPLOAD} DISPATCH SENT: {trade.action} {trade.symbol} "
-                f"| Vol: {trade.volume:.2f} | Risk: ${estimated_risk_usd:.2f} | ID: {short_id}"
+                f"| Vol: {trade.volume:.2f} | Price: {trade.entry_price} | Type: {trade.entry_type} | Risk: ${estimated_risk_usd:.2f}"
             )
         except Exception as e:
             logger.error(f"{LogSymbols.ERROR} Dispatch Failed for {trade.symbol}: {e}")

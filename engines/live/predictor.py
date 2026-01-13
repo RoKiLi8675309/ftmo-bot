@@ -6,11 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX STRATEGY V12.14 (LIVE PREDICTOR - DATA INTEGRITY):
-# 1. LOGIC: "Mean Reversion" regime purged (Trend Only Protocol).
-# 2. MATH: Robust Golden Trio calculation (safe log/variance).
-# 3. FILTERS: JPY Pairs strictly bypass RSI Overbought/Oversold checks.
-# 4. FLOW: Explicit propagation of buy/sell volume from Bar to Features.
+# PHOENIX V12.32 CRITICAL FIX (HURST CALIBRATION):
+# 1. MATH FIX: Removed erroneous '* 2.0' scalar from Hurst Calculation.
+#    - PREVIOUS: Random Walk (0.5) -> Scaled to 1.0 (False Positive Trend).
+#    - NOW: Random Walk (0.5) -> Remains 0.5 (Correctly rejected by Gate 0.51).
+# 2. LOGIC: This stops the bot from "Buying the Top" in choppy/ranging markets.
 # =============================================================================
 import logging
 import pickle
@@ -276,8 +276,9 @@ class MultiAssetPredictor:
                     tau.append(std if std > 1e-9 else 1e-9)
                 
                 # Polyfit on log-log
+                # V12.32 FIX: Removed '* 2.0' which was forcing False Positive Trends
                 poly = np.polyfit(np.log(lags), np.log(tau), 1)
-                hurst = poly[0] * 2.0 # Adjust scale
+                hurst = poly[0] 
                 hurst = max(0.0, min(1.0, hurst))
         except:
             hurst = 0.5

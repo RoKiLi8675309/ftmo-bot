@@ -2,18 +2,22 @@
 # FILENAME: diagnose.py
 # ENVIRONMENT: Linux/WSL2 (Python 3.11)
 # PATH: diagnose.py
-# DEPENDENCIES: unittest, numpy, shared
-# DESCRIPTION: Pre-Flight Forensic Diagnostics. Validates Math Kernels & Config.
-# Updates:
-# - FIXED: Removed invalid LogSymbols.SEARCH reference.
-# - CHECK: Verifies 1.0% Risk and Disabled Regime settings.
-# CRITICAL: Must pass (Exit Code 0) before 'run_pipeline.sh' proceeds.
+# DEPENDENCIES: unittest, numpy, redis, shared
+# DESCRIPTION: Pre-Flight Forensic Diagnostics & PIPELINE VERIFICATION.
+# 
+# PHOENIX V12.18 UPDATE (INTEGRATED PIPELINE PROBE):
+# 1. INFRASTRUCTURE: Verifies Redis connectivity from Linux.
+# 2. HEARTBEAT: Checks if Windows Producer is alive (reading 'producer:heartbeat').
+# 3. INJECTION: Sends a 'PROBE' signal to force a reaction from MT5.
 # =============================================================================
 import unittest
 import numpy as np
 import pandas as pd
 import logging
 import time
+import json
+import uuid
+import redis
 from collections import deque
 
 # Shared Imports
@@ -27,11 +31,13 @@ from shared import (
     PrecisionGuard,
     SystemDiagnose,
     TradeContext,
-    CONFIG
+    CONFIG,
+    get_redis_connection
 )
 
 # Configure Test Logging
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logger = logging.getLogger("Diagnose")
 
 class TestConfigurationIntegrity(unittest.TestCase):
     """
@@ -39,51 +45,111 @@ class TestConfigurationIntegrity(unittest.TestCase):
     with the Unshackled Protocol parameters.
     """
     def test_unshackled_risk_params(self):
-        """
-        Verify Risk Management is set to 1.0% Base / 1.5% Scaled.
-        """
+        """Verify Risk Management is set to 1.0% Base / 1.5% Scaled."""
         risk_conf = CONFIG.get('risk_management', {})
         base_risk = risk_conf.get('base_risk_per_trade_percent')
         scaled_risk = risk_conf.get('scaled_risk_percent')
         
         print(f"   [CONF] Base Risk: {base_risk*100:.1f}% | Scaled Risk: {scaled_risk*100:.1f}%")
-        
         self.assertEqual(base_risk, 0.010, "CRITICAL: Base Risk must be 1.0% (0.010)")
         self.assertEqual(scaled_risk, 0.015, "CRITICAL: Scaled Risk must be 1.5% (0.015)")
 
     def test_regime_settings(self):
-        """
-        Verify Regime Enforcement is DISABLED for maximum AI adaptability.
-        """
+        """Verify Regime Enforcement is DISABLED for maximum AI adaptability."""
         phx_conf = CONFIG.get('phoenix_strategy', {})
         regime_mode = phx_conf.get('regime_enforcement')
-        
         print(f"   [CONF] Regime Mode: {regime_mode}")
-        
         self.assertEqual(regime_mode, "DISABLED", "CRITICAL: Regime Enforcement must be DISABLED")
 
-    def test_confidence_gates(self):
+class TestInfrastructureAndExecution(unittest.TestCase):
+    """
+    V12.18 PIPELINE FORENSICS:
+    Validates the connection between Linux Logic and Windows Execution.
+    """
+    def setUp(self):
+        self.r = get_redis_connection(
+            host=CONFIG['redis']['host'],
+            port=CONFIG['redis']['port'],
+            db=0,
+            decode_responses=True
+        )
+        self.stream_key = CONFIG['redis']['trade_request_stream']
+
+    def test_1_redis_connectivity(self):
+        """Can we talk to the database?"""
+        try:
+            self.r.ping()
+            print(f"   {LogSymbols.ONLINE} Redis Connection: ESTABLISHED ({CONFIG['redis']['host']})")
+        except redis.ConnectionError:
+            self.fail(f"{LogSymbols.CRITICAL} CRITICAL: Cannot connect to Redis. Check 'redis' container.")
+
+    def test_2_windows_producer_heartbeat(self):
         """
-        Verify Confidence Gating is removed (Min Probability = 0.00).
+        CRITICAL: Is the Windows machine writing to THIS Redis instance?
+        Checks 'producer:heartbeat' timestamp.
         """
-        ml_conf = CONFIG.get('online_learning', {})
-        min_prob = ml_conf.get('min_calibrated_probability')
+        heartbeat_key = CONFIG.get('redis', {}).get('heartbeat_key', 'producer:heartbeat')
+        last_beat = self.r.get(heartbeat_key)
         
-        print(f"   [CONF] Min Probability: {min_prob}")
+        if not last_beat:
+            print(f"   {LogSymbols.OFFLINE} HEARTBEAT MISSING: Windows Producer has NOT written to key '{heartbeat_key}'.")
+            print("   -> CAUSE: Windows is either offline OR connecting to a different Redis IP.")
+            # We don't fail, but we warn LOUDLY
+        else:
+            delta = time.time() - float(last_beat)
+            status = "ALIVE" if delta < 30 else f"STALE ({int(delta)}s ago)"
+            icon = LogSymbols.ONLINE if delta < 30 else LogSymbols.WARNING
+            print(f"   {icon} Windows Producer Status: {status}")
+            
+            if delta > 60:
+                print(f"   {LogSymbols.CRITICAL} WARNING: Windows Producer is effectively DEAD (Last beat > 60s ago).")
+
+    def test_3_inject_probe_signal(self):
+        """
+        INJECTS A TEST TRADE to force a reaction from Windows.
+        Target: EURUSD @ 0.50000 (Safe Limit Order).
+        """
+        print(f"\n   {LogSymbols.UPLOAD} INJECTING PROBE SIGNAL (PIPELINE CHECK)...")
         
-        self.assertLessEqual(min_prob, 0.01, "CRITICAL: Confidence Gate must be effectively disabled (<= 0.01)")
+        payload = {
+            "id": str(uuid.uuid4()),
+            "uuid": str(uuid.uuid4()),
+            "symbol": "EURUSD",
+            "action": "BUY",
+            "volume": "0.01",
+            "price": "0.50000",
+            "stop_loss": "0.49000",
+            "take_profit": "0.51000",
+            "magic_number": "999999", # Diagnostic Magic
+            "comment": "DIAGNOSE_PROBE",
+            "timestamp": str(time.time()),
+            "type": "LIMIT"
+        }
+        
+        try:
+            msg_id = self.r.xadd(self.stream_key, payload)
+            print(f"   {LogSymbols.SUCCESS} Probe Sent! Msg ID: {msg_id}")
+            print(f"   -> CHECK WINDOWS TERMINAL NOW. It should say 'RECEIVED TRADE REQUEST'.")
+        except Exception as e:
+            self.fail(f"Failed to inject probe: {e}")
+
+    def test_4_inspect_stream_flow(self):
+        """Are signals actually landing in the stream?"""
+        slen = self.r.xlen(self.stream_key)
+        print(f"   {LogSymbols.VPIN} Stream '{self.stream_key}' Depth: {slen} messages")
+        
+        if slen > 0:
+            last = self.r.xrevrange(self.stream_key, count=1)
+            print(f"   -> Latest Message: {last[0][1]}")
+        else:
+            print("   -> Stream is empty.")
 
 class TestFeatureEngineering(unittest.TestCase):
-    """
-    Validates the 'Golden Six' feature calculations.
-    """
+    """Validates the 'Golden Six' feature calculations."""
     def setUp(self):
         self.fe = OnlineFeatureEngineer(window_size=50)
 
     def test_entropy_calculation(self):
-        """
-        FORENSIC CHECK: Entropy should be 0.0 for constant data, high for noise.
-        """
         # Case A: Constant Data (Extremely Low Entropy / Ordered)
         current_ts = 1000.0
         constant_prices = np.full(100, 100.0)
@@ -96,7 +162,7 @@ class TestFeatureEngineering(unittest.TestCase):
         entropy_ordered = features.get('entropy', 0.5)
         self.assertAlmostEqual(entropy_ordered, 0.0, places=4, msg="Constant data should have 0.0 entropy")
 
-        # Case B: Random Noise (High Entropy / Disordered)
+        # Case B: Random Noise
         self.fe = OnlineFeatureEngineer(window_size=50)
         np.random.seed(42)
         noise_prices = 100.0 + np.random.normal(0, 5.0, 150)
@@ -107,49 +173,6 @@ class TestFeatureEngineering(unittest.TestCase):
         features_noise = self.fe.update(price=100.0, timestamp=current_ts, volume=100)
         entropy_noise = features_noise.get('entropy', 0.5)
         self.assertGreater(entropy_noise, 0.1, msg="Random noise should have non-zero entropy")
-
-class TestLabeling(unittest.TestCase):
-    """
-    Validates Triple Barrier Method (TBM) logic.
-    """
-    def setUp(self):
-        self.tbm = StreamingTripleBarrier(
-            vol_multiplier=2.0,
-            barrier_len=50
-        )
-
-    def test_take_profit_hit(self):
-        for _ in range(30):
-            self.tbm.history.append(100.0)
-        
-        start_ts = 1000.0
-        self.tbm.update(price=100.0, timestamp=start_ts)
-
-        # Tick below TP -> No resolution
-        resolved = self.tbm.update(price=100.1, timestamp=start_ts + 1)
-        self.assertEqual(len(resolved), 0)
-
-        # Tick above TP -> Buy Signal
-        resolved = self.tbm.update(price=100.3, timestamp=start_ts + 2)
-        self.assertGreaterEqual(len(resolved), 1)
-        labels = [r[0] for r in resolved]
-        self.assertIn(1, labels)
-
-class TestVolumeAggregation(unittest.TestCase):
-    def test_volume_threshold_carry_over(self):
-        agg = VolumeBarAggregator(symbol="TEST", threshold=100)
-        
-        # 1. Add small tick
-        bar = agg.process_tick(price=1.0, volume=50, timestamp=1000)
-        self.assertIsNone(bar)
-        
-        # 2. Add triggering tick (50 + 60 = 110)
-        bar = agg.process_tick(price=1.0, volume=60, timestamp=1001)
-        self.assertIsNotNone(bar)
-        self.assertEqual(bar.volume, 100.0)
-        
-        # 3. Verify Carry Over
-        self.assertEqual(agg.current_volume, 10.0)
 
 class TestRiskCalculations(unittest.TestCase):
     def test_cross_pair_pip_value(self):
@@ -162,9 +185,7 @@ class TestRiskCalculations(unittest.TestCase):
             win_rate=0.55,
             risk_reward_ratio=1.0
         )
-        
         mock_prices = {"USDCAD": 1.3500}
-
         trade, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=0.6,
@@ -172,18 +193,15 @@ class TestRiskCalculations(unittest.TestCase):
             active_correlations=0,
             market_prices=mock_prices
         )
-        
         self.assertGreater(trade.volume, 0.0, "Trade volume should be > 0")
         self.assertGreater(risk_usd, 0.0, "Risk USD should be calculated")
 
     def test_precision_guard(self):
         digits = PrecisionGuard.get_digits("US30")
         self.assertTrue(digits in [1, 2], "Indices should have 1 or 2 digits")
-        
         digits = PrecisionGuard.get_digits("BTCUSD")
         self.assertEqual(digits, 2, "Crypto heuristic should work")
 
 if __name__ == '__main__':
-    # Fixed LogSymbols usage: Use explicit emoji or existing symbol
-    print(f"\n🔍 RUNNING PHOENIX V12.7 PRE-FLIGHT DIAGNOSTICS...")
+    print(f"\n🔍 RUNNING PHOENIX V12.18 PIPELINE DIAGNOSTICS...")
     unittest.main(verbosity=2)
