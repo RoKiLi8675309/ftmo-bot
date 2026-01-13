@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX V12.41 (HURST FIX PARITY):
-# 1. MATH FIX: Removed '* 2.0' from Hurst calculation in Live Engine.
-#    - REASON: Aligns with Shared Library and Research Engine.
-#    - IMPACT: Prevents "Buy the Top" in ranging markets by correctly identifying H ~ 0.5.
+# PHOENIX V13.0 UPDATE (SURVIVAL MODE):
+# 1. GATE RELAXATION: Hurst threshold lowered to 0.50 for earlier entry.
+# 2. FILTER WIDENING: RSI filters relaxed to 80/20 to allow strong breakouts.
+# 3. MATH PARITY: Removed Hurst scalar to match Research Engine.
 # =============================================================================
 import logging
 import pickle
@@ -87,7 +87,7 @@ class MultiAssetPredictor:
         self.closes_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         self.volume_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         self.bb_window = 20
-        self.bb_std = 1.5 # V11.1 FIX: Lowered from 2.0 to catch earlier moves
+        self.bb_std = 1.5 # V13.0: 1.5 Std Dev allowed for earlier entries
         self.bb_buffers = {s: deque(maxlen=self.bb_window) for s in symbols}
         
         # --- SNIPER PROTOCOL BUFFERS ---
@@ -163,13 +163,13 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V12.3) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V13.0) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         self.default_max_rvol = 8.0
         
-        # V12.0 Logic Thresholds (Optimized for velocity)
-        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.02))
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.55))
+        # V13.0 Logic Thresholds (Relaxed for Survival Mode)
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.01))
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.50)) # RELAXED
         # Mean Reversion Threshold Ignored in V12.7
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
@@ -533,11 +533,11 @@ class MultiAssetPredictor:
             return 
 
         # ============================================================
-        # 4. PHOENIX V12.7: UNSHACKLED PROTOCOL (TREND ONLY)
+        # 4. PHOENIX V13.0: SURVIVAL PROTOCOL (TREND ONLY)
         # ============================================================
         
         phx = CONFIG.get('phoenix_strategy', {})
-        max_rvol_thresh = float(phx.get('max_relative_volume', 8.0)) 
+        max_rvol_thresh = float(phx.get('max_relative_volume', 15.0)) # Relaxed from 8.0
         
         # FRIDAY GUARD
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
@@ -563,12 +563,12 @@ class MultiAssetPredictor:
             
         bb_mu = np.mean(self.bb_buffers[symbol])
         bb_std = np.std(self.bb_buffers[symbol])
+        bb_mult = 1.5 # V13.0: 1.5 Std Dev allowed
         upper_bb = bb_mu + (self.bb_std * bb_std)
         lower_bb = bb_mu - (self.bb_std * bb_std)
         
-        # --- V12.7 LOGIC MAPPING: TREND ONLY ---
+        # --- V13.0 LOGIC MAPPING: TREND ONLY ---
         is_trending = hurst > self.hurst_breakout
-        # REVERSION LOGIC REMOVED (PURGED)
         
         if is_trending:
             if preferred_regime == "MEAN_REVERSION":
@@ -590,7 +590,7 @@ class MultiAssetPredictor:
             stats["No Trigger"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "No BB Trigger in Regime"})
             
-        # --- REGIME ENFORCEMENT (V12.3) ---
+        # --- REGIME ENFORCEMENT ---
         if is_regime_clash:
             if self.regime_enforcement == "HARD":
                 stats["Personality Clash (Hard Block)"] += 1
@@ -626,10 +626,8 @@ class MultiAssetPredictor:
         is_profitable = meta_labeler.predict(features, proposed_action, threshold=meta_threshold)
 
         # --- EXECUTION WITH DYNAMIC CONFIDENCE ---
-        # REMOVED IN V12.7: min_prob gating.
         
         if is_regime_clash:
-            # SOFT Override logic technically bypassed if Disabled, keeping for safety
             pass 
 
         # --- SNIPER PROTOCOL: FINAL FILTER GATE (V11) ---
@@ -690,12 +688,9 @@ class MultiAssetPredictor:
 
     def _check_sniper_filters(self, symbol: str, signal: int, price: float, d1_ema: float) -> bool:
         """
-        V11.0 SNIPER PROTOCOL (LIVE):
+        V13.0 SNIPER PROTOCOL (LIVE):
         1. Trend Filter: D1 Alignment (DISABLED in V11 Aggressor Mode).
-        2. RSI Guard: Strict Overbought (70) / Oversold (30) rejection.
-        
-        V12.4 AGGRESSOR UPDATE:
-        - JPY pairs (GBPJPY, USDJPY) bypass RSI filters to capture runaway trends.
+        2. RSI Guard: Relaxed Overbought (80) / Oversold (20) rejection.
         """
         # 1. RSI CALCULATION (M5 Extension)
         if len(self.sniper_rsi[symbol]) < 14:
@@ -721,15 +716,15 @@ class MultiAssetPredictor:
         else:
             trend_aligned = True # Pass if disabled or no data
 
-        # 3. RSI EXTREME GUARD
-        # AGGRESSOR PROTOCOL: Bypass RSI filter for JPY pairs
+        # 3. RSI EXTREME GUARD (V13.0 RELAXED)
+        # We allow deeper excursions to catch breakout momentum
         if "JPY" in symbol:
             pass # JPY pairs trend hard, ignore RSI extremes
         else:
             if signal == 1: # BUY
-                if rsi > 70: return False # Reject Overbought
+                if rsi > 80: return False # Reject Overbought > 80
             elif signal == -1: # SELL
-                if rsi < 30: return False # Reject Oversold
+                if rsi < 20: return False # Reject Oversold < 20
         
         return True
 

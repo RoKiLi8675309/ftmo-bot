@@ -5,10 +5,8 @@
 # DEPENDENCIES: unittest, numpy, redis, shared
 # DESCRIPTION: Pre-Flight Forensic Diagnostics & PIPELINE VERIFICATION.
 # 
-# PHOENIX V12.18 UPDATE (INTEGRATED PIPELINE PROBE):
-# 1. INFRASTRUCTURE: Verifies Redis connectivity from Linux.
-# 2. HEARTBEAT: Checks if Windows Producer is alive (reading 'producer:heartbeat').
-# 3. INJECTION: Sends a 'PROBE' signal to force a reaction from MT5.
+# PHOENIX V13.1 UPDATE (SURVIVAL DIAGNOSTICS):
+# 1. RISK CHECK: Updated assertions to match V13.0 Survival Mode (0.5% / 1.0%).
 # =============================================================================
 import unittest
 import numpy as np
@@ -41,18 +39,18 @@ logger = logging.getLogger("Diagnose")
 
 class TestConfigurationIntegrity(unittest.TestCase):
     """
-    V12.7 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
-    with the Unshackled Protocol parameters.
+    V13.0 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
+    with the Survival Protocol parameters.
     """
     def test_unshackled_risk_params(self):
-        """Verify Risk Management is set to 1.0% Base / 1.5% Scaled."""
+        """Verify Risk Management is set to 0.5% Base / 1.0% Scaled (Survival Mode)."""
         risk_conf = CONFIG.get('risk_management', {})
         base_risk = risk_conf.get('base_risk_per_trade_percent')
         scaled_risk = risk_conf.get('scaled_risk_percent')
         
         print(f"   [CONF] Base Risk: {base_risk*100:.1f}% | Scaled Risk: {scaled_risk*100:.1f}%")
-        self.assertEqual(base_risk, 0.010, "CRITICAL: Base Risk must be 1.0% (0.010)")
-        self.assertEqual(scaled_risk, 0.015, "CRITICAL: Scaled Risk must be 1.5% (0.015)")
+        self.assertEqual(base_risk, 0.005, "CRITICAL: Base Risk must be 0.5% (0.005)")
+        self.assertEqual(scaled_risk, 0.010, "CRITICAL: Scaled Risk must be 1.0% (0.010)")
 
     def test_regime_settings(self):
         """Verify Regime Enforcement is DISABLED for maximum AI adaptability."""
@@ -203,5 +201,5 @@ class TestRiskCalculations(unittest.TestCase):
         self.assertEqual(digits, 2, "Crypto heuristic should work")
 
 if __name__ == '__main__':
-    print(f"\n🔍 RUNNING PHOENIX V12.18 PIPELINE DIAGNOSTICS...")
+    print(f"\n🔍 RUNNING PHOENIX V13.1 PIPELINE DIAGNOSTICS...")
     unittest.main(verbosity=2)

@@ -5,10 +5,9 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX STRATEGY V12.8 (MATH HARMONIZATION):
-# 1. MATH FIX: Removed '* 2.0' from Hurst calculation to match Live Engine.
-# 2. LOGIC: Ensures Backtest respects the same Random Walk rejection as Live.
-# 3. VERIFICATION: Aligned Golden Trio calculation with shared.features logic.
+# PHOENIX V13.1 UPDATE (LEVERAGE HARMONY):
+# 1. MARGIN CALCULATION: Simulates 'used_margin' to estimate 'free_margin'.
+# 2. LEVERAGE GUARD: Passes estimated free margin to RiskManager for clamping.
 # =============================================================================
 import logging
 import sys
@@ -47,7 +46,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V12.7 Alpha Seeker Protocol.
+    Strictly implements the Phoenix V13.0 Survival Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -111,12 +110,12 @@ class ResearchStrategy:
         self.current_d1_ema = 0.0 
         
         # --- SNIPER PROTOCOL INDICATORS ---
-        self.sniper_closes = deque(maxlen=200)        
+        self.sniper_closes = deque(maxlen=200)       
         self.sniper_rsi = deque(maxlen=15)    
         
         # --- V11.1 MOMENTUM INDICATORS ---
         self.bb_window = 20
-        self.bb_std = 1.5 # V11.1 FIX: Lowered from 2.0 to 1.5 to catch starts of moves
+        self.bb_std = 1.5 # V13.0: 1.5 Default for earlier entries
         self.bb_buffer = deque(maxlen=self.bb_window)
         
         # --- FORENSIC RECORDER ---
@@ -125,12 +124,12 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX V12.0 CONFIGURATION ---
+        # --- PHOENIX V13.0 CONFIGURATION ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V12.0 Logic Thresholds
-        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.02)) 
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.55))
+        # V13.0 Logic Thresholds
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.01)) 
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.50)) # RELAXED
         # Mean Reversion Threshold ignored in V12.7 (Logic Removed)
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
@@ -140,7 +139,7 @@ class ResearchStrategy:
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
         
         self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 1.1)) 
-        self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 8.0))
+        self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 15.0)) # RELAXED
         self.chop_threshold = float(phx_conf.get('choppiness_threshold', 60.0)) # Relaxed
         
         adx_cfg = CONFIG.get('features', {}).get('adx', {})
@@ -190,7 +189,7 @@ class ResearchStrategy:
             lags = range(2, 20)
             tau = [np.std(np.subtract(prices[lag:], prices[:-lag])) for lag in lags]
             poly = np.polyfit(np.log(lags), np.log(tau), 1)
-            # V12.8 FIX: Removed * 2.0 to match Live Engine & Correct Math
+            # V12.8 FIX: Removed * 2.0 scalar to match Live Engine & Correct Math
             hurst = poly[0] 
             hurst = max(0.0, min(1.0, hurst))
         except:
@@ -288,7 +287,7 @@ class ResearchStrategy:
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (V12.7 FTMO Sniper Mode).
+        Main Event Loop for the Strategy (V13.0 FTMO Survival Mode).
         """
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
@@ -350,8 +349,6 @@ class ResearchStrategy:
         self._manage_time_stops(broker, dt_ts)
 
         # --- GAP-PROOF WEEKEND LIQUIDATION (V12.5) ---
-        # Explicit check for Saturday/Sunday OR Friday late hours
-        # Sat=5, Sun=6 in Python weekday()
         is_weekend_hold = (server_time.weekday() > 4) 
         is_friday_close = (server_time.weekday() == 4 and server_time.hour >= self.friday_close_hour)
 
@@ -460,10 +457,10 @@ class ResearchStrategy:
             return 
 
         # ============================================================
-        # E. AGGRESSOR GATES & ASSET PERSONALITY (V12.7 UNSHACKLED)
+        # E. SURVIVAL GATES & ASSET PERSONALITY (V13.0)
         # ============================================================
         
-        # G1: EFFICIENCY (KER) - AGGRESSIVE
+        # G1: EFFICIENCY (KER)
         base_thresh = self.ker_floor 
         effective_ker_thresh = max(0.005, base_thresh + self.dynamic_ker_offset)
             
@@ -484,11 +481,11 @@ class ResearchStrategy:
             
         bb_mu = np.mean(self.bb_buffer)
         bb_std = np.std(self.bb_buffer)
-        bb_mult = 1.5
+        bb_mult = 1.5 # V13.0: 1.5 Std Dev allowed
         upper_bb = bb_mu + (bb_mult * bb_std)
         lower_bb = bb_mu - (bb_mult * bb_std)
         
-        # --- V12.7 LOGIC MAPPING: TREND ONLY ---
+        # --- V13.0 LOGIC MAPPING: TREND ONLY ---
         is_trending = hurst > self.hurst_breakout
         
         if is_trending:
@@ -503,7 +500,7 @@ class ResearchStrategy:
                 proposed_action = -1 # Breakout Sell
                 
         else:
-            # NEUTRAL ZONE (Also catches Reversion since logic removed)
+            # NEUTRAL ZONE 
             self.rejection_stats[f"Random Walk Regime (H={hurst:.2f})"] += 1
             return
 
@@ -511,7 +508,7 @@ class ResearchStrategy:
             self.rejection_stats["No Trigger"] += 1
             return
             
-        # --- REGIME ENFORCEMENT (V12.7) ---
+        # --- REGIME ENFORCEMENT ---
         if is_regime_clash:
             if self.regime_enforcement == "HARD":
                 self.rejection_stats[f"Personality Clash ({regime_label} on {preferred_regime})"] += 1
@@ -541,12 +538,9 @@ class ResearchStrategy:
         
         try:
             pred_proba = self.model.predict_proba_one(features)
-            # prob_buy = pred_proba.get(1, 0.0)
-            # prob_sell = pred_proba.get(-1, 0.0)
             
-            # V12.7 UNSHACKLED: Bypass Calibration/Confidence Check
-            # We trust the Meta Labeler and Regime Filters entirely.
-            confidence = 1.0 # Force max confidence to bypass filters
+            # V13.0 SURVIVAL: Bypass Calibration
+            confidence = 1.0 
             
             is_profitable = self.meta_labeler.predict(
                 features, 
@@ -557,9 +551,7 @@ class ResearchStrategy:
             if proposed_action != 0:
                 self.meta_label_events += 1
 
-            # V12.7: SOFT REGIME OVERRIDE LOGIC REMOVED/DISABLED
             if is_regime_clash:
-               # If clashing was allowed by DISABLED config, we treat as normal
                pass
 
             # --- SNIPER PROTOCOL ---
@@ -567,7 +559,7 @@ class ResearchStrategy:
                 self.rejection_stats["Sniper Reject"] += 1
                 return
             
-            # --- PORTFOLIO HEAT (V12.3) ---
+            # --- PORTFOLIO HEAT ---
             if not self._check_currency_exposure(broker, self.symbol):
                 return
 
@@ -584,8 +576,8 @@ class ResearchStrategy:
 
     def _execute_entry(self, confidence, price, features, broker, dt_timestamp, action_int, regime, tighten_stops):
         """
-        Executes the trade entry logic with Fixed Risk.
-        V12.0: Includes Profit Buffer Scaling Logic.
+        Executes the trade entry logic with Fixed Risk & Portfolio Cap.
+        V13.1: Calculates Leverage-Based Margin to prevent "No Money".
         """
         action = "BUY" if action_int == 1 else "SELL"
         
@@ -617,9 +609,33 @@ class ResearchStrategy:
         else:
             effective_sqn = sqn_score
 
-        # V12.0: CALCULATE DAILY PNL PCT FOR BUFFER SCALING
+        # V12.0: CALCULATE DAILY PNL PCT
         daily_pnl_val = broker.equity - broker.daily_start_equity
         daily_pnl_pct = daily_pnl_val / broker.daily_start_equity if broker.daily_start_equity > 0 else 0.0
+
+        # --- V13.0: CALCULATE TOTAL OPEN RISK % (THE FIX) ---
+        current_open_risk_usd = 0.0
+        # --- V13.1: ESTIMATE USED MARGIN (LEVERAGE GUARD) ---
+        used_margin = 0.0
+        contract_size = 100000 
+        
+        for pos in broker.open_positions:
+            # 1. Open Risk
+            price_dist = abs(pos.entry_price - pos.stop_loss)
+            rate = RiskManager.get_conversion_rate(pos.symbol, pos.entry_price, self.last_price_map)
+            risk_val = price_dist * pos.quantity * contract_size * rate
+            current_open_risk_usd += risk_val
+            
+            # 2. Used Margin (Estimate)
+            trade_margin = RiskManager.calculate_required_margin(
+                pos.symbol, pos.quantity, pos.entry_price, contract_size, rate
+            )
+            used_margin += trade_margin
+            
+        current_open_risk_pct = (current_open_risk_usd / broker.equity) * 100.0
+        
+        # Estimate Free Margin (Broker Equity - Used Margin)
+        estimated_free_margin = max(0.0, broker.equity - used_margin)
 
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
@@ -632,14 +648,15 @@ class ResearchStrategy:
             account_size=broker.equity,
             risk_percent_override=risk_override,
             performance_score=effective_sqn,
-            daily_pnl_pct=daily_pnl_pct # V12.0 UPDATE
+            daily_pnl_pct=daily_pnl_pct,
+            current_open_risk_pct=current_open_risk_pct,
+            free_margin=estimated_free_margin # V13.1 PASSED
         )
 
         if trade_intent.volume <= 0:
             self.rejection_stats[f"Risk Zero ({trade_intent.comment})"] += 1
             return
 
-        # V11.0: If Volatility Trigger is active (tighten_stops), reduce the ATR multiplier
         atr_mult = self.sl_atr_mult
         if tighten_stops:
             atr_mult = max(1.0, atr_mult * 0.75) 
@@ -759,6 +776,16 @@ class ResearchStrategy:
             )
 
     def _manage_trailing_stops(self, broker: BacktestBroker, current_price: float, timestamp: datetime):
+        """
+        V13.0 PATIENCE UPDATE:
+        - Wait for 1.0R (Configurable) before moving to Breakeven.
+        - Trail loosely (0.5R default) to allow volatility breathing room.
+        """
+        # Load from config, default to 1.0R activation if missing (Patience)
+        trail_conf = self.risk_conf.get('trailing_stop', {})
+        activation_r = float(trail_conf.get('activation_r', 1.0))
+        trail_dist_r = float(trail_conf.get('trail_dist_r', 0.5))
+
         for pos in broker.open_positions:
             if pos.symbol != self.symbol: continue
             
@@ -774,33 +801,39 @@ class ResearchStrategy:
             new_sl = None
             reason = ""
             
-            # V11.1: Aggressive Scalp Trailing (0.5R Activation)
-            if r_multiple >= 0.5 and r_multiple < 1.0:
-                target_sl = pos.entry_price - (risk_dist * 0.5) if pos.side == 1 else pos.entry_price + (risk_dist * 0.5)
+            # 1. ACTIVATION (Wait for profit > 1.0R)
+            if r_multiple >= activation_r:
                 
-                if pos.side == 1 and target_sl > pos.stop_loss:
-                    new_sl = target_sl
-                    reason = "Tighten (0.5R)"
-                elif pos.side == -1 and target_sl < pos.stop_loss:
-                    new_sl = target_sl
-                    reason = "Tighten (0.5R)"
-
-            elif r_multiple >= 1.0:
-                trail_dist = risk_dist * 0.5
+                # Calculate Trail Distance (e.g. 0.5R behind price)
+                trail_pips = risk_dist * trail_dist_r
+                
                 if pos.side == 1: 
-                    target_sl = current_price - trail_dist
+                    # BUY: SL = Current Price - Trail Distance
+                    target_sl = current_price - trail_pips
+                    
+                    # Also ensure we at least lock in Breakeven + small buffer (0.1R)
+                    min_lock = pos.entry_price + (risk_dist * 0.1)
+                    target_sl = max(target_sl, min_lock)
+                    
                     if target_sl > pos.stop_loss:
                         new_sl = target_sl
                         reason = f"Trail ({r_multiple:.1f}R)"
+                        
                 else: 
-                    target_sl = current_price + trail_dist
+                    # SELL: SL = Current Price + Trail Distance
+                    target_sl = current_price + trail_pips
+                    
+                    # Ensure Breakeven + buffer
+                    min_lock = pos.entry_price - (risk_dist * 0.1)
+                    target_sl = min(target_sl, min_lock)
+                    
                     if target_sl < pos.stop_loss:
                         new_sl = target_sl
                         reason = f"Trail ({r_multiple:.1f}R)"
             
             if new_sl is not None:
                 pos.stop_loss = new_sl
-                if "Trail" in reason or "Tighten" in reason:
+                if "Trail" in reason:
                       if reason not in pos.comment:
                           pos.comment += f"|{reason}"
                       if self.debug_mode:
@@ -809,7 +842,8 @@ class ResearchStrategy:
     def _check_daily_loss_limit(self, broker: BacktestBroker) -> bool:
         try:
             current_dd_pct = (broker.initial_balance - broker.equity) / broker.initial_balance
-            if current_dd_pct > 0.049: 
+            # V13.0: 4.5% Hard Cap Logic
+            if current_dd_pct > 0.045: 
                 return True
             return False
         except:
@@ -903,12 +937,9 @@ class ResearchStrategy:
 
     def _check_sniper_filters(self, signal: int, price: float) -> bool:
         """
-        V11.0 SNIPER PROTOCOL (LIVE):
-        1. Trend Filter: D1 Alignment (DISABLED in V11 Aggressor Mode).
-        2. RSI Guard: Strict Overbought (70) / Oversold (30) rejection.
-        
-        V12.4 AGGRESSOR UPDATE:
-        - Jettison RSI filters for JPY pairs to capture runaway trends.
+        V13.0 UPDATE:
+        - Relaxed RSI filters (80/20) for all pairs.
+        - Allow breakouts to breathe.
         """
         # 1. RSI CALCULATION (M5 Extension)
         if len(self.sniper_rsi) < 14:
@@ -925,7 +956,7 @@ class ResearchStrategy:
         trend_aligned = False
         d1_ema = self.current_d1_ema
         
-        if self.require_d1_trend and d1_ema > 0: # Check if Enabled in Config
+        if self.require_d1_trend and d1_ema > 0: 
             if signal == 1: # BUY Signal
                 if price > d1_ema: trend_aligned = True
                 else:
@@ -939,19 +970,17 @@ class ResearchStrategy:
         else:
             trend_aligned = True 
 
-        # 3. RSI EXTREME GUARD
-        # AGGRESSOR PROTOCOL: Bypass RSI filter for JPY pairs (e.g. GBPJPY, USDJPY)
-        if "JPY" in self.symbol:
-            pass # Explicit bypass for Yen crosses
-        else:
-            if signal == 1: # BUY
-                if rsi > 70:
-                    self.rejection_stats['Overbought_RSI_>70'] += 1
-                    return False
-            elif signal == -1: # SELL
-                if rsi < 30:
-                    self.rejection_stats['Oversold_RSI_<30'] += 1
-                    return False
+        # 3. RSI EXTREME GUARD (RELAXED)
+        # We assume if it's over 80, it's dangerously overbought, 
+        # but 70 is often just the start of a strong trend.
+        if signal == 1: # BUY
+            if rsi > 80: # Was 70
+                self.rejection_stats['Overbought_RSI_>80'] += 1
+                return False
+        elif signal == -1: # SELL
+            if rsi < 20: # Was 30
+                self.rejection_stats['Oversold_RSI_<20'] += 1
+                return False
         
         return True
 
@@ -960,7 +989,7 @@ class ResearchStrategy:
             "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
             "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
             "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0,
-            "GBPAUD": 1.95 # Added for V12.4
+            "GBPAUD": 1.95 
         }
         for sym, price in defaults.items():
             if sym not in self.last_price_map:

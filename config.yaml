@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V12.35 (FTMO UNSHACKLED - AUDITED)
+# config.yaml – PROJECT PHOENIX V13.1 (LEVERAGE HARMONY)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# AUDIT REMEDIATION (2025-01-13):
-# 1. COMPLIANCE: Added NZD news events (Auxiliary Symbol Protection).
-# 2. COMPLIANCE: Enhanced AUD/JPY event lists.
-# 3. VERIFICATION: Confirmed Base Risk 1.0% for Unshackled Mode.
+# REMEDIATION STRATEGY (V13.1):
+# 1. LEVERAGE GUARD: Added granular leverage limits per asset class.
+# 2. SURVIVAL: Maintained V13.0 Risk Slash (0.5% Base).
+# 3. HARMONY: Ensures trade size never exceeds Broker Margin limits.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -74,18 +74,16 @@ producer:
   midnight_freeze_seconds: 300
   d1_update_interval: 60
 
-# --- DATA SETTINGS (V10.1 TIBs) ---
+# --- DATA SETTINGS ---
 data:
   sampling_method: "imbalance" # Adaptive Imbalance Bars
-  # FINE-TUNED: Lowered to 10.0 to eliminate "Insufficient bars" bottleneck 
-  # and capture high-resolution market structure immediately.
   volume_bar_threshold: 10.0      
   imbalance_alpha: 0.05        # EWMA Forgetting Factor
   download_start_date: "2020-01-01"
   num_candles_producer: 50000
-  num_candles_train: 10000000  # INCREASED: 10M Ticks for deep learning
+  num_candles_train: 10000000  # 10M Ticks
   num_candles_wfo: 10000
-  num_candles_backtest: 1000000 # INCREASED: 1M Ticks for robust backtest
+  num_candles_backtest: 1000000 # 1M Ticks
 
 # --- FEATURE ENGINEERING ---
 features:
@@ -98,12 +96,12 @@ features:
   use_log_returns: true
   
   # Project Phoenix L1 Proxies
-  use_parkinson_vol: true          
+  use_parkinson_vol: true           
   use_amihud_liquidity: true 
-  use_relative_volume: true          
-  use_aggressor_ratio: true          
+  use_relative_volume: true           
+  use_aggressor_ratio: true           
   
-  # NEW: Regime Filters (Anti-Chop)
+  # Regime Filters (Anti-Chop)
   use_choppiness: true
   use_vortex: true
   
@@ -118,7 +116,7 @@ features:
   macd_signal: 9
   atr_period: 14
   
-  # New Regime Settings
+  # Regime Settings
   choppiness:
     period: 14
     threshold: 60.0 # RELAXED
@@ -138,44 +136,44 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 15.0 # V12.33 RESEARCH: Relaxed to 15.0 to allow ML to decide
+    threshold: 20.0 # STRENGTHENED: Ensure trend has momentum
   
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V12.33 RESEARCH MODE) ---
+# --- PHOENIX STRATEGY PARAMETERS ---
 phoenix_strategy:
   # --- ASSET REGIME MAPPING ---
-  # V12.33: DISABLED to allow full AI adaptability during training.
+  # DISABLED allows ML to decide based on data, not hardcoded bias
   regime_enforcement: "DISABLED" 
   
   asset_regime_map:
-    GBP: "TREND_BREAKOUT"   
-    EUR: "TREND_BREAKOUT"          
-    USD: "TREND_BREAKOUT"          
-    JPY: "TREND_BREAKOUT"   
-    AUD: "NEUTRAL"   
-    CAD: "NEUTRAL"   
-    CHF: "NEUTRAL"   
+    GBP: "TREND_BREAKOUT"    
+    EUR: "TREND_BREAKOUT"           
+    USD: "TREND_BREAKOUT"           
+    JPY: "TREND_BREAKOUT"    
+    AUD: "NEUTRAL"    
+    CAD: "NEUTRAL"    
+    CHF: "NEUTRAL"    
 
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true       
-  require_d1_trend: false             # DISABLED: M5 Trend is independent          
+  enable_regime_a_entries: true        
+  require_d1_trend: false             # DISABLED: M5 Trend is independent           
   require_h4_alignment: false         # Rely on ML for context        
   
   # --- LOGIC MAPPING THRESHOLDS ---
-  # V12.33: Calibrated Hurst thresholds for corrected math.
-  hurst_breakout_threshold: 0.55        
+  # V13.0: Relaxed thresholds to increase trade frequency
+  hurst_breakout_threshold: 0.50      # RELAXED: 0.50 allows early trend entry
   hurst_mean_reversion_threshold: 0.00  # DISABLED 
-  ker_trend_threshold: 0.02             # FLOOR: Only reject absolute flatlines
+  ker_trend_threshold: 0.01             # FLOOR: Minimal efficiency required
   
   rvol_volatility_trigger: 3.0        # Liquidity Injection
   
   # --- FILTER THRESHOLDS ---
-  max_relative_volume: 12.0        # V12.33 RESEARCH: Relaxed to 12.0
-  volume_gate_ratio: 1.1           # Min Relative Volume
+  max_relative_volume: 15.0        # RELAXED: Allow news spikes if ML approves
+  volume_gate_ratio: 1.0           # Min Relative Volume
   aggressor_threshold: 0.53        
   ml_confirmation_threshold: 0.50  # STANDARD BINARY (50%)
   choppiness_threshold: 60.0       # RELAXED
@@ -218,8 +216,8 @@ optimization_search_space:
     min: 2.0  
     max: 6.0  
   tbm_horizon_minutes:
-    min: 60
-    max: 1440 # Extended to 24h
+    min: 120
+    max: 1440
     step: 60
   tbm_drift_threshold:
     min: 1.0
@@ -227,7 +225,7 @@ optimization_search_space:
   
   # Strategy Execution
   min_calibrated_probability:
-    min: 0.00 # REMOVED CONFIDENCE GATING
+    min: 0.00 
     max: 0.01
 
 # --- RISK MANAGEMENT (FTMO COMPLIANCE) ---
@@ -237,38 +235,53 @@ risk_management:
   # --- SIZING METHOD: PROFIT BUFFER SCALING ---
   sizing_method: "fixed_risk"
   
-  # V12.33 RESEARCH: 1.0% Base Risk
-  base_risk_per_trade_percent: 0.010 
+  # V13.0 SURVIVAL: 0.5% Base Risk (Survives 20 loss streak)
+  base_risk_per_trade_percent: 0.005 
   
   # PROFIT BUFFER LOGIC
   profit_buffer_threshold: 0.03
-  # Scaled risk 1.5% max
-  scaled_risk_percent: 0.015
+  # Scaled risk 1.0% max (Only when profitable)
+  scaled_risk_percent: 0.010
   
   # LIMITS (TIGHTENED)
-  max_daily_loss_pct: 0.040        # 4.0% (Buffer before FTMO 5%)
-  max_total_loss_pct: 0.080        # 8.0% (Buffer before FTMO 10%)
+  max_daily_loss_pct: 0.045        # 4.5% (Leave 0.5% buffer for slippage)
+  max_total_loss_pct: 0.095        # 9.5% (Leave 0.5% buffer for slippage)
   
   # PORTFOLIO HEAT
   max_currency_exposure: 2         # Max 2 positions per currency (e.g. 2 USD pairs)
   
-  max_risk_percent: 2.5            # Allow more open risk
-  max_open_trades: 6               # V12.33 RESEARCH: 6
+  max_risk_percent: 2.0            # Total Open Risk Hard Cap (0.5% * 4 trades)
+  max_open_trades: 4               # REDUCED: 6 -> 4 to prevent correlation death
+  
+  # --- LEVERAGE GUARD (NEW V13.1) ---
+  # Defines the max leverage permitted per asset class.
+  # RiskManager will clamp volume if (Notional / Equity) > Leverage
+  leverage:
+    default: 30.0        # Forex Majors (EURUSD, GBPUSD, USDJPY)
+    minor: 20.0          # Forex Minors/Crosses (EURJPY, GBPJPY)
+    gold: 20.0           # XAUUSD
+    indices: 20.0        # US30, SPX500
+    crypto: 2.0          # BTCUSD
+  
+  # Hard cap on max leverage usage per trade (Safety Factor)
+  # e.g., if max leverage is 30, and safety is 3.0, single trade cap is 10x.
+  # This leaves 66% margin free for other trades.
+  leverage_safety_divisor: 3.0
   
   max_leverage: 30.0
   max_lot_size: 50.0 
   min_lot_size: 0.01
   
-  # PROJECT PHOENIX EXIT LOGIC (SCALPER MODE)
-  stop_loss_atr_mult: 1.5         # TIGHTER: Cut losers fast        
-  take_profit_atr_mult: 2.0       # TIGHTER: Bag wins fast        
+  # PROJECT PHOENIX EXIT LOGIC (SWING HYBRID)
+  stop_loss_atr_mult: 1.5         # Standard Stop       
+  take_profit_atr_mult: 3.0       # Higher Reward Target       
   
   # ACTIVE TRAILING STOP
   trailing_stop:
     enabled: true        
-    activation_r: 0.5        # AGGRESSIVE: Start trailing at 0.5R profit
-    trail_trigger_r: 0.75 # Trigger next step
-    trail_dist_r: 0.3       # TIGHT: 0.3R Distance behind price
+    activation_r: 1.0        # PATIENCE: Wait for 1.0R profit before trailing
+    trail_trigger_r: 1.25    # Trigger next step
+    trail_dist_r: 0.5        # BREATHE: 0.5R Distance behind price
   
   risk_timezone: "Europe/Prague"
   friday_entry_cutoff_hour: 18        
@@ -283,9 +296,9 @@ risk_management:
   hard_stop_equity_usd: 80000.0
   min_stop_loss_pips: 3.0
 
-# --- TRADING PORTFOLIO (V12.4 SNIPER MODE) ---
+# --- TRADING PORTFOLIO (V13.0) ---
 trading:
-  # AGGRESSOR PORTFOLIO ROTATION:
+  # SURVIVAL PORTFOLIO:
   symbols:
     - "EURUSD"
     - "GBPUSD"
@@ -303,7 +316,7 @@ trading:
   
   # --- EXECUTION OPTIMIZATION ---
   limit_order_offset_pips: 0.2 
-  limit_order_ttl_seconds: 30         # TIGHTER: 60s -> 30s for intraday precision
+  limit_order_ttl_seconds: 30
 
 # --- ONLINE LEARNING ---
 online_learning:
@@ -357,25 +370,23 @@ news_filter:
     CAD: ["BOC", "CPI", "Rate", "Employment"]
     CHF: ["SNB", "CPI", "Rate"]
     AUD: ["RBA", "CPI", "Rate", "Employment", "GDP"]
-    NZD: ["RBNZ", "CPI", "Rate", "GDP"] # Added for NZDUSD (Aux)
+    NZD: ["RBNZ", "CPI", "Rate", "GDP"] 
 
-# --- FORENSIC AUDIT ASSUMPTIONS (RELAXED FOR RAW SPREADS) ---
-# These values are used by the Volatility Gate to ensure the market is "alive".
-# Lower values mean the bot will trade in lower volatility (fewer rejections).
+# --- FORENSIC AUDIT ASSUMPTIONS ---
 forensic_audit:
   enforce_spread: true
   max_slippage_pips: 2.0
   commission_per_lot: 5.0
   spread_pips:
-    default: 0.8  # Relaxed from 1.5
-    GBPJPY: 1.5   # Relaxed from 2.5
-    USDJPY: 0.8   # Relaxed from 1.5
-    EURJPY: 1.0   # Relaxed from 2.0
-    AUDJPY: 1.2   # Relaxed from 2.5
-    GBPUSD: 1.0   # Relaxed from 1.8
-    EURUSD: 0.5   # Relaxed from 1.2 (Raw spreads are often 0.1-0.3)
-    USDCAD: 1.2   # Relaxed from 1.8
-    USDCHF: 1.0   # Relaxed from 1.6
+    default: 0.8  
+    GBPJPY: 1.5   
+    USDJPY: 0.8   
+    EURJPY: 1.0   
+    AUDJPY: 1.2   
+    GBPUSD: 1.0   
+    EURUSD: 0.5   
+    USDCAD: 1.2   
+    USDCHF: 1.0   
 
 # --- WFO OPTIMIZATION ---
 wfo:

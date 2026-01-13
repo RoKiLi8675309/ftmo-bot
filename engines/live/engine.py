@@ -6,10 +6,9 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX V12.31 FIX (TRADE RESTORATION DEDUPLICATION):
-# 1. FIX: Added 'tickets' set to daily_execution_stats to track unique deal IDs.
-# 2. LOGIC: Checks 'if ticket in seen' before counting a loss/win.
-# 3. REASON: Prevents double-counting if Producer restarts and re-sends closed trades.
+# PHOENIX V13.1 UPDATE (LEVERAGE HARMONY):
+# 1. MARGIN AWARENESS: Fetches real-time 'free_margin' from Redis.
+# 2. SAFETY CLAMP: Passes free margin to RiskManager to prevent "No Money" errors.
 # =============================================================================
 import logging
 import time
@@ -789,6 +788,41 @@ class LiveTradingEngine:
         except:
             daily_pnl_pct = 0.0
 
+        # --- V13.0: CALCULATE TOTAL OPEN RISK % (LIVE) ---
+        current_open_risk_usd = 0.0
+        contract_size = 100000 
+        
+        for sym, pos in open_positions.items():
+            entry = float(pos.get('entry_price', 0.0))
+            sl = float(pos.get('sl', 0.0))
+            vol = float(pos.get('volume', 0.0))
+            
+            if sl > 0 and entry > 0:
+                price_dist = abs(entry - sl)
+                curr_p = self.latest_prices.get(sym, entry)
+                rate = RiskManager.get_conversion_rate(sym, curr_p, self.latest_prices)
+                
+                risk_val = price_dist * vol * contract_size * rate
+                current_open_risk_usd += risk_val
+                
+        equity = self.ftmo_guard.equity
+        if equity > 0:
+            current_open_risk_pct = (current_open_risk_usd / equity) * 100.0
+        else:
+            current_open_risk_pct = 0.0
+
+        # --- V13.1: FETCH REAL FREE MARGIN (LEVERAGE HARMONY) ---
+        # We fetch this from Redis 'account_info' which is updated by Windows Producer every second.
+        try:
+            acc_info_raw = self.stream_mgr.r.hgetall(CONFIG['redis']['account_info_key'])
+            if acc_info_raw and 'free_margin' in acc_info_raw:
+                real_free_margin = float(acc_info_raw['free_margin'])
+            else:
+                # Fallback: Assume 95% of equity is free if data missing (Risk of rejection, but better than 0)
+                real_free_margin = equity * 0.95
+        except:
+            real_free_margin = equity * 0.95
+
         # Get Base Trade Intent with Buffer Scaling
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
@@ -802,7 +836,9 @@ class LiveTradingEngine:
             ker=ker_val,
             risk_percent_override=risk_percent_override,
             performance_score=sqn_score,
-            daily_pnl_pct=daily_pnl_pct # V12.0 Pass PnL
+            daily_pnl_pct=daily_pnl_pct,
+            current_open_risk_pct=current_open_risk_pct,
+            free_margin=real_free_margin # V13.1 PASSED
         )
 
         if trade_intent.volume <= 0:

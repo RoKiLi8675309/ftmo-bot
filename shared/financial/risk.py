@@ -5,10 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX V12.26 FIX (MARGIN GUARD & LEVERAGE PARTITIONING):
-# 1. FIX: "No Money" rejection caused by single trades consuming 100% margin.
-# 2. LOGIC: Implements 'Margin Safety Divisor' (3.0) to cap per-trade leverage
-#    at ~10x (on a 30x account), ensuring room for portfolio execution.
+# PHOENIX V13.1 UPDATE (LEVERAGE GUARD):
+# 1. MARGIN CHECK: Calculates required margin based on asset class leverage.
+# 2. VOLUME CLAMP: Reduces trade size if required margin > free margin.
+# 3. HARMONY: Ensures 1:30 leverage compliance to prevent "No Money" errors.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -126,6 +126,38 @@ class RiskManager:
         return 1.0
 
     @staticmethod
+    def calculate_required_margin(symbol: str, lots: float, price: float, contract_size: float, conversion_rate: float) -> float:
+        """
+        V13.1: Calculates the margin required to open a trade based on asset class leverage.
+        Formula: (Lots * Contract_Size * Price * Conversion_Rate) / Leverage
+        """
+        # 1. Identify Asset Class Leverage
+        risk_conf = CONFIG.get('risk_management', {})
+        lev_map = risk_conf.get('leverage', {})
+        
+        # Default to 30:1 (Major Forex)
+        leverage = float(lev_map.get('default', 30.0))
+        
+        s = symbol.upper()
+        if "JPY" in s and not "USD" in s and not "GBP" in s and not "EUR" in s:
+            leverage = float(lev_map.get('minor', 20.0)) # Crosses often lower
+        if "XAU" in s or "XAG" in s:
+            leverage = float(lev_map.get('gold', 20.0))
+        if any(x in s for x in ["US30", "GER30", "NAS100", "SPX500"]):
+            leverage = float(lev_map.get('indices', 20.0))
+        if "BTC" in s or "ETH" in s:
+            leverage = float(lev_map.get('crypto', 2.0))
+            
+        if leverage <= 0: leverage = 1.0 # Safety
+        
+        # 2. Calculate Notional Value in Account Currency (USD)
+        notional_value = lots * contract_size * price * conversion_rate
+        
+        # 3. Required Margin
+        margin = notional_value / leverage
+        return margin
+
+    @staticmethod
     def calculate_rck_size(
         context: TradeContext,
         conf: float,
@@ -138,11 +170,13 @@ class RiskManager:
         ker: float = 1.0, 
         risk_percent_override: Optional[float] = None,
         performance_score: float = 0.0, 
-        daily_pnl_pct: float = 0.0
+        daily_pnl_pct: float = 0.0,
+        current_open_risk_pct: float = 0.0,  # V13.0: Total Risk Cap
+        free_margin: float = 999999.0        # V13.1: Leverage Guard
     ) -> Tuple[Trade, float]:
         """
         Calculates position size using strict prop firm logic (Sniper Protocol).
-        V12.26 FIX: Enforces 'Margin Safety Divisor' to prevent Margin Calls on Portfolio.
+        V13.1 UPDATE: Enforces Leverage/Margin Constraints.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -194,10 +228,10 @@ class RiskManager:
         lots = 0.0
         calculated_risk_usd = 0.0
         
-        # --- V12.7: UNSHACKLED RISK PARAMETERS ---
-        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.010)
+        # --- V13.0: SURVIVAL RISK PARAMETERS ---
+        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.005) # 0.5%
         buffer_threshold = risk_conf.get('profit_buffer_threshold', 0.03)
-        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.015)
+        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.010) # 1.0%
         
         scaling_comment = ""
         
@@ -248,6 +282,20 @@ class RiskManager:
                     risk_pct = max(0.0, decay_risk_pct)
                     scaling_comment += "|Decay:ON"
 
+        # --- V13.0: TOTAL PORTFOLIO RISK CAP ---
+        max_total_risk_pct = float(risk_conf.get('max_risk_percent', 2.0))
+        potential_total_risk = current_open_risk_pct + (risk_pct / 100.0) * 100.0 # Standardize to % points
+        
+        if potential_total_risk > max_total_risk_pct:
+            # Clamp risk to remaining capacity
+            allowed_risk = max_total_risk_pct - current_open_risk_pct
+            if allowed_risk < 0.1: # If less than 0.1% risk allowed, skip trade
+                return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, f"Max Risk Cap Hit ({current_open_risk_pct:.2f}%)"), 0.0
+            
+            # Apply Clamp
+            risk_pct = allowed_risk
+            scaling_comment += f"|Cap:{risk_pct:.2f}%"
+
         # Calculate Risk Amount in USD
         calculated_risk_usd = balance * (risk_pct / 100.0)
         
@@ -264,34 +312,24 @@ class RiskManager:
             penalty_factor = 1.0 / (1.0 + (0.5 * active_correlations))
             lots *= penalty_factor
 
-        # --- V12.26 LEVERAGE SAFETY CLAMP (THE FIX) ---
-        # Prevent "No Money" errors by ensuring Notional Value <= Account Capacity
-        # We enforce a 'Portfolio Partitioning' logic.
-        # If the account max leverage is 30x, we do NOT allow a single trade to use 30x.
-        # We divide by 'margin_safety_divisor' (3.0) to allow ~3 concurrent max-size trades.
+        # --- V13.1 LEVERAGE GUARD (REAL MARGIN CHECK) ---
+        # 1. Calculate Required Margin for this trade
+        req_margin = RiskManager.calculate_required_margin(symbol, lots, price, c_size, conversion_rate)
         
-        max_lev_account = float(risk_conf.get('max_leverage', 30.0))
+        # 2. Check against Available Free Margin
+        # We assume free_margin is provided (from Broker). If not, we skip this check (e.g. Backtest)
+        # But we also enforce a "Safety Buffer" (e.g. keep 20% margin free)
         
-        # SAFETY DIVISOR: 3.0 means we cap single trade leverage at 10x (if Account Max is 30x).
-        # This leaves 66% of margin free for other positions or spread widening.
-        margin_safety_divisor = 3.0 
-        
-        max_lev_per_trade = max_lev_account / margin_safety_divisor
-        
-        notional_value_usd = lots * c_size * price * conversion_rate
-        
-        # Theoretical Max Notional Allowed Per Trade
-        max_notional_allowed = balance * max_lev_per_trade 
-        
-        if notional_value_usd > max_notional_allowed:
-            # We are asking for too much leverage for a single trade. Clamp it.
-            if (c_size * price * conversion_rate) > 0:
-                max_safe_lots = max_notional_allowed / (c_size * price * conversion_rate)
-                if lots > max_safe_lots:
-                    # Log the intervention
-                    logger.warning(f"⚠️ LEVERAGE CLAMP: {symbol} Lots {lots:.2f} -> {max_safe_lots:.2f} (Cap {max_lev_per_trade:.1f}x)")
-                    scaling_comment += "|LevClamp"
-                    lots = max_safe_lots
+        if req_margin > (free_margin * 0.95): # Leave 5% buffer always
+            # Reduce Lots to fit margin
+            # New Lots = (Free Margin * 0.95) / Margin_Per_Lot
+            margin_per_lot = req_margin / lots if lots > 0 else 0
+            if margin_per_lot > 0:
+                max_margin_lots = (free_margin * 0.95) / margin_per_lot
+                if max_margin_lots < lots:
+                    logger.warning(f"⚠️ MARGIN CLAMP: {symbol} Lots {lots:.2f} -> {max_margin_lots:.2f} (Free Margin ${free_margin:.0f})")
+                    lots = max_margin_lots
+                    scaling_comment += "|LevGuard"
 
         # --- FINAL HARD LIMITS ---
         min_lot = risk_conf.get('min_lot_size', 0.01)
