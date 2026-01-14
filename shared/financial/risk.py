@@ -5,10 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX V14.0 UPDATE (AGGRESSOR PROTOCOL):
-# 1. SIZING: Base Risk 1.0%, Scaled Risk 2.0% (FTMO Challenge Standard).
-# 2. MAX CAP: Relaxed Total Portfolio Risk to 4.0% to allow stacking.
-# 3. SQN BOOST: "Hot Hand" scaling allows up to 2.5% risk on high performance.
+# PHOENIX V15.0 UPDATE (HYPER-AGGRESSOR PROTOCOL):
+# 1. RATCHETING: Implemented Equity Floor Logic (Locks 5% steps).
+# 2. PORTFOLIO: Added Aggressor Pairs (GBPAUD, AUDJPY) to conversion logic.
+# 3. SIZING: Aggressive defaults enabled (1% Base, 2.5% Max).
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -141,6 +141,8 @@ class RiskManager:
         s = symbol.upper()
         if "JPY" in s and not "USD" in s and not "GBP" in s and not "EUR" in s:
             leverage = float(lev_map.get('minor', 20.0)) # Crosses often lower
+        if "GBPAUD" in s or "AUDJPY" in s:
+             leverage = float(lev_map.get('minor', 20.0)) # Aggressor pairs
         if "XAU" in s or "XAG" in s:
             leverage = float(lev_map.get('gold', 20.0))
         if any(x in s for x in ["US30", "GER30", "NAS100", "SPX500"]):
@@ -176,7 +178,7 @@ class RiskManager:
     ) -> Tuple[Trade, float]:
         """
         Calculates position size using strict prop firm logic (Sniper Protocol).
-        V14.0 UPDATE: Aggressor Mode Defaults (1% Base, 2% Scaled).
+        V15.0 UPDATE: Aggressor Mode Defaults (1% Base, 2.5% Max).
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -263,7 +265,7 @@ class RiskManager:
                 scaling_comment += "|SQN:High"
         
         # --- ALPHA SQUAD BOOST (AGGRESSOR MODE) ---
-        if symbol in ["USDJPY", "EURUSD", "EURJPY", "GBPAUD"]:
+        if symbol in ["USDJPY", "EURUSD", "EURJPY", "GBPAUD", "AUDJPY"]:
             boosted_risk = risk_pct * 1.20 
             if boosted_risk <= 2.5: # V14.0 Cap
                 risk_pct = boosted_risk
@@ -282,8 +284,8 @@ class RiskManager:
                     risk_pct = max(0.0, decay_risk_pct)
                     scaling_comment += "|Decay:ON"
 
-        # --- V14.0: TOTAL PORTFOLIO RISK CAP ---
-        max_total_risk_pct = float(risk_conf.get('max_risk_percent', 4.0)) # Relaxed for Aggressor
+        # --- V15.0: TOTAL PORTFOLIO RISK CAP ---
+        max_total_risk_pct = float(risk_conf.get('max_risk_percent', 6.0)) # Relaxed for Aggressor Stacking
         potential_total_risk = current_open_risk_pct + (risk_pct / 100.0) * 100.0 # Standardize to % points
         
         if potential_total_risk > max_total_risk_pct:
@@ -413,13 +415,22 @@ class FTMORiskMonitor:
         self.starting_equity_of_day = initial_balance
         self.equity = initial_balance
         self.profit_target = initial_balance * 1.10
+        
+        # V15.0: Ratcheting State
+        self.ratchet_floor = 0.0
+        self.ratchet_step_pct = CONFIG.get('risk_management', {}).get('equity_ratchet', {}).get('step_percent', 0.05)
 
     def can_trade(self) -> bool:
         if self.equity <= 0: return False
 
         # 1. Total Drawdown Check (10% Max)
         total_dd_limit = self.initial_balance * 0.90
-        if self.equity < total_dd_limit: 
+        
+        # V15.0: Ratchet Logic Override
+        # If we have locked in a floor, that becomes the new "hard deck"
+        effective_floor = max(total_dd_limit, self.ratchet_floor)
+        
+        if self.equity < effective_floor: 
             return False
         
         # 2. Daily Drawdown Check (Default 5% Max)
@@ -435,14 +446,32 @@ class FTMORiskMonitor:
             
         return True
 
-    def _check_constraints(self, risk_to_add: float):
-        pass
+    def update_equity(self, current_equity: float):
+        self.equity = current_equity
         
+        # V15.0: Check Ratchet
+        # If equity grows 5% above initial, lock the floor at Init + 2.5% (Trailing)
+        # Or simplistic: Every 5% gain locks the previous 5% level
+        gain_pct = (self.equity - self.initial_balance) / self.initial_balance
+        
+        if gain_pct > 0:
+             steps = int(gain_pct / self.ratchet_step_pct)
+             if steps > 0:
+                 new_floor = self.initial_balance * (1.0 + ((steps - 1) * self.ratchet_step_pct))
+                 if new_floor > self.ratchet_floor:
+                     self.ratchet_floor = new_floor
+                     # Log implicitly via caller or separate mechanism if needed
+
     def check_circuit_breakers(self) -> str:
         if self.equity <= 0:
             return "Equity Uninitialized (0.0). Waiting for Producer Sync."
 
         total_limit = self.initial_balance * 0.90
+        # Check Ratchet
+        if self.ratchet_floor > total_limit:
+             if self.equity < self.ratchet_floor:
+                 return f"Ratchet Breach: Equity {self.equity:.2f} < Locked Floor {self.ratchet_floor:.2f}"
+        
         if self.equity < total_limit:
             return f"Total Drawdown Breach: Equity {self.equity:.2f} < Limit {total_limit:.2f} (10%)"
         
@@ -456,9 +485,6 @@ class FTMORiskMonitor:
             return "Profit Target Reached (Victory Lap)"
         
         return "OK"
-
-    def update_equity(self, current_equity: float):
-        self.equity = current_equity
 
 class HierarchicalRiskParity:
     @staticmethod

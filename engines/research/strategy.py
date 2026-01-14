@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX V14.0 UPDATE (AGGRESSOR PROTOCOL):
-# 1. LOGIC SYNC: Mirrors Live Engine's Momentum Ignition (RSI > 80 + Hurst > 0.6).
-# 2. DYNAMIC REWARD: Boosts TP to 4.0R on High RVOL events in backtest.
-# 3. FREQUENCY: Relaxed BB Std Dev to 1.2 to capture earlier entries.
+# PHOENIX V15.0 UPDATE (HYPER-AGGRESSOR PROTOCOL):
+# 1. PYRAMIDING: Enabled "Aggressor" adding to winners (0.5R threshold).
+# 2. LOGIC SYNC: Matches Live Engine's multi-position handling.
+# 3. PORTFOLIO: Added Aggressor pairs (GBPAUD, AUDJPY) to defaults.
 # =============================================================================
 import logging
 import sys
@@ -47,7 +47,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V14.0 Aggressor Protocol.
+    Strictly implements the Phoenix V15.0 Aggressor Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -295,7 +295,7 @@ class ResearchStrategy:
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (V14.0 Aggressor Mode).
+        Main Event Loop for the Strategy (V15.0 Aggressor Mode).
         """
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
@@ -362,15 +362,15 @@ class ResearchStrategy:
 
         if is_weekend_hold or is_friday_close:
             # Force close if we have an open position
-            pos = broker.get_position(self.symbol)
-            if pos:
-                 broker._close_partial_position(
-                    pos, 
-                    pos.quantity, 
-                    price, 
-                    dt_ts, 
-                    "Weekend/Friday Liquidation"
-                )
+            for pos in broker.open_positions:
+                if pos.symbol == self.symbol:
+                     broker._close_partial_position(
+                        pos, 
+                        pos.quantity, 
+                        price, 
+                        dt_ts, 
+                        "Weekend/Friday Liquidation"
+                    )
             return # Stop processing
         
         # Friday Entry Guard (No new trades after cutoff)
@@ -460,10 +460,9 @@ class ResearchStrategy:
         current_atr = features.get('atr', 0.001)
         self.labeler.add_trade_opportunity(features, price, current_atr, timestamp, parkinson_vol=parkinson)
 
-        # D. ACTIVE TRADE MANAGEMENT
-        if self.symbol in broker.positions:
-            return 
-
+        # D. ACTIVE TRADE MANAGEMENT (REMOVED - CHECKED LATER FOR PYRAMIDING)
+        existing_positions = [p for p in broker.open_positions if p.symbol == self.symbol]
+        
         # ============================================================
         # E. SURVIVAL GATES & ASSET PERSONALITY (V14.0)
         # ============================================================
@@ -574,9 +573,37 @@ class ResearchStrategy:
                 return
 
             if is_profitable:
+                # V15.0 PYRAMIDING CHECK
+                is_pyramid = False
+                
+                if existing_positions:
+                    pyramid_config = self.risk_conf.get('pyramiding', {})
+                    if not pyramid_config.get('enabled', False):
+                        return # Standard Block
+                    
+                    # 1. Direction Check
+                    last_pos = existing_positions[-1]
+                    if (last_pos.side == 1 and proposed_action != 1) or \
+                       (last_pos.side == -1 and proposed_action != -1):
+                        return # No flipping/hedging
+
+                    # 2. Max Adds Check
+                    if len(existing_positions) > pyramid_config.get('max_adds', 3):
+                        return
+                        
+                    # 3. Profit Threshold Check (Aggressor)
+                    risk_dist = last_pos.metadata.get('initial_risk_dist', 1.0)
+                    dist = (price - last_pos.entry_price) if last_pos.side == 1 else (last_pos.entry_price - price)
+                    current_r = dist / risk_dist if risk_dist > 0 else 0
+                    
+                    if current_r < pyramid_config.get('add_on_profit_r', 0.5):
+                        return # Not profitable enough to add
+                    
+                    is_pyramid = True
+
                 # V11.0: Tighten Stops Logic (RVOL Trigger)
                 tighten_stops = (rvol_val > self.rvol_trigger)
-                self._execute_entry(confidence, price, features, broker, dt_ts, proposed_action, regime_label, tighten_stops)
+                self._execute_entry(confidence, price, features, broker, dt_ts, proposed_action, regime_label, tighten_stops, is_pyramid)
             else:
                 self.rejection_stats['Meta-Labeler Reject'] += 1
 
@@ -584,11 +611,10 @@ class ResearchStrategy:
             if self.debug_mode: logger.error(f"Strategy Error: {e}")
             pass
 
-    def _execute_entry(self, confidence, price, features, broker, dt_timestamp, action_int, regime, tighten_stops):
+    def _execute_entry(self, confidence, price, features, broker, dt_timestamp, action_int, regime, tighten_stops, is_pyramid=False):
         """
         Executes the trade entry logic with Fixed Risk & Portfolio Cap.
-        V14.0: Calculates Leverage-Based Margin to prevent "No Money".
-        V14.0: Boosts TP if High RVOL.
+        V15.0: Handles Pyramid sizing logic.
         """
         action = "BUY" if action_int == 1 else "SELL"
         
@@ -618,7 +644,12 @@ class ResearchStrategy:
         current_atr = features.get('atr', 0.001)
         current_ker = features.get('ker', 1.0)
         volatility = features.get('volatility', 0.001)
-        risk_override = self.params.get('risk_per_trade_percent')
+        
+        # V15.0: Risk Override for Pyramid Trades
+        if is_pyramid:
+             risk_override = self.risk_conf.get('pyramiding', {}).get('risk_per_add_percent', 0.005)
+        else:
+             risk_override = self.params.get('risk_per_trade_percent')
         
         sqn_score = self._calculate_symbol_sqn(broker)
         
@@ -719,7 +750,8 @@ class ResearchStrategy:
                 'optimized_rr': current_reward,
                 'initial_risk_dist': stop_dist, 
                 'entry_price_snap': price,
-                'tighten_stops': tighten_stops
+                'tighten_stops': tighten_stops,
+                'is_pyramid': is_pyramid
             }
         )
         
@@ -741,7 +773,8 @@ class ResearchStrategy:
             'ker': current_ker,
             'atr': current_atr,
             'regime': regime,
-            'top_feats': imp_feats
+            'top_feats': imp_feats,
+            'pyramid': is_pyramid
         })
 
     def _calculate_symbol_sqn(self, broker: BacktestBroker) -> float:
@@ -993,18 +1026,18 @@ class ResearchStrategy:
             if rsi > 80: 
                 # Check for Ignition
                 if current_hurst > 0.60:
-                     pass # IGNITION: ALLOW TRADE
+                      pass # IGNITION: ALLOW TRADE
                 else:
-                     self.rejection_stats['Overbought_RSI_>80'] += 1
-                     return False
+                      self.rejection_stats['Overbought_RSI_>80'] += 1
+                      return False
         elif signal == -1: # SELL
             if rsi < 20: 
                 # Check for Ignition
                 if current_hurst > 0.60:
-                     pass # IGNITION: ALLOW TRADE
+                      pass # IGNITION: ALLOW TRADE
                 else:
-                     self.rejection_stats['Oversold_RSI_<20'] += 1
-                     return False
+                      self.rejection_stats['Oversold_RSI_<20'] += 1
+                      return False
         
         return True
 
@@ -1012,8 +1045,8 @@ class ResearchStrategy:
         defaults = {
             "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
             "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
-            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0,
-            "GBPAUD": 1.95 
+            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0, # Added Aggressor Pair
+            "GBPAUD": 1.95 # Added Aggressor Pair
         }
         for sym, price in defaults.items():
             if sym not in self.last_price_map:

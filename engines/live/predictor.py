@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX V14.0 UPDATE (AGGRESSOR PROTOCOL):
-# 1. MOMENTUM IGNITION: RSI > 80 allowed if Hurst > 0.60 (Catching Parabolic Moves).
-# 2. DYNAMIC REWARD: Boosts TP to 4.0R if RVOL > 3.0 (High Fuel).
-# 3. FREQUENCY: Relaxed rejection logic to increase trade count.
+# PHOENIX V15.0 UPDATE (HYPER-AGGRESSOR PROTOCOL):
+# 1. PYRAMIDING: Unblocked signal generation for open positions if enabled.
+# 2. PORTFOLIO: Added Aggressor pair defaults (GBPAUD, AUDJPY).
+# 3. LOGIC: Fully preserved Momentum Ignition and Sniper Protocols.
 # =============================================================================
 import logging
 import pickle
@@ -530,8 +530,18 @@ class MultiAssetPredictor:
 
         # D. ACTIVE TRADE MANAGEMENT (Local check)
         open_positions = context_data.get('positions', {}) if context_data else {}
+        
+        # V15.0: PYRAMIDING LOGIC (HYPER-AGGRESSOR)
+        # If Pyramiding is enabled in config, we allow the signal to be generated.
+        # We flag it as 'pyramid' so the Risk Manager can handle the sizing/checks.
+        is_pyramid_attempt = False
+        
         if symbol in open_positions:
-            return 
+            pyramid_config = CONFIG.get('risk_management', {}).get('pyramiding', {})
+            if pyramid_config.get('enabled', False):
+                is_pyramid_attempt = True
+            else:
+                return None # Standard Blocking
 
         # ============================================================
         # 4. PHOENIX V14.0: AGGRESSOR PROTOCOL
@@ -683,8 +693,8 @@ class MultiAssetPredictor:
                     "drivers": imp_feats,
                     "optimized_rr": opt_rr,
                     "risk_percent_override": opt_risk,
-                    "pyramid": False,
-                    "tighten_stops": tighten_stops # NEW: Risk Manager Signal
+                    "pyramid": is_pyramid_attempt, # V15.0 Flag
+                    "tighten_stops": tighten_stops 
                 })
         else:
             stats['Meta Rejected'] += 1
@@ -754,11 +764,12 @@ class MultiAssetPredictor:
 
     def _inject_auxiliary_data(self):
         """Injects static approximations ONLY if missing."""
+        # V15.0: Added Aggressor Pairs (GBPAUD, AUDJPY)
         defaults = {
             "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
             "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
-            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0,
-            "GBPAUD": 1.95 # Added for V12.4
+            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0, # AUDJPY Risk-On Proxy
+            "GBPAUD": 1.95 # High Volatility Beast
         }
         for sym, price in defaults.items():
             if sym not in self.last_close_prices or self.last_close_prices[sym] == 0:
