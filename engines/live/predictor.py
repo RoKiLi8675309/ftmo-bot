@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX V13.0 UPDATE (SURVIVAL MODE):
-# 1. GATE RELAXATION: Hurst threshold lowered to 0.50 for earlier entry.
-# 2. FILTER WIDENING: RSI filters relaxed to 80/20 to allow strong breakouts.
-# 3. MATH PARITY: Removed Hurst scalar to match Research Engine.
+# PHOENIX V14.0 UPDATE (AGGRESSOR PROTOCOL):
+# 1. MOMENTUM IGNITION: RSI > 80 allowed if Hurst > 0.60 (Catching Parabolic Moves).
+# 2. DYNAMIC REWARD: Boosts TP to 4.0R if RVOL > 3.0 (High Fuel).
+# 3. FREQUENCY: Relaxed rejection logic to increase trade count.
 # =============================================================================
 import logging
 import pickle
@@ -75,7 +75,7 @@ class MultiAssetPredictor:
         tbm_conf = CONFIG['online_learning']['tbm']
         risk_conf = CONFIG.get('risk_management', {})
         
-        # V11.0: Tighter Stops/Targets for Scalping
+        # V14.0: Standardize risk multiplier
         risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 1.5))
         
         self.labelers = {}
@@ -87,7 +87,7 @@ class MultiAssetPredictor:
         self.closes_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         self.volume_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         self.bb_window = 20
-        self.bb_std = 1.5 # V13.0: 1.5 Std Dev allowed for earlier entries
+        self.bb_std = CONFIG['phoenix_strategy'].get('bb_std_dev', 1.2) # V14.0: 1.2 Aggressor Std
         self.bb_buffers = {s: deque(maxlen=self.bb_window) for s in symbols}
         
         # --- SNIPER PROTOCOL BUFFERS ---
@@ -98,8 +98,7 @@ class MultiAssetPredictor:
             # Default from Config
             s_risk = risk_mult_conf
             s_reward = tbm_conf.get('barrier_width', 3.0)
-            # V12.4: Default to 720m (12h) to match new config
-            s_horizon = tbm_conf.get('horizon_minutes', 720)
+            s_horizon = tbm_conf.get('horizon_minutes', 480) # V14.0: 8 Hours Aggressor
             
             # --- DYNAMIC PARAMETER LOADING ---
             params_path = self.models_dir / f"best_params_{s}.json"
@@ -136,7 +135,7 @@ class MultiAssetPredictor:
         
         # 4. Warm-up State
         self.burn_in_counters = {s: 0 for s in symbols}
-        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 100) # REDUCED for V11
+        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 50) # REDUCED for V14
         
         # 5. Forensic Stats
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
@@ -150,7 +149,7 @@ class MultiAssetPredictor:
         
         # V10.0: Daily Performance Tracking (Symbol Circuit Breaker)
         self.daily_performance = {s: {'date': None, 'losses': 0, 'pnl': 0.0} for s in symbols}
-        self.daily_max_losses = 2 # Circuit Breaker Limit
+        self.daily_max_losses = 3 # Increased for V14 Aggressor
         
         # 7. Architecture: Auto-Save Timer
         self.last_save_time = time.time()
@@ -159,18 +158,17 @@ class MultiAssetPredictor:
         # --- Gating Params ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.5)
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.0)
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V13.0) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V14.0) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        self.default_max_rvol = 8.0
+        self.default_max_rvol = 20.0
         
-        # V13.0 Logic Thresholds (Relaxed for Survival Mode)
-        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.01))
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.50)) # RELAXED
-        # Mean Reversion Threshold Ignored in V12.7
+        # V14.0 Logic Thresholds (Relaxed for Aggressor)
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.005))
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.48)) 
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
         
@@ -179,14 +177,14 @@ class MultiAssetPredictor:
         self.adx_threshold = float(adx_cfg.get('threshold', 20.0))
 
         # V12.3: Regime Enforcement Mode (HARD vs SOFT)
-        self.regime_enforcement = phx_conf.get('regime_enforcement', 'HARD').upper()
+        self.regime_enforcement = phx_conf.get('regime_enforcement', 'DISABLED').upper()
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
         
-        # V12.3: Portfolio Heat
-        self.max_currency_exposure = int(CONFIG['risk_management'].get('max_currency_exposure', 2))
+        # V14.0: Portfolio Heat - Aggressor
+        self.max_currency_exposure = int(CONFIG['risk_management'].get('max_currency_exposure', 3))
         
         # Friday Guard
-        self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 18)
+        self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 19)
         
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
@@ -346,7 +344,7 @@ class MultiAssetPredictor:
     def _check_currency_exposure(self, symbol: str, open_positions: Dict[str, Any]) -> bool:
         """
         V12.3: Enforces Portfolio Heat Limits.
-        Prevents stacking too much risk on one currency (e.g. max 2 USD pairs).
+        Prevents stacking too much risk on one currency (e.g. max 3 USD pairs).
         """
         base_ccy = symbol[:3]
         quote_ccy = symbol[3:]
@@ -376,7 +374,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V12.0 Logic.
+        Executes the Learn-Predict Loop with Project Phoenix V14.0 Logic.
         Enforces Asset-Specific Regimes (The "Personality Filter").
         """
         if symbol not in self.symbols: return None
@@ -479,7 +477,8 @@ class MultiAssetPredictor:
         if self.daily_performance[symbol]['date'] != current_date:
             self.daily_performance[symbol] = {'date': current_date, 'losses': 0, 'pnl': 0.0}
 
-        # --- V10.0 CIRCUIT BREAKER (Signal Level) ---
+        # --- V14.0 CIRCUIT BREAKER (Aggressor) ---
+        # Increased to 3 losses to prevent early lockout
         if self.daily_performance[symbol]['losses'] >= self.daily_max_losses:
             stats["Circuit Breaker (Daily Losses)"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Circuit Breaker Active"})
@@ -535,17 +534,18 @@ class MultiAssetPredictor:
             return 
 
         # ============================================================
-        # 4. PHOENIX V13.0: SURVIVAL PROTOCOL (TREND ONLY)
+        # 4. PHOENIX V14.0: AGGRESSOR PROTOCOL
         # ============================================================
         
         phx = CONFIG.get('phoenix_strategy', {})
-        max_rvol_thresh = float(phx.get('max_relative_volume', 15.0)) # Relaxed from 8.0
+        max_rvol_thresh = float(phx.get('max_relative_volume', 20.0)) # Relaxed
         
         # FRIDAY GUARD
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
              return Signal(symbol, "HOLD", 0.0, {"reason": "Friday Entry Guard"})
 
-        # G1: EFFICIENCY (KER) - AGGRESSIVE (V11.0)
+        # G1: EFFICIENCY (KER) - AGGRESSIVE (V14.0)
+        # Reduced floor to 0.005 to catch early moves
         base_thresh = self.ker_floor 
         effective_ker_thresh = max(0.005, base_thresh + self.dynamic_ker_offsets[symbol])
 
@@ -565,11 +565,12 @@ class MultiAssetPredictor:
             
         bb_mu = np.mean(self.bb_buffers[symbol])
         bb_std = np.std(self.bb_buffers[symbol])
-        bb_mult = 1.5 # V13.0: 1.5 Std Dev allowed
-        upper_bb = bb_mu + (self.bb_std * bb_std)
-        lower_bb = bb_mu - (self.bb_std * bb_std)
+        bb_mult = self.bb_std # V14.0: 1.2 Std Dev for earlier entries
         
-        # --- V13.0 LOGIC MAPPING: TREND ONLY ---
+        upper_bb = bb_mu + (bb_mult * bb_std)
+        lower_bb = bb_mu - (bb_mult * bb_std)
+        
+        # --- V14.0 LOGIC MAPPING: TREND ONLY ---
         is_trending = hurst > self.hurst_breakout
         
         if is_trending:
@@ -598,7 +599,7 @@ class MultiAssetPredictor:
                 stats["Personality Clash (Hard Block)"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "Asset Personality Clash"})
             elif self.regime_enforcement == "DISABLED":
-                 # V12.7 UNSHACKLED: Bypass clash flag to allow full adaptability
+                 # V14.0: Bypass clash flag to allow full adaptability
                  is_regime_clash = False 
             else:
                 # SOFT Mode: Mark for high confidence check later
@@ -620,7 +621,7 @@ class MultiAssetPredictor:
         # 5. ML Confirmation & Calibration
         pred_proba = model.predict_proba_one(features)
         
-        # V13.0 SURVIVAL: Bypass Calibration/Confidence Check
+        # V14.0 SURVIVAL: Bypass Calibration/Confidence Check
         # We trust the Meta Labeler and Regime Filters entirely.
         confidence = 1.0 # Force max confidence to bypass filters
         
@@ -632,9 +633,11 @@ class MultiAssetPredictor:
         if is_regime_clash:
             pass 
 
-        # --- SNIPER PROTOCOL: FINAL FILTER GATE (V11) ---
+        # --- SNIPER PROTOCOL: FINAL FILTER GATE (V14.0 MOMENTUM IGNITION) ---
         d1_ema = context_data.get('d1', {}).get('ema200', 0.0) if context_data else 0.0
-        if not self._check_sniper_filters(symbol, proposed_action, bar.close, d1_ema):
+        
+        # NOTE: Passing 'hurst' now to check for Ignition
+        if not self._check_sniper_filters(symbol, proposed_action, bar.close, d1_ema, hurst):
             stats["Sniper Reject (Trend/RSI)"] += 1
             return Signal(symbol, "HOLD", confidence, {"reason": "Sniper Filter Reject"})
         # ------------------------------------------
@@ -656,6 +659,12 @@ class MultiAssetPredictor:
                     self.feature_importance_counter[symbol][f] += 1
                 
                 opt_rr = self.labelers[symbol].reward_mult
+                
+                # V14.0 DYNAMIC REWARD: HIGH FUEL = HIGH REWARD
+                # If Volume is exploding (Ignition), aim for 4R
+                if rvol_val > 3.0:
+                    opt_rr = max(opt_rr, 4.0)
+
                 opt_risk = self.optimized_params.get(symbol, {}).get('risk_per_trade_percent')
                 
                 # V10.2: Tighten Stops Logic (RVOL Trigger)
@@ -688,11 +697,13 @@ class MultiAssetPredictor:
             
         return Signal(symbol, "HOLD", confidence, {})
 
-    def _check_sniper_filters(self, symbol: str, signal: int, price: float, d1_ema: float) -> bool:
+    def _check_sniper_filters(self, symbol: str, signal: int, price: float, d1_ema: float, current_hurst: float) -> bool:
         """
-        V13.0 SNIPER PROTOCOL (LIVE):
-        1. Trend Filter: D1 Alignment (DISABLED in V11 Aggressor Mode).
-        2. RSI Guard: Relaxed Overbought (80) / Oversold (20) rejection.
+        V14.0 SNIPER PROTOCOL (AGGRESSOR UPDATE):
+        1. Trend Filter: D1 Alignment (DISABLED in Config).
+        2. RSI Guard: UNLOCKED via Momentum Ignition.
+           - If RSI > 80 AND Hurst > 0.60, Trade is ALLOWED (Ignition).
+           - Only blocks if RSI > 80 and Hurst < 0.60 (Exhaustion).
         """
         # 1. RSI CALCULATION (M5 Extension)
         if len(self.sniper_rsi[symbol]) < 14:
@@ -718,15 +729,26 @@ class MultiAssetPredictor:
         else:
             trend_aligned = True # Pass if disabled or no data
 
-        # 3. RSI EXTREME GUARD (V13.0 RELAXED)
-        # We allow deeper excursions to catch breakout momentum
+        # 3. RSI EXTREME GUARD (V14.0 MOMENTUM IGNITION)
+        # We invert the logic: High RSI + High Hurst = IGNITION (Buy!)
         if "JPY" in symbol:
             pass # JPY pairs trend hard, ignore RSI extremes
         else:
             if signal == 1: # BUY
-                if rsi > 80: return False # Reject Overbought > 80
+                if rsi > 80: 
+                    # V14.0 CHECK: Is this Exhaustion or Ignition?
+                    if current_hurst > 0.60:
+                        pass # IGNITION: ALLOW TRADE (Momentum is huge)
+                    else:
+                        return False # EXHAUSTION: Reject Overbought
+            
             elif signal == -1: # SELL
-                if rsi < 20: return False # Reject Oversold < 20
+                if rsi < 20: 
+                    # V14.0 CHECK: Ignition?
+                    if current_hurst > 0.60:
+                        pass # IGNITION: ALLOW TRADE (Crash mode)
+                    else:
+                        return False # EXHAUSTION: Reject Oversold
         
         return True
 

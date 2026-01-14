@@ -5,10 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX V13.1 UPDATE (LEVERAGE GUARD):
-# 1. MARGIN CHECK: Calculates required margin based on asset class leverage.
-# 2. VOLUME CLAMP: Reduces trade size if required margin > free margin.
-# 3. HARMONY: Ensures 1:30 leverage compliance to prevent "No Money" errors.
+# PHOENIX V14.0 UPDATE (AGGRESSOR PROTOCOL):
+# 1. SIZING: Base Risk 1.0%, Scaled Risk 2.0% (FTMO Challenge Standard).
+# 2. MAX CAP: Relaxed Total Portfolio Risk to 4.0% to allow stacking.
+# 3. SQN BOOST: "Hot Hand" scaling allows up to 2.5% risk on high performance.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -176,7 +176,7 @@ class RiskManager:
     ) -> Tuple[Trade, float]:
         """
         Calculates position size using strict prop firm logic (Sniper Protocol).
-        V13.1 UPDATE: Enforces Leverage/Margin Constraints.
+        V14.0 UPDATE: Aggressor Mode Defaults (1% Base, 2% Scaled).
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -197,7 +197,7 @@ class RiskManager:
         
         # --- SNIPER PROTOCOL: VOLATILITY-ADJUSTED STOPS ---
         atr_mult_sl = float(risk_conf.get('stop_loss_atr_mult', 1.5)) 
-        atr_mult_tp = float(risk_conf.get('take_profit_atr_mult', 3.0))
+        atr_mult_tp = float(risk_conf.get('take_profit_atr_mult', 4.0)) # V14.0: 4R Target
         
         # ATR Fallback Logic
         if atr and atr > 0:
@@ -228,18 +228,15 @@ class RiskManager:
         lots = 0.0
         calculated_risk_usd = 0.0
         
-        # --- V13.0: SURVIVAL RISK PARAMETERS ---
-        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.005) # 0.5%
-        buffer_threshold = risk_conf.get('profit_buffer_threshold', 0.03)
-        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.010) # 1.0%
+        # --- V14.0: AGGRESSOR RISK PARAMETERS ---
+        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.010) # 1.0% (Aggressor)
+        buffer_threshold = risk_conf.get('profit_buffer_threshold', 0.02)
+        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.020) # 2.0% (House Money)
         
         scaling_comment = ""
         
         if risk_percent_override is not None:
             # Optuna/WFO override has highest priority
-            # risk_percent_override is float e.g. 0.01 for 1%
-            # Config uses percentage points sometimes, so ensure standardization
-            # Here we assume override is like 0.01
             risk_pct = risk_percent_override * 100.0 if risk_percent_override < 1.0 else risk_percent_override
         else:
             # Default Strategy Logic with Buffer Scaling
@@ -261,14 +258,14 @@ class RiskManager:
                 scaling_comment += "|SQN:Low"
                 
             elif performance_score > 2.5:
-                # HOT HAND: Scale up slightly (1.25x)
-                risk_pct = min(risk_pct * 1.25, 2.0) # Cap at 2.0%
+                # HOT HAND: Scale up (V14.0: 1.25x up to 2.5% max)
+                risk_pct = min(risk_pct * 1.25, 2.5) 
                 scaling_comment += "|SQN:High"
         
         # --- ALPHA SQUAD BOOST (AGGRESSOR MODE) ---
         if symbol in ["USDJPY", "EURUSD", "EURJPY", "GBPAUD"]:
             boosted_risk = risk_pct * 1.20 
-            if boosted_risk <= 2.0: 
+            if boosted_risk <= 2.5: # V14.0 Cap
                 risk_pct = boosted_risk
                 scaling_comment += "|AlphaBoost"
 
@@ -285,8 +282,8 @@ class RiskManager:
                     risk_pct = max(0.0, decay_risk_pct)
                     scaling_comment += "|Decay:ON"
 
-        # --- V13.0: TOTAL PORTFOLIO RISK CAP ---
-        max_total_risk_pct = float(risk_conf.get('max_risk_percent', 2.0))
+        # --- V14.0: TOTAL PORTFOLIO RISK CAP ---
+        max_total_risk_pct = float(risk_conf.get('max_risk_percent', 4.0)) # Relaxed for Aggressor
         potential_total_risk = current_open_risk_pct + (risk_pct / 100.0) * 100.0 # Standardize to % points
         
         if potential_total_risk > max_total_risk_pct:
@@ -320,12 +317,8 @@ class RiskManager:
         req_margin = RiskManager.calculate_required_margin(symbol, lots, price, c_size, conversion_rate)
         
         # 2. Check against Available Free Margin
-        # We assume free_margin is provided (from Broker). If not, we skip this check (e.g. Backtest)
-        # But we also enforce a "Safety Buffer" (e.g. keep 5% margin free)
-        
         if req_margin > (free_margin * 0.95): # Leave 5% buffer always
             # Reduce Lots to fit margin
-            # New Lots = (Free Margin * 0.95) / Margin_Per_Lot
             margin_per_lot = req_margin / lots if lots > 0 else 0
             if margin_per_lot > 0:
                 max_margin_lots = (free_margin * 0.95) / margin_per_lot

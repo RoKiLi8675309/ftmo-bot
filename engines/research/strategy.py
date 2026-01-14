@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX V13.1 UPDATE (LEVERAGE HARMONY):
-# 1. MARGIN CALCULATION: Simulates 'used_margin' to estimate 'free_margin'.
-# 2. LEVERAGE GUARD: Passes estimated free margin to RiskManager for clamping.
-# 3. MATH PARITY: Hurst calculation synchronized with Live Engine.
+# PHOENIX V14.0 UPDATE (AGGRESSOR PROTOCOL):
+# 1. LOGIC SYNC: Mirrors Live Engine's Momentum Ignition (RSI > 80 + Hurst > 0.6).
+# 2. DYNAMIC REWARD: Boosts TP to 4.0R on High RVOL events in backtest.
+# 3. FREQUENCY: Relaxed BB Std Dev to 1.2 to capture earlier entries.
 # =============================================================================
 import logging
 import sys
@@ -47,7 +47,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V13.0 Survival Protocol.
+    Strictly implements the Phoenix V14.0 Aggressor Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -62,9 +62,9 @@ class ResearchStrategy:
         
         # --- RISK CONFIGURATION ---
         self.risk_conf = params.get('risk_management', CONFIG.get('risk_management', {}))
-        # V11.1: Tighter stops (1.5 ATR) by default
+        # V14.0: Standardize risk multiplier
         self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 1.5))
-        self.max_currency_exposure = int(self.risk_conf.get('max_currency_exposure', 2))
+        self.max_currency_exposure = int(self.risk_conf.get('max_currency_exposure', 3))
         
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
@@ -72,7 +72,7 @@ class ResearchStrategy:
         self.optimized_reward_mult = float(tbm_conf.get('barrier_width', 3.0))
         
         self.labeler = AdaptiveTripleBarrier(
-            horizon_ticks=int(tbm_conf.get('horizon_minutes', 120)), 
+            horizon_ticks=int(tbm_conf.get('horizon_minutes', 480)), 
             risk_mult=risk_mult_conf, 
             reward_mult=self.optimized_reward_mult,
             drift_threshold=float(tbm_conf.get('drift_threshold', 1.5))
@@ -87,7 +87,7 @@ class ResearchStrategy:
         self.calibrator_sell = ProbabilityCalibrator(window=2000)
         
         # 5. Warm-up State
-        self.burn_in_limit = params.get('burn_in_periods', 100) # Reduced for V11
+        self.burn_in_limit = params.get('burn_in_periods', 50) # Reduced for V14
         self.burn_in_counter = 0
         self.burn_in_complete = False
         
@@ -114,9 +114,9 @@ class ResearchStrategy:
         self.sniper_closes = deque(maxlen=200)        
         self.sniper_rsi = deque(maxlen=15)    
         
-        # --- V11.1 MOMENTUM INDICATORS ---
+        # --- V14.0 MOMENTUM INDICATORS ---
         self.bb_window = 20
-        self.bb_std = 1.5 # V13.0: 1.5 Default for earlier entries
+        self.bb_std = CONFIG['phoenix_strategy'].get('bb_std_dev', 1.2) # 1.2 Default for Aggressor
         self.bb_buffer = deque(maxlen=self.bb_window)
         
         # --- FORENSIC RECORDER ---
@@ -125,33 +125,32 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX V13.0 CONFIGURATION ---
+        # --- PHOENIX V14.0 CONFIGURATION ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V13.0 Logic Thresholds
-        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.01)) 
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.50)) # RELAXED
-        # Mean Reversion Threshold ignored in V12.7 (Logic Removed)
+        # V14.0 Logic Thresholds
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.005)) 
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.48)) 
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
         
         # V12.3: Regime Enforcement Mode (HARD vs SOFT)
-        self.regime_enforcement = phx_conf.get('regime_enforcement', 'HARD').upper()
+        self.regime_enforcement = phx_conf.get('regime_enforcement', 'DISABLED').upper()
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
         
-        self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 1.1)) 
-        self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 15.0)) # RELAXED
-        self.chop_threshold = float(phx_conf.get('choppiness_threshold', 60.0)) # Relaxed
+        self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 0.8)) 
+        self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 20.0)) # Relaxed
+        self.chop_threshold = float(phx_conf.get('choppiness_threshold', 65.0)) # Relaxed
         
         adx_cfg = CONFIG.get('features', {}).get('adx', {})
         # Relaxed ADX to 20.0 (or config override)
         self.adx_threshold = float(params.get('adx_threshold', adx_cfg.get('threshold', 20.0))) 
         
-        self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.2)
+        self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.1)
         
-        # Friday Liquidation (Aggressor: 18:00 cutoff)
-        self.friday_entry_cutoff = self.risk_conf.get('friday_entry_cutoff_hour', 18)
-        self.friday_close_hour = self.risk_conf.get('friday_liquidation_hour_server', 21)
+        # Friday Liquidation (Aggressor: 19:00 cutoff)
+        self.friday_entry_cutoff = self.risk_conf.get('friday_entry_cutoff_hour', 19)
+        self.friday_close_hour = self.risk_conf.get('friday_liquidation_hour_server', 22)
         
         # Timezone Handling
         tz_str = self.risk_conf.get('risk_timezone', 'Europe/Prague')
@@ -165,8 +164,8 @@ class ResearchStrategy:
         self.dynamic_ker_offset = 0.0
 
         # --- REC 3: Daily Circuit Breaker State ---
-        self.daily_max_losses = 2
-        self.daily_max_loss_pct = 0.01 
+        self.daily_max_losses = 3 # Increased to 3
+        self.daily_max_loss_pct = 0.045 
 
     def _calculate_golden_trio(self) -> Tuple[float, float, float]:
         """
@@ -199,7 +198,7 @@ class ResearchStrategy:
                     tau.append(std if std > 1e-9 else 1e-9)
                 
                 # Polyfit on log-log
-                # V13.1 FIX: Slope = H. Removed legacy scalar.
+                # Slope = H.
                 poly = np.polyfit(np.log(lags), np.log(tau), 1)
                 hurst = poly[0] 
                 hurst = max(0.0, min(1.0, hurst))
@@ -254,12 +253,10 @@ class ResearchStrategy:
                 regimes_found.append(regime)
         
         # Priority 1: Trend Breakout (Aggressor)
-        # If ANY component is Trend (e.g., JPY in GBPJPY), we treat it as Trend.
         if "TREND_BREAKOUT" in regimes_found:
             return "TREND_BREAKOUT"
             
         # Priority 2: Mean Reversion
-        # If NO Trend, but ANY component is Mean Rev (e.g., CAD in USDCAD), treat as Mean Rev.
         if "MEAN_REVERSION" in regimes_found:
             return "MEAN_REVERSION"
             
@@ -269,7 +266,7 @@ class ResearchStrategy:
     def _check_currency_exposure(self, broker: BacktestBroker, symbol: str) -> bool:
         """
         V12.3: Enforces Portfolio Heat Limits.
-        Prevents stacking too much risk on one currency (e.g. max 2 USD pairs).
+        Prevents stacking too much risk on one currency (e.g. max 3 USD pairs).
         """
         base_ccy = symbol[:3]
         quote_ccy = symbol[3:]
@@ -298,7 +295,7 @@ class ResearchStrategy:
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (V13.0 FTMO Survival Mode).
+        Main Event Loop for the Strategy (V14.0 Aggressor Mode).
         """
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
@@ -468,7 +465,7 @@ class ResearchStrategy:
             return 
 
         # ============================================================
-        # E. SURVIVAL GATES & ASSET PERSONALITY (V13.0)
+        # E. SURVIVAL GATES & ASSET PERSONALITY (V14.0)
         # ============================================================
         
         # G1: EFFICIENCY (KER)
@@ -492,11 +489,12 @@ class ResearchStrategy:
             
         bb_mu = np.mean(self.bb_buffer)
         bb_std = np.std(self.bb_buffer)
-        bb_mult = 1.5 # V13.0: 1.5 Std Dev allowed
+        bb_mult = self.bb_std # V14.0: 1.2 Std Dev allowed
+        
         upper_bb = bb_mu + (bb_mult * bb_std)
         lower_bb = bb_mu - (bb_mult * bb_std)
         
-        # --- V13.0 LOGIC MAPPING: TREND ONLY ---
+        # --- V14.0 LOGIC MAPPING: TREND ONLY ---
         is_trending = hurst > self.hurst_breakout
         
         if is_trending:
@@ -525,7 +523,7 @@ class ResearchStrategy:
                 self.rejection_stats[f"Personality Clash ({regime_label} on {preferred_regime})"] += 1
                 return
             elif self.regime_enforcement == "DISABLED":
-                 # V12.7 UNSHACKLED: Bypass clash flag to allow full adaptability
+                 # V14.0: Bypass clash flag to allow full adaptability
                  is_regime_clash = False 
             else:
                 # SOFT Mode: Mark for high confidence check later
@@ -550,7 +548,7 @@ class ResearchStrategy:
         try:
             pred_proba = self.model.predict_proba_one(features)
             
-            # V13.0 SURVIVAL: Bypass Calibration
+            # V14.0 SURVIVAL: Bypass Calibration
             confidence = 1.0 
             
             is_profitable = self.meta_labeler.predict(
@@ -566,7 +564,8 @@ class ResearchStrategy:
                pass
 
             # --- SNIPER PROTOCOL ---
-            if not self._check_sniper_filters(proposed_action, price):
+            # V14.0: Pass current_hurst to enable Momentum Ignition
+            if not self._check_sniper_filters(proposed_action, price, hurst):
                 self.rejection_stats["Sniper Reject"] += 1
                 return
             
@@ -588,7 +587,8 @@ class ResearchStrategy:
     def _execute_entry(self, confidence, price, features, broker, dt_timestamp, action_int, regime, tighten_stops):
         """
         Executes the trade entry logic with Fixed Risk & Portfolio Cap.
-        V13.1: Calculates Leverage-Based Margin to prevent "No Money".
+        V14.0: Calculates Leverage-Based Margin to prevent "No Money".
+        V14.0: Boosts TP if High RVOL.
         """
         action = "BUY" if action_int == 1 else "SELL"
         
@@ -598,6 +598,13 @@ class ResearchStrategy:
             if quote_currency in pos.symbol: 
                 exposure_count += 1
         
+        # Check High Fuel (RVOL) for Reward Boost
+        rvol = features.get('rvol', 0.0)
+        current_reward = self.optimized_reward_mult
+        
+        if rvol > 3.0:
+            current_reward = max(current_reward, 4.0)
+
         ctx = TradeContext(
             symbol=self.symbol,
             price=price,
@@ -605,7 +612,7 @@ class ResearchStrategy:
             account_equity=broker.equity,
             account_currency="USD",
             win_rate=0.45, 
-            risk_reward_ratio=self.optimized_reward_mult 
+            risk_reward_ratio=current_reward 
         )
 
         current_atr = features.get('atr', 0.001)
@@ -674,7 +681,7 @@ class ResearchStrategy:
 
         stop_dist = current_atr * atr_mult
         trade_intent.stop_loss = stop_dist
-        dynamic_tp_dist = current_atr * self.optimized_reward_mult
+        dynamic_tp_dist = current_atr * current_reward
         trade_intent.take_profit = dynamic_tp_dist
         
         trade_intent.action = action
@@ -709,7 +716,7 @@ class ResearchStrategy:
                 'parkinson': features.get('parkinson_vol', 0),
                 'ker': current_ker,
                 'atr': current_atr,
-                'optimized_rr': self.optimized_reward_mult,
+                'optimized_rr': current_reward,
                 'initial_risk_dist': stop_dist, 
                 'entry_price_snap': price,
                 'tighten_stops': tighten_stops
@@ -789,13 +796,13 @@ class ResearchStrategy:
     def _manage_trailing_stops(self, broker: BacktestBroker, current_price: float, timestamp: datetime):
         """
         V13.0 PATIENCE UPDATE:
-        - Wait for 1.0R (Configurable) before moving to Breakeven.
-        - Trail loosely (0.5R default) to allow volatility breathing room.
+        - Wait for 1.5R (Configurable) before moving to Breakeven.
+        - Trail loosely (0.75R default) to allow volatility breathing room.
         """
-        # Load from config, default to 1.0R activation if missing (Patience)
+        # Load from config, default to 1.5R activation if missing (Patience)
         trail_conf = self.risk_conf.get('trailing_stop', {})
-        activation_r = float(trail_conf.get('activation_r', 1.0))
-        trail_dist_r = float(trail_conf.get('trail_dist_r', 0.5))
+        activation_r = float(trail_conf.get('activation_r', 1.5))
+        trail_dist_r = float(trail_conf.get('trail_dist_r', 0.75))
 
         for pos in broker.open_positions:
             if pos.symbol != self.symbol: continue
@@ -812,10 +819,10 @@ class ResearchStrategy:
             new_sl = None
             reason = ""
             
-            # 1. ACTIVATION (Wait for profit > 1.0R)
+            # 1. ACTIVATION (Wait for profit > 1.5R)
             if r_multiple >= activation_r:
                 
-                # Calculate Trail Distance (e.g. 0.5R behind price)
+                # Calculate Trail Distance (e.g. 0.75R behind price)
                 trail_pips = risk_dist * trail_dist_r
                 
                 if pos.side == 1: 
@@ -946,11 +953,11 @@ class ResearchStrategy:
             
         return ctx
 
-    def _check_sniper_filters(self, signal: int, price: float) -> bool:
+    def _check_sniper_filters(self, signal: int, price: float, current_hurst: float) -> bool:
         """
-        V13.0 UPDATE:
+        V14.0 UPDATE:
         - Relaxed RSI filters (80/20) for all pairs.
-        - Allow breakouts to breathe.
+        - MOMENTUM IGNITION: Allow Overbought entries if Hurst > 0.60.
         """
         # 1. RSI CALCULATION (M5 Extension)
         if len(self.sniper_rsi) < 14:
@@ -981,17 +988,23 @@ class ResearchStrategy:
         else:
             trend_aligned = True 
 
-        # 3. RSI EXTREME GUARD (RELAXED)
-        # We assume if it's over 80, it's dangerously overbought, 
-        # but 70 is often just the start of a strong trend.
+        # 3. RSI EXTREME GUARD (V14.0 MOMENTUM IGNITION)
         if signal == 1: # BUY
-            if rsi > 80: # Was 70
-                self.rejection_stats['Overbought_RSI_>80'] += 1
-                return False
+            if rsi > 80: 
+                # Check for Ignition
+                if current_hurst > 0.60:
+                     pass # IGNITION: ALLOW TRADE
+                else:
+                     self.rejection_stats['Overbought_RSI_>80'] += 1
+                     return False
         elif signal == -1: # SELL
-            if rsi < 20: # Was 30
-                self.rejection_stats['Oversold_RSI_<20'] += 1
-                return False
+            if rsi < 20: 
+                # Check for Ignition
+                if current_hurst > 0.60:
+                     pass # IGNITION: ALLOW TRADE
+                else:
+                     self.rejection_stats['Oversold_RSI_<20'] += 1
+                     return False
         
         return True
 
