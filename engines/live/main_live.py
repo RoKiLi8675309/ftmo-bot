@@ -12,6 +12,15 @@ import signal
 import logging
 import time
 
+# --- CRITICAL STABILITY FIX: FORCE SINGLE THREADING FOR MATH LIBS ---
+# Prevents libraries like NumPy/PyTorch from spawning thread pools that 
+# fight with our own threading model, causing latency spikes or deadlocks.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 # Ensure the project root is in sys.path to resolve 'shared' and 'engines' modules
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "../../"))
@@ -36,6 +45,7 @@ def main():
     """
     log.info(f"{LogSymbols.ONLINE} Initializing Live Trading Consumer (Linux/WSL2)...")
     log.info(f"{LogSymbols.INFO} Python Version: {sys.version}")
+    log.info(f"{LogSymbols.INFO} Project Root: {project_root}")
 
     # Initialize Engine
     try:

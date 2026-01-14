@@ -186,7 +186,7 @@ class StreamingParkinsonVolatility:
         try:
             # Raw Parkinson Variance for this bar
             # Guard against flat bar log(1) = 0
-            if high == low: return self.ema.get()
+            if abs(high - low) < 1e-9: return self.ema.get()
 
             log_hl = math.log(high / low)
             variance = self.factor * (log_hl ** 2)
@@ -241,7 +241,7 @@ class StreamingRelativeVolume:
         duration = timestamp - self.last_ts
         self.last_ts = timestamp
         
-        if duration <= 0: duration = 0.001 # Prevent div by zero (instant fill)
+        if duration <= 1e-3: duration = 1e-3 # Prevent div by zero (instant fill)
         
         avg_dur = self.dur_ema.get()
         
@@ -1066,7 +1066,7 @@ class OnlineFeatureEngineer:
             'rvol': rvol_val,
             'aggressor': aggressor_val,
             'flow_imbalance': flow_imbalance, 
-            'flow_ratio': flow_ratio,         
+            'flow_ratio': flow_ratio,          
             
             # V9 Momentum Features (NEW)
             'bb_breakout': bb_feats['bb_breakout'],

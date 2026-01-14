@@ -7,6 +7,7 @@
 # CRITICAL: Python 3.9 Compatible.
 # =============================================================================
 
+from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional
@@ -41,6 +42,7 @@ class Trade:
     comment: str
     entry_type: str = "MARKET"
     magic_number: int = 0
+    ticket: int = 0
     
     # Advanced Trade Management
     limit_offset_atr: float = 0.5

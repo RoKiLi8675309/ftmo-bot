@@ -237,6 +237,9 @@ class RiskManager:
         
         if risk_percent_override is not None:
             # Optuna/WFO override has highest priority
+            # risk_percent_override is float e.g. 0.01 for 1%
+            # Config uses percentage points sometimes, so ensure standardization
+            # Here we assume override is like 0.01
             risk_pct = risk_percent_override * 100.0 if risk_percent_override < 1.0 else risk_percent_override
         else:
             # Default Strategy Logic with Buffer Scaling
@@ -318,7 +321,7 @@ class RiskManager:
         
         # 2. Check against Available Free Margin
         # We assume free_margin is provided (from Broker). If not, we skip this check (e.g. Backtest)
-        # But we also enforce a "Safety Buffer" (e.g. keep 20% margin free)
+        # But we also enforce a "Safety Buffer" (e.g. keep 5% margin free)
         
         if req_margin > (free_margin * 0.95): # Leave 5% buffer always
             # Reduce Lots to fit margin

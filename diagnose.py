@@ -7,6 +7,7 @@
 # 
 # PHOENIX V13.1 UPDATE (SURVIVAL DIAGNOSTICS):
 # 1. RISK CHECK: Updated assertions to match V13.0 Survival Mode (0.5% / 1.0%).
+# 2. LEVERAGE CHECK: Verifies leverage map exists for Margin Guard.
 # =============================================================================
 import unittest
 import numpy as np
@@ -58,6 +59,16 @@ class TestConfigurationIntegrity(unittest.TestCase):
         regime_mode = phx_conf.get('regime_enforcement')
         print(f"   [CONF] Regime Mode: {regime_mode}")
         self.assertEqual(regime_mode, "DISABLED", "CRITICAL: Regime Enforcement must be DISABLED")
+
+    def test_leverage_map_integrity(self):
+        """V13.1: Verify Leverage Map exists for Asset Classes."""
+        risk_conf = CONFIG.get('risk_management', {})
+        lev_map = risk_conf.get('leverage', {})
+        required_keys = ['default', 'minor', 'gold', 'indices', 'crypto']
+        
+        print(f"   [CONF] Leverage Keys: {list(lev_map.keys())}")
+        for k in required_keys:
+            self.assertIn(k, lev_map, f"CRITICAL: Missing leverage config for '{k}'")
 
 class TestInfrastructureAndExecution(unittest.TestCase):
     """
@@ -184,12 +195,15 @@ class TestRiskCalculations(unittest.TestCase):
             risk_reward_ratio=1.0
         )
         mock_prices = {"USDCAD": 1.3500}
+        
+        # V13.1 Update: Pass free_margin explicitly to test new signature
         trade, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=0.6,
             volatility=0.001,
             active_correlations=0,
-            market_prices=mock_prices
+            market_prices=mock_prices,
+            free_margin=100000.0 
         )
         self.assertGreater(trade.volume, 0.0, "Trade volume should be > 0")
         self.assertGreater(risk_usd, 0.0, "Risk USD should be calculated")

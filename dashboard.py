@@ -5,8 +5,9 @@
 # DEPENDENCIES: streamlit, pandas, redis, shared
 # DESCRIPTION: Real-time GUI for monitoring the Algorithmic Trading System.
 #
-# PHOENIX V12.12 UPDATE (SPREAD FIX):
-# 1. FIX: Corrected JPY Pip Multiplier (100 vs 10000) for accurate spread display.
+# PHOENIX V13.1 UPDATE (LEVERAGE VISIBILITY):
+# 1. UI UPDATE: Added Free Margin & Margin Level to Risk Cockpit.
+# 2. SPREAD FIX: Maintained correct JPY pip multipliers.
 # =============================================================================
 import streamlit as st
 import pandas as pd
@@ -90,6 +91,23 @@ def get_risk_metrics():
     except Exception:
         return 0.0, 0.0, 0.0, 0.0, 0.0
 
+def get_account_margin_info():
+    """
+    V13.1: Fetches Margin info for Leverage Guard visibility.
+    Updated by Windows Producer in 'bot:account_info' hash.
+    """
+    try:
+        key = CONFIG['redis'].get('account_info_key', 'bot:account_info')
+        info = r.hgetall(key)
+        if not info:
+            return 0.0, 0.0
+        
+        free_margin = float(info.get('free_margin', 0.0))
+        margin = float(info.get('margin', 0.0))
+        return free_margin, margin
+    except Exception:
+        return 0.0, 0.0
+
 def toggle_kill_switch():
     """Toggles the global trading suspension flag (Logic)."""
     key = CONFIG['redis']['risk_keys']['kill_switch_active']
@@ -166,18 +184,22 @@ st.markdown(f"**Environment:** {sys.platform} | **Python:** {sys.version.split()
 
 # 3. RISK COCKPIT (Top Row)
 start_eq, curr_eq, hwm, daily_dd_pct, daily_dd_val = get_risk_metrics()
+free_margin, used_margin = get_account_margin_info() # V13.1 Update
 limit_pct = CONFIG['risk_management']['max_daily_loss_pct']
 
 # Progress Bar for Daily Limit
-st.markdown("#### Daily Risk Utilization")
-col1, col2, col3, col4 = st.columns(4)
+st.markdown("#### Daily Risk & Leverage")
+col1, col2, col3, col4, col5 = st.columns(5)
+
 with col1:
-    st.metric("Current Equity", f"${curr_eq:,.2f}", delta=f"{curr_eq - start_eq:,.2f}")
+    st.metric("Equity", f"${curr_eq:,.2f}", delta=f"{curr_eq - start_eq:,.2f}")
 with col2:
     st.metric("Daily Drawdown", f"{daily_dd_pct:.2%}", delta=f"-{daily_dd_val:,.2f}", delta_color="inverse")
 with col3:
-    st.metric("Daily Limit", f"{limit_pct:.1%}", f"Buffer: {(limit_pct - daily_dd_pct):.2%}")
+    st.metric("Free Margin", f"${free_margin:,.0f}", f"Used: ${used_margin:,.0f}")
 with col4:
+    st.metric("Daily Limit", f"{limit_pct:.1%}", f"Buffer: {(limit_pct - daily_dd_pct):.2%}")
+with col5:
     st.metric("High Water Mark", f"${hwm:,.2f}")
 
 progress = min(1.0, max(0.0, daily_dd_pct / limit_pct)) if limit_pct > 0 else 0

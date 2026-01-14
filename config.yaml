@@ -77,7 +77,7 @@ producer:
 # --- DATA SETTINGS ---
 data:
   sampling_method: "imbalance" # Adaptive Imbalance Bars
-  volume_bar_threshold: 10.0      
+  volume_bar_threshold: 10.0       
   imbalance_alpha: 0.05        # EWMA Forgetting Factor
   download_start_date: "2020-01-01"
   num_candles_producer: 50000
@@ -96,10 +96,10 @@ features:
   use_log_returns: true
   
   # Project Phoenix L1 Proxies
-  use_parkinson_vol: true           
+  use_parkinson_vol: true            
   use_amihud_liquidity: true 
-  use_relative_volume: true           
-  use_aggressor_ratio: true           
+  use_relative_volume: true            
+  use_aggressor_ratio: true            
   
   # Regime Filters (Anti-Chop)
   use_choppiness: true
@@ -151,8 +151,8 @@ phoenix_strategy:
   
   asset_regime_map:
     GBP: "TREND_BREAKOUT"    
-    EUR: "TREND_BREAKOUT"           
-    USD: "TREND_BREAKOUT"           
+    EUR: "TREND_BREAKOUT"            
+    USD: "TREND_BREAKOUT"            
     JPY: "TREND_BREAKOUT"    
     AUD: "NEUTRAL"    
     CAD: "NEUTRAL"    
@@ -160,7 +160,7 @@ phoenix_strategy:
 
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true        
-  require_d1_trend: false             # DISABLED: M5 Trend is independent           
+  require_d1_trend: false             # DISABLED: M5 Trend is independent            
   require_h4_alignment: false         # Rely on ML for context        
   
   # --- LOGIC MAPPING THRESHOLDS ---
@@ -273,8 +273,8 @@ risk_management:
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC (SWING HYBRID)
-  stop_loss_atr_mult: 1.5         # Standard Stop       
-  take_profit_atr_mult: 3.0       # Higher Reward Target       
+  stop_loss_atr_mult: 1.5         # Standard Stop        
+  take_profit_atr_mult: 3.0       # Higher Reward Target        
   
   # ACTIVE TRAILING STOP
   trailing_stop:

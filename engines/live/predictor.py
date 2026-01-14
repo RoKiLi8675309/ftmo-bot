@@ -275,7 +275,7 @@ class MultiAssetPredictor:
                     tau.append(std if std > 1e-9 else 1e-9)
                 
                 # Polyfit on log-log
-                # V12.41 FIX: Removed '* 2.0' scalar. Slope = H.
+                # V13.1 FIX: Slope = H. Removed legacy scalar.
                 poly = np.polyfit(np.log(lags), np.log(tau), 1)
                 hurst = poly[0] 
                 hurst = max(0.0, min(1.0, hurst))
@@ -287,6 +287,7 @@ class MultiAssetPredictor:
             diffs = np.diff(prices)
             net_change = abs(prices[-1] - prices[0])
             sum_changes = np.sum(np.abs(diffs))
+            # V13.1 FIX: Strict Zero Division Guard
             if sum_changes > 1e-9:
                 ker = net_change / sum_changes
             else:
@@ -298,6 +299,7 @@ class MultiAssetPredictor:
         if len(vols) > 10:
             curr_vol = vols[-1]
             avg_vol = np.mean(list(vols)[:-1]) # Exclude current
+            # V13.1 FIX: Strict Zero Division Guard
             if avg_vol > 1e-9:
                 rvol = curr_vol / avg_vol
             else:
@@ -618,7 +620,7 @@ class MultiAssetPredictor:
         # 5. ML Confirmation & Calibration
         pred_proba = model.predict_proba_one(features)
         
-        # V12.7 UNSHACKLED: Bypass Calibration/Confidence Check
+        # V13.0 SURVIVAL: Bypass Calibration/Confidence Check
         # We trust the Meta Labeler and Regime Filters entirely.
         confidence = 1.0 # Force max confidence to bypass filters
         

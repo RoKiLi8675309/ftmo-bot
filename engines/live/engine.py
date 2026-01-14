@@ -9,6 +9,7 @@
 # PHOENIX V13.1 UPDATE (LEVERAGE HARMONY):
 # 1. MARGIN AWARENESS: Fetches real-time 'free_margin' from Redis.
 # 2. SAFETY CLAMP: Passes free margin to RiskManager to prevent "No Money" errors.
+# 3. BUG FIX (V13.1.1): Fixed critical deduplication pass-through error.
 # =============================================================================
 import logging
 import time
@@ -561,8 +562,9 @@ class LiveTradingEngine:
             
             last_ts = self.processed_ticks.get(symbol, 0.0)
             if tick_ts <= last_ts:
-                # OPTIONAL: Allow update if volume changed, but for now strict time is safer
-                pass
+                # CRITICAL FIX (V13.1.1): Dropped ticks must RETURN, not PASS.
+                # 'pass' allowed duplicates to corrupt volume aggregation.
+                return 
             
             self.processed_ticks[symbol] = tick_ts
 

@@ -8,7 +8,7 @@ set -e
 
 # --- CONSOLE FEEDBACK (UNFREEZE INDICATOR) ---
 echo "================================================================="
-echo " 🚀 STARTING FTMO FORENSIC PIPELINE"
+echo " 🚀 STARTING FTMO FORENSIC PIPELINE (V13.1 SURVIVAL MODE)"
 echo " 🕒 $(date)"
 echo "================================================================="
 
@@ -62,7 +62,9 @@ done
 
 # --- ENVIRONMENT SETUP ---
 # Smart detection of Python interpreter
-if [ -f "venv/bin/python" ]; then
+if [ -n "$VIRTUAL_ENV" ]; then
+    TARGET_PYTHON="python" # Use active venv
+elif [ -f "venv/bin/python" ]; then
     TARGET_PYTHON="venv/bin/python"
 elif [ -f "anaconda3/envs/algo_env_stable/bin/python" ]; then
     TARGET_PYTHON="anaconda3/envs/algo_env_stable/bin/python"

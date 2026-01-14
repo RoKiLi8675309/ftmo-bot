@@ -7,8 +7,8 @@
 # CRITICAL: Python 3.9 Compatible. Unmutes Optuna for Research Transparency.
 # AUDIT REMEDIATION:
 #   - CLEANUP: Removed initialization print statement to reduce console spam.
-#   - SILENCE: Added 'hmmlearn' to noisy_libs and suppressed Python warnings.
-#   - FIX: Removed 'Logging Initialized' console log to stop worker spam.
+#   - SILENCE: Added 'hmmlearn', 'river', 'joblib' to noisy_libs.
+#   - ROBUSTNESS: Added missing LogSymbols (TRASH, TRAINING, SAVE, BACKTEST).
 # =============================================================================
 
 import logging
@@ -57,6 +57,12 @@ class LogSymbols:
     UNLOCK = "🔓"
     UPLOAD = "📤"
     DOWNLOAD = "📥"
+    
+    # Research & Training (Added to prevent AttributeError)
+    TRASH = "🗑️"
+    TRAINING = "🏋️"
+    SAVE = "💾"
+    BACKTEST = "📉"
     
     # Sessions
     SESSION_LDN = "🇬🇧"
@@ -147,8 +153,6 @@ def setup_logging(component_name: str = "FTMO_Bot", log_level_override: Optional
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
         
-        # AUDIT FIX: Removed print statement entirely
-        
     except Exception as e:
         print(f"Logging setup failed (File Handler): {e}")
 
@@ -179,11 +183,11 @@ def setup_logging(component_name: str = "FTMO_Bot", log_level_override: Optional
         "PIL",
         "websockets",
         "hmmlearn",
-        "river"
+        "river",
+        "joblib"
     ]
     
     for lib in noisy_libs:
         logging.getLogger(lib).setLevel(logging.WARNING)
 
     # AUDIT FIX: Removed the "Logging Initialized" info log to prevent worker spam
-    # logging.info(f"{LogSymbols.SUCCESS} Logging Initialized for {component_name} (Level: {config_log_level_str})")

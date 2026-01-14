@@ -47,13 +47,21 @@ class MarketSnapshot:
         try:
             # Try specific column first (e.g., 'EURUSD_close')
             key = f"{symbol}_{price_type}" if symbol else price_type
-            if key in self.data:
-                return float(self.data[key])
+            val = None
             
+            if key in self.data:
+                val = self.data[key]
             # Fallback for generic names if only one symbol exists
-            if price_type in self.data:
-                return float(self.data[price_type])
-                
+            elif price_type in self.data:
+                val = self.data[price_type]
+            
+            if val is not None:
+                # Handle potential non-numeric data
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return 0.0
+            
             return 0.0
         except Exception:
             return 0.0
@@ -67,10 +75,14 @@ class MarketSnapshot:
     def to_price_dict(self) -> Dict[str, float]:
         """Returns a dictionary of {symbol: close_price}."""
         res = {}
+        # Iterate safely over index
         for col in self.data.index:
-            if "_close" in col:
+            if isinstance(col, str) and "_close" in col:
                 sym = col.replace("_close", "")
-                res[sym] = float(self.data[col])
+                try:
+                    res[sym] = float(self.data[col])
+                except:
+                    res[sym] = 0.0
         return res
 
 @dataclass
@@ -232,11 +244,16 @@ class BacktestBroker:
             
         # 1. Update Price Map
         for col in snapshot.data.index:
-            if "_close" in col:
-                sym = col.replace("_close", "")
-                self.last_price_map[sym] = float(snapshot.data[col])
-            elif "_" not in col and len(col) == 6:
-                 self.last_price_map[col] = float(snapshot.data[col])
+            if isinstance(col, str):
+                try:
+                    val = float(snapshot.data[col])
+                    if "_close" in col:
+                        sym = col.replace("_close", "")
+                        self.last_price_map[sym] = val
+                    elif "_" not in col and len(col) == 6:
+                         self.last_price_map[col] = val
+                except:
+                    continue
 
         # 2. Check Open Positions
         active_positions = []
@@ -390,25 +407,35 @@ class BacktestBroker:
         self.closed_positions.append(trade)
         
         # 6. Log to Trade Log (Enhanced Metadata for V12.6)
+        # Ensure metadata is serializable
+        clean_metadata = {}
+        for k, v in trade.metadata.items():
+            if isinstance(v, (np.float64, np.float32)):
+                clean_metadata[k] = float(v)
+            elif isinstance(v, (np.int64, np.int32)):
+                clean_metadata[k] = int(v)
+            else:
+                clean_metadata[k] = v
+
         self.trade_log.append({
             'Entry_Time': trade.timestamp_created,
             'Exit_Time': close_time,
             'Symbol': trade.symbol,
             'Action': trade.action,
-            'Size': trade.quantity,
-            'Entry_Price': trade.entry_price,
-            'Exit_Price': close_price,
-            'Gross_PnL': gross_pnl,
-            'Commission': trade.commission,
-            'Net_PnL': net_pnl,
+            'Size': float(trade.quantity),
+            'Entry_Price': float(trade.entry_price),
+            'Exit_Price': float(close_price),
+            'Gross_PnL': float(gross_pnl),
+            'Commission': float(trade.commission),
+            'Net_PnL': float(net_pnl),
             'Status': "CLOSED",
             'Comment': reason,
-            'MFE_Pips': trade.max_favorable_excursion,
-            'MAE_Pips': trade.max_adverse_excursion,
+            'MFE_Pips': float(trade.max_favorable_excursion),
+            'MAE_Pips': float(trade.max_adverse_excursion),
             'Duration_Min': (close_time - trade.timestamp_created).total_seconds() / 60,
-            'Regime': trade.metadata.get('regime', 'Unknown'),
-            'Confidence': trade.metadata.get('confidence', 0.0),
-            'Tighten_Stops': trade.metadata.get('tighten_stops', False) # New for V12.6
+            'Regime': clean_metadata.get('regime', 'Unknown'),
+            'Confidence': clean_metadata.get('confidence', 0.0),
+            'Tighten_Stops': clean_metadata.get('tighten_stops', False) # New for V12.6
         })
         
         symbol_icon = "🟢" if net_pnl > 0 else "🔴"

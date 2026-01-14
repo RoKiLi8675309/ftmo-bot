@@ -8,6 +8,7 @@
 # PHOENIX V13.1 UPDATE (LEVERAGE HARMONY):
 # 1. MARGIN CALCULATION: Simulates 'used_margin' to estimate 'free_margin'.
 # 2. LEVERAGE GUARD: Passes estimated free margin to RiskManager for clamping.
+# 3. MATH PARITY: Hurst calculation synchronized with Live Engine.
 # =============================================================================
 import logging
 import sys
@@ -110,7 +111,7 @@ class ResearchStrategy:
         self.current_d1_ema = 0.0 
         
         # --- SNIPER PROTOCOL INDICATORS ---
-        self.sniper_closes = deque(maxlen=200)       
+        self.sniper_closes = deque(maxlen=200)        
         self.sniper_rsi = deque(maxlen=15)    
         
         # --- V11.1 MOMENTUM INDICATORS ---
@@ -186,12 +187,22 @@ class ResearchStrategy:
         
         # 1. Simple Hurst
         try:
-            lags = range(2, 20)
-            tau = [np.std(np.subtract(prices[lag:], prices[:-lag])) for lag in lags]
-            poly = np.polyfit(np.log(lags), np.log(tau), 1)
-            # V12.8 FIX: Removed * 2.0 scalar to match Live Engine & Correct Math
-            hurst = poly[0] 
-            hurst = max(0.0, min(1.0, hurst))
+            # Math Guard: Variance check
+            if np.var(prices) < 1e-9:
+                hurst = 0.5
+            else:
+                lags = range(2, 20)
+                tau = []
+                for lag in lags:
+                    diff = np.subtract(prices[lag:], prices[:-lag])
+                    std = np.std(diff)
+                    tau.append(std if std > 1e-9 else 1e-9)
+                
+                # Polyfit on log-log
+                # V13.1 FIX: Slope = H. Removed legacy scalar.
+                poly = np.polyfit(np.log(lags), np.log(tau), 1)
+                hurst = poly[0] 
+                hurst = max(0.0, min(1.0, hurst))
         except:
             hurst = 0.5
 
@@ -200,7 +211,7 @@ class ResearchStrategy:
             diffs = np.diff(prices)
             net_change = abs(prices[-1] - prices[0])
             sum_changes = np.sum(np.abs(diffs))
-            if sum_changes > 0:
+            if sum_changes > 1e-9:
                 ker = net_change / sum_changes
             else:
                 ker = 0.0
@@ -211,7 +222,7 @@ class ResearchStrategy:
         if len(vols) > 10:
             curr_vol = vols[-1]
             avg_vol = np.mean(list(vols)[:-1]) 
-            if avg_vol > 0:
+            if avg_vol > 1e-9:
                 rvol = curr_vol / avg_vol
             else:
                 rvol = 1.0

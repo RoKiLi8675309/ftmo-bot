@@ -44,4 +44,5 @@ dependencies:
   - pip:
     - cloudscraper # REQUIRED: Bypass Cloudflare on Forex Factory HTML
     - requests # REQUIRED: HTTP polling
+    - hmmlearn # REQUIRED: For GaussianHMM in RegimeDetector
     # MetaTrader5 is excluded here as it's Windows-only; manually install on Windows

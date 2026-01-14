@@ -37,10 +37,10 @@ class PrecisionGuard:
             return 2
         
         # Indices (Usually 1 or 2 digits)
-        # US30, GER40, SPX500, NAS100
+        # US30, GER40, SPX500, NAS100, USTEC, FRA40, UK100
         if any(idx in s for idx in ["US30", "GER30", "GER40", "FRA40", "UK100", "JP225"]):
             return 1
-        if any(idx in s for idx in ["SPX", "NAS", "US500", "US100"]):
+        if any(idx in s for idx in ["SPX", "NAS", "US500", "US100", "USTEC", "NDX"]):
             return 2
 
         # Crypto (Usually 2 or 5 digits depending on price, assume 2 for major pairs like BTCUSD)
