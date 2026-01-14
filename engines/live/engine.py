@@ -6,10 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX V13.1 UPDATE (LEVERAGE HARMONY):
-# 1. MARGIN AWARENESS: Fetches real-time 'free_margin' from Redis.
-# 2. SAFETY CLAMP: Passes free margin to RiskManager to prevent "No Money" errors.
-# 3. BUG FIX (V13.1.1): Fixed critical deduplication pass-through error.
+# PHOENIX V14.0 UPDATE (AGGRESSOR PROTOCOL):
+# 1. MOMENTUM IGNITION: Live implementation of RSI > 80 override.
+# 2. DYNAMIC REWARD: Boosts TP to 4.0R if Live RVOL > 3.0.
+# 3. FREQUENCY: Aligned rejection logic with Research Strategy.
 # =============================================================================
 import logging
 import time
@@ -66,7 +66,7 @@ class LiveTradingEngine:
     The Central Logic Unit for the Linux Consumer.
     1. Consumes Ticks from Redis.
     2. Aggregates Ticks into Adaptive Imbalance Bars (TIBs).
-    3. Feeds Bars to Golden Trio Predictor (V12.4 Logic).
+    3. Feeds Bars to Golden Trio Predictor (V14.0 Logic).
     4. Manages Active Positions (Time Stop / Trailing).
     5. Dispatches Orders to Windows.
     """
@@ -104,7 +104,7 @@ class LiveTradingEngine:
         self.aggregators = {}
         
         # Use Volume Threshold config as a proxy for Initial Imbalance Threshold
-        init_threshold = CONFIG['data'].get('volume_bar_threshold', 50) # V12.4 Default
+        init_threshold = CONFIG['data'].get('volume_bar_threshold', 10) # V14.0 Default
         # Default alpha 0.05 if not in config
         alpha = CONFIG['data'].get('imbalance_alpha', 0.05) 
 
@@ -145,8 +145,8 @@ class LiveTradingEngine:
         # Added 'tickets' set to track unique deal IDs and prevent double counting
         self.daily_execution_stats = defaultdict(lambda: {'date': None, 'losses': 0, 'pnl': 0.0, 'tickets': set()})
         
-        # V12.7 UNSHACKLED: Increased from 2 to 4 to align with 1% Risk and 4% Daily Buffer
-        self.max_daily_losses_per_symbol = 4 
+        # V14.0 UNSHACKLED: Increased to 5 to prevent early lockout in Aggressor Mode
+        self.max_daily_losses_per_symbol = 5
         
         # --- TIMEZONE INIT (MOVED UP FOR V12.20 FIX) ---
         tz_str = CONFIG['risk_management'].get('risk_timezone', 'Europe/Prague')
@@ -177,7 +177,7 @@ class LiveTradingEngine:
         # --- Volatility Gate Config ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.5)
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.0) # Lowered for V14
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
 
         # V11.1: Active Position Management Thread
@@ -862,6 +862,7 @@ class LiveTradingEngine:
             logger.info(f"🛡️ STOP TIGHTENED: {symbol} (High Volatility) -> SL Dist {sl_dist:.5f}")
 
         # --- DYNAMIC R:R OVERRIDE ---
+        # V14.0 UPDATE: Check for Momentum Ignition reward boost
         optimized_rr = signal.meta_data.get('optimized_rr')
         if optimized_rr and optimized_rr > 0 and current_atr > 0:
             tp_dist = current_atr * optimized_rr

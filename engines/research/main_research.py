@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# PHOENIX STRATEGY V12.34 (FIX: LOGSYMBOLS ATTRIBUTE ERROR):
-# 1. FIX: Replaced non-existent LogSymbols attributes (trash, training, save, backtest)
-#    with direct emoji literals to prevent crashes.
-# 2. STABILITY: Preserves full logic and structure of the 1000+ line research engine.
+# PHOENIX V14.0 UPDATE (AGGRESSOR OPTIMIZATION):
+# 1. RISK SPACE: Expanded search to include 2.0% risk (House Money Tier).
+# 2. SIGNIFICANCE: Enforces min_trades from config (100) to filter luck.
+# 3. ALIGNMENT: Ensures optimization objective matches Aggressor goals.
 # =============================================================================
 import os
 import sys
@@ -261,9 +261,9 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
             
-            # V12.4 AGGRESSOR PROTOCOL: Updated Risk Search Space
-            # Includes 0.5% (Base), 1.0% (Scaled), 1.5% (Aggressor Cap)
-            risk_options = [0.005, 0.010, 0.015] 
+            # V14.0 AGGRESSOR PROTOCOL: Updated Risk Search Space
+            # Includes 0.5% (Prob), 1.0% (Base), 1.5% (Strong), 2.0% (House Money)
+            risk_options = [0.005, 0.010, 0.015, 0.020] 
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             trial.set_user_attr("risk_pct", params['risk_per_trade_percent'] * 100)
             
@@ -309,7 +309,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 trial.set_user_attr("blown", True)
                 return -10000.0
 
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 30)
+            # V14.0: SIGNIFICANCE FILTER
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 100)
             if trades < min_trades:
                 trial.set_user_attr("pruned", True)
                 return 0.0 
@@ -406,8 +407,8 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 }
                 params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
                 
-                # V12.4 AGGRESSOR: Updated Risk Search for WFO
-                risk_options = [0.005, 0.010, 0.015]
+                # V14.0 AGGRESSOR: Updated Risk Search for WFO
+                risk_options = [0.005, 0.010, 0.015, 0.020]
                 params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
                 
                 pipeline_inst = ResearchPipeline()
@@ -494,9 +495,9 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
             log.warning(f"No trials found for {symbol}. Skipping finalization.")
             return
 
-        # --- V12.2: ROBUST SELECTION LOGIC ---
+        # --- V14.0: ROBUST SELECTION LOGIC ---
         # Filter trials that met the trade count threshold
-        min_trades = CONFIG['wfo'].get('min_trades_optimization', 20)
+        min_trades = CONFIG['wfo'].get('min_trades_optimization', 100)
         
         valid_trials = [
             t for t in study.trials 
