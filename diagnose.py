@@ -5,8 +5,8 @@
 # DEPENDENCIES: unittest, numpy, redis, shared
 # DESCRIPTION: Pre-Flight Forensic Diagnostics & PIPELINE VERIFICATION.
 # 
-# PHOENIX V13.1 UPDATE (SURVIVAL DIAGNOSTICS):
-# 1. RISK CHECK: Updated assertions to match V13.0 Survival Mode (0.5% / 1.0%).
+# PHOENIX V14.0 UPDATE (AGGRESSOR DIAGNOSTICS):
+# 1. RISK CHECK: Updated assertions to match V14.0 Aggressor Mode (1.0% / 2.0%).
 # 2. LEVERAGE CHECK: Verifies leverage map exists for Margin Guard.
 # =============================================================================
 import unittest
@@ -40,18 +40,18 @@ logger = logging.getLogger("Diagnose")
 
 class TestConfigurationIntegrity(unittest.TestCase):
     """
-    V13.0 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
-    with the Survival Protocol parameters.
+    V14.0 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
+    with the Aggressor Protocol parameters.
     """
-    def test_unshackled_risk_params(self):
-        """Verify Risk Management is set to 0.5% Base / 1.0% Scaled (Survival Mode)."""
+    def test_aggressor_risk_params(self):
+        """Verify Risk Management is set to 1.0% Base / 2.0% Scaled (Aggressor Mode)."""
         risk_conf = CONFIG.get('risk_management', {})
         base_risk = risk_conf.get('base_risk_per_trade_percent')
         scaled_risk = risk_conf.get('scaled_risk_percent')
         
         print(f"   [CONF] Base Risk: {base_risk*100:.1f}% | Scaled Risk: {scaled_risk*100:.1f}%")
-        self.assertEqual(base_risk, 0.005, "CRITICAL: Base Risk must be 0.5% (0.005)")
-        self.assertEqual(scaled_risk, 0.010, "CRITICAL: Scaled Risk must be 1.0% (0.010)")
+        self.assertEqual(base_risk, 0.010, "CRITICAL: Base Risk must be 1.0% (0.010) for Aggressor Mode")
+        self.assertEqual(scaled_risk, 0.020, "CRITICAL: Scaled Risk must be 2.0% (0.020) for Aggressor Mode")
 
     def test_regime_settings(self):
         """Verify Regime Enforcement is DISABLED for maximum AI adaptability."""
@@ -61,7 +61,7 @@ class TestConfigurationIntegrity(unittest.TestCase):
         self.assertEqual(regime_mode, "DISABLED", "CRITICAL: Regime Enforcement must be DISABLED")
 
     def test_leverage_map_integrity(self):
-        """V13.1: Verify Leverage Map exists for Asset Classes."""
+        """V14.0: Verify Leverage Map exists for Asset Classes."""
         risk_conf = CONFIG.get('risk_management', {})
         lev_map = risk_conf.get('leverage', {})
         required_keys = ['default', 'minor', 'gold', 'indices', 'crypto']
@@ -215,5 +215,5 @@ class TestRiskCalculations(unittest.TestCase):
         self.assertEqual(digits, 2, "Crypto heuristic should work")
 
 if __name__ == '__main__':
-    print(f"\n🔍 RUNNING PHOENIX V13.1 PIPELINE DIAGNOSTICS...")
+    print(f"\n🔍 RUNNING PHOENIX V14.0 PIPELINE DIAGNOSTICS...")
     unittest.main(verbosity=2)
