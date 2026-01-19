@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V15.0 (HYPER-AGGRESSOR PROTOCOL)
-# STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
+# config.yaml – PROJECT PHOENIX V16.0 (FOREX HYPER-SCALPER)
+# STATUS: OPTIMIZING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGIC SHIFT:
-# 1. PORTFOLIO: Dropped dead EURUSD. Added high-beta GBPAUD & AUDJPY.
-# 2. PYRAMIDING: Aggressive stacking on winners (Max 3 adds, Trigger 0.5R).
-# 3. RATCHETING: Equity floor raises every 5% gain to lock profits.
+# STRATEGIC SHIFT (V16.0 FOREX ONLY):
+# 1. FREQUENCY: Added High-Beta Crosses (GBPAUD, EURAUD, GBPNZD) for velocity.
+# 2. DRAWDOWN: Reduced Base Risk to 0.5% to survive volatility clusters.
+# 3. DURATION: Hard limit on trade holding (Intraday Focus).
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -79,7 +79,7 @@ data:
   sampling_method: "imbalance" # Adaptive Imbalance Bars
   volume_bar_threshold: 10.0        
   imbalance_alpha: 0.05        # EWMA Forgetting Factor
-  download_start_date: "2020-01-01"
+  download_start_date: "2022-01-01" 
   num_candles_producer: 50000
   num_candles_train: 10000000  # 10M Ticks
   num_candles_wfo: 10000
@@ -136,7 +136,7 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 20.0 
+    threshold: 15.0 # V16.0: Relaxed for Scalping (Forex)
   
   cyclical_time: true
   session_awareness: true
@@ -146,13 +146,16 @@ features:
 # --- PHOENIX STRATEGY PARAMETERS ---
 phoenix_strategy:
   # --- ASSET REGIME MAPPING ---
-  # DISABLED allows ML to decide based on data
   regime_enforcement: "DISABLED" 
   
   asset_regime_map:
-    GBP: "TREND_BREAKOUT"     
-    JPY: "TREND_BREAKOUT"   
-    AUD: "TREND_BREAKOUT"     
+    GBPAUD: "TREND_BREAKOUT" # The Beast
+    EURAUD: "TREND_BREAKOUT"
+    GBPNZD: "TREND_BREAKOUT"
+    GBPJPY: "TREND_BREAKOUT" 
+    USDJPY: "TREND_BREAKOUT"
+    GBPUSD: "TREND_BREAKOUT"
+    EURJPY: "TREND_BREAKOUT"
     CAD: "NEUTRAL"    
     CHF: "NEUTRAL"    
     USD: "NEUTRAL"
@@ -162,18 +165,17 @@ phoenix_strategy:
   require_d1_trend: false                        
   require_h4_alignment: false                 
   
-  # --- LOGIC MAPPING THRESHOLDS ---
-  # V15.0: Hyper-Aggressive thresholds
-  hurst_breakout_threshold: 0.48      
+  # --- LOGIC MAPPING THRESHOLDS (V16.0 SCALPER) ---
+  hurst_breakout_threshold: 0.45      # Relaxed from 0.48
   hurst_mean_reversion_threshold: 0.00   
-  ker_trend_threshold: 0.005           
+  ker_trend_threshold: 0.002          # Relaxed from 0.005 (Catch chopped trends)
   
   bb_std_dev: 1.2                     
   
-  rvol_volatility_trigger: 2.5        # LOWERED: Easier to trigger TP Boost
+  rvol_volatility_trigger: 2.5        # Lowered to trigger easier
   
   # --- FILTER THRESHOLDS ---
-  max_relative_volume: 25.0        # RELAXED further
+  max_relative_volume: 25.0        
   volume_gate_ratio: 0.8           
   aggressor_threshold: 0.51        
   ml_confirmation_threshold: 0.50  
@@ -214,12 +216,12 @@ optimization_search_space:
   
   # Triple Barrier Method (Labeling)
   tbm_barrier_width:
-    min: 2.0  
-    max: 6.0  
+    min: 1.5  # Tighter for scalping
+    max: 4.0  
   tbm_horizon_minutes:
-    min: 120
-    max: 720
-    step: 60
+    min: 60   # 1 Hour
+    max: 360  # 6 Hours
+    step: 30
   tbm_drift_threshold:
     min: 1.0
     max: 2.0
@@ -233,48 +235,48 @@ optimization_search_space:
 risk_management:
   account_currency: "USD"
   
-  # --- SIZING METHOD: AGGRESSOR PROTOCOL ---
+  # --- SIZING METHOD: HYPER-SCALPER PROTOCOL ---
   sizing_method: "fixed_risk"
   
-  # V15.0: 1.0% Base Risk 
-  base_risk_per_trade_percent: 0.010 
+  # V16.0: 0.5% Base Risk (High Frequency, Low Impact)
+  base_risk_per_trade_percent: 0.005 
   
   # PROFIT BUFFER LOGIC
   profit_buffer_threshold: 0.02
-  # Scaled risk 2.5% max (V15 Boost)
-  scaled_risk_percent: 0.025
+  # Scaled risk 1.5% max
+  scaled_risk_percent: 0.015
   
-  # PYRAMIDING (COMPOUNDING) - V15.0 AGGRESSOR
+  # PYRAMIDING (COMPOUNDING)
   pyramiding:
     enabled: true
-    max_adds: 3
-    add_on_profit_r: 0.5  # AGGRESSOR: Add when trade is just 0.5R in profit
-    risk_per_add_percent: 0.005 # 0.5% risk per add
+    max_adds: 2 # Reduced from 3 for safety
+    add_on_profit_r: 0.5  
+    risk_per_add_percent: 0.0025 # 0.25% risk per add
   
   # EQUITY RATCHET
   equity_ratchet:
     enabled: true
-    step_percent: 0.05    # Lock floor every 5% gain
+    step_percent: 0.025    # Lock floor every 2.5% gain
   
   # LIMITS
-  max_daily_loss_pct: 0.045        
+  max_daily_loss_pct: 0.040        # Tightened to 4.0% for safety buffer
   max_total_loss_pct: 0.095        
   
   # PORTFOLIO HEAT
-  max_currency_exposure: 4         # RELAXED: Max 4 positions per currency
+  max_currency_exposure: 2         # STRICT: Max 2 correlated pairs
   
-  max_risk_percent: 6.0            # INCREASED: Allow stacking room
-  max_open_trades: 8               # INCREASED: Allow pyramiding layers
+  max_risk_percent: 3.0            # Reduced from 6.0% (Safety Cap)
+  max_open_trades: 5               # Reduced from 8 (Focus)
   
   # --- LEVERAGE GUARD ---
   leverage:
-    default: 30.0        # Forex Majors (EURUSD, GBPUSD, USDJPY)
-    minor: 20.0          # Forex Minors/Crosses (EURJPY, GBPJPY, GBPAUD)
+    default: 30.0        # Forex Majors
+    minor: 20.0          # Forex Minors
     gold: 20.0           # XAUUSD
     indices: 20.0        # US30, SPX500
     crypto: 2.0          # BTCUSD
   
-  leverage_safety_divisor: 1.5 # Maximum leverage utilization
+  leverage_safety_divisor: 1.5
   
   max_leverage: 30.0
   max_lot_size: 50.0 
@@ -282,41 +284,43 @@ risk_management:
   
   # PROJECT PHOENIX EXIT LOGIC
   stop_loss_atr_mult: 1.5               
-  take_profit_atr_mult: 4.0              
+  take_profit_atr_mult: 3.0              
   
   # ACTIVE TRAILING STOP
   trailing_stop:
     enabled: true        
-    activation_r: 1.5        
-    trail_trigger_r: 1.5     
-    trail_dist_r: 1.0       # Looser trail (1.0R) to avoid noise outs
+    activation_r: 1.0       # Activate earlier (1.0R)
+    trail_trigger_r: 1.0     
+    trail_dist_r: 0.5       # Tight Trail (0.5R) to bank scalps
   
   risk_timezone: "Europe/Prague"
-  friday_entry_cutoff_hour: 19        
-  friday_liquidation_hour_server: 22  
+  friday_entry_cutoff_hour: 18        
+  friday_liquidation_hour_server: 21  
   
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 100           # Uncapped frequency
-  correlation_penalty_threshold: 0.90 # Relaxed correlation check
+  max_trades_per_day: 100          
+  correlation_penalty_threshold: 0.85 # Stricter correlation check
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
   min_stop_loss_pips: 3.0
 
-# --- TRADING PORTFOLIO (V15.0) ---
+# --- TRADING PORTFOLIO (V16.0) ---
 trading:
-  # HYPER-AGGRESSOR PORTFOLIO (High Beta Pairs):
+  # HYPER-SCALPER FOREX PORTFOLIO (High Volatility Crosses):
   symbols:
-    - "GBPJPY"   # The King of Volatility
-    - "GBPUSD"   # The Cable
-    - "USDJPY"   # The Ninja
     - "GBPAUD"   # The Beast (High Volatility)
-    - "AUDJPY"   # Risk-On Proxy
+    - "GBPJPY"   # The Dragon
+    - "EURAUD"   # High Beta Cross
+    - "GBPNZD"   # High Volatility
+    - "USDJPY"   # Carry/Trend
+    - "GBPUSD"   # Cable
+    - "EURJPY"   # Cross
   
   auxiliary_symbols:
-    - "EURJPY"
-    - "XAUUSD"   # Gold (Optional if data available)
+    - "AUDJPY"
+    - "EURUSD"
     
   timeframe: "M5"
   magic_number: 621001
@@ -339,7 +343,7 @@ online_learning:
   max_features: 'sqrt'    
   metric: "LogLoss"        
   
-  burn_in_periods: 50    
+  burn_in_periods: 30    # Reduced Warmup
   
   # Volatility Gate
   volatility_gate:
@@ -352,8 +356,8 @@ online_learning:
   meta_labeling_threshold: 0.50 
   
   tbm:
-    # HORIZON: 8 Hours
-    horizon_minutes: 480        
+    # HORIZON: 4 Hours (Scalper)
+    horizon_minutes: 240        
     barrier_width: 3.0        
     min_profit_pips: 5.0        
     drift_threshold: 1.5 
@@ -368,10 +372,10 @@ news_filter:
   enabled: true
   primary_url: "http://nfs.faireconomy.media/ff_calendar_thisweek.xml"
   backup_url: "https://www.forexfactory.com/calendar"
-  buffer_minutes_before: 5   # Minimal buffer for Aggressor
+  buffer_minutes_before: 5   # Minimal buffer for Scalping
   buffer_minutes_after: 5    # Minimal buffer
   restricted_events:
-    USD: ["FOMC", "NFP", "CPI"] # Only the big 3
+    USD: ["FOMC", "NFP", "CPI"] 
     GBP: ["BOE", "CPI"]
     JPY: ["BOJ"]
     AUD: ["RBA", "CPI"]
@@ -389,8 +393,8 @@ forensic_audit:
     AUDJPY: 1.2   
     GBPUSD: 1.0   
     GBPAUD: 1.8   # High spread but huge moves
-    USDCAD: 1.2   
-    USDCHF: 1.0   
+    EURAUD: 1.8
+    GBPNZD: 2.2
 
 # --- WFO OPTIMIZATION ---
 wfo:
@@ -398,4 +402,4 @@ wfo:
   train_years: 2
   test_months: 6
   min_trades_optimization: 100 
-  risk_per_trade_options: [0.010, 0.020, 0.025] # Added 2.5% Tier
+  risk_per_trade_options: [0.005, 0.010, 0.015] # 0.5%, 1.0%, 1.5%

@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# PHOENIX V14.0 UPDATE (AGGRESSOR OPTIMIZATION):
-# 1. RISK SPACE: Expanded search to include 2.0% risk (House Money Tier).
+# PHOENIX V16.0 UPDATE (FOREX HYPER-SCALPER):
+# 1. RISK SPACE: Tightened search to [0.5%, 1.0%, 1.5%] for scalping safety.
 # 2. SIGNIFICANCE: Enforces min_trades from config (100) to filter luck.
-# 3. ALIGNMENT: Ensures optimization objective matches Aggressor goals.
+# 3. ALIGNMENT: Ensures optimization objective matches Scalper goals.
 # =============================================================================
 import os
 import sys
@@ -261,9 +261,10 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
             
-            # V14.0 AGGRESSOR PROTOCOL: Updated Risk Search Space
-            # Includes 0.5% (Prob), 1.0% (Base), 1.5% (Strong), 2.0% (House Money)
-            risk_options = [0.005, 0.010, 0.015, 0.020] 
+            # V16.0 HYPER-SCALPER PROTOCOL: Updated Risk Search Space
+            # Includes 0.5% (Base), 1.0% (Strong), 1.5% (Max)
+            # REMOVED 2.0% (Too risky for scalping)
+            risk_options = [0.005, 0.010, 0.015] 
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             trial.set_user_attr("risk_pct", params['risk_per_trade_percent'] * 100)
             
@@ -407,8 +408,9 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 }
                 params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
                 
-                # V14.0 AGGRESSOR: Updated Risk Search for WFO
-                risk_options = [0.005, 0.010, 0.015, 0.020]
+                # V16.0 AGGRESSOR: Updated Risk Search for WFO
+                # [0.5%, 1.0%, 1.5%]
+                risk_options = [0.005, 0.010, 0.015]
                 params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
                 
                 pipeline_inst = ResearchPipeline()

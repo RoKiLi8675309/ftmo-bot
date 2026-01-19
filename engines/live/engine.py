@@ -6,10 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX V14.0 UPDATE (AGGRESSOR PROTOCOL):
-# 1. MOMENTUM IGNITION: Live implementation of RSI > 80 override.
-# 2. DYNAMIC REWARD: Boosts TP to 4.0R if Live RVOL > 3.0.
-# 3. FREQUENCY: Aligned rejection logic with Research Strategy.
+# PHOENIX V16.1 MAINTENANCE PATCH:
+# 1. FIX: Relaxed Tick Deduplication to allow same-ms bursts (Volume Integrity).
+# 2. SAFETY: Added robust type casting for Redis payloads.
+# 3. STABILITY: Protected JSON parsing for Context Data.
 # =============================================================================
 import logging
 import time
@@ -66,7 +66,7 @@ class LiveTradingEngine:
     The Central Logic Unit for the Linux Consumer.
     1. Consumes Ticks from Redis.
     2. Aggregates Ticks into Adaptive Imbalance Bars (TIBs).
-    3. Feeds Bars to Golden Trio Predictor (V14.0 Logic).
+    3. Feeds Bars to Golden Trio Predictor (V16.0 Logic).
     4. Manages Active Positions (Time Stop / Trailing).
     5. Dispatches Orders to Windows.
     """
@@ -148,7 +148,7 @@ class LiveTradingEngine:
         # V14.0 UNSHACKLED: Increased to 5 to prevent early lockout in Aggressor Mode
         self.max_daily_losses_per_symbol = 5
         
-        # --- TIMEZONE INIT (MOVED UP FOR V12.20 FIX) ---
+        # --- TIMEZONE INIT ---
         tz_str = CONFIG['risk_management'].get('risk_timezone', 'Europe/Prague')
         try:
             self.server_tz = pytz.timezone(tz_str)
@@ -200,8 +200,6 @@ class LiveTradingEngine:
             start_ts_ms = int(start_of_day.timestamp() * 1000)
             
             # Fetch range from start of day until now
-            # Use '0-0' if we want absolutely everything, but start_ts_ms is more efficient
-            # xrange(key, min, max)
             messages = self.stream_mgr.r.xrange(stream_key, min=start_ts_ms, max='+')
             
             restored_count = 0
@@ -225,7 +223,6 @@ class LiveTradingEngine:
                     
                     # --- DEDUPLICATION CHECK ---
                     if ticket and ticket in self.daily_execution_stats[symbol]['tickets']:
-                        # Skip processing if we already saw this ticket today
                         continue
 
                     # Apply Logic
@@ -307,7 +304,6 @@ class LiveTradingEngine:
         Background thread to listen for CLOSED trades.
         1. Updates SQN stats (performance sizing).
         2. Updates Daily Circuit Breaker (stops trading on bad days).
-        V12.31: Applies deduplication for live monitoring as well.
         """
         logger.info(f"{LogSymbols.INFO} Performance Monitor (SQN & Circuit Breaker) Thread Started.")
         stream_key = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
@@ -333,7 +329,7 @@ class LiveTradingEngine:
                                     # 1. SQN Window Update
                                     self.performance_stats[symbol].append(net_pnl)
                                     
-                                    # 2. V10.0 Circuit Breaker Update
+                                    # 2. Circuit Breaker Update
                                     now_server = datetime.now(self.server_tz).date()
                                     
                                     # Reset if new day
@@ -380,7 +376,7 @@ class LiveTradingEngine:
         
     def _check_circuit_breaker(self, symbol: str) -> bool:
         """
-        V10.0: Checks if the symbol is locked out for the day due to losses.
+        Checks if the symbol is locked out for the day due to losses.
         Returns TRUE if trading should be BLOCKED.
         """
         now_server = datetime.now(self.server_tz).date()
@@ -433,12 +429,12 @@ class LiveTradingEngine:
 
     def _manage_active_positions_loop(self):
         """
-        V12.7 REFACTOR: Active Position Management Thread.
+        V16.0 UPDATE: Active Position Management Thread.
         Enforces:
-        1. 24h Time Stop (Hard Exit).
+        1. 8h Time Stop (Hard Exit) - Reduced from 24h for Scalping.
         2. 0.5R Trailing Stop.
         """
-        logger.info(f"{LogSymbols.INFO} Active Position Manager Started (Time-Stop: 24h, Trail: 0.5R).")
+        logger.info(f"{LogSymbols.INFO} Active Position Manager Started (Time-Stop: 8h, Trail: 0.5R).")
         while not self.shutdown_flag:
             try:
                 positions = self._get_open_positions_from_redis()
@@ -447,7 +443,7 @@ class LiveTradingEngine:
                     continue
 
                 now_utc = datetime.now(pytz.utc)
-                hard_stop_seconds = 86400 # 24 hours
+                hard_stop_seconds = 28800 # 8 Hours (Intraday Focus)
 
                 for sym, pos in positions.items():
                     # --- TIME BASED EXITS ---
@@ -458,9 +454,9 @@ class LiveTradingEngine:
                         
                         exit_reason = None
                         
-                        # 1. Hard Time Stop (24h)
+                        # 1. Hard Time Stop (8h)
                         if duration > hard_stop_seconds:
-                            exit_reason = "Time Stop (24h)"
+                            exit_reason = "Time Stop (8h)"
                             logger.warning(f"⌛ TIME STOP: {sym} held for {duration/3600:.1f}h. Closing.")
                         
                         if exit_reason:
@@ -557,24 +553,26 @@ class LiveTradingEngine:
             
             # --- TIMESTAMP DEDUPLICATION ---
             tick_ts = float(tick_data.get('time', 0.0))
+            # Normalize ms to seconds if needed
             if tick_ts > 100_000_000_000:
                 tick_ts /= 1000.0
             
             last_ts = self.processed_ticks.get(symbol, 0.0)
-            if tick_ts <= last_ts:
-                # CRITICAL FIX (V13.1.1): Dropped ticks must RETURN, not PASS.
-                # 'pass' allowed duplicates to corrupt volume aggregation.
+            
+            # AUDIT FIX: Relaxed Deduplication (< instead of <=)
+            # Allows same-millisecond bursts (HFT/Volume Aggregation)
+            if tick_ts < last_ts:
                 return 
             
             self.processed_ticks[symbol] = tick_ts
 
             # --- VISUAL HEARTBEAT ---
-            # Pulse check every 10 ticks so user knows it's alive
             self.ticks_processed += 1
             if self.ticks_processed % 1000 == 0:
                 logger.info(f"⚡ HEARTBEAT: Processed {self.ticks_processed} ticks... (Last: {symbol})")
 
             # --- DATA INTEGRITY ---
+            # Explicit float casting for safety
             bid = float(tick_data.get('bid', 0.0))
             ask = float(tick_data.get('ask', 0.0))
             
@@ -588,8 +586,6 @@ class LiveTradingEngine:
             if price <= 0: return
 
             # --- CRITICAL FIX: FORCE VOLUME FLOOR (Synthetic Tick Rule) ---
-            # If MT5 sends 0 volume (common in Forex/CFD ticks), we default to 1.0.
-            # This ensures bars are generated and VPIN/OFI math doesn't div-by-zero.
             raw_vol = float(tick_data.get('volume', 0.0))
             volume = raw_vol if raw_vol > 0 else 1.0
 
@@ -603,17 +599,20 @@ class LiveTradingEngine:
 
             self.latest_prices[symbol] = price
             
-            # --- CONTEXT EXTRACTION ---
+            # --- CONTEXT EXTRACTION (SAFETY PATCH) ---
             if 'ctx_d1' in tick_data:
-                try: self.latest_context[symbol]['d1'] = json.loads(tick_data['ctx_d1'])
-                except: pass
+                try: 
+                    self.latest_context[symbol]['d1'] = json.loads(tick_data['ctx_d1'])
+                except (json.JSONDecodeError, TypeError): 
+                    pass
             
             if 'ctx_h4' in tick_data:
-                try: self.latest_context[symbol]['h4'] = json.loads(tick_data['ctx_h4'])
-                except: pass
+                try: 
+                    self.latest_context[symbol]['h4'] = json.loads(tick_data['ctx_h4'])
+                except (json.JSONDecodeError, TypeError): 
+                    pass
 
             # 1. Feed Adaptive Aggregator
-            # Now guarantees non-zero volume/flow
             bar = self.aggregators[symbol].process_tick(
                 price=price, 
                 volume=volume, 
@@ -650,7 +649,6 @@ class LiveTradingEngine:
             logger.error(f"Portfolio Update Error: {e}")
         
         # --- V12.5 GAP-PROOF WEEKEND LIQUIDATION ---
-        # Get Bar Timestamp in Server Time
         if bar.timestamp.tzinfo is None:
             bar_ts_aware = bar.timestamp.replace(tzinfo=pytz.utc)
         else:
@@ -666,10 +664,6 @@ class LiveTradingEngine:
         is_friday_close = (server_time.weekday() == 4 and server_time.hour >= friday_close_hour)
 
         if is_weekend_hold or is_friday_close:
-            # If we are in the danger zone, do not generate signals.
-            # Liquidation is handled by the Active Position loop, but we must ensure
-            # we don't open *new* trades here.
-            # Also, trigger a liquidation if not already done for this symbol today.
             if not self.liquidation_triggered_map[symbol]:
                 logger.warning(f"{LogSymbols.CLOSE} WEEKEND/FRIDAY GAP GUARD: Closing {symbol}.")
                 close_intent = Trade(
@@ -736,15 +730,12 @@ class LiveTradingEngine:
         # Ensure we don't fire if a trade is currently pending dispatch or waiting at broker
         is_pending_execution = False
         with self.lock:
-            # self.pending_orders is {uuid: {symbol: 'EURUSD', ...}}
             for oid, p_data in self.pending_orders.items():
                 if p_data.get('symbol') == symbol:
                     is_pending_execution = True
                     break
         
         if is_pending_execution:
-            # Silently ignore to prevent log spam, or debug log
-            # logger.debug(f"Skipping {symbol} signal - Order already pending.")
             return
 
         # 6. Calculate Size (Fixed Risk Mode)
@@ -820,7 +811,6 @@ class LiveTradingEngine:
             if acc_info_raw and 'free_margin' in acc_info_raw:
                 real_free_margin = float(acc_info_raw['free_margin'])
             else:
-                # Fallback: Assume 95% of equity is free if data missing (Risk of rejection, but better than 0)
                 real_free_margin = equity * 0.95
         except:
             real_free_margin = equity * 0.95
@@ -840,7 +830,7 @@ class LiveTradingEngine:
             performance_score=sqn_score,
             daily_pnl_pct=daily_pnl_pct,
             current_open_risk_pct=current_open_risk_pct,
-            free_margin=real_free_margin # V13.1 PASSED
+            free_margin=real_free_margin 
         )
 
         if trade_intent.volume <= 0:
@@ -868,7 +858,7 @@ class LiveTradingEngine:
             tp_dist = current_atr * optimized_rr
             trade_intent.comment += f"|OptRR:{optimized_rr:.2f}"
 
-        # --- CRITICAL FIX: CONVERT DISTANCES TO ABSOLUTE PRICES ---
+        # --- CONVERT DISTANCES TO ABSOLUTE PRICES ---
         if trade_intent.action == "BUY":
             trade_intent.stop_loss = bar.close - sl_dist
             trade_intent.take_profit = bar.close + tp_dist
@@ -970,10 +960,8 @@ class LiveTradingEngine:
                         self.ftmo_guard.update_equity(float(cached_eq))
 
                     # 2. Update Daily Anchor (The Fix for Drawdown False Positives)
-                    # We must respect the Anchor calculated by the Producer at midnight/startup.
                     cached_anchor = self.stream_mgr.r.get(CONFIG['redis']['risk_keys']['daily_starting_equity'])
                     if cached_anchor and float(cached_anchor) > 0:
-                        # Direct attribute sync to ensure logic consistency
                         self.ftmo_guard.starting_equity_of_day = float(cached_anchor)
                     
                     # 3. Update Account Size (Total Drawdown Base)

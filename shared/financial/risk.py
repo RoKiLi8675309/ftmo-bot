@@ -5,10 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX V15.0 UPDATE (HYPER-AGGRESSOR PROTOCOL):
-# 1. RATCHETING: Implemented Equity Floor Logic (Locks 5% steps).
-# 2. PORTFOLIO: Added Aggressor Pairs (GBPAUD, AUDJPY) to conversion logic.
-# 3. SIZING: Aggressive defaults enabled (1% Base, 2.5% Max).
+# PHOENIX V16.1 MAINTENANCE PATCH:
+# 1. PNL ACCURACY: Removed static exchange rate fallbacks (e.g. 0.00645).
+# 2. DYNAMIC LOOKUP: Enforced live price checks for all cross-pair conversions.
+# 3. SAFETY: Strict zero-check for account balance to prevent division errors.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -64,6 +64,8 @@ class RiskManager:
         """
         Calculates the Quote -> USD conversion rate using LIVE market data.
         Critical for accurate risk calculation in USD.
+        
+        V16.1 FIX: Removed static constants. Returns 0.0 if conversion fails to fail-safe.
         """
         s = symbol.upper()
         
@@ -82,48 +84,45 @@ class RiskManager:
             usdjpy = get_price("USDJPY")
             if usdjpy and usdjpy > 0: return 1.0 / usdjpy
             if s == "USDJPY" and price > 0: return 1.0 / price
-            
-            if market_prices is not None:
-                # Suppress log noise if price missing temporarily
-                pass
-            return 0.00645 # Fallback ~155.0
+            # No static fallback
+            return 0.0
         
         # GBP Pairs (Quote = GBP). Need GBP->USD (GBPUSD).
         if s.endswith("GBP"):
             gbpusd = get_price("GBPUSD")
             if gbpusd: return gbpusd
-            return 1.25 # Fallback
+            return 0.0
 
         # CAD Pairs (Quote = CAD). Need CAD->USD (1 / USDCAD).
         if s.endswith("CAD"):
             usdcad = get_price("USDCAD")
             if usdcad and usdcad > 0: return 1.0 / usdcad
             if s == "USDCAD" and price > 0: return 1.0 / price
-            return 0.73 # ~1.37
+            return 0.0
 
         # CHF Pairs (Quote = CHF). Need CHF->USD (1 / USDCHF).
         if s.endswith("CHF"):
             usdchf = get_price("USDCHF")
             if usdchf and usdchf > 0: return 1.0 / usdchf
             if s == "USDCHF" and price > 0: return 1.0 / price
-            return 1.10
+            return 0.0
 
         # AUD Pairs (Quote = AUD). Need AUD->USD (AUDUSD).
         if s.endswith("AUD"):
             audusd = get_price("AUDUSD")
             if audusd: return audusd
             if s == "AUDUSD" and price > 0: return price
-            return 0.63
+            return 0.0
 
         # NZD Pairs
         if s.endswith("NZD"):
             nzdusd = get_price("NZDUSD")
             if nzdusd: return nzdusd
             if s == "NZDUSD" and price > 0: return price
-            return 0.58
+            return 0.0
             
-        # Default fallback
-        return 1.0
+        # Default fallback for unknown pairs
+        return 0.0
 
     @staticmethod
     def calculate_required_margin(symbol: str, lots: float, price: float, contract_size: float, conversion_rate: float) -> float:
@@ -141,8 +140,11 @@ class RiskManager:
         s = symbol.upper()
         if "JPY" in s and not "USD" in s and not "GBP" in s and not "EUR" in s:
             leverage = float(lev_map.get('minor', 20.0)) # Crosses often lower
-        if "GBPAUD" in s or "AUDJPY" in s:
-             leverage = float(lev_map.get('minor', 20.0)) # Aggressor pairs
+        
+        # V16.0: Explicitly define High-Beta Scalper Pairs as minor/crosses
+        if any(pair in s for pair in ["GBPAUD", "AUDJPY", "EURAUD", "GBPNZD", "GBPJPY"]):
+             leverage = float(lev_map.get('minor', 20.0)) 
+             
         if "XAU" in s or "XAG" in s:
             leverage = float(lev_map.get('gold', 20.0))
         if any(x in s for x in ["US30", "GER30", "NAS100", "SPX500"]):
@@ -178,7 +180,7 @@ class RiskManager:
     ) -> Tuple[Trade, float]:
         """
         Calculates position size using strict prop firm logic (Sniper Protocol).
-        V15.0 UPDATE: Aggressor Mode Defaults (1% Base, 2.5% Max).
+        V16.0 UPDATE: Hyper-Scalper Defaults (0.5% Base).
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -199,7 +201,7 @@ class RiskManager:
         
         # --- SNIPER PROTOCOL: VOLATILITY-ADJUSTED STOPS ---
         atr_mult_sl = float(risk_conf.get('stop_loss_atr_mult', 1.5)) 
-        atr_mult_tp = float(risk_conf.get('take_profit_atr_mult', 4.0)) # V14.0: 4R Target
+        atr_mult_tp = float(risk_conf.get('take_profit_atr_mult', 3.0)) # V16.0: 3R Target for Scalping
         
         # ATR Fallback Logic
         if atr and atr > 0:
@@ -221,8 +223,9 @@ class RiskManager:
         # --- CROSS-PAIR PIP VALUE CALCULATION ---
         conversion_rate = RiskManager.get_conversion_rate(symbol, price, market_prices)
         
+        # FAIL-SAFE: If conversion fails, DO NOT TRADE.
         if conversion_rate <= 0:
-            return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, "Conversion Error"), 0.0
+            return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, "Conversion Error (No Rate)"), 0.0
             
         usd_per_pip_per_lot = c_size * pip_val * conversion_rate
         loss_per_lot_usd = sl_pips * usd_per_pip_per_lot
@@ -230,10 +233,11 @@ class RiskManager:
         lots = 0.0
         calculated_risk_usd = 0.0
         
-        # --- V14.0: AGGRESSOR RISK PARAMETERS ---
-        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.010) # 1.0% (Aggressor)
+        # --- V16.0: HYPER-SCALPER RISK PARAMETERS ---
+        # Default base risk lowered to 0.5%
+        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.005) 
         buffer_threshold = risk_conf.get('profit_buffer_threshold', 0.02)
-        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.020) # 2.0% (House Money)
+        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.015) 
         
         scaling_comment = ""
         
@@ -260,19 +264,20 @@ class RiskManager:
                 scaling_comment += "|SQN:Low"
                 
             elif performance_score > 2.5:
-                # HOT HAND: Scale up (V14.0: 1.25x up to 2.5% max)
-                risk_pct = min(risk_pct * 1.25, 2.5) 
+                # HOT HAND: Scale up (V16.0: Max 1.5% for Scalping)
+                risk_pct = min(risk_pct * 1.25, 1.5) 
                 scaling_comment += "|SQN:High"
         
-        # --- ALPHA SQUAD BOOST (AGGRESSOR MODE) ---
-        if symbol in ["USDJPY", "EURUSD", "EURJPY", "GBPAUD", "AUDJPY"]:
+        # --- ALPHA SQUAD BOOST (V16.0 AGGRESSOR MODE) ---
+        # Added High-Beta Crosses: GBPAUD, EURAUD, GBPNZD
+        if symbol in ["GBPAUD", "EURAUD", "GBPNZD", "GBPJPY", "USDJPY", "GBPUSD"]:
             boosted_risk = risk_pct * 1.20 
-            if boosted_risk <= 2.5: # V14.0 Cap
+            if boosted_risk <= 1.5: # V16.0 Cap
                 risk_pct = boosted_risk
                 scaling_comment += "|AlphaBoost"
 
         # --- ASYMPTOTIC DECAY ---
-        daily_limit_pct = risk_conf.get('max_daily_loss_pct', 0.045)
+        daily_limit_pct = risk_conf.get('max_daily_loss_pct', 0.040) # V16.0: 4% Limit
         
         if daily_pnl_pct < 0:
             current_loss_pct = abs(daily_pnl_pct)
@@ -285,8 +290,8 @@ class RiskManager:
                     scaling_comment += "|Decay:ON"
 
         # --- V15.0: TOTAL PORTFOLIO RISK CAP ---
-        max_total_risk_pct = float(risk_conf.get('max_risk_percent', 6.0)) # Relaxed for Aggressor Stacking
-        potential_total_risk = current_open_risk_pct + (risk_pct / 100.0) * 100.0 # Standardize to % points
+        max_total_risk_pct = float(risk_conf.get('max_risk_percent', 3.0)) # V16.0: 3% Cap
+        potential_total_risk = current_open_risk_pct + (risk_pct / 100.0) * 100.0 
         
         if potential_total_risk > max_total_risk_pct:
             # Clamp risk to remaining capacity

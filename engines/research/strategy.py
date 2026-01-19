@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX V15.0 UPDATE (HYPER-AGGRESSOR PROTOCOL):
-# 1. PYRAMIDING: Enabled "Aggressor" adding to winners (0.5R threshold).
-# 2. LOGIC SYNC: Matches Live Engine's multi-position handling.
-# 3. PORTFOLIO: Added Aggressor pairs (GBPAUD, AUDJPY) to defaults.
+# PHOENIX V16.0 UPDATE (FOREX HYPER-SCALPER):
+# 1. DURATION: Enforced 8-Hour Hard Time Stop (Intraday Focus).
+# 2. HORIZON: Default TBM reduced to 240m (4h) for faster labeling.
+# 3. DATA: Added fallbacks for High-Beta Crosses (EURAUD, GBPNZD).
 # =============================================================================
 import logging
 import sys
@@ -47,7 +47,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V15.0 Aggressor Protocol.
+    Strictly implements the Phoenix V16.0 Hyper-Scalper Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -64,15 +64,16 @@ class ResearchStrategy:
         self.risk_conf = params.get('risk_management', CONFIG.get('risk_management', {}))
         # V14.0: Standardize risk multiplier
         self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 1.5))
-        self.max_currency_exposure = int(self.risk_conf.get('max_currency_exposure', 3))
+        self.max_currency_exposure = int(self.risk_conf.get('max_currency_exposure', 2)) # V16.0: Stricter (2)
         
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
         risk_mult_conf = self.sl_atr_mult
         self.optimized_reward_mult = float(tbm_conf.get('barrier_width', 3.0))
         
+        # V16.0 UPDATE: Reduced default horizon to 240m (4 Hours) for Scalping
         self.labeler = AdaptiveTripleBarrier(
-            horizon_ticks=int(tbm_conf.get('horizon_minutes', 480)), 
+            horizon_ticks=int(tbm_conf.get('horizon_minutes', 240)), 
             risk_mult=risk_mult_conf, 
             reward_mult=self.optimized_reward_mult,
             drift_threshold=float(tbm_conf.get('drift_threshold', 1.5))
@@ -87,7 +88,7 @@ class ResearchStrategy:
         self.calibrator_sell = ProbabilityCalibrator(window=2000)
         
         # 5. Warm-up State
-        self.burn_in_limit = params.get('burn_in_periods', 50) # Reduced for V14
+        self.burn_in_limit = params.get('burn_in_periods', 30) # V16.0: Faster Start
         self.burn_in_counter = 0
         self.burn_in_complete = False
         
@@ -116,7 +117,7 @@ class ResearchStrategy:
         
         # --- V14.0 MOMENTUM INDICATORS ---
         self.bb_window = 20
-        self.bb_std = CONFIG['phoenix_strategy'].get('bb_std_dev', 1.2) # 1.2 Default for Aggressor
+        self.bb_std = CONFIG['phoenix_strategy'].get('bb_std_dev', 1.2)
         self.bb_buffer = deque(maxlen=self.bb_window)
         
         # --- FORENSIC RECORDER ---
@@ -125,32 +126,31 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX V14.0 CONFIGURATION ---
+        # --- PHOENIX V16.0 CONFIGURATION ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V14.0 Logic Thresholds
-        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.005)) 
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.48)) 
-        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
+        # V16.0 Logic Thresholds (Scalper Tuned)
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.002)) # Relaxed
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.45)) # Relaxed
+        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 2.5))
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
         
-        # V12.3: Regime Enforcement Mode (HARD vs SOFT)
+        # Regime Enforcement
         self.regime_enforcement = phx_conf.get('regime_enforcement', 'DISABLED').upper()
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
         
         self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 0.8)) 
-        self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 20.0)) # Relaxed
-        self.chop_threshold = float(phx_conf.get('choppiness_threshold', 65.0)) # Relaxed
+        self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 25.0))
+        self.chop_threshold = float(phx_conf.get('choppiness_threshold', 65.0))
         
         adx_cfg = CONFIG.get('features', {}).get('adx', {})
-        # Relaxed ADX to 20.0 (or config override)
-        self.adx_threshold = float(params.get('adx_threshold', adx_cfg.get('threshold', 20.0))) 
+        self.adx_threshold = float(params.get('adx_threshold', adx_cfg.get('threshold', 15.0))) # Scalper
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.1)
         
-        # Friday Liquidation (Aggressor: 19:00 cutoff)
-        self.friday_entry_cutoff = self.risk_conf.get('friday_entry_cutoff_hour', 19)
-        self.friday_close_hour = self.risk_conf.get('friday_liquidation_hour_server', 22)
+        # Friday Liquidation
+        self.friday_entry_cutoff = self.risk_conf.get('friday_entry_cutoff_hour', 18)
+        self.friday_close_hour = self.risk_conf.get('friday_liquidation_hour_server', 21)
         
         # Timezone Handling
         tz_str = self.risk_conf.get('risk_timezone', 'Europe/Prague')
@@ -164,8 +164,8 @@ class ResearchStrategy:
         self.dynamic_ker_offset = 0.0
 
         # --- REC 3: Daily Circuit Breaker State ---
-        self.daily_max_losses = 3 # Increased to 3
-        self.daily_max_loss_pct = 0.045 
+        self.daily_max_losses = 5 # V16.0: Allow 5 intraday stops before lockout
+        self.daily_max_loss_pct = 0.040 
 
     def _calculate_golden_trio(self) -> Tuple[float, float, float]:
         """
@@ -266,7 +266,7 @@ class ResearchStrategy:
     def _check_currency_exposure(self, broker: BacktestBroker, symbol: str) -> bool:
         """
         V12.3: Enforces Portfolio Heat Limits.
-        Prevents stacking too much risk on one currency (e.g. max 3 USD pairs).
+        Prevents stacking too much risk on one currency (e.g. max 2 USD pairs).
         """
         base_ccy = symbol[:3]
         quote_ccy = symbol[3:]
@@ -295,7 +295,7 @@ class ResearchStrategy:
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (V15.0 Aggressor Mode).
+        Main Event Loop for the Strategy (V16.0 Scalper Mode).
         """
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
@@ -469,7 +469,7 @@ class ResearchStrategy:
         
         # G1: EFFICIENCY (KER)
         base_thresh = self.ker_floor 
-        effective_ker_thresh = max(0.005, base_thresh + self.dynamic_ker_offset)
+        effective_ker_thresh = max(0.002, base_thresh + self.dynamic_ker_offset) # V16.0
             
         if ker_val < effective_ker_thresh:
             self.rejection_stats[f"Low Efficiency (KER {ker_val:.3f} < {effective_ker_thresh:.3f})"] += 1
@@ -488,7 +488,7 @@ class ResearchStrategy:
             
         bb_mu = np.mean(self.bb_buffer)
         bb_std = np.std(self.bb_buffer)
-        bb_mult = self.bb_std # V14.0: 1.2 Std Dev allowed
+        bb_mult = self.bb_std 
         
         upper_bb = bb_mu + (bb_mult * bb_std)
         lower_bb = bb_mu - (bb_mult * bb_std)
@@ -791,10 +791,10 @@ class ResearchStrategy:
 
     def _manage_time_stops(self, broker: BacktestBroker, current_time: datetime):
         """
-        V12.4 FEATURE: Managed Time Exits.
-        1. Hard Time Stop (24h): Closes position regardless of PnL.
+        V16.0 FEATURE: Managed Time Exits.
+        1. Hard Time Stop (8h): Closes position regardless of PnL to force intraday rotation.
         """
-        hard_stop_seconds = 86400  # 24 Hours
+        hard_stop_seconds = 28800  # 8 Hours (Intraday Focus)
         
         to_close = []
         for pos in broker.open_positions:
@@ -813,9 +813,9 @@ class ResearchStrategy:
             
             duration = (curr_time_aware - pos_time).total_seconds()
             
-            # 1. Hard Time Stop (24h)
+            # 1. Hard Time Stop (8h)
             if duration > hard_stop_seconds:
-                to_close.append((pos, "Time Stop (24h)"))
+                to_close.append((pos, "Time Stop (8h)"))
             
         for pos, reason in to_close:
             broker._close_partial_position(
@@ -1045,8 +1045,10 @@ class ResearchStrategy:
         defaults = {
             "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
             "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
-            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0, # Added Aggressor Pair
-            "GBPAUD": 1.95 # Added Aggressor Pair
+            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0,
+            "GBPAUD": 1.95, # Added Aggressor Pair
+            "EURAUD": 1.65, # Added High Beta
+            "GBPNZD": 2.05  # Added High Beta
         }
         for sym, price in defaults.items():
             if sym not in self.last_price_map:

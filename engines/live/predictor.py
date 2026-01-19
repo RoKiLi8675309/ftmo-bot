@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX V15.0 UPDATE (HYPER-AGGRESSOR PROTOCOL):
-# 1. PYRAMIDING: Unblocked signal generation for open positions if enabled.
-# 2. PORTFOLIO: Added Aggressor pair defaults (GBPAUD, AUDJPY).
-# 3. LOGIC: Fully preserved Momentum Ignition and Sniper Protocols.
+# PHOENIX V16.0 UPDATE (FOREX HYPER-SCALPER):
+# 1. HORIZON: Reduced TBM to 240m (4H) for intraday rotations.
+# 2. LOGIC: Relaxed KER (0.002) and Hurst (0.45) for high-frequency capture.
+# 3. PORTFOLIO: Added High-Beta Crosses (EURAUD, GBPNZD) to auxiliary data.
 # =============================================================================
 import logging
 import pickle
@@ -78,6 +78,9 @@ class MultiAssetPredictor:
         # V14.0: Standardize risk multiplier
         risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 1.5))
         
+        # V16.0: Stricter Portfolio Heat (Max 2 correlated pairs)
+        self.max_currency_exposure = int(risk_conf.get('max_currency_exposure', 2))
+        
         self.labelers = {}
         self.optimized_params = {} # Cache for gates
         
@@ -98,7 +101,9 @@ class MultiAssetPredictor:
             # Default from Config
             s_risk = risk_mult_conf
             s_reward = tbm_conf.get('barrier_width', 3.0)
-            s_horizon = tbm_conf.get('horizon_minutes', 480) # V14.0: 8 Hours Aggressor
+            
+            # V16.0: Default Horizon Reduced to 240m (4h)
+            s_horizon = tbm_conf.get('horizon_minutes', 240) 
             
             # --- DYNAMIC PARAMETER LOADING ---
             params_path = self.models_dir / f"best_params_{s}.json"
@@ -135,7 +140,8 @@ class MultiAssetPredictor:
         
         # 4. Warm-up State
         self.burn_in_counters = {s: 0 for s in symbols}
-        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 50) # REDUCED for V14
+        # V16.0: Faster Start (30 periods)
+        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 30)
         
         # 5. Forensic Stats
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
@@ -149,7 +155,9 @@ class MultiAssetPredictor:
         
         # V10.0: Daily Performance Tracking (Symbol Circuit Breaker)
         self.daily_performance = {s: {'date': None, 'losses': 0, 'pnl': 0.0} for s in symbols}
-        self.daily_max_losses = 3 # Increased for V14 Aggressor
+        
+        # V16.0: Scalper Allowance (5 Losses)
+        self.daily_max_losses = 5 
         
         # 7. Architecture: Auto-Save Timer
         self.last_save_time = time.time()
@@ -162,30 +170,29 @@ class MultiAssetPredictor:
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V14.0) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V16.0) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        self.default_max_rvol = 20.0
         
-        # V14.0 Logic Thresholds (Relaxed for Aggressor)
-        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.005))
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.48)) 
-        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
+        # V16.0 Logic Thresholds (Scalper Tuned)
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.002)) # Relaxed from 0.005
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.45)) # Relaxed from 0.48
+        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 2.5)) # Lowered
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
         
-        # V12.7: ADX Threshold (Cached for Logging)
-        adx_cfg = CONFIG.get('features', {}).get('adx', {})
-        self.adx_threshold = float(adx_cfg.get('threshold', 20.0))
-
+        self.default_max_rvol = float(phx_conf.get('max_relative_volume', 25.0))
+        
         # V12.3: Regime Enforcement Mode (HARD vs SOFT)
         self.regime_enforcement = phx_conf.get('regime_enforcement', 'DISABLED').upper()
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
         
-        # V14.0: Portfolio Heat - Aggressor
-        self.max_currency_exposure = int(CONFIG['risk_management'].get('max_currency_exposure', 3))
-        
         # Friday Guard
-        self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 19)
+        self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 18)
         
+        # V12.7: ADX Threshold (Cached for Logging)
+        adx_cfg = CONFIG.get('features', {}).get('adx', {})
+        # V16.0: Relaxed ADX for Scalping
+        self.adx_threshold = float(adx_cfg.get('threshold', 15.0))
+
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
         self.last_close_prices = {s: 0.0 for s in symbols}
@@ -344,7 +351,7 @@ class MultiAssetPredictor:
     def _check_currency_exposure(self, symbol: str, open_positions: Dict[str, Any]) -> bool:
         """
         V12.3: Enforces Portfolio Heat Limits.
-        Prevents stacking too much risk on one currency (e.g. max 3 USD pairs).
+        Prevents stacking too much risk on one currency (e.g. max 2 USD pairs).
         """
         base_ccy = symbol[:3]
         quote_ccy = symbol[3:]
@@ -374,7 +381,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V14.0 Logic.
+        Executes the Learn-Predict Loop with Project Phoenix V16.0 Logic.
         Enforces Asset-Specific Regimes (The "Personality Filter").
         """
         if symbol not in self.symbols: return None
@@ -478,7 +485,7 @@ class MultiAssetPredictor:
             self.daily_performance[symbol] = {'date': current_date, 'losses': 0, 'pnl': 0.0}
 
         # --- V14.0 CIRCUIT BREAKER (Aggressor) ---
-        # Increased to 3 losses to prevent early lockout
+        # Increased to 5 losses to prevent early lockout
         if self.daily_performance[symbol]['losses'] >= self.daily_max_losses:
             stats["Circuit Breaker (Daily Losses)"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Circuit Breaker Active"})
@@ -547,17 +554,16 @@ class MultiAssetPredictor:
         # 4. PHOENIX V14.0: AGGRESSOR PROTOCOL
         # ============================================================
         
-        phx = CONFIG.get('phoenix_strategy', {})
-        max_rvol_thresh = float(phx.get('max_relative_volume', 20.0)) # Relaxed
+        max_rvol_thresh = self.default_max_rvol
         
         # FRIDAY GUARD
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
              return Signal(symbol, "HOLD", 0.0, {"reason": "Friday Entry Guard"})
 
         # G1: EFFICIENCY (KER) - AGGRESSIVE (V14.0)
-        # Reduced floor to 0.005 to catch early moves
+        # Reduced floor to 0.002 to catch early moves
         base_thresh = self.ker_floor 
-        effective_ker_thresh = max(0.005, base_thresh + self.dynamic_ker_offsets[symbol])
+        effective_ker_thresh = max(0.002, base_thresh + self.dynamic_ker_offsets[symbol])
 
         if ker_val < effective_ker_thresh:
             stats[f"Low Efficiency"] += 1
@@ -575,7 +581,7 @@ class MultiAssetPredictor:
             
         bb_mu = np.mean(self.bb_buffers[symbol])
         bb_std = np.std(self.bb_buffers[symbol])
-        bb_mult = self.bb_std # V14.0: 1.2 Std Dev for earlier entries
+        bb_mult = self.bb_std 
         
         upper_bb = bb_mu + (bb_mult * bb_std)
         lower_bb = bb_mu - (bb_mult * bb_std)
@@ -764,12 +770,14 @@ class MultiAssetPredictor:
 
     def _inject_auxiliary_data(self):
         """Injects static approximations ONLY if missing."""
-        # V15.0: Added Aggressor Pairs (GBPAUD, AUDJPY)
+        # V16.0: Added High-Beta Crosses (EURAUD, GBPNZD) for fallback
         defaults = {
             "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
             "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
-            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0, # AUDJPY Risk-On Proxy
-            "GBPAUD": 1.95 # High Volatility Beast
+            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0, 
+            "GBPAUD": 1.95, 
+            "EURAUD": 1.65, # Added
+            "GBPNZD": 2.05  # Added
         }
         for sym, price in defaults.items():
             if sym not in self.last_close_prices or self.last_close_prices[sym] == 0:

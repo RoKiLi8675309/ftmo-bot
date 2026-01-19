@@ -1066,7 +1066,7 @@ class OnlineFeatureEngineer:
             'rvol': rvol_val,
             'aggressor': aggressor_val,
             'flow_imbalance': flow_imbalance, 
-            'flow_ratio': flow_ratio,          
+            'flow_ratio': flow_ratio,           
             
             # V9 Momentum Features (NEW)
             'bb_breakout': bb_feats['bb_breakout'],
