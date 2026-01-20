@@ -5,9 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX V16.1 MAINTENANCE PATCH:
-# 1. PNL ACCURACY: Removed static exchange rate fallbacks (e.g. 0.00645).
-# 2. DYNAMIC LOOKUP: Enforced live price checks for all cross-pair conversions.
+# PHOENIX V16.3 MAINTENANCE PATCH (MARGIN GUARD):
+# 1. MARGIN SAFETY: Added `_calculate_max_margin_volume` to clamp trade sizes
+#    based on actual free margin, preventing [No Money] rejections.
+# 2. PNL ACCURACY: Enforced live conversion rates for cross-pair calculations.
 # 3. SAFETY: Strict zero-check for account balance to prevent division errors.
 # =============================================================================
 from __future__ import annotations
@@ -162,25 +163,73 @@ class RiskManager:
         return margin
 
     @staticmethod
+    def _calculate_max_margin_volume(symbol: str, free_margin: float, contract_size: float) -> float:
+        """
+        V16.3: MARGIN CLAMP.
+        Calculates the maximum lot size allowed by available free margin.
+        Formula: MaxVol = (FreeMargin * Leverage) / (ContractSize * BaseToUSD)
+        """
+        if free_margin <= 0: return 0.0
+
+        risk_conf = CONFIG.get('risk_management', {})
+        lev_map = risk_conf.get('leverage', {})
+
+        # Determine Leverage
+        lev = float(lev_map.get('default', 30.0))
+        s = symbol.upper()
+        if "JPY" in s and not "USD" in s and not "GBP" in s and not "EUR" in s:
+            lev = float(lev_map.get('minor', 20.0))
+        if any(pair in s for pair in ["GBPAUD", "AUDJPY", "EURAUD", "GBPNZD", "GBPJPY"]):
+            lev = float(lev_map.get('minor', 20.0))
+        if "XAU" in s or "XAG" in s:
+            lev = float(lev_map.get('gold', 20.0))
+        elif "BTC" in s or "ETH" in s:
+            lev = float(lev_map.get('crypto', 2.0))
+        elif any(x in s for x in ["US30", "GER30", "NAS100", "SPX500"]):
+            lev = float(lev_map.get('indices', 20.0))
+
+        if lev <= 0: return 0.0
+
+        # Heuristic Base Value in USD (Conservative)
+        base_ccy = symbol[:3]
+        base_val_usd = 1.0
+        if base_ccy == "GBP": base_val_usd = 1.35
+        elif base_ccy == "EUR": base_val_usd = 1.15
+        elif base_ccy == "AUD": base_val_usd = 0.75
+        elif base_ccy == "NZD": base_val_usd = 0.70
+        elif base_ccy == "XAU": base_val_usd = 2000.0 # Approximate Gold Price
+        
+        # One_Lot_Margin = (100,000 * Base_Val) / Leverage
+        one_lot_margin = (contract_size * base_val_usd) / lev
+
+        if one_lot_margin <= 0: return 0.0
+
+        # Max Volume = Free Margin / One Lot Margin
+        # Apply 90% Safety Factor to leave room for spread/fluctuation
+        max_vol = (free_margin * 0.90) / one_lot_margin
+
+        return max_vol
+
+    @staticmethod
     def calculate_rck_size(
-        context: TradeContext,
-        conf: float,
+        context: TradeContext, 
+        conf: float, 
         volatility: float,
-        active_correlations: int = 0,
+        active_correlations: int,
         market_prices: Optional[Dict[str, float]] = None,
         atr: Optional[float] = None,
+        ker: float = 0.0,
         account_size: Optional[float] = None, 
         contract_size_override: Optional[float] = None, 
-        ker: float = 1.0, 
         risk_percent_override: Optional[float] = None,
-        performance_score: float = 0.0, 
+        performance_score: float = 0.0, # SQN or Sharpe
         daily_pnl_pct: float = 0.0,
-        current_open_risk_pct: float = 0.0,  # V13.0: Total Risk Cap
-        free_margin: float = 999999.0        # V13.1: Leverage Guard
+        current_open_risk_pct: float = 0.0,
+        free_margin: float = 999999.0 # V13.1 Update: Passed from Engine
     ) -> Tuple[Trade, float]:
         """
-        Calculates position size using strict prop firm logic (Sniper Protocol).
-        V16.0 UPDATE: Hyper-Scalper Defaults (0.5% Base).
+        ADVANCED POSITION SIZING KERNEL (V16.3).
+        Integrates RCK (Risk-Confidence-Kelly) Optimization with Margin Guards.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -210,15 +259,15 @@ class RiskManager:
             stop_dist = price * 0.002 * atr_mult_sl
             
         # --- DEAD PAIR PROTECTION (SPREAD CLAMP) ---
-        pip_val, _ = RiskManager.get_pip_info(symbol)
+        pip_val_raw, _ = RiskManager.get_pip_info(symbol)
         spread_assumed = CONFIG.get('forensic_audit', {}).get('spread_pips', {}).get(symbol, 1.5)
         
         # Minimum Stop Loss must be at least 3.0x Spread to survive noise
-        min_stop_req = (spread_assumed * 3.0 * pip_val)
+        min_stop_req = (spread_assumed * 3.0 * pip_val_raw)
         if stop_dist < min_stop_req:
              stop_dist = min_stop_req
              
-        sl_pips = stop_dist / pip_val
+        sl_pips = stop_dist / pip_val_raw
 
         # --- CROSS-PAIR PIP VALUE CALCULATION ---
         conversion_rate = RiskManager.get_conversion_rate(symbol, price, market_prices)
@@ -227,7 +276,7 @@ class RiskManager:
         if conversion_rate <= 0:
             return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, "Conversion Error (No Rate)"), 0.0
             
-        usd_per_pip_per_lot = c_size * pip_val * conversion_rate
+        usd_per_pip_per_lot = c_size * pip_val_raw * conversion_rate
         loss_per_lot_usd = sl_pips * usd_per_pip_per_lot
         
         lots = 0.0
@@ -320,19 +369,18 @@ class RiskManager:
             lots *= penalty_factor
 
         # --- V13.1 LEVERAGE GUARD (REAL MARGIN CHECK) ---
-        # 1. Calculate Required Margin for this trade
-        req_margin = RiskManager.calculate_required_margin(symbol, lots, price, c_size, conversion_rate)
+        # 1. Calculate Required Margin for this trade (Estimate)
+        # req_margin = RiskManager.calculate_required_margin(symbol, lots, price, c_size, conversion_rate)
         
-        # 2. Check against Available Free Margin
-        if req_margin > (free_margin * 0.95): # Leave 5% buffer always
-            # Reduce Lots to fit margin
-            margin_per_lot = req_margin / lots if lots > 0 else 0
-            if margin_per_lot > 0:
-                max_margin_lots = (free_margin * 0.95) / margin_per_lot
-                if max_margin_lots < lots:
-                    logger.warning(f"⚠️ MARGIN CLAMP: {symbol} Lots {lots:.2f} -> {max_margin_lots:.2f} (Free Margin ${free_margin:.0f})")
-                    lots = max_margin_lots
-                    scaling_comment += "|LevGuard"
+        # --- V16.3: MARGIN CLAMP (THE FIX) ---
+        # Calculate max volume allowed by Free Margin
+        max_margin_lots = RiskManager._calculate_max_margin_volume(symbol, free_margin, c_size)
+
+        if lots > max_margin_lots:
+            logger.warning(f"⚠️ MARGIN CLAMP: {symbol} Lots {lots:.2f} -> {max_margin_lots:.2f} (Free Margin ${free_margin:.0f})")
+            lots = max_margin_lots
+            scaling_comment += "|LevGuard"
+        # -----------------------------------
 
         # --- FINAL HARD LIMITS ---
         min_lot = risk_conf.get('min_lot_size', 0.01)

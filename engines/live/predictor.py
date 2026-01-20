@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX V16.0 UPDATE (FOREX HYPER-SCALPER):
-# 1. HORIZON: Reduced TBM to 240m (4H) for intraday rotations.
-# 2. LOGIC: Relaxed KER (0.002) and Hurst (0.45) for high-frequency capture.
-# 3. PORTFOLIO: Added High-Beta Crosses (EURAUD, GBPNZD) to auxiliary data.
+# PHOENIX V16.2 UPDATE (OPTIMIZATION PATCH):
+# 1. TREND GATE: Added SMA-200 Filter to block counter-trend scalps (Fixes GBPAUD).
+# 2. MOMENTUM LOCK: Added Volatility Expansion check (prevents dead-zone entries).
+# 3. SIGNAL PURITY: Raised internal confidence thresholds.
 # =============================================================================
 import logging
 import pickle
@@ -96,6 +96,12 @@ class MultiAssetPredictor:
         # --- SNIPER PROTOCOL BUFFERS ---
         self.sniper_closes = {s: deque(maxlen=200) for s in symbols} # For SMA 200
         self.sniper_rsi = {s: deque(maxlen=15) for s in symbols}      # For RSI 14
+
+        # --- V16.2 NEW FILTERS ---
+        # SMA 200 Trend Filter Buffer
+        self.sma_window = {s: deque(maxlen=200) for s in symbols}
+        # Volatility Gate Buffer (Returns)
+        self.returns_window = {s: deque(maxlen=20) for s in symbols}
 
         for s in symbols:
             # Default from Config
@@ -312,6 +318,47 @@ class MultiAssetPredictor:
         
         return hurst, ker, rvol
 
+    def _calculate_trend_bias(self, symbol: str, current_price: float) -> int:
+        """
+        V16.2: Returns 1 (Bullish), -1 (Bearish), or 0 (Neutral).
+        Based on Price vs SMA(200). Helps align Scalps with Macro Trend.
+        """
+        buffer = self.sma_window[symbol]
+        if len(buffer) < 200:
+            return 0 # Not enough data
+            
+        sma_200 = sum(buffer) / 200
+        
+        # 0.05% Filter Buffer to avoid noise around the MA
+        threshold = sma_200 * 0.0005
+        
+        if current_price > (sma_200 + threshold):
+            return 1
+        elif current_price < (sma_200 - threshold):
+            return -1
+        else:
+            return 0
+
+    def _check_volatility_condition(self, symbol: str, current_price: float) -> bool:
+        """
+        V16.2: Ensures distinct market movement exists before entering.
+        Prevents entering during dead zones where spreads kill profit.
+        """
+        buffer = self.returns_window[symbol]
+        if len(buffer) < 10:
+            return True # Allow early trades
+            
+        # Calculate Volatility (Std Dev of Returns)
+        vol = np.std(list(buffer))
+        
+        # Minimum Volatility Threshold (approx 1.5 pips movement per bar)
+        MIN_VOLATILITY = 0.00015 
+        
+        if vol < MIN_VOLATILITY:
+            return False
+            
+        return True
+
     def _calibrate_confidence(self, raw_conf: float) -> float:
         """
         Calibrates raw model probability to a more reliable confidence score.
@@ -381,7 +428,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V16.0 Logic.
+        Executes the Learn-Predict Loop with Project Phoenix V16.2 Logic.
         Enforces Asset-Specific Regimes (The "Personality Filter").
         """
         if symbol not in self.symbols: return None
@@ -407,6 +454,17 @@ class MultiAssetPredictor:
         # --- UPDATE BUFFERS ---
         self.closes_buffer[symbol].append(bar.close)
         self.volume_buffer[symbol].append(bar.volume)
+        
+        # V16.2: Update Trend Filter Buffer
+        self.sma_window[symbol].append(bar.close)
+        
+        # V16.2: Update Returns Buffer for Volatility Gate
+        if len(self.sma_window[symbol]) >= 2:
+             prev_p = self.sma_window[symbol][-2]
+             if prev_p > 0:
+                 ret = math.log(bar.close / prev_p)
+                 self.returns_window[symbol].append(ret)
+
         self.sniper_closes[symbol].append(bar.close)
         if len(self.sniper_closes[symbol]) > 1:
             delta = self.sniper_closes[symbol][-1] - self.sniper_closes[symbol][-2]
@@ -436,7 +494,9 @@ class MultiAssetPredictor:
                 buy_vol = effective_vol / 2.0
                 sell_vol = effective_vol / 2.0
         
-        # 1. Feature Engineering (Standard)
+        self.last_price = bar.close
+
+        # A. Feature Engineering (Standard)
         features = fe.update(
             price=bar.close,
             timestamp=bar.timestamp.timestamp(),
@@ -445,6 +505,7 @@ class MultiAssetPredictor:
             low=bar.low,
             buy_vol=buy_vol,
             sell_vol=sell_vol,
+            time_feats={},
             context_data=context_data
         )
         
@@ -551,7 +612,7 @@ class MultiAssetPredictor:
                 return None # Standard Blocking
 
         # ============================================================
-        # 4. PHOENIX V14.0: AGGRESSOR PROTOCOL
+        # 4. PHOENIX V16.2: AGGRESSOR PROTOCOL WITH NEW GATES
         # ============================================================
         
         max_rvol_thresh = self.default_max_rvol
@@ -609,6 +670,23 @@ class MultiAssetPredictor:
             stats["No Trigger"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "No BB Trigger in Regime"})
             
+        # --- V16.2 GATE: TREND ALIGNMENT (SMA 200) ---
+        # Forces Trend Breakout trades to align with the macro trend.
+        trend_bias = self._calculate_trend_bias(symbol, bar.close)
+        if regime_label == "TREND_BREAKOUT":
+            if (proposed_action == 1 and trend_bias == -1):
+                stats["Counter-Trend Block (SMA200)"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": "Counter-Trend Block (SMA200)"})
+            if (proposed_action == -1 and trend_bias == 1):
+                stats["Counter-Trend Block (SMA200)"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": "Counter-Trend Block (SMA200)"})
+
+        # --- V16.2 GATE: VOLATILITY EXPANSION ---
+        # Prevents entries in low-volatility dead zones where time stops kill trades.
+        if not self._check_volatility_condition(symbol, bar.close):
+            stats["Low Volatility (Dead Zone)"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "Low Volatility (Dead Zone)"})
+
         # --- REGIME ENFORCEMENT ---
         if is_regime_clash:
             if self.regime_enforcement == "HARD":

@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX V16.0 UPDATE (FOREX HYPER-SCALPER):
-# 1. DURATION: Enforced 8-Hour Hard Time Stop (Intraday Focus).
-# 2. HORIZON: Default TBM reduced to 240m (4h) for faster labeling.
-# 3. DATA: Added fallbacks for High-Beta Crosses (EURAUD, GBPNZD).
+# PHOENIX V16.2 UPDATE (OPTIMIZATION PATCH):
+# 1. TREND GATE: Added SMA-200 Filter to block counter-trend scalps (Fixes GBPAUD).
+# 2. MOMENTUM LOCK: Added Volatility Expansion check (prevents dead-zone entries).
+# 3. SIGNAL PURITY: Raised internal confidence thresholds.
 # =============================================================================
 import logging
 import sys
@@ -47,7 +47,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V16.0 Hyper-Scalper Protocol.
+    Strictly implements the Phoenix V16.2 Hyper-Scalper Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -119,6 +119,12 @@ class ResearchStrategy:
         self.bb_window = 20
         self.bb_std = CONFIG['phoenix_strategy'].get('bb_std_dev', 1.2)
         self.bb_buffer = deque(maxlen=self.bb_window)
+        
+        # --- V16.2 NEW FILTERS ---
+        # SMA 200 Trend Filter Buffer
+        self.sma_window = deque(maxlen=200)
+        # Volatility Gate Buffer (Returns)
+        self.returns_window = deque(maxlen=20)
         
         # --- FORENSIC RECORDER ---
         self.decision_log = deque(maxlen=1000)
@@ -228,6 +234,54 @@ class ResearchStrategy:
         
         return hurst, ker, rvol
 
+    def _calculate_trend_bias(self, current_price: float) -> int:
+        """
+        V16.2: Returns 1 (Bullish), -1 (Bearish), or 0 (Neutral).
+        Based on Price vs SMA(200). Helps align Scalps with Macro Trend.
+        """
+        if len(self.sma_window) < 200:
+            return 0 # Not enough data
+            
+        sma_200 = sum(self.sma_window) / 200
+        
+        # 0.05% Filter Buffer to avoid noise around the MA
+        threshold = sma_200 * 0.0005
+        
+        if current_price > (sma_200 + threshold):
+            return 1
+        elif current_price < (sma_200 - threshold):
+            return -1
+        else:
+            return 0
+
+    def _check_volatility_condition(self, current_price: float) -> bool:
+        """
+        V16.2: Ensures distinct market movement exists before entering.
+        Prevents entering during dead zones where spreads kill profit.
+        """
+        if len(self.sma_window) < 2:
+            return True # Allow early trades
+            
+        # Calculate Log Return
+        prev_price = self.sma_window[-2]
+        if prev_price > 0:
+            ret = math.log(current_price / prev_price)
+            self.returns_window.append(ret)
+            
+        if len(self.returns_window) < 10:
+            return True
+            
+        # Calculate Volatility (Std Dev of Returns)
+        vol = np.std(list(self.returns_window))
+        
+        # Minimum Volatility Threshold (approx 1.5 pips movement per bar)
+        MIN_VOLATILITY = 0.00015 
+        
+        if vol < MIN_VOLATILITY:
+            return False
+            
+        return True
+
     def _calibrate_confidence(self, raw_conf: float) -> float:
         """
         Calibrates raw model probability to a more reliable confidence score.
@@ -295,7 +349,7 @@ class ResearchStrategy:
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (V16.0 Scalper Mode).
+        Main Event Loop for the Strategy (V16.2 Scalper Mode).
         """
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
@@ -312,6 +366,9 @@ class ResearchStrategy:
         # Update Buffers (Golden Trio + Sniper)
         self.closes_buffer.append(price)
         self.volume_buffer.append(volume)
+        
+        # V16.2: Update Trend Filter Buffer
+        self.sma_window.append(price)
         
         self.sniper_closes.append(price)
         if len(self.sniper_closes) > 1:
@@ -516,6 +573,23 @@ class ResearchStrategy:
             self.rejection_stats["No Trigger"] += 1
             return
             
+        # --- V16.2 GATE: TREND ALIGNMENT (SMA 200) ---
+        # Forces Trend Breakout trades to align with the macro trend.
+        trend_bias = self._calculate_trend_bias(price)
+        if regime_label == "TREND_BREAKOUT":
+            if (proposed_action == 1 and trend_bias == -1):
+                self.rejection_stats["Counter-Trend Block (SMA200)"] += 1
+                return
+            if (proposed_action == -1 and trend_bias == 1):
+                self.rejection_stats["Counter-Trend Block (SMA200)"] += 1
+                return
+
+        # --- V16.2 GATE: VOLATILITY EXPANSION ---
+        # Prevents entries in low-volatility dead zones where time stops kill trades.
+        if not self._check_volatility_condition(price):
+            self.rejection_stats["Low Volatility (Dead Zone)"] += 1
+            return
+
         # --- REGIME ENFORCEMENT ---
         if is_regime_clash:
             if self.regime_enforcement == "HARD":

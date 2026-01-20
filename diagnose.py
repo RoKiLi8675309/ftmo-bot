@@ -5,8 +5,8 @@
 # DEPENDENCIES: unittest, numpy, redis, shared
 # DESCRIPTION: Pre-Flight Forensic Diagnostics & PIPELINE VERIFICATION.
 # 
-# PHOENIX V15.0 UPDATE (HYPER-AGGRESSOR DIAGNOSTICS):
-# 1. RISK CHECK: Updated assertions to match V15.0 Aggressor Mode (1.0% / 2.5%).
+# PHOENIX V16.2 UPDATE (OPTIMIZATION PATCH DIAGNOSTICS):
+# 1. RISK CHECK: Updated assertions to match V16.2 (0.8% Base / 1.5% Scaled).
 # 2. LEVERAGE CHECK: Verifies leverage map exists for Margin Guard.
 # =============================================================================
 import unittest
@@ -40,19 +40,22 @@ logger = logging.getLogger("Diagnose")
 
 class TestConfigurationIntegrity(unittest.TestCase):
     """
-    V15.0 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
-    with the Hyper-Aggressor Protocol parameters.
+    V16.2 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
+    with the Hyper-Scalper Protocol parameters.
     """
     def test_aggressor_risk_params(self):
-        """Verify Risk Management is set to 1.0% Base / 2.5% Scaled (V15.0 Aggressor Mode)."""
+        """Verify Risk Management is set to 0.8% Base / 1.5% Scaled (V16.2 Optimization Patch)."""
         risk_conf = CONFIG.get('risk_management', {})
         base_risk = risk_conf.get('base_risk_per_trade_percent')
         scaled_risk = risk_conf.get('scaled_risk_percent')
         
         print(f"   [CONF] Base Risk: {base_risk*100:.1f}% | Scaled Risk: {scaled_risk*100:.1f}%")
-        self.assertEqual(base_risk, 0.010, "CRITICAL: Base Risk must be 1.0% (0.010) for Aggressor Mode")
-        # V15.0 UPDATE: Expect 2.5% Scaled Risk
-        self.assertEqual(scaled_risk, 0.025, "CRITICAL: Scaled Risk must be 2.5% (0.025) for Hyper-Aggressor Mode")
+        
+        # V16.2 UPDATE: Base Risk increased to 0.8% (0.008) to capitalize on filtered setups
+        self.assertEqual(base_risk, 0.008, "CRITICAL: Base Risk must be 0.8% (0.008) for V16.2 Mode")
+        
+        # V16.0 UPDATE: Scaled Risk capped at 1.5% (0.015)
+        self.assertEqual(scaled_risk, 0.015, "CRITICAL: Scaled Risk must be 1.5% (0.015) for Hyper-Scalper Mode")
 
     def test_regime_settings(self):
         """Verify Regime Enforcement is DISABLED for maximum AI adaptability."""
@@ -216,5 +219,5 @@ class TestRiskCalculations(unittest.TestCase):
         self.assertEqual(digits, 2, "Crypto heuristic should work")
 
 if __name__ == '__main__':
-    print(f"\n🔍 RUNNING PHOENIX V15.0 PIPELINE DIAGNOSTICS...")
+    print(f"\n🔍 RUNNING PHOENIX V16.2 PIPELINE DIAGNOSTICS...")
     unittest.main(verbosity=2)

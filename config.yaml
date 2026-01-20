@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V16.0 (FOREX HYPER-SCALPER)
+# config.yaml – PROJECT PHOENIX V16.2 (FOREX HYPER-SCALPER)
 # STATUS: OPTIMIZING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGIC SHIFT (V16.0 FOREX ONLY):
-# 1. FREQUENCY: Added High-Beta Crosses (GBPAUD, EURAUD, GBPNZD) for velocity.
-# 2. DRAWDOWN: Reduced Base Risk to 0.5% to survive volatility clusters.
-# 3. DURATION: Hard limit on trade holding (Intraday Focus).
+# STRATEGIC SHIFT (V16.2 OPTIMIZATION PATCH):
+# 1. PRECISION: Tightened Barrier Width (2.5) for faster profit taking.
+# 2. CONVICTION: Raised ML Threshold (0.55) to filter weak signals.
+# 3. IMPACT: Increased Base Risk (0.8%) to capitalize on filtered setups.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -162,7 +162,7 @@ phoenix_strategy:
 
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true         
-  require_d1_trend: false                        
+  require_d1_trend: false                         
   require_h4_alignment: false                 
   
   # --- LOGIC MAPPING THRESHOLDS (V16.0 SCALPER) ---
@@ -178,7 +178,7 @@ phoenix_strategy:
   max_relative_volume: 25.0        
   volume_gate_ratio: 0.8           
   aggressor_threshold: 0.51        
-  ml_confirmation_threshold: 0.50  
+  ml_confirmation_threshold: 0.55  # V16.2: Raised from 0.50 for higher precision
   choppiness_threshold: 65.0       
   
   # Microstructure Filters (Proxies)
@@ -217,7 +217,7 @@ optimization_search_space:
   # Triple Barrier Method (Labeling)
   tbm_barrier_width:
     min: 1.5  # Tighter for scalping
-    max: 4.0  
+    max: 3.5  
   tbm_horizon_minutes:
     min: 60   # 1 Hour
     max: 360  # 6 Hours
@@ -238,8 +238,8 @@ risk_management:
   # --- SIZING METHOD: HYPER-SCALPER PROTOCOL ---
   sizing_method: "fixed_risk"
   
-  # V16.0: 0.5% Base Risk (High Frequency, Low Impact)
-  base_risk_per_trade_percent: 0.005 
+  # V16.2: 0.8% Base Risk (Increased from 0.5% due to higher quality gates)
+  base_risk_per_trade_percent: 0.008 
   
   # PROFIT BUFFER LOGIC
   profit_buffer_threshold: 0.02
@@ -353,12 +353,12 @@ online_learning:
   positive_class_weight: 1.5 
   negative_class_weight: 1.0
   
-  meta_labeling_threshold: 0.50 
+  meta_labeling_threshold: 0.55  # V16.2: Raised from 0.50
   
   tbm:
     # HORIZON: 4 Hours (Scalper)
     horizon_minutes: 240        
-    barrier_width: 3.0        
+    barrier_width: 2.5        # V16.2: Tightened from 3.0
     min_profit_pips: 5.0        
     drift_threshold: 1.5 
   
