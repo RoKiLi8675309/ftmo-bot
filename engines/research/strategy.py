@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX V16.2 UPDATE (OPTIMIZATION PATCH):
-# 1. TREND GATE: Added SMA-200 Filter to block counter-trend scalps (Fixes GBPAUD).
-# 2. MOMENTUM LOCK: Added Volatility Expansion check (prevents dead-zone entries).
-# 3. SIGNAL PURITY: Raised internal confidence thresholds.
+# PHOENIX V16.3 UPDATE (HYPER-SCALPER TUNING):
+# 1. THRESHOLD RELAXATION: Hurst lowered to 0.42, BB Std to 1.0 to unblock GBP pairs.
+# 2. MARGIN INTEGRATION: Passes equity as free_margin proxy for leverage checks.
+# 3. RECOVERY SUPPORT: Supports "Probe Sizing" for Toxic Assets.
 # =============================================================================
 import logging
 import sys
@@ -47,7 +47,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V16.2 Hyper-Scalper Protocol.
+    Strictly implements the Phoenix V16.3 Hyper-Scalper Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -64,14 +64,14 @@ class ResearchStrategy:
         self.risk_conf = params.get('risk_management', CONFIG.get('risk_management', {}))
         # V14.0: Standardize risk multiplier
         self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 1.5))
-        self.max_currency_exposure = int(self.risk_conf.get('max_currency_exposure', 2)) # V16.0: Stricter (2)
+        self.max_currency_exposure = int(self.risk_conf.get('max_currency_exposure', 2)) 
         
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
         risk_mult_conf = self.sl_atr_mult
-        self.optimized_reward_mult = float(tbm_conf.get('barrier_width', 3.0))
+        self.optimized_reward_mult = float(tbm_conf.get('barrier_width', 2.5)) # V16.2 Tightened
         
-        # V16.0 UPDATE: Reduced default horizon to 240m (4 Hours) for Scalping
+        # V16.0: Default Horizon Reduced to 240m (4h) for Scalping
         self.labeler = AdaptiveTripleBarrier(
             horizon_ticks=int(tbm_conf.get('horizon_minutes', 240)), 
             risk_mult=risk_mult_conf, 
@@ -117,7 +117,7 @@ class ResearchStrategy:
         
         # --- V14.0 MOMENTUM INDICATORS ---
         self.bb_window = 20
-        self.bb_std = CONFIG['phoenix_strategy'].get('bb_std_dev', 1.2)
+        self.bb_std = CONFIG['phoenix_strategy'].get('bb_std_dev', 1.0) # V16.3: Relaxed to 1.0
         self.bb_buffer = deque(maxlen=self.bb_window)
         
         # --- V16.2 NEW FILTERS ---
@@ -132,12 +132,12 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- PHOENIX V16.0 CONFIGURATION ---
+        # --- PHOENIX V16.3 CONFIGURATION ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V16.0 Logic Thresholds (Scalper Tuned)
-        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.002)) # Relaxed
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.45)) # Relaxed
+        # V16.3 Logic Thresholds (Scalper Tuned)
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.001)) # Relaxed
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.42)) # Relaxed
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 2.5))
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
         
@@ -349,7 +349,7 @@ class ResearchStrategy:
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (V16.2 Scalper Mode).
+        Main Event Loop for the Strategy (V16.3 Scalper Mode).
         """
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
@@ -521,12 +521,12 @@ class ResearchStrategy:
         existing_positions = [p for p in broker.open_positions if p.symbol == self.symbol]
         
         # ============================================================
-        # E. SURVIVAL GATES & ASSET PERSONALITY (V14.0)
+        # E. SURVIVAL GATES & ASSET PERSONALITY (V16.3)
         # ============================================================
         
         # G1: EFFICIENCY (KER)
         base_thresh = self.ker_floor 
-        effective_ker_thresh = max(0.002, base_thresh + self.dynamic_ker_offset) # V16.0
+        effective_ker_thresh = max(0.001, base_thresh + self.dynamic_ker_offset) # Relaxed floor
             
         if ker_val < effective_ker_thresh:
             self.rejection_stats[f"Low Efficiency (KER {ker_val:.3f} < {effective_ker_thresh:.3f})"] += 1
@@ -627,14 +627,14 @@ class ResearchStrategy:
             is_profitable = self.meta_labeler.predict(
                 features, 
                 proposed_action, 
-                threshold=float(self.params.get('meta_labeling_threshold', 0.50))
+                threshold=float(self.params.get('meta_labeling_threshold', 0.55))
             )
             
             if proposed_action != 0:
                 self.meta_label_events += 1
 
             if is_regime_clash:
-               pass
+               pass 
 
             # --- SNIPER PROTOCOL ---
             # V14.0: Pass current_hurst to enable Momentum Ignition
@@ -688,7 +688,7 @@ class ResearchStrategy:
     def _execute_entry(self, confidence, price, features, broker, dt_timestamp, action_int, regime, tighten_stops, is_pyramid=False):
         """
         Executes the trade entry logic with Fixed Risk & Portfolio Cap.
-        V15.0: Handles Pyramid sizing logic.
+        V16.3: Integrates Margin Awareness via Free Margin passing.
         """
         action = "BUY" if action_int == 1 else "SELL"
         
@@ -758,6 +758,7 @@ class ResearchStrategy:
         current_open_risk_pct = (current_open_risk_usd / broker.equity) * 100.0
         
         # Estimate Free Margin (Broker Equity - Used Margin)
+        # Use simple equity for backtest approximation if detailed margin tracking unavailable
         estimated_free_margin = max(0.0, broker.equity - used_margin)
 
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
@@ -773,7 +774,7 @@ class ResearchStrategy:
             performance_score=effective_sqn,
             daily_pnl_pct=daily_pnl_pct,
             current_open_risk_pct=current_open_risk_pct,
-            free_margin=estimated_free_margin # V13.1 PASSED
+            free_margin=estimated_free_margin # V16.3 PASSED
         )
 
         if trade_intent.volume <= 0:
@@ -1100,18 +1101,18 @@ class ResearchStrategy:
             if rsi > 80: 
                 # Check for Ignition
                 if current_hurst > 0.60:
-                      pass # IGNITION: ALLOW TRADE
+                       pass # IGNITION: ALLOW TRADE
                 else:
-                      self.rejection_stats['Overbought_RSI_>80'] += 1
-                      return False
+                       self.rejection_stats['Overbought_RSI_>80'] += 1
+                       return False
         elif signal == -1: # SELL
             if rsi < 20: 
                 # Check for Ignition
                 if current_hurst > 0.60:
-                      pass # IGNITION: ALLOW TRADE
+                       pass # IGNITION: ALLOW TRADE
                 else:
-                      self.rejection_stats['Oversold_RSI_<20'] += 1
-                      return False
+                       self.rejection_stats['Oversold_RSI_<20'] += 1
+                       return False
         
         return True
 

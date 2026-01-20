@@ -5,11 +5,11 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX V16.3 MAINTENANCE PATCH (MARGIN GUARD):
-# 1. MARGIN SAFETY: Added `_calculate_max_margin_volume` to clamp trade sizes
-#    based on actual free margin, preventing [No Money] rejections.
-# 2. PNL ACCURACY: Enforced live conversion rates for cross-pair calculations.
-# 3. SAFETY: Strict zero-check for account balance to prevent division errors.
+# PHOENIX V16.3 UPDATE (RECOVERY PROTOCOL):
+# 1. TOXIC ASSET RECOVERY: Implemented "Probe Sizing" (0.1%) for SQN < -2.0.
+#    - PREVIOUS: Hard Lock (0% Risk) -> Asset died forever.
+#    - NOW: Small risk allowed to fight out of drawdown.
+# 2. MARGIN CLAMP: Enforced strict free margin checks to prevent [No Money] errors.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -65,8 +65,6 @@ class RiskManager:
         """
         Calculates the Quote -> USD conversion rate using LIVE market data.
         Critical for accurate risk calculation in USD.
-        
-        V16.1 FIX: Removed static constants. Returns 0.0 if conversion fails to fail-safe.
         """
         s = symbol.upper()
         
@@ -85,7 +83,6 @@ class RiskManager:
             usdjpy = get_price("USDJPY")
             if usdjpy and usdjpy > 0: return 1.0 / usdjpy
             if s == "USDJPY" and price > 0: return 1.0 / price
-            # No static fallback
             return 0.0
         
         # GBP Pairs (Quote = GBP). Need GBP->USD (GBPUSD).
@@ -228,8 +225,9 @@ class RiskManager:
         free_margin: float = 999999.0 # V13.1 Update: Passed from Engine
     ) -> Tuple[Trade, float]:
         """
-        ADVANCED POSITION SIZING KERNEL (V16.3).
-        Integrates RCK (Risk-Confidence-Kelly) Optimization with Margin Guards.
+        ADVANCED POSITION SIZING KERNEL (V16.3 RECOVERY PATCH).
+        Integrates RCK (Risk-Confidence-Kelly) Optimization with Margin Guards
+        and Toxic Asset Recovery.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -283,7 +281,6 @@ class RiskManager:
         calculated_risk_usd = 0.0
         
         # --- V16.0: HYPER-SCALPER RISK PARAMETERS ---
-        # Default base risk lowered to 0.5%
         default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.005) 
         buffer_threshold = risk_conf.get('profit_buffer_threshold', 0.02)
         scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.015) 
@@ -301,11 +298,13 @@ class RiskManager:
             else:
                 risk_pct = default_base_risk * 100.0
         
-        # --- SQN PERFORMANCE SCALING (FINE-TUNED) ---
+        # --- SQN PERFORMANCE SCALING (V16.3: RECOVERY PATCH) ---
         if performance_score != 0.0:
             if performance_score < -2.0:
-                risk_pct = 0.0
-                return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, f"Toxic Asset (SQN {performance_score:.2f})"), 0.0
+                # V16.3 FIX: TOXIC ASSET RECOVERY PROTOCOL
+                # Instead of 0% (Hard Lock), allow 0.1% (Probe)
+                risk_pct = 0.1 
+                scaling_comment += "|Toxic:Probe"
                 
             elif performance_score < 0.0:
                 # LOSING STREAK: Probe Size Only (0.25%)
@@ -369,9 +368,6 @@ class RiskManager:
             lots *= penalty_factor
 
         # --- V13.1 LEVERAGE GUARD (REAL MARGIN CHECK) ---
-        # 1. Calculate Required Margin for this trade (Estimate)
-        # req_margin = RiskManager.calculate_required_margin(symbol, lots, price, c_size, conversion_rate)
-        
         # --- V16.3: MARGIN CLAMP (THE FIX) ---
         # Calculate max volume allowed by Free Margin
         max_margin_lots = RiskManager._calculate_max_margin_volume(symbol, free_margin, c_size)

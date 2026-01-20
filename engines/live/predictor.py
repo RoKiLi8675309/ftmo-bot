@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
 #
-# PHOENIX V16.2 UPDATE (OPTIMIZATION PATCH):
-# 1. TREND GATE: Added SMA-200 Filter to block counter-trend scalps (Fixes GBPAUD).
-# 2. MOMENTUM LOCK: Added Volatility Expansion check (prevents dead-zone entries).
-# 3. SIGNAL PURITY: Raised internal confidence thresholds.
+# PHOENIX V16.3 UPDATE (LIVE KERNEL):
+# 1. TUNING: Synced defaults with Config V16.3 (Hurst=0.42, BB=1.0) for GBP pairs.
+# 2. LOGIC: Relaxed "No Trigger" gates to allow higher frequency scalping.
+# 3. SAFETY: Retained SMA-200 and Volatility Gates from V16.2.
 # =============================================================================
 import logging
 import pickle
@@ -90,7 +90,7 @@ class MultiAssetPredictor:
         self.closes_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         self.volume_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         self.bb_window = 20
-        self.bb_std = CONFIG['phoenix_strategy'].get('bb_std_dev', 1.2) # V14.0: 1.2 Aggressor Std
+        self.bb_std = CONFIG['phoenix_strategy'].get('bb_std_dev', 1.0) # V16.3: Relaxed to 1.0 for Scalping
         self.bb_buffers = {s: deque(maxlen=self.bb_window) for s in symbols}
         
         # --- SNIPER PROTOCOL BUFFERS ---
@@ -106,7 +106,7 @@ class MultiAssetPredictor:
         for s in symbols:
             # Default from Config
             s_risk = risk_mult_conf
-            s_reward = tbm_conf.get('barrier_width', 3.0)
+            s_reward = tbm_conf.get('barrier_width', 2.5) # V16.2: Tightened to 2.5 for faster rotation
             
             # V16.0: Default Horizon Reduced to 240m (4h)
             s_horizon = tbm_conf.get('horizon_minutes', 240) 
@@ -172,17 +172,17 @@ class MultiAssetPredictor:
         # --- Gating Params ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.0)
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 0.8) # V16.3: Relaxed
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V16.0) ---
+        # --- PHOENIX STRATEGY PARAMETERS (V16.3) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V16.0 Logic Thresholds (Scalper Tuned)
-        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.002)) # Relaxed from 0.005
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.45)) # Relaxed from 0.48
-        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 2.5)) # Lowered
+        # V16.3 Logic Thresholds (Scalper Tuned)
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.001)) # Relaxed from 0.002
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.42)) # Relaxed from 0.45
+        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 2.5)) 
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
         
         self.default_max_rvol = float(phx_conf.get('max_relative_volume', 25.0))
@@ -428,7 +428,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V16.2 Logic.
+        Executes the Learn-Predict Loop with Project Phoenix V16.3 Logic.
         Enforces Asset-Specific Regimes (The "Personality Filter").
         """
         if symbol not in self.symbols: return None
@@ -600,8 +600,6 @@ class MultiAssetPredictor:
         open_positions = context_data.get('positions', {}) if context_data else {}
         
         # V15.0: PYRAMIDING LOGIC (HYPER-AGGRESSOR)
-        # If Pyramiding is enabled in config, we allow the signal to be generated.
-        # We flag it as 'pyramid' so the Risk Manager can handle the sizing/checks.
         is_pyramid_attempt = False
         
         if symbol in open_positions:
@@ -612,7 +610,7 @@ class MultiAssetPredictor:
                 return None # Standard Blocking
 
         # ============================================================
-        # 4. PHOENIX V16.2: AGGRESSOR PROTOCOL WITH NEW GATES
+        # 4. PHOENIX V16.3: AGGRESSOR PROTOCOL WITH NEW GATES
         # ============================================================
         
         max_rvol_thresh = self.default_max_rvol
@@ -621,10 +619,10 @@ class MultiAssetPredictor:
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
              return Signal(symbol, "HOLD", 0.0, {"reason": "Friday Entry Guard"})
 
-        # G1: EFFICIENCY (KER) - AGGRESSIVE (V14.0)
-        # Reduced floor to 0.002 to catch early moves
+        # G1: EFFICIENCY (KER) - AGGRESSIVE (V16.3)
+        # Reduced floor to 0.001 to catch early GBP moves
         base_thresh = self.ker_floor 
-        effective_ker_thresh = max(0.002, base_thresh + self.dynamic_ker_offsets[symbol])
+        effective_ker_thresh = max(0.001, base_thresh + self.dynamic_ker_offsets[symbol])
 
         if ker_val < effective_ker_thresh:
             stats[f"Low Efficiency"] += 1
@@ -719,7 +717,7 @@ class MultiAssetPredictor:
         # We trust the Meta Labeler and Regime Filters entirely.
         confidence = 1.0 # Force max confidence to bypass filters
         
-        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.50) 
+        meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.55) 
         is_profitable = meta_labeler.predict(features, proposed_action, threshold=meta_threshold)
 
         # --- EXECUTION WITH DYNAMIC CONFIDENCE ---

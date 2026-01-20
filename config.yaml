@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V16.2 (FOREX HYPER-SCALPER)
+# config.yaml – PROJECT PHOENIX V16.3 (FOREX HYPER-SCALPER)
 # STATUS: OPTIMIZING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGIC SHIFT (V16.2 OPTIMIZATION PATCH):
-# 1. PRECISION: Tightened Barrier Width (2.5) for faster profit taking.
-# 2. CONVICTION: Raised ML Threshold (0.55) to filter weak signals.
-# 3. IMPACT: Increased Base Risk (0.8%) to capitalize on filtered setups.
+# STRATEGIC SHIFT (V16.3 TUNING PATCH):
+# 1. ACCESSIBILITY: Relaxed Hurst (0.42) & BB Std (1.0) to unblock GBP pairs.
+# 2. RECOVERY: Enabled Probe Sizing for low SQN assets (RiskManager update).
+# 3. SIGNIFICANCE: Lowered min_trades to 40 to allow optimization of slower pairs.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -96,10 +96,10 @@ features:
   use_log_returns: true
   
   # Project Phoenix L1 Proxies
-  use_parkinson_vol: true             
+  use_parkinson_vol: true              
   use_amihud_liquidity: true 
-  use_relative_volume: true             
-  use_aggressor_ratio: true             
+  use_relative_volume: true              
+  use_aggressor_ratio: true              
   
   # Regime Filters (Anti-Chop)
   use_choppiness: true
@@ -149,37 +149,37 @@ phoenix_strategy:
   regime_enforcement: "DISABLED" 
   
   asset_regime_map:
-    GBPAUD: "TREND_BREAKOUT" # The Beast
+    GBPAUD: "TREND_BREAKOUT" # Explicitly defined
     EURAUD: "TREND_BREAKOUT"
     GBPNZD: "TREND_BREAKOUT"
     GBPJPY: "TREND_BREAKOUT" 
     USDJPY: "TREND_BREAKOUT"
-    GBPUSD: "TREND_BREAKOUT"
+    GBPUSD: "TREND_BREAKOUT" # Explicitly defined
     EURJPY: "TREND_BREAKOUT"
     CAD: "NEUTRAL"    
     CHF: "NEUTRAL"    
     USD: "NEUTRAL"
 
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true         
-  require_d1_trend: false                         
-  require_h4_alignment: false                 
+  enable_regime_a_entries: true          
+  require_d1_trend: false                          
+  require_h4_alignment: false                  
   
-  # --- LOGIC MAPPING THRESHOLDS (V16.0 SCALPER) ---
-  hurst_breakout_threshold: 0.45      # Relaxed from 0.48
-  hurst_mean_reversion_threshold: 0.00   
-  ker_trend_threshold: 0.002          # Relaxed from 0.005 (Catch chopped trends)
+  # --- LOGIC MAPPING THRESHOLDS (V16.3 TUNING) ---
+  hurst_breakout_threshold: 0.42      # Relaxed from 0.45 to catch GBP moves
+  hurst_mean_reversion_threshold: 0.00    
+  ker_trend_threshold: 0.001          # Relaxed from 0.002
   
-  bb_std_dev: 1.2                     
+  bb_std_dev: 1.0                     # Relaxed from 1.2 to trigger more signals
   
-  rvol_volatility_trigger: 2.5        # Lowered to trigger easier
+  rvol_volatility_trigger: 2.5        
   
   # --- FILTER THRESHOLDS ---
   max_relative_volume: 25.0        
-  volume_gate_ratio: 0.8           
+  volume_gate_ratio: 0.8            
   aggressor_threshold: 0.51        
-  ml_confirmation_threshold: 0.55  # V16.2: Raised from 0.50 for higher precision
-  choppiness_threshold: 65.0       
+  ml_confirmation_threshold: 0.55  
+  choppiness_threshold: 65.0        
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -238,7 +238,7 @@ risk_management:
   # --- SIZING METHOD: HYPER-SCALPER PROTOCOL ---
   sizing_method: "fixed_risk"
   
-  # V16.2: 0.8% Base Risk (Increased from 0.5% due to higher quality gates)
+  # V16.2: 0.8% Base Risk
   base_risk_per_trade_percent: 0.008 
   
   # PROFIT BUFFER LOGIC
@@ -249,7 +249,7 @@ risk_management:
   # PYRAMIDING (COMPOUNDING)
   pyramiding:
     enabled: true
-    max_adds: 2 # Reduced from 3 for safety
+    max_adds: 2
     add_on_profit_r: 0.5  
     risk_per_add_percent: 0.0025 # 0.25% risk per add
   
@@ -259,14 +259,14 @@ risk_management:
     step_percent: 0.025    # Lock floor every 2.5% gain
   
   # LIMITS
-  max_daily_loss_pct: 0.040        # Tightened to 4.0% for safety buffer
+  max_daily_loss_pct: 0.040        # 4.0% Daily Limit
   max_total_loss_pct: 0.095        
   
   # PORTFOLIO HEAT
-  max_currency_exposure: 2         # STRICT: Max 2 correlated pairs
+  max_currency_exposure: 2         
   
-  max_risk_percent: 3.0            # Reduced from 6.0% (Safety Cap)
-  max_open_trades: 5               # Reduced from 8 (Focus)
+  max_risk_percent: 3.0            
+  max_open_trades: 5               
   
   # --- LEVERAGE GUARD ---
   leverage:
@@ -283,14 +283,14 @@ risk_management:
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC
-  stop_loss_atr_mult: 1.5               
+  stop_loss_atr_mult: 1.5                
   take_profit_atr_mult: 3.0              
   
   # ACTIVE TRAILING STOP
   trailing_stop:
     enabled: true        
     activation_r: 1.0       # Activate earlier (1.0R)
-    trail_trigger_r: 1.0     
+    trail_trigger_r: 1.0      
     trail_dist_r: 0.5       # Tight Trail (0.5R) to bank scalps
   
   risk_timezone: "Europe/Prague"
@@ -301,7 +301,7 @@ risk_management:
   contract_size: 100000
   
   max_trades_per_day: 100          
-  correlation_penalty_threshold: 0.85 # Stricter correlation check
+  correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
   min_stop_loss_pips: 3.0
@@ -343,22 +343,22 @@ online_learning:
   max_features: 'sqrt'    
   metric: "LogLoss"        
   
-  burn_in_periods: 30    # Reduced Warmup
+  burn_in_periods: 30    
   
   # Volatility Gate
   volatility_gate:
     enabled: true
-    min_atr_spread_ratio: 1.0 
+    min_atr_spread_ratio: 0.8  # Relaxed from 1.0 to allow high-spread pair entries
   
   positive_class_weight: 1.5 
   negative_class_weight: 1.0
   
-  meta_labeling_threshold: 0.55  # V16.2: Raised from 0.50
+  meta_labeling_threshold: 0.55
   
   tbm:
     # HORIZON: 4 Hours (Scalper)
     horizon_minutes: 240        
-    barrier_width: 2.5        # V16.2: Tightened from 3.0
+    barrier_width: 2.5        
     min_profit_pips: 5.0        
     drift_threshold: 1.5 
   
@@ -387,12 +387,12 @@ forensic_audit:
   commission_per_lot: 5.0
   spread_pips:
     default: 0.8  
-    GBPJPY: 1.5   
-    USDJPY: 0.8   
-    EURJPY: 1.0   
-    AUDJPY: 1.2   
-    GBPUSD: 1.0   
-    GBPAUD: 1.8   # High spread but huge moves
+    GBPJPY: 1.5    
+    USDJPY: 0.8    
+    EURJPY: 1.0    
+    AUDJPY: 1.2    
+    GBPUSD: 1.0    
+    GBPAUD: 1.8    # High spread but huge moves
     EURAUD: 1.8
     GBPNZD: 2.2
 
@@ -401,5 +401,5 @@ wfo:
   n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 100 
+  min_trades_optimization: 40  # Lowered from 100 to allow slower pairs to survive
   risk_per_trade_options: [0.005, 0.010, 0.015] # 0.5%, 1.0%, 1.5%
