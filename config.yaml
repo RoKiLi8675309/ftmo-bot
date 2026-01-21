@@ -1,11 +1,12 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V16.3 (FOREX HYPER-SCALPER)
-# STATUS: OPTIMIZING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
+# config.yaml – PROJECT PHOENIX V16.6 (UNSHACKLED PROTOCOL)
+# STATUS: LIVE TRADING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGIC SHIFT (V16.3 TUNING PATCH):
-# 1. ACCESSIBILITY: Relaxed Hurst (0.42) & BB Std (1.0) to unblock GBP pairs.
-# 2. RECOVERY: Enabled Probe Sizing for low SQN assets (RiskManager update).
-# 3. SIGNIFICANCE: Lowered min_trades to 40 to allow optimization of slower pairs.
+# UNSHACKLED UPDATE (V16.6):
+# 1. GATES: Relaxed ADX (10.0) and Disabled Regime Enforcement for max adaptability.
+# 2. LATENCY: Execution requires < 5.0s latency (Aggressor Mode).
+# 3. RECOVERY: Probe Sizing active for toxic assets.
+# 4. LEARNING: Pre-Training enabled (5000 ticks) to eliminate Cold Start.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -136,7 +137,7 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 15.0 # V16.0: Relaxed for Scalping (Forex)
+    threshold: 10.0 # V16.6: RELAXED to 10.0 for Scalping (Was 15.0)
   
   cyclical_time: true
   session_awareness: true
@@ -146,6 +147,7 @@ features:
 # --- PHOENIX STRATEGY PARAMETERS ---
 phoenix_strategy:
   # --- ASSET REGIME MAPPING ---
+  # V16.6: DISABLED to allow ML to decide best action (Trend vs Reversion)
   regime_enforcement: "DISABLED" 
   
   asset_regime_map:
@@ -321,6 +323,11 @@ trading:
   auxiliary_symbols:
     - "AUDJPY"
     - "EURUSD"
+    # ADDED FOR CONVERSION SAFETY:
+    - "NZDUSD"  # Required for GBPNZD
+    - "AUDUSD"  # Required for GBPAUD, EURAUD
+    - "USDCAD"  # Fallback
+    - "USDCHF"  # Fallback
     
   timeframe: "M5"
   magic_number: 621001

@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX V16.3 UPDATE (HYPER-SCALPER TUNING):
-# 1. THRESHOLD RELAXATION: Hurst lowered to 0.42, BB Std to 1.0 to unblock GBP pairs.
-# 2. MARGIN INTEGRATION: Passes equity as free_margin proxy for leverage checks.
-# 3. RECOVERY SUPPORT: Supports "Probe Sizing" for Toxic Assets.
+# PHOENIX V16.6 UPDATE (RESEARCH PARITY):
+# 1. SYNCHRONIZATION: Matches 'Unshackled' logic of Live Predictor.
+# 2. GATES: Disabled SMA200 & Relaxed ADX to simulate Scalper Mode.
+# 3. RECOVERY: Supports "Probe Sizing" for Toxic Assets.
 # =============================================================================
 import logging
 import sys
@@ -47,7 +47,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V16.3 Hyper-Scalper Protocol.
+    Strictly implements the Phoenix V16.6 Hyper-Scalper Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -88,7 +88,8 @@ class ResearchStrategy:
         self.calibrator_sell = ProbabilityCalibrator(window=2000)
         
         # 5. Warm-up State
-        self.burn_in_limit = params.get('burn_in_periods', 30) # V16.0: Faster Start
+        # V16.6: Reduced burn-in limit to match Live (assuming data sufficiency)
+        self.burn_in_limit = params.get('burn_in_periods', 5) 
         self.burn_in_counter = 0
         self.burn_in_complete = False
         
@@ -150,7 +151,8 @@ class ResearchStrategy:
         self.chop_threshold = float(phx_conf.get('choppiness_threshold', 65.0))
         
         adx_cfg = CONFIG.get('features', {}).get('adx', {})
-        self.adx_threshold = float(params.get('adx_threshold', adx_cfg.get('threshold', 15.0))) # Scalper
+        # V16.6: Default to 10.0 for Scalper Parity
+        self.adx_threshold = float(params.get('adx_threshold', adx_cfg.get('threshold', 10.0))) 
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.1)
         
@@ -349,7 +351,7 @@ class ResearchStrategy:
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (V16.3 Scalper Mode).
+        Main Event Loop for the Strategy (V16.6 Scalper Mode).
         """
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
@@ -566,23 +568,33 @@ class ResearchStrategy:
                 
         else:
             # NEUTRAL ZONE 
-            self.rejection_stats[f"Random Walk Regime (H={hurst:.2f})"] += 1
-            return
+            # V16.6: If we disable regime enforcement, allow Mean Reversion on Low Hurst
+            if self.regime_enforcement == "DISABLED":
+                 # Low Hurst = Reversion. If hitting bands, fade it.
+                 regime_label = "MEAN_REVERSION"
+                 if price > upper_bb:
+                     proposed_action = -1 # Reversion Sell
+                 elif price < lower_bb:
+                     proposed_action = 1  # Reversion Buy
+            else:
+                self.rejection_stats[f"Random Walk Regime (H={hurst:.2f})"] += 1
+                return
 
         if proposed_action == 0:
             self.rejection_stats["No Trigger"] += 1
             return
             
         # --- V16.2 GATE: TREND ALIGNMENT (SMA 200) ---
-        # Forces Trend Breakout trades to align with the macro trend.
-        trend_bias = self._calculate_trend_bias(price)
-        if regime_label == "TREND_BREAKOUT":
-            if (proposed_action == 1 and trend_bias == -1):
-                self.rejection_stats["Counter-Trend Block (SMA200)"] += 1
-                return
-            if (proposed_action == -1 and trend_bias == 1):
-                self.rejection_stats["Counter-Trend Block (SMA200)"] += 1
-                return
+        # V16.6 UPDATE: DISABLE SMA200 for Scalping (Often Counter-Trend)
+        # We comment this out to allow rapid reversion scalps.
+        # trend_bias = self._calculate_trend_bias(price)
+        # if regime_label == "TREND_BREAKOUT":
+        #     if (proposed_action == 1 and trend_bias == -1):
+        #         self.rejection_stats["Counter-Trend Block (SMA200)"] += 1
+        #         return
+        #     if (proposed_action == -1 and trend_bias == 1):
+        #         self.rejection_stats["Counter-Trend Block (SMA200)"] += 1
+        #         return
 
         # --- V16.2 GATE: VOLATILITY EXPANSION ---
         # Prevents entries in low-volatility dead zones where time stops kill trades.
@@ -611,8 +623,9 @@ class ResearchStrategy:
         if regime_label == "TREND_BREAKOUT":
             adx_val = features.get('adx', 0.0)
             if adx_val < self.adx_threshold:
+                # V16.6 UPDATE: Just log warning, don't block hard if other signals strong
                 self.rejection_stats[f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
-                return
+                # return
 
         # ============================================================
         # F. ML CONFIRMATION & EXECUTION
@@ -1082,19 +1095,20 @@ class ResearchStrategy:
         trend_aligned = False
         d1_ema = self.current_d1_ema
         
-        if self.require_d1_trend and d1_ema > 0: 
-            if signal == 1: # BUY Signal
-                if price > d1_ema: trend_aligned = True
-                else:
-                    self.rejection_stats['Counter_Trend_D1_EMA'] += 1
-                    return False
-            elif signal == -1: # SELL Signal
-                if price < d1_ema: trend_aligned = True
-                else:
-                    self.rejection_stats['Counter_Trend_D1_EMA'] += 1
-                    return False
-        else:
-            trend_aligned = True 
+        # V16.6 UPDATE: DISABLE SMA200 for Scalping
+        # if self.require_d1_trend and d1_ema > 0: 
+        #     if signal == 1: # BUY Signal
+        #         if price > d1_ema: trend_aligned = True
+        #         else:
+        #             self.rejection_stats['Counter_Trend_D1_EMA'] += 1
+        #             return False
+        #     elif signal == -1: # SELL Signal
+        #         if price < d1_ema: trend_aligned = True
+        #         else:
+        #             self.rejection_stats['Counter_Trend_D1_EMA'] += 1
+        #             return False
+        # else:
+        #     trend_aligned = True 
 
         # 3. RSI EXTREME GUARD (V14.0 MOMENTUM IGNITION)
         if signal == 1: # BUY

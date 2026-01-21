@@ -2,14 +2,14 @@
 # FILENAME: engines/live/predictor.py
 # ENVIRONMENT: Linux/WSL2 (Python 3.11)
 # PATH: engines/live/predictor.py
-# DEPENDENCIES: shared, river, numpy
+# DEPENDENCIES: shared, river, numpy, pandas
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
-# Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier), and Weighted Learning.
+# Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier).
 #
-# PHOENIX V16.3 UPDATE (LIVE KERNEL):
-# 1. TUNING: Synced defaults with Config V16.3 (Hurst=0.42, BB=1.0) for GBP pairs.
-# 2. LOGIC: Relaxed "No Trigger" gates to allow higher frequency scalping.
-# 3. SAFETY: Retained SMA-200 and Volatility Gates from V16.2.
+# PHOENIX V16.6 PATCH (UNSHACKLED MODE):
+# 1. WARM-UP: Pre-trains models on 5,000 historical bars to eliminate "Cold Start".
+# 2. GATES: Disabled SMA200 and relaxed ADX/Regime filters for Scalping.
+# 3. DIAGNOSTICS: Logs "Shadow Probabilities" for rejected trades.
 # =============================================================================
 import logging
 import pickle
@@ -23,6 +23,7 @@ from collections import defaultdict, deque, Counter
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np 
+import pandas as pd
 
 # Third-Party ML Imports
 try:
@@ -40,7 +41,9 @@ from shared import (
     AdaptiveTripleBarrier,
     ProbabilityCalibrator,
     VolumeBar,
-    RiskManager
+    RiskManager,
+    load_real_data,             # Required for Warm-up
+    AdaptiveImbalanceBarGenerator # Required for Warm-up
 )
 
 # New Feature Import
@@ -146,8 +149,8 @@ class MultiAssetPredictor:
         
         # 4. Warm-up State
         self.burn_in_counters = {s: 0 for s in symbols}
-        # V16.0: Faster Start (30 periods)
-        self.burn_in_limit = CONFIG['online_learning'].get('burn_in_periods', 30)
+        # V16.6: Reduced burn-in limit since we do Pre-Training
+        self.burn_in_limit = 5
         
         # 5. Forensic Stats
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
@@ -196,8 +199,8 @@ class MultiAssetPredictor:
         
         # V12.7: ADX Threshold (Cached for Logging)
         adx_cfg = CONFIG.get('features', {}).get('adx', {})
-        # V16.0: Relaxed ADX for Scalping
-        self.adx_threshold = float(adx_cfg.get('threshold', 15.0))
+        # V16.6: RELAXED ADX for Scalping (Default to 10 if not set)
+        self.adx_threshold = float(adx_cfg.get('threshold', 10.0))
 
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
@@ -221,6 +224,9 @@ class MultiAssetPredictor:
         # Initialize Models & Load State
         self._init_models()
         self._load_state()
+        
+        # V16.6: PRE-TRAINING WARMUP (CRITICAL)
+        self._perform_warmup()
 
     def _init_models(self):
         """
@@ -254,6 +260,103 @@ class MultiAssetPredictor:
             self.meta_labelers[sym] = MetaLabeler()
             self.calibrators[sym] = ProbabilityCalibrator()
 
+    def _perform_warmup(self):
+        """
+        V16.6: Loads 5,000 ticks from DB and pre-trains the model.
+        Solves the 'Cold Start' problem where the model rejects everything initially.
+        """
+        logger.info(f"{LogSymbols.TRAINING} Starting Model Pre-Training (Warm-Up)...")
+        
+        for sym in self.symbols:
+            try:
+                # 1. Load Data
+                df = load_real_data(sym, n_candles=5000, days=30)
+                if df.empty:
+                    logger.warning(f"⚠️ No historical data for {sym}. Model will start cold.")
+                    continue
+                
+                # 2. Setup Generator
+                # Match config threshold
+                thresh = CONFIG['data'].get('volume_bar_threshold', 10.0)
+                alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
+                gen = AdaptiveImbalanceBarGenerator(sym, initial_threshold=thresh, alpha=alpha)
+                
+                logger.info(f"🔥 Pre-training {sym} on {len(df)} ticks...")
+                
+                # 3. Simulate Feed
+                bars_trained = 0
+                for row in df.itertuples():
+                    price = getattr(row, 'price', getattr(row, 'close', None))
+                    vol = getattr(row, 'volume', 1.0)
+                    ts_val = getattr(row, 'Index', None).timestamp()
+                    
+                    if price is None: continue
+                    
+                    # Synthetic Flow for Warmup
+                    b_vol = getattr(row, 'buy_vol', 0.0)
+                    s_vol = getattr(row, 'sell_vol', 0.0)
+                    if b_vol == 0 and s_vol == 0:
+                        b_vol = vol / 2
+                        s_vol = vol / 2
+                        
+                    bar = gen.process_tick(price, vol, ts_val, b_vol, s_vol)
+                    
+                    if bar:
+                        # Call process_bar logic BUT without returning signals
+                        # This effectively updates the feature engineer, labeler, and model state
+                        self._train_on_bar(sym, bar)
+                        bars_trained += 1
+                        
+                logger.info(f"✅ {sym} Warm-Up Complete: Trained on {bars_trained} bars.")
+                
+            except Exception as e:
+                logger.error(f"❌ Warm-Up Failed for {sym}: {e}")
+
+    def _train_on_bar(self, symbol: str, bar: VolumeBar):
+        """
+        Internal method to update Model/FE state without generating trading signals.
+        Used exclusively for Warm-Up.
+        """
+        # Feature Engineering
+        fe = self.feature_engineers[symbol]
+        labeler = self.labelers[symbol]
+        model = self.models[symbol]
+        
+        # Buffer updates needed for features
+        self.closes_buffer[symbol].append(bar.close)
+        self.volume_buffer[symbol].append(bar.volume)
+        self.bb_buffers[symbol].append(bar.close)
+        
+        # Simple Flow assumption
+        buy_vol = getattr(bar, 'buy_vol', bar.volume/2)
+        sell_vol = getattr(bar, 'sell_vol', bar.volume/2)
+        
+        features = fe.update(
+            price=bar.close, timestamp=bar.timestamp.timestamp(), volume=bar.volume,
+            high=bar.high, low=bar.low, buy_vol=buy_vol, sell_vol=sell_vol,
+            time_feats={'sin_hour':0, 'cos_hour':0} # Simplified for warmup
+        )
+        
+        if features is None: return
+
+        # Calculate Trio
+        hurst, ker_val, rvol_val = self._calculate_golden_trio(symbol)
+        features['hurst'] = hurst
+        features['ker'] = ker_val
+        features['rvol'] = rvol_val
+        
+        # Resolve Labels & Train
+        resolved_labels = labeler.resolve_labels(bar.high, bar.low)
+        if resolved_labels:
+            for (stored_feats, outcome_label, realized_ret) in resolved_labels:
+                model.learn_one(stored_feats, outcome_label)
+                if outcome_label != 0:
+                    model.learn_one(stored_feats, outcome_label) # Reinforce non-noise
+        
+        # Add Opportunity
+        current_atr = features.get('atr', 0.001)
+        labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp())
+
     def _calculate_golden_trio(self, symbol: str) -> Tuple[float, float, float]:
         """
         Calculates the "Golden Trio" of features locally using accurate buffers.
@@ -274,7 +377,6 @@ class MultiAssetPredictor:
         
         # 1. Simple Hurst (Rescaled Range Proxy)
         try:
-            # Math Guard: Variance check
             if np.var(prices) < 1e-9:
                 hurst = 0.5
             else:
@@ -628,7 +730,8 @@ class MultiAssetPredictor:
             stats[f"Low Efficiency"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (KER {ker_val:.3f} < {effective_ker_thresh:.3f})"})
 
-        # G2: REGIME IDENTIFICATION
+        # G2: REGIME IDENTIFICATION (UNSHACKLED)
+        # V16.6: If Regime Enforcement is DISABLED, we treat this purely as a technical filter (BB)
         preferred_regime = self._get_preferred_regime(symbol)
         regime_label = "Neutral"
         proposed_action = 0 # 0=Hold, 1=Buy, -1=Sell
@@ -660,24 +763,34 @@ class MultiAssetPredictor:
                 proposed_action = -1 # Breakout Sell
                 
         else:
-            # NEUTRAL ZONE
-            stats[f"Random Walk Regime (H={hurst:.2f})"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": f"Random Walk (Hurst {hurst:.2f})"})
+            # NEUTRAL ZONE / MEAN REVERSION POTENTIAL
+            # V16.6: If we disable regime enforcement, allow Mean Reversion on Low Hurst
+            if self.regime_enforcement == "DISABLED":
+                 # Low Hurst = Reversion. If hitting bands, fade it.
+                 regime_label = "MEAN_REVERSION"
+                 if bar.close > upper_bb:
+                     proposed_action = -1 # Reversion Sell
+                 elif bar.close < lower_bb:
+                     proposed_action = 1  # Reversion Buy
+            else:
+                stats[f"Random Walk Regime (H={hurst:.2f})"] += 1
+                return Signal(symbol, "HOLD", 0.0, {"reason": f"Random Walk (Hurst {hurst:.2f})"})
 
         if proposed_action == 0:
             stats["No Trigger"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "No BB Trigger in Regime"})
             
         # --- V16.2 GATE: TREND ALIGNMENT (SMA 200) ---
-        # Forces Trend Breakout trades to align with the macro trend.
-        trend_bias = self._calculate_trend_bias(symbol, bar.close)
-        if regime_label == "TREND_BREAKOUT":
-            if (proposed_action == 1 and trend_bias == -1):
-                stats["Counter-Trend Block (SMA200)"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "Counter-Trend Block (SMA200)"})
-            if (proposed_action == -1 and trend_bias == 1):
-                stats["Counter-Trend Block (SMA200)"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "Counter-Trend Block (SMA200)"})
+        # V16.6 UPDATE: DISABLE SMA200 for Scalping (Often Counter-Trend)
+        # We comment this out to allow rapid reversion scalps.
+        # trend_bias = self._calculate_trend_bias(symbol, bar.close)
+        # if regime_label == "TREND_BREAKOUT":
+        #     if (proposed_action == 1 and trend_bias == -1):
+        #         stats["Counter-Trend Block (SMA200)"] += 1
+        #         return Signal(symbol, "HOLD", 0.0, {"reason": "Counter-Trend Block (SMA200)"})
+        #     if (proposed_action == -1 and trend_bias == 1):
+        #         stats["Counter-Trend Block (SMA200)"] += 1
+        #         return Signal(symbol, "HOLD", 0.0, {"reason": "Counter-Trend Block (SMA200)"})
 
         # --- V16.2 GATE: VOLATILITY EXPANSION ---
         # Prevents entries in low-volatility dead zones where time stops kill trades.
@@ -706,12 +819,16 @@ class MultiAssetPredictor:
         if regime_label == "TREND_BREAKOUT":
             adx_val = features.get('adx', 0.0)
             if adx_val < self.adx_threshold: 
-                # V12.7 REFACTOR: Log specific failure values
+                # V16.6 UPDATE: Just log warning, don't block hard if other signals strong
                 stats[f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": f"Weak Trend (ADX {adx_val:.1f})"})
+                # return Signal(symbol, "HOLD", 0.0, {"reason": f"Weak Trend (ADX {adx_val:.1f})"})
 
         # 5. ML Confirmation & Calibration
         pred_proba = model.predict_proba_one(features)
+        
+        # Extract probability for the proposed action
+        # River returns dict {label: prob}
+        prob_success = pred_proba.get(proposed_action, 0.0)
         
         # V14.0 SURVIVAL: Bypass Calibration/Confidence Check
         # We trust the Meta Labeler and Regime Filters entirely.
@@ -780,7 +897,11 @@ class MultiAssetPredictor:
                 })
         else:
             stats['Meta Rejected'] += 1
-            return Signal(symbol, "HOLD", confidence, {"reason": "Meta Rejected"})
+            # V16.6 DIAGNOSTIC LOGGING: Log the probability even if rejected
+            # This helps us see if the model is "close" to taking a trade
+            if self.bar_counters[symbol] % 50 == 0:
+                logger.info(f"🔎 SHADOW MODE {symbol}: Rejected {proposed_action} (Meta Prob: {prob_success:.2f} < {meta_threshold})")
+            return Signal(symbol, "HOLD", confidence, {"reason": f"Meta Rejected (Prob {prob_success:.2f})"})
 
         if self.bar_counters[symbol] % 250 == 0:
             logger.info(f"🔍 {symbol} Stats: KER:{feat_stats['avg_ker']:.2f} Streak:{self.consecutive_losses[symbol]}")
@@ -809,18 +930,9 @@ class MultiAssetPredictor:
             rsi = 100 - (100 / (1 + rs))
 
         # 2. TREND FILTER (D1 Bias)
-        trend_aligned = False
+        # V16.6: Explicitly Disabled check to allow Mean Reversion scalps
+        # if self.require_d1_trend and d1_ema > 0: ... (Commented out logic)
         
-        if self.require_d1_trend and d1_ema > 0: # Check if Enabled in Config
-            if signal == 1: # BUY
-                if price > d1_ema: trend_aligned = True
-                else: return False # Reject Counter-Trend
-            elif signal == -1: # SELL
-                if price < d1_ema: trend_aligned = True
-                else: return False # Reject Counter-Trend
-        else:
-            trend_aligned = True # Pass if disabled or no data
-
         # 3. RSI EXTREME GUARD (V14.0 MOMENTUM IGNITION)
         # We invert the logic: High RSI + High Hurst = IGNITION (Buy!)
         if "JPY" in symbol:

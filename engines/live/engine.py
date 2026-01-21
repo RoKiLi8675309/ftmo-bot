@@ -6,10 +6,11 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX V16.1 MAINTENANCE PATCH:
-# 1. FIX: Relaxed Tick Deduplication to allow same-ms bursts (Volume Integrity).
-# 2. SAFETY: Added robust type casting for Redis payloads.
-# 3. STABILITY: Protected JSON parsing for Context Data.
+# PHOENIX V16.6 PATCH (DATA FIDELITY):
+# 1. REMOVED: Synthetic 50/50 volume splitting. Now passes 0.0 to aggregators
+#    to allow proper Tick Rule inference downstream.
+# 2. SELF-HEALING: Maintains Anti-Stacking and stale order cleanup.
+# 3. ROBUSTNESS: Enhanced error handling in execution flow.
 # =============================================================================
 import logging
 import time
@@ -127,6 +128,10 @@ class LiveTradingEngine:
             pending_tracker=self.pending_orders,
             lock=self.lock
         )
+        
+        # DEBUG FIX: Force clear pending orders on startup to remove ghosts
+        with self.lock:
+            self.pending_orders.clear()
 
         # 6. Sentiment Engine
         self.global_sentiment = {} # {symbol: score} or {'GLOBAL': score}
@@ -165,6 +170,11 @@ class LiveTradingEngine:
         self.is_warm = False
         self.last_corr_update = time.time()
         self.latest_prices = {}
+        
+        # --- V16.4 FIX: INJECT FALLBACK PRICES ---
+        # Ensures RiskManager has conversion rates before first tick arrives
+        self._inject_fallback_prices()
+        
         self.liquidation_triggered_map = {sym: False for sym in CONFIG['trading']['symbols']}
         
         # --- TICK DEDUPLICATION & HEARTBEAT STATE ---
@@ -183,6 +193,30 @@ class LiveTradingEngine:
         # V11.1: Active Position Management Thread
         self.mgmt_thread = threading.Thread(target=self._manage_active_positions_loop, daemon=True)
         self.mgmt_thread.start()
+
+    def _inject_fallback_prices(self):
+        """
+        Injects static fallback prices for conversion pairs to prevent
+        'No Rate' errors before the first tick arrives.
+        """
+        defaults = {
+            "NZDUSD": 0.60,
+            "AUDUSD": 0.65,
+            "GBPUSD": 1.25,
+            "EURUSD": 1.08,
+            "USDJPY": 150.0,
+            "USDCAD": 1.35,
+            "USDCHF": 0.90,
+            "AUDJPY": 95.0,
+            "EURJPY": 160.0,
+            "GBPJPY": 190.0
+        }
+        for sym, price in defaults.items():
+            # Only inject if not already present (though unlikely on init)
+            if sym not in self.latest_prices:
+                self.latest_prices[sym] = price
+        
+        logger.info(f"💉 Injected {len(defaults)} fallback prices for PnL conversion.")
 
     def _restore_daily_state(self):
         """
@@ -592,10 +626,9 @@ class LiveTradingEngine:
             bid_vol = float(tick_data.get('bid_vol', 0.0))
             ask_vol = float(tick_data.get('ask_vol', 0.0))
 
-            # If volumes were 0 upstream, inject synthetic split
-            if bid_vol == 0 and ask_vol == 0:
-                bid_vol = volume / 2.0
-                ask_vol = volume / 2.0
+            # V16.6 PATCH: REMOVED SYNTHETIC 50/50 INJECTION
+            # If flows are 0, we pass 0 so Predictor/Aggregator can use Tick Rule.
+            # (Old block removed)
 
             self.latest_prices[symbol] = price
             
@@ -722,17 +755,29 @@ class LiveTradingEngine:
                 return
 
         # 5. Check Risk & Compliance Gates
-        # V10.0: Includes strict Midnight Anchor and Freeze check
+        # DEBUG: Verbose logging for Gate Checks
+        logger.info(f"🛡️ Checking Risk Gates for {symbol}...")
         if not self._check_risk_gates(symbol):
+            logger.warning(f"🚫 Risk Gate BLOCKED {symbol}")
             return
 
         # --- V12.24 ANTI-STACKING GUARD ---
-        # Ensure we don't fire if a trade is currently pending dispatch or waiting at broker
+        # --- V16.5 FIX: SELF-HEALING ANTI-STACKING ---
+        logger.info(f"🔄 Checking Anti-Stacking for {symbol}...")
         is_pending_execution = False
+        now_ts = time.time()
+        
         with self.lock:
-            for oid, p_data in self.pending_orders.items():
+            for oid, p_data in list(self.pending_orders.items()):
+                # Clean up stale orders > 60s
+                if now_ts - p_data.get('timestamp', 0) > 60:
+                    logger.warning(f"🧹 Clearing Stale Pending Order: {oid} ({symbol})")
+                    del self.pending_orders[oid]
+                    continue
+                    
                 if p_data.get('symbol') == symbol:
                     is_pending_execution = True
+                    logger.warning(f"⚠️ Anti-Stacking: Order {oid} pending for {symbol}. Skipping.")
                     break
         
         if is_pending_execution:
@@ -810,10 +855,16 @@ class LiveTradingEngine:
             acc_info_raw = self.stream_mgr.r.hgetall(CONFIG['redis']['account_info_key'])
             if acc_info_raw and 'free_margin' in acc_info_raw:
                 real_free_margin = float(acc_info_raw['free_margin'])
+                # FIX: If 0.0 received (init), fallback to estimate
+                if real_free_margin == 0.0:
+                    real_free_margin = equity * 0.95
             else:
                 real_free_margin = equity * 0.95
         except:
             real_free_margin = equity * 0.95
+
+        # DEBUG: Verbose Sizing Log
+        logger.info(f"📐 Calculating Size for {symbol}: Equity={account_size}, Margin={real_free_margin}, Risk%= {risk_percent_override}")
 
         # Get Base Trade Intent with Buffer Scaling
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
@@ -834,7 +885,7 @@ class LiveTradingEngine:
         )
 
         if trade_intent.volume <= 0:
-            logger.warning(f"Trade Size 0 for {symbol} (Risk Constraints: {trade_intent.comment}).")
+            logger.warning(f"❌ Trade Size 0 for {symbol}: {trade_intent.comment}")
             return
 
         trade_intent.action = signal.action
@@ -877,6 +928,7 @@ class LiveTradingEngine:
             logger.info(f"⚡ PYRAMID: Scaling In {trade_intent.volume} lots")
 
         # 7. Dispatch
+        logger.info(f"📤 Dispatching Order: {trade_intent.action} {trade_intent.symbol} {trade_intent.volume} Lots")
         self.dispatcher.send_order(trade_intent, risk_usd)
 
     def _check_risk_gates(self, symbol: str) -> bool:
