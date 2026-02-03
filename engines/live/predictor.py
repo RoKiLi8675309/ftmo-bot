@@ -6,10 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier).
 #
-# PHOENIX V16.6 PATCH (UNSHACKLED MODE):
-# 1. WARM-UP: Pre-trains models on 5,000 historical bars to eliminate "Cold Start".
-# 2. GATES: Disabled SMA200 and relaxed ADX/Regime filters for Scalping.
-# 3. DIAGNOSTICS: Logs "Shadow Probabilities" for rejected trades.
+# PHOENIX V16.7 PATCH (SYNCHRONIZED SAMPLING):
+# 1. SAMPLING SYNC: Accepts 'threshold_map' to align Warm-up bars with Live bars.
+# 2. WARM-UP: Uses calibrated thresholds to prevent "Cold Start" model mismatch.
+# 3. DIAGNOSTICS: Logs Shadow Mode probabilities for forensic analysis.
 # =============================================================================
 import logging
 import pickle
@@ -66,15 +66,21 @@ class MultiAssetPredictor:
     Manages a dictionary of Online Models (one per symbol).
     Performs 'Inference -> Train' loop on every Volume Bar.
     """
-    def __init__(self, symbols: List[str]):
+    def __init__(self, symbols: List[str], threshold_map: Optional[Dict[str, float]] = None):
+        """
+        V16.7 UPDATE: Accepts threshold_map to enforce sampling consistency.
+        """
         self.symbols = symbols
         self.models_dir = Path("models")
         self.models_dir.mkdir(exist_ok=True)
         
-        # 1. State Containers
+        # 1. Sampling Synchronization
+        self.threshold_map = threshold_map if threshold_map else {}
+
+        # 2. State Containers
         self.feature_engineers = {s: OnlineFeatureEngineer(window_size=CONFIG['features']['window_size']) for s in symbols}
         
-        # 2. Adaptive Triple Barrier (Per-Symbol Dynamic Configuration)
+        # 3. Adaptive Triple Barrier (Per-Symbol Dynamic Configuration)
         tbm_conf = CONFIG['online_learning']['tbm']
         risk_conf = CONFIG.get('risk_management', {})
         
@@ -262,8 +268,9 @@ class MultiAssetPredictor:
 
     def _perform_warmup(self):
         """
-        V16.6: Loads 5,000 ticks from DB and pre-trains the model.
-        Solves the 'Cold Start' problem where the model rejects everything initially.
+        V16.7 PATCH: Synchronized Warm-Up.
+        Uses the EXACT same threshold as the Live Engine to prevent data distribution shift.
+        Loads 5,000 ticks from DB and pre-trains the model.
         """
         logger.info(f"{LogSymbols.TRAINING} Starting Model Pre-Training (Warm-Up)...")
         
@@ -275,13 +282,22 @@ class MultiAssetPredictor:
                     logger.warning(f"⚠️ No historical data for {sym}. Model will start cold.")
                     continue
                 
-                # 2. Setup Generator
-                # Match config threshold
-                thresh = CONFIG['data'].get('volume_bar_threshold', 10.0)
+                # 2. Setup Generator (V16.7 SYNC FIX)
+                # Use the calibrated threshold if available, else config
+                calibrated_thresh = self.threshold_map.get(sym)
+                config_thresh = CONFIG['data'].get('volume_bar_threshold', 10.0)
+                
+                if calibrated_thresh:
+                    thresh = calibrated_thresh
+                    source = "CALIBRATED"
+                else:
+                    thresh = config_thresh
+                    source = "CONFIG"
+
                 alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
                 gen = AdaptiveImbalanceBarGenerator(sym, initial_threshold=thresh, alpha=alpha)
                 
-                logger.info(f"🔥 Pre-training {sym} on {len(df)} ticks...")
+                logger.info(f"🔥 Pre-training {sym} on {len(df)} ticks... (Thresh: {thresh} [{source}])")
                 
                 # 3. Simulate Feed
                 bars_trained = 0
@@ -780,18 +796,6 @@ class MultiAssetPredictor:
             stats["No Trigger"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "No BB Trigger in Regime"})
             
-        # --- V16.2 GATE: TREND ALIGNMENT (SMA 200) ---
-        # V16.6 UPDATE: DISABLE SMA200 for Scalping (Often Counter-Trend)
-        # We comment this out to allow rapid reversion scalps.
-        # trend_bias = self._calculate_trend_bias(symbol, bar.close)
-        # if regime_label == "TREND_BREAKOUT":
-        #     if (proposed_action == 1 and trend_bias == -1):
-        #         stats["Counter-Trend Block (SMA200)"] += 1
-        #         return Signal(symbol, "HOLD", 0.0, {"reason": "Counter-Trend Block (SMA200)"})
-        #     if (proposed_action == -1 and trend_bias == 1):
-        #         stats["Counter-Trend Block (SMA200)"] += 1
-        #         return Signal(symbol, "HOLD", 0.0, {"reason": "Counter-Trend Block (SMA200)"})
-
         # --- V16.2 GATE: VOLATILITY EXPANSION ---
         # Prevents entries in low-volatility dead zones where time stops kill trades.
         if not self._check_volatility_condition(symbol, bar.close):
@@ -897,8 +901,7 @@ class MultiAssetPredictor:
                 })
         else:
             stats['Meta Rejected'] += 1
-            # V16.6 DIAGNOSTIC LOGGING: Log the probability even if rejected
-            # This helps us see if the model is "close" to taking a trade
+            # V16.7 DIAGNOSTIC LOGGING: Log Shadow Mode probability
             if self.bar_counters[symbol] % 50 == 0:
                 logger.info(f"🔎 SHADOW MODE {symbol}: Rejected {proposed_action} (Meta Prob: {prob_success:.2f} < {meta_threshold})")
             return Signal(symbol, "HOLD", confidence, {"reason": f"Meta Rejected (Prob {prob_success:.2f})"})

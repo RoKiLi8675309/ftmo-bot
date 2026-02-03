@@ -6,11 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX V16.6 PATCH (DATA FIDELITY):
-# 1. REMOVED: Synthetic 50/50 volume splitting. Now passes 0.0 to aggregators
-#    to allow proper Tick Rule inference downstream.
-# 2. SELF-HEALING: Maintains Anti-Stacking and stale order cleanup.
-# 3. ROBUSTNESS: Enhanced error handling in execution flow.
+# PHOENIX V16.7 PATCH (SAMPLING SYNCHRONIZATION):
+# 1. AUTO-CALIBRATION: Runs the exact same threshold discovery loop as Backtester.
+# 2. SYNC: Passes calibrated thresholds to Predictor to align Training/Inference.
+# 3. ROBUSTNESS: Calculates optimal bar size based on recent volatility.
 # =============================================================================
 import logging
 import time
@@ -49,7 +48,8 @@ from shared import (
     VolumeBar,
     Trade,
     RiskManager,
-    TradeContext
+    TradeContext,
+    load_real_data # Required for Calibration
 )
 
 # Local Engine Modules
@@ -101,24 +101,31 @@ class LiveTradingEngine:
         self.calendar_thread = threading.Thread(target=self._calendar_sync_loop, daemon=True)
         self.calendar_thread.start()
         
-        # 3. Data Aggregation (Adaptive Imbalance Bars)
-        self.aggregators = {}
+        # 3. Data Aggregation & Calibration (V16.7 SYNC FIX)
+        # We must calibrate thresholds BEFORE initializing aggregators/predictor
+        self.threshold_map = self._calibrate_thresholds()
         
-        # Use Volume Threshold config as a proxy for Initial Imbalance Threshold
-        init_threshold = CONFIG['data'].get('volume_bar_threshold', 10) # V14.0 Default
+        self.aggregators = {}
         # Default alpha 0.05 if not in config
         alpha = CONFIG['data'].get('imbalance_alpha', 0.05) 
 
         for sym in CONFIG['trading']['symbols']:
+            # Use the calibrated threshold if found, else config default
+            thresh = self.threshold_map.get(sym, CONFIG['data'].get('volume_bar_threshold', 10.0))
+            
             self.aggregators[sym] = AdaptiveImbalanceBarGenerator(
                 symbol=sym,
-                initial_threshold=init_threshold,
+                initial_threshold=thresh,
                 alpha=alpha
             )
-            logger.info(f"Initialized TIB Generator for {sym} (Start: {init_threshold}, Alpha: {alpha})")
+            logger.info(f"Initialized TIB Generator for {sym} (Start: {thresh:.1f}, Alpha: {alpha})")
 
         # 4. AI Predictor (Golden Trio / ARF)
-        self.predictor = MultiAssetPredictor(symbols=CONFIG['trading']['symbols'])
+        # V16.7: Pass the calibrated map so Predictor warms up with SAME data
+        self.predictor = MultiAssetPredictor(
+            symbols=CONFIG['trading']['symbols'],
+            threshold_map=self.threshold_map
+        )
         
         # 5. Execution Dispatcher
         self.pending_orders = {}  # Track orders to prevent dupes
@@ -193,6 +200,74 @@ class LiveTradingEngine:
         # V11.1: Active Position Management Thread
         self.mgmt_thread = threading.Thread(target=self._manage_active_positions_loop, daemon=True)
         self.mgmt_thread.start()
+
+    def _calibrate_thresholds(self) -> Dict[str, float]:
+        """
+        V16.7 NEW: Analyzes historical data to determine optimal bar thresholds.
+        Replicates the Backtester's logic exactly to ensure the Live model sees
+        the same data distribution it was trained on.
+        """
+        logger.info(f"{LogSymbols.TRAINING} Starting Threshold Auto-Calibration...")
+        threshold_map = {}
+        alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
+        config_thresh = CONFIG['data'].get('volume_bar_threshold', 10.0)
+        
+        min_bars_needed = 500
+        
+        for sym in CONFIG['trading']['symbols']:
+            try:
+                # 1. Load Data (Last 30 Days)
+                df = load_real_data(sym, n_candles=50000, days=30)
+                if df.empty:
+                    logger.warning(f"⚠️ Calibration: No data for {sym}. Using default {config_thresh}.")
+                    threshold_map[sym] = config_thresh
+                    continue
+                
+                # 2. Calibration Loop
+                current_threshold = config_thresh
+                attempts = 0
+                max_attempts = 4
+                
+                final_bars = 0
+                
+                while attempts < max_attempts:
+                    gen = AdaptiveImbalanceBarGenerator(sym, initial_threshold=current_threshold, alpha=alpha)
+                    bar_count = 0
+                    
+                    for row in df.itertuples():
+                        price = getattr(row, 'price', getattr(row, 'close', None))
+                        vol = getattr(row, 'volume', 1.0)
+                        ts_val = getattr(row, 'Index', None).timestamp()
+                        if price is None: continue
+                        
+                        # Synthetic flow for calibration estimate
+                        b_vol = vol / 2
+                        s_vol = vol / 2
+                        
+                        if gen.process_tick(price, vol, ts_val, b_vol, s_vol):
+                            bar_count += 1
+                    
+                    if bar_count >= min_bars_needed:
+                        # Found a good threshold
+                        threshold_map[sym] = current_threshold
+                        final_bars = bar_count
+                        break
+                    else:
+                        # Too few bars -> Threshold too high -> Lower it
+                        attempts += 1
+                        new_threshold = max(5.0, current_threshold * 0.5)
+                        logger.info(f"🔎 {sym}: Calibrating... {bar_count} bars (Threshold {current_threshold:.1f} -> {new_threshold:.1f})")
+                        current_threshold = new_threshold
+                        # Fallback if max attempts reached, use the lowest tested
+                        threshold_map[sym] = current_threshold
+                
+                logger.info(f"✅ {sym} Calibrated: Threshold {threshold_map[sym]:.1f} (~{final_bars} bars/month)")
+                
+            except Exception as e:
+                logger.error(f"❌ Calibration Error {sym}: {e}")
+                threshold_map[sym] = config_thresh
+        
+        return threshold_map
 
     def _inject_fallback_prices(self):
         """
@@ -575,6 +650,27 @@ class LiveTradingEngine:
             
             time.sleep(5) # Check every 5 seconds
 
+    def _reconcile_pending_orders(self, open_positions: Dict[str, Dict]):
+        """
+        V16.7: Clears 'Pending' status if the trade is found in Open Positions.
+        Uses the UUID (first 8 chars) embedded in the MT5 Comment.
+        """
+        with self.lock:
+            to_remove = []
+            for oid, p_data in self.pending_orders.items():
+                short_id = str(oid)[:8]
+                # Check if this short_id exists in any open position comment
+                for pos in open_positions.values():
+                    if short_id in pos.get('comment', ''):
+                        to_remove.append(oid)
+                        break
+            
+            for oid in to_remove:
+                if oid in self.pending_orders:
+                    del self.pending_orders[oid]
+                    # Only log if it was actually removed (avoid spam)
+                    logger.info(f"✅ Order {oid} confirmed filled. Removed from pending.")
+
     def process_tick(self, tick_data: dict):
         """
         Handles a single raw tick from Redis.
@@ -628,7 +724,6 @@ class LiveTradingEngine:
 
             # V16.6 PATCH: REMOVED SYNTHETIC 50/50 INJECTION
             # If flows are 0, we pass 0 so Predictor/Aggregator can use Tick Rule.
-            # (Old block removed)
 
             self.latest_prices[symbol] = price
             
@@ -720,6 +815,10 @@ class LiveTradingEngine:
         current_sentiment = self.global_sentiment.get('GLOBAL', 0.0)
         mt5_context = self.latest_context.get(symbol, {})
         open_positions = self._get_open_positions_from_redis()
+        
+        # --- V16.7 FIX: RECONCILE PENDING ORDERS ---
+        # Check if any "Pending" orders are actually open now
+        self._reconcile_pending_orders(open_positions)
         
         context_data = {
             'd1': mt5_context.get('d1', {}),
@@ -902,11 +1001,27 @@ class LiveTradingEngine:
             trade_intent.comment += "|Tightened"
             logger.info(f"🛡️ STOP TIGHTENED: {symbol} (High Volatility) -> SL Dist {sl_dist:.5f}")
 
+        # --- V16.8: STOP DISTANCE CLAMP (THE FIX) ---
+        # Ensure SL/TP are not inside the spread (min 5 pips)
+        pip_size, _ = RiskManager.get_pip_info(symbol)
+        min_pips = CONFIG['risk_management'].get('min_stop_loss_pips', 5.0)
+        min_dist = min_pips * pip_size
+        
+        if sl_dist < min_dist:
+            sl_dist = min_dist
+            trade_intent.comment += "|MinSL"
+            
+        if tp_dist < min_dist:
+            tp_dist = min_dist
+            trade_intent.comment += "|MinTP"
+
         # --- DYNAMIC R:R OVERRIDE ---
         # V14.0 UPDATE: Check for Momentum Ignition reward boost
         optimized_rr = signal.meta_data.get('optimized_rr')
         if optimized_rr and optimized_rr > 0 and current_atr > 0:
             tp_dist = current_atr * optimized_rr
+            # Re-check min dist after boost
+            if tp_dist < min_dist: tp_dist = min_dist
             trade_intent.comment += f"|OptRR:{optimized_rr:.2f}"
 
         # --- CONVERT DISTANCES TO ABSOLUTE PRICES ---

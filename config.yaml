@@ -1,12 +1,10 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V16.6 (UNSHACKLED PROTOCOL)
+# config.yaml – PROJECT PHOENIX V16.9 (RISK REALITY PATCH)
 # STATUS: LIVE TRADING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# UNSHACKLED UPDATE (V16.6):
-# 1. GATES: Relaxed ADX (10.0) and Disabled Regime Enforcement for max adaptability.
-# 2. LATENCY: Execution requires < 5.0s latency (Aggressor Mode).
-# 3. RECOVERY: Probe Sizing active for toxic assets.
-# 4. LEARNING: Pre-Training enabled (5000 ticks) to eliminate Cold Start.
+# REALITY PATCH (V16.9):
+# 1. RISK SAFETY: Increased min_stop_loss_pips to 8.0 to survive Spread+Comm.
+# 2. ACCURACY: Updated Spread assumptions for Cross Pairs.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -137,7 +135,7 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 10.0 # V16.6: RELAXED to 10.0 for Scalping (Was 15.0)
+    threshold: 10.0 # V16.6: RELAXED to 10.0 for Scalping
   
   cyclical_time: true
   session_awareness: true
@@ -306,7 +304,8 @@ risk_management:
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
-  min_stop_loss_pips: 3.0
+  # V16.9 SAFETY: Increased to 8.0 pips to cover Spread+Comm drag
+  min_stop_loss_pips: 8.0
 
 # --- TRADING PORTFOLIO (V16.0) ---
 trading:
@@ -399,9 +398,9 @@ forensic_audit:
     EURJPY: 1.0    
     AUDJPY: 1.2    
     GBPUSD: 1.0    
-    GBPAUD: 1.8    # High spread but huge moves
-    EURAUD: 1.8
-    GBPNZD: 2.2
+    GBPAUD: 2.5    # V16.9: Updated to reality
+    EURAUD: 2.5    # V16.9: Updated to reality
+    GBPNZD: 3.0    # V16.9: Updated to reality
 
 # --- WFO OPTIMIZATION ---
 wfo:

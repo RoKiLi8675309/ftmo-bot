@@ -6,10 +6,10 @@
 # DESCRIPTION: Outbound Trade Router. Formats and pushes execution requests to Redis.
 # CRITICAL: Ensures strict compatibility with Windows Producer (Py3.9).
 # 
-# PHOENIX V12.39 FIX (MARKET ORDER SAFETY):
-# 1. FIX: Force 'price' to "0.0" if type is "MARKET".
-# 2. REASON: Prevents Producer from misinterpreting Market orders as Pending/Limit
-#    orders when a snapshot price is inadvertently passed.
+# PHOENIX V16.9 FIX (PROTOCOL TRANSLATION):
+# 1. MAPPING: Translates "BUY"/"SELL" -> MT5 Ints (0/1) for 'type'.
+# 2. MAPPING: Translates "MARKET" -> MT5 Int (1) for 'action'.
+# 3. KEYS: Maps 'stop_loss' -> 'sl' and 'take_profit' -> 'tp' for Producer.
 # =============================================================================
 import logging
 import json
@@ -22,6 +22,13 @@ from typing import Any, Dict
 from shared import CONFIG, LogSymbols, RedisStreamManager, Trade
 
 logger = logging.getLogger("TradeDispatcher")
+
+# --- MT5 CONSTANTS (HARDCODED FOR LINUX) ---
+# Since we cannot import MetaTrader5 on Linux, we define the standard constants here.
+MT5_ORDER_TYPE_BUY = 0
+MT5_ORDER_TYPE_SELL = 1
+MT5_TRADE_ACTION_DEAL = 1
+MT5_TRADE_ACTION_PENDING = 5
 
 class TradeDispatcher:
     """
@@ -59,42 +66,80 @@ class TradeDispatcher:
                     "status": "PENDING"
                 }
 
-            # 3. Construct Payload (Strict String Typing for Redis)
+            # 3. Construct Payload (Strict Protocol Translation)
+            
+            # A. Translate Action (BUY/SELL -> 0/1) to 'type' field
+            # Windows Producer expects 'type' to be the direction.
+            if trade.action == "BUY":
+                mt5_type = MT5_ORDER_TYPE_BUY
+            elif trade.action == "SELL":
+                mt5_type = MT5_ORDER_TYPE_SELL
+            else:
+                # Fallback for "CLOSE_ALL" or "MODIFY" which handle their own logic in Producer
+                # But for standard entry, this is required.
+                mt5_type = MT5_ORDER_TYPE_BUY # Default dummy
+
+            # B. Translate Entry Type (MARKET -> DEAL, LIMIT -> PENDING) to 'action' field
+            # Windows Producer expects 'action' to be the execution method.
+            entry_type_str = str(trade.entry_type).upper()
+            final_price = str(trade.entry_price)
+            
+            if "MARKET" in entry_type_str:
+                mt5_action = MT5_TRADE_ACTION_DEAL
+                final_price = "0.0" # Force zero for Market Execution
+            else:
+                mt5_action = MT5_TRADE_ACTION_PENDING
+
+            # Handling Special Actions (MODIFY / CLOSE_ALL)
+            # These override the standard mapping logic
+            if trade.action == "MODIFY":
+                # Producer expects 'action' but handles MODIFY separately in its loop.
+                # We pass the strings it looks for in the `if action == "MODIFY":` block.
+                # However, to be safe for the `execute_trade` method, we set defaults.
+                pass 
+            
             # Ensure Comment length compliance (MT5 limit)
             # Shorten UUID for comment: "Auto_1234abcd"
             comment = f"Auto_{short_id}"
             if trade.comment:
                 comment = f"{comment}_{trade.comment}"[:31]
 
-            # V12.39 FIX: MARKET ORDER PRICE SAFETY
-            # If it's a MARKET order, we MUST send price="0.0" to force Instant Execution.
-            # Sending a specific price (e.g. 1.0500) might trigger Pending Limit logic in Producer.
-            entry_type = str(trade.entry_type).upper()
-            final_price = str(trade.entry_price)
-            
-            if "MARKET" in entry_type:
-                final_price = "0.0"
-
             payload = {
                 "id": str(order_id),
                 "uuid": str(order_id),  # CRITICAL for Producer Deduplication
                 "symbol": str(trade.symbol),
-                "action": str(trade.action),  # "BUY" or "SELL"
-                "volume": "{:.2f}".format(float(trade.volume)),  # Explicit float formatting
+                
+                # --- PROTOCOL TRANSLATION START ---
+                # Producer: request['action'] (Deal/Pending)
+                # Producer: request['type'] (Buy/Sell)
+                # We send them as strings, Producer casts to int.
+                
+                # Special Case: MODIFY/CLOSE_ALL are high-level commands trapped by Producer before casting
+                "action": str(trade.action) if trade.action in ["MODIFY", "CLOSE_ALL"] else str(mt5_action),
+                "type": str(mt5_type),
+                # ----------------------------------
+
+                "volume": "{:.2f}".format(float(trade.volume)),
                 
                 # V12.19 FIX: Send both legacy 'entry_price' and new 'price' keys
-                # The Producer looks for 'price' to enable Limit Order logic.
                 "entry_price": final_price,
                 "price": final_price, 
                 
+                # CRITICAL MAPPING: Producer looks for 'sl' and 'tp', NOT 'stop_loss'
+                "sl": str(trade.stop_loss),
+                "tp": str(trade.take_profit),
+                # Legacy keys kept for logging transparency
                 "stop_loss": str(trade.stop_loss),
                 "take_profit": str(trade.take_profit),
+                
                 "magic_number": str(self.magic_number),
+                "magic": str(self.magic_number), # Map to 'magic' for Producer
+                
                 "comment": comment,
                 "timestamp": str(time.time()),  # ZOMBIE CHECK: High precision time
                 
-                # V12.19 FIX: Respect trade.entry_type (LIMIT vs MARKET)
-                "type": entry_type
+                # Ticket required for MODIFY
+                "ticket": str(trade.ticket) if trade.ticket else "0"
             }
 
             # 4. Transmit to Redis
@@ -103,7 +148,7 @@ class TradeDispatcher:
             
             logger.info(
                 f"{LogSymbols.UPLOAD} DISPATCH SENT: {trade.action} {trade.symbol} "
-                f"| Vol: {trade.volume:.2f} | Price: {final_price} | Type: {entry_type} | Risk: ${estimated_risk_usd:.2f}"
+                f"| Vol: {trade.volume:.2f} | Price: {final_price} | Type: {mt5_type} (MT5) | Risk: ${estimated_risk_usd:.2f}"
             )
         except Exception as e:
             logger.error(f"{LogSymbols.ERROR} Dispatch Failed for {trade.symbol}: {e}")
