@@ -6,10 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX V16.7 PATCH (SAMPLING SYNCHRONIZATION):
-# 1. AUTO-CALIBRATION: Runs the exact same threshold discovery loop as Backtester.
-# 2. SYNC: Passes calibrated thresholds to Predictor to align Training/Inference.
-# 3. ROBUSTNESS: Calculates optimal bar size based on recent volatility.
+# PHOENIX V16.20 AUDIT FIX (THE AMNESIA CURE):
+# 1. ANCHOR AUTHORITY: Daily resets now triggered by BROKER TIME (via Ticks), not Local Time.
+# 2. STATE SYNC: Hard sync of 'daily_starting_equity' from Redis to prevent drift.
+# 3. EXECUTION: Preserved 60s hard throttle to prevent Redis race conditions.
 # =============================================================================
 import logging
 import time
@@ -33,7 +33,7 @@ except ImportError:
     NLP_AVAILABLE = False
     print("WARNING: NLP libraries not found (newspaper3k, textblob). Sentiment features disabled.")
 
-# Shared Modules (Modularized Architecture)
+# Shared Imports (Modularized Architecture)
 from shared import (
     CONFIG,
     setup_logging,
@@ -136,6 +136,9 @@ class LiveTradingEngine:
             lock=self.lock
         )
         
+        # V16.13: EXECUTION THROTTLE STATE
+        self.last_dispatch_time = defaultdict(float)
+        
         # DEBUG FIX: Force clear pending orders on startup to remove ghosts
         with self.lock:
             self.pending_orders.clear()
@@ -177,6 +180,10 @@ class LiveTradingEngine:
         self.is_warm = False
         self.last_corr_update = time.time()
         self.latest_prices = {}
+        
+        # --- V16.20 FIX: BROKER TIME AUTHORITY ---
+        # We track the last known server date from Ticks to prevent local clock drift issues
+        self.last_known_server_date = datetime.now(self.server_tz).date()
         
         # --- V16.4 FIX: INJECT FALLBACK PRICES ---
         # Ensures RiskManager has conversion rates before first tick arrives
@@ -439,11 +446,12 @@ class LiveTradingEngine:
                                     self.performance_stats[symbol].append(net_pnl)
                                     
                                     # 2. Circuit Breaker Update
-                                    now_server = datetime.now(self.server_tz).date()
+                                    # V16.20: Use known server date instead of local time
+                                    now_server_date = self.last_known_server_date
                                     
                                     # Reset if new day
-                                    if self.daily_execution_stats[symbol]['date'] != now_server:
-                                        self.daily_execution_stats[symbol] = {'date': now_server, 'losses': 0, 'pnl': 0.0, 'tickets': set()}
+                                    if self.daily_execution_stats[symbol]['date'] != now_server_date:
+                                        self.daily_execution_stats[symbol] = {'date': now_server_date, 'losses': 0, 'pnl': 0.0, 'tickets': set()}
                                     
                                     # --- DEDUPLICATION CHECK ---
                                     if ticket and ticket in self.daily_execution_stats[symbol]['tickets']:
@@ -488,14 +496,16 @@ class LiveTradingEngine:
         Checks if the symbol is locked out for the day due to losses.
         Returns TRUE if trading should be BLOCKED.
         """
-        now_server = datetime.now(self.server_tz).date()
+        # V16.20 FIX: Use the authoritative Server Date from Producer ticks
+        now_server_date = self.last_known_server_date
         
         with self.stats_lock:
             stats = self.daily_execution_stats[symbol]
             
             # Auto-reset if accessed on a new day before trade loop hits it
-            if stats['date'] != now_server:
-                self.daily_execution_stats[symbol] = {'date': now_server, 'losses': 0, 'pnl': 0.0, 'tickets': set()}
+            if stats['date'] != now_server_date:
+                logger.info(f"⚓ DAILY RESET for {symbol} (Server Date: {now_server_date})")
+                self.daily_execution_stats[symbol] = {'date': now_server_date, 'losses': 0, 'pnl': 0.0, 'tickets': set()}
                 return False
                 
             losses = stats['losses']
@@ -648,28 +658,49 @@ class LiveTradingEngine:
             except Exception as e:
                 logger.error(f"Position Manager Error: {e}")
             
-            time.sleep(5) # Check every 5 seconds
+            time.sleep(1) # V16.10: Faster checking (1s) to clear ghosts immediately
 
     def _reconcile_pending_orders(self, open_positions: Dict[str, Dict]):
         """
-        V16.7: Clears 'Pending' status if the trade is found in Open Positions.
-        Uses the UUID (first 8 chars) embedded in the MT5 Comment.
+        V16.10 GHOST BUSTER: Clears 'Pending' status if any position exists for the symbol.
+        Robust against broken comment/UUID chains.
         """
         with self.lock:
             to_remove = []
+            
+            # 1. Standard UUID Matching
             for oid, p_data in self.pending_orders.items():
                 short_id = str(oid)[:8]
-                # Check if this short_id exists in any open position comment
+                found = False
+                
+                # Check for UUID match (Precision)
                 for pos in open_positions.values():
                     if short_id in pos.get('comment', ''):
-                        to_remove.append(oid)
+                        found = True
                         break
+                
+                if found:
+                    to_remove.append(oid)
+                    continue
+                
+                # 2. Aggressive Symbol Matching (Safety Valve)
+                # If we have an open position for Symbol X, and a pending order for Symbol X,
+                # assume it filled to prevent "Anti-Stacking" deadlocks.
+                # Only apply if pending order is older than 5 seconds (to allow filling time)
+                pending_symbol = p_data.get('symbol')
+                pending_ts = p_data.get('timestamp', 0)
+                
+                if time.time() - pending_ts > 5.0:
+                    for pos in open_positions.values():
+                         if pos.get('symbol') == pending_symbol:
+                             logger.warning(f"👻 GHOST BUSTER: Clearing pending {pending_symbol} (Position exists)")
+                             to_remove.append(oid)
+                             break
             
             for oid in to_remove:
                 if oid in self.pending_orders:
                     del self.pending_orders[oid]
-                    # Only log if it was actually removed (avoid spam)
-                    logger.info(f"✅ Order {oid} confirmed filled. Removed from pending.")
+                    logger.info(f"✅ Order {oid} reconciled (Matched/Cleared).")
 
     def process_tick(self, tick_data: dict):
         """
@@ -687,6 +718,14 @@ class LiveTradingEngine:
             if tick_ts > 100_000_000_000:
                 tick_ts /= 1000.0
             
+            # --- V16.20 FIX: UPDATE BROKER TIME AUTHORITY ---
+            try:
+                # Update our idea of "Server Date" from the tick itself
+                # This keeps the Circuit Breaker synced with the Producer's timezone
+                tick_dt = datetime.fromtimestamp(tick_ts, pytz.utc).astimezone(self.server_tz)
+                self.last_known_server_date = tick_dt.date()
+            except: pass
+
             last_ts = self.processed_ticks.get(symbol, 0.0)
             
             # AUDIT FIX: Relaxed Deduplication (< instead of <=)
@@ -721,9 +760,6 @@ class LiveTradingEngine:
 
             bid_vol = float(tick_data.get('bid_vol', 0.0))
             ask_vol = float(tick_data.get('ask_vol', 0.0))
-
-            # V16.6 PATCH: REMOVED SYNTHETIC 50/50 INJECTION
-            # If flows are 0, we pass 0 so Predictor/Aggregator can use Tick Rule.
 
             self.latest_prices[symbol] = price
             
@@ -761,6 +797,16 @@ class LiveTradingEngine:
         Triggered when a Tick Imbalance Bar (TIB) is closed.
         Executes the Prediction and Dispatch logic.
         """
+        # --- V16.13: EXECUTION THROTTLE (THE MACHINE GUN FIX) ---
+        # Forces a hard wait time between orders for the same symbol.
+        # This covers the critical "Redis Round Trip" latency window.
+        ttl_sec = CONFIG['trading'].get('limit_order_ttl_seconds', 60)
+        last_time = self.last_dispatch_time.get(symbol, 0)
+        
+        if time.time() - last_time < ttl_sec:
+            logger.info(f"⏳ {symbol} in Execution Cool-down ({ttl_sec}s). Skipping.")
+            return
+
         # --- V10.0 EXECUTION CIRCUIT BREAKER ---
         if self._check_circuit_breaker(symbol):
             return
@@ -927,13 +973,18 @@ class LiveTradingEngine:
 
         # --- V13.0: CALCULATE TOTAL OPEN RISK % (LIVE) ---
         current_open_risk_usd = 0.0
-        contract_size = 100000 
+        contract_size = 100000
+        
+        # --- V16.11 MARGIN SAFETY: Calculate Used Margin Locally ---
+        # Fallback if Redis data is missing or stale.
+        local_used_margin = 0.0
         
         for sym, pos in open_positions.items():
             entry = float(pos.get('entry_price', 0.0))
             sl = float(pos.get('sl', 0.0))
             vol = float(pos.get('volume', 0.0))
             
+            # Risk Calculation
             if sl > 0 and entry > 0:
                 price_dist = abs(entry - sl)
                 curr_p = self.latest_prices.get(sym, entry)
@@ -942,28 +993,40 @@ class LiveTradingEngine:
                 risk_val = price_dist * vol * contract_size * rate
                 current_open_risk_usd += risk_val
                 
+                # Margin Calculation (Estimated)
+                # IMPORTANT: We use conservative leverage logic here (RiskManager handles 1:30 fallback)
+                margin_req = RiskManager.calculate_required_margin(
+                    symbol=sym, lots=vol, price=curr_p, contract_size=contract_size, conversion_rate=rate
+                )
+                local_used_margin += margin_req
+                
         equity = self.ftmo_guard.equity
         if equity > 0:
             current_open_risk_pct = (current_open_risk_usd / equity) * 100.0
         else:
             current_open_risk_pct = 0.0
 
-        # --- V13.1: FETCH REAL FREE MARGIN (LEVERAGE HARMONY) ---
-        # We fetch this from Redis 'account_info' which is updated by Windows Producer every second.
+        # --- V16.11: FETCH REAL FREE MARGIN WITH LOCAL FALLBACK ---
+        real_free_margin = 0.0
         try:
             acc_info_raw = self.stream_mgr.r.hgetall(CONFIG['redis']['account_info_key'])
             if acc_info_raw and 'free_margin' in acc_info_raw:
-                real_free_margin = float(acc_info_raw['free_margin'])
-                # FIX: If 0.0 received (init), fallback to estimate
-                if real_free_margin == 0.0:
-                    real_free_margin = equity * 0.95
+                redis_free_margin = float(acc_info_raw['free_margin'])
+                
+                # If Redis reports suspiciously high margin (== Equity) while we know we have positions,
+                # TRUST LOCAL CALCULATION. This happens if the Broker isn't sending Margin updates fast enough.
+                if len(open_positions) > 0 and redis_free_margin >= (equity * 0.99):
+                    logger.warning(f"⚠️ Suspicious Redis Free Margin ({redis_free_margin:.2f}). Using Local Estimate.")
+                    real_free_margin = max(0.0, equity - local_used_margin)
+                else:
+                    real_free_margin = redis_free_margin
             else:
-                real_free_margin = equity * 0.95
+                real_free_margin = max(0.0, equity - local_used_margin)
         except:
-            real_free_margin = equity * 0.95
+            real_free_margin = max(0.0, equity - local_used_margin)
 
         # DEBUG: Verbose Sizing Log
-        logger.info(f"📐 Calculating Size for {symbol}: Equity={account_size}, Margin={real_free_margin}, Risk%= {risk_percent_override}")
+        logger.info(f"📐 Calculating Size for {symbol}: Equity={account_size}, Margin={real_free_margin:.2f}, Risk%= {risk_percent_override}")
 
         # Get Base Trade Intent with Buffer Scaling
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
@@ -1045,11 +1108,14 @@ class LiveTradingEngine:
         # 7. Dispatch
         logger.info(f"📤 Dispatching Order: {trade_intent.action} {trade_intent.symbol} {trade_intent.volume} Lots")
         self.dispatcher.send_order(trade_intent, risk_usd)
+        
+        # V16.13: UPDATE DISPATCH TIMER
+        self.last_dispatch_time[symbol] = time.time()
 
     def _check_risk_gates(self, symbol: str) -> bool:
         """
         Runs the gauntlet of safety checks.
-        V10.0: Includes strict Midnight Anchor and Freeze check.
+        V16.11: Includes Margin Level Guard.
         """
         # 1. Midnight Freeze Check
         if self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['midnight_freeze']):
@@ -1084,6 +1150,25 @@ class LiveTradingEngine:
         # 7. News Check
         if not self.compliance_guard.check_trade_permission(symbol):
              return False
+
+        # --- 8. MARGIN LEVEL GUARD (V16.11) ---
+        # Fetch current margin health from Redis
+        try:
+            acc_info = self.stream_mgr.r.hgetall(CONFIG['redis']['account_info_key'])
+            if acc_info:
+                equity = float(acc_info.get('equity', 0))
+                margin = float(acc_info.get('margin', 0))
+                
+                # Margin Level = (Equity / Used Margin) * 100
+                if margin > 0:
+                    margin_level = (equity / margin) * 100.0
+                    min_margin_level = CONFIG.get('risk_management', {}).get('min_margin_level_percent', 150.0)
+                    
+                    if margin_level < min_margin_level:
+                        logger.critical(f"🛑 MARGIN LEVEL CRITICAL: {margin_level:.2f}% < {min_margin_level}%. BLOCKING TRADES.")
+                        return False
+        except Exception as e:
+            logger.warning(f"Margin Check Failed: {e}")
 
         return True
 

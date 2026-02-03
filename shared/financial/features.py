@@ -5,12 +5,12 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 # 
-# PHOENIX STRATEGY V12.38 (MATH HARDENING):
-# 1. HURST FIX: Removed erroneous scalar (* 2.0) from Hurst Calculation.
-#    - REASON: Slope of log(std) vs log(lag) IS the Hurst exponent (H).
-#    - PREVIOUS: Random Walk (0.5) -> Reported as 1.0 (Trend).
-#    - NOW: Random Walk (0.5) -> Reported as 0.5 (Correctly rejected).
-# 2. ROBUSTNESS: Preserved HMM variance checks and zero-division guards.
+# PHOENIX V16.20 AUDIT FIX (THE MATH BREAKER CURE):
+# 1. NUMBA STABILITY: Replaced 'np.linalg.lstsq' with explicit linear regression
+#    in 'calculate_hurst'. This fixes the "Tuple vs Array" return crash across 
+#    different Numpy versions.
+# 2. TYPE SAFETY: Enforced float64 casting in JIT blocks.
+# 3. ROBUSTNESS: Preserved HMM variance checks and zero-division guards.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -1257,38 +1257,62 @@ class VolatilityMonitor:
 
 @njit
 def calculate_hurst(ts):
+    """
+    Calculates the Hurst Exponent using Numba-optimized standard deviation analysis.
+    V16.20 FIX: Uses explicit manual linear regression (O(N)) to replace 
+    np.linalg.lstsq, which is unstable across Numpy versions in Numba.
+    """
     n = len(ts)
     if n < 20: return 0.5
-    # Strict Variance Check to prevent log(0)
+    
+    # 1. Variance Check (Math Guard)
     if np.std(ts) < 1e-9: return 0.5
     
-    lags = np.arange(2, 20)
-    tau = np.zeros(len(lags))
+    lags = np.arange(2, 20, dtype=np.float64)
+    tau = np.zeros(len(lags), dtype=np.float64)
+    
     for i in range(len(lags)):
-        lag = lags[i]
+        lag = int(lags[i])
+        # Manually compute diff to avoid creation of large arrays if possible, 
+        # but here slicing is cleaner.
         diff = ts[lag:] - ts[:-lag]
         std_diff = np.std(diff)
+        
+        # Guard against zero std dev in flat markets
         if std_diff < 1e-9:
             tau[i] = 1e-9
         else:
             tau[i] = std_diff
     
-    # Safe Log
-    tau = np.maximum(tau, 1e-9)
+    # Safe Log (Avoid log(0))
+    # Using np.maximum is safe in Numba
+    log_lags = np.log(lags)
+    log_tau = np.log(tau)
     
-    x = np.log(lags.astype(np.float64))
-    y = np.log(tau)
+    # 2. MANUAL LINEAR REGRESSION (Least Squares)
+    # y = mx + c
+    # m = (N * sum(xy) - sum(x) * sum(y)) / (N * sum(x^2) - (sum(x))^2)
     
-    # Linear Regression using Least Squares
-    A = np.column_stack((x, np.ones(len(x))))
-    try:
-        m, c = np.linalg.lstsq(A, y)[0]
-        # V12.38 FIX: REMOVED * 2.0 SCALAR
-        # In std deviation method, H = m.
-        hurst = m 
-        return max(0.0, min(1.0, hurst))
-    except:
+    N = float(len(lags))
+    sum_x = np.sum(log_lags)
+    sum_y = np.sum(log_tau)
+    sum_xy = np.sum(log_lags * log_tau)
+    sum_xx = np.sum(log_lags * log_lags)
+    
+    denominator = (N * sum_xx) - (sum_x * sum_x)
+    
+    if abs(denominator) < 1e-9:
         return 0.5
+        
+    slope = ((N * sum_xy) - (sum_x * sum_y)) / denominator
+    
+    # Hurst = Slope (in this specific R/S proxy method)
+    hurst = slope
+    
+    # Clamp result
+    if hurst < 0.0: return 0.0
+    if hurst > 1.0: return 1.0
+    return hurst
 
 def enrich_with_d1_data(features: Dict[str, float], d1_data: Dict[str, float], current_price: float) -> Dict[str, float]:
     if not d1_data: return features

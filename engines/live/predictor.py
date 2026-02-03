@@ -6,10 +6,11 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier).
 #
-# PHOENIX V16.7 PATCH (SYNCHRONIZED SAMPLING):
-# 1. SAMPLING SYNC: Accepts 'threshold_map' to align Warm-up bars with Live bars.
-# 2. WARM-UP: Uses calibrated thresholds to prevent "Cold Start" model mismatch.
-# 3. DIAGNOSTICS: Logs Shadow Mode probabilities for forensic analysis.
+# PHOENIX V16.20 AUDIT FIX (THE HALLUCINATOR CURE):
+# 1. GAP BRIDGING: First live bar after warmup is used ONLY for state alignment,
+#    preventing "Gap Return" shocks from triggering false breakout signals.
+# 2. STATE SEPARATION: Strict reset of price references between History and Live.
+# 3. PYRAMID GUARD: Reinforced "Profit Gate" to prevent adding to losers.
 # =============================================================================
 import logging
 import pickle
@@ -27,7 +28,7 @@ import pandas as pd
 
 # Third-Party ML Imports
 try:
-    from river import forest, compose, preprocessing, metrics, drift, linear_model, multioutput, ensemble
+    from river import forest, compose, preprocessing, metrics, drift, multioutput, ensemble
 except ImportError:
     print("CRITICAL: 'river' library not found. Install with: pip install river>=0.21.0")
     import sys
@@ -158,6 +159,10 @@ class MultiAssetPredictor:
         # V16.6: Reduced burn-in limit since we do Pre-Training
         self.burn_in_limit = 5
         
+        # V16.20 FIX: HALLUCINATION GUARD
+        # Flag to indicate warmup just finished, so we can bridge the gap safely
+        self.warmup_gap_bridge = {s: False for s in symbols}
+        
         # 5. Forensic Stats
         self.rejection_stats = {s: defaultdict(int) for s in symbols}
         self.feature_stats = {s: defaultdict(float) for s in symbols}
@@ -283,7 +288,6 @@ class MultiAssetPredictor:
                     continue
                 
                 # 2. Setup Generator (V16.7 SYNC FIX)
-                # Use the calibrated threshold if available, else config
                 calibrated_thresh = self.threshold_map.get(sym)
                 config_thresh = CONFIG['data'].get('volume_bar_threshold', 10.0)
                 
@@ -318,12 +322,19 @@ class MultiAssetPredictor:
                     bar = gen.process_tick(price, vol, ts_val, b_vol, s_vol)
                     
                     if bar:
-                        # Call process_bar logic BUT without returning signals
-                        # This effectively updates the feature engineer, labeler, and model state
                         self._train_on_bar(sym, bar)
                         bars_trained += 1
-                        
-                logger.info(f"✅ {sym} Warm-Up Complete: Trained on {bars_trained} bars.")
+                
+                # V16.20 FIX: THE HALLUCINATOR CURE
+                # Mark this symbol as requiring a "Gap Bridge".
+                # The first live bar will update EMAs but NOT trigger a signal.
+                # This prevents the model from seeing a massive return jump from Historical End -> Live Start.
+                self.warmup_gap_bridge[sym] = True
+                
+                # Force reset of price reference to prevent drift
+                self.last_close_prices[sym] = 0.0 
+                
+                logger.info(f"✅ {sym} Warm-Up Complete: Trained on {bars_trained} bars. Gap Bridge Armed.")
                 
             except Exception as e:
                 logger.error(f"❌ Warm-Up Failed for {sym}: {e}")
@@ -565,6 +576,18 @@ class MultiAssetPredictor:
         
         self.bar_counters[symbol] += 1
         
+        # V16.20 FIX: GAP BRIDGING (HALLUCINATOR CURE)
+        # If we just finished warmup, the 'last_price' in FE is stale (from history).
+        # We must treat this bar as a bridge: update state, but DO NOT predict.
+        is_bridging_gap = False
+        if self.warmup_gap_bridge[symbol]:
+            is_bridging_gap = True
+            logger.info(f"🌉 BRIDGING GAP {symbol}: Syncing Live Price {bar.close:.5f} (Skipping Signal)")
+            # Turn off the flag so next bar is normal
+            self.warmup_gap_bridge[symbol] = False
+            # Force update last_price to current, so next return is valid
+            self.last_close_prices[symbol] = bar.close
+        
         # Capture previous close before updating with current bar
         prev_close = self.last_close_prices.get(symbol, bar.close)
         self.last_close_prices[symbol] = bar.close
@@ -655,6 +678,12 @@ class MultiAssetPredictor:
             self.burn_in_counters[symbol] += 1
             return Signal(symbol, "WARMUP", 0.0, {})
 
+        # --- V16.20 GAP BRIDGE EXECUTION ---
+        if is_bridging_gap:
+            # We processed the features to update EMAs, but we RETURN now.
+            # This ensures the model logic never sees the "gap return".
+            return Signal(symbol, "HOLD", 0.0, {"reason": "Bridging Gap"})
+
         # --- SERVER TIME & DAILY STATS MANAGEMENT ---
         server_time = bar.timestamp.astimezone(self.server_tz)
         current_date = server_time.date()
@@ -703,11 +732,14 @@ class MultiAssetPredictor:
                 
                 final_weight = base_weight * ret_scalar * ker_weight
                 
-                model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
+                # V16.20 FIX: Ensure features are strictly floats for River
+                clean_stored = {k: float(v) for k, v in stored_feats.items()}
+                
+                model.learn_one(clean_stored, outcome_label, sample_weight=final_weight)
                 if outcome_label != 0:
-                      model.learn_one(stored_feats, outcome_label, sample_weight=final_weight * 1.5)
+                      model.learn_one(clean_stored, outcome_label, sample_weight=final_weight * 1.5)
                 if outcome_label != 0:
-                    meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
+                    meta_labeler.update(clean_stored, primary_action=outcome_label, outcome_pnl=realized_ret)
 
         # 3. Add Trade Opportunity
         current_atr = features.get('atr', 0.0)
@@ -717,15 +749,53 @@ class MultiAssetPredictor:
         # D. ACTIVE TRADE MANAGEMENT (Local check)
         open_positions = context_data.get('positions', {}) if context_data else {}
         
-        # V15.0: PYRAMIDING LOGIC (HYPER-AGGRESSOR)
+        # V16.14 FIX: PROFITABILITY CHECK FOR PYRAMIDING
         is_pyramid_attempt = False
         
         if symbol in open_positions:
+            pos = open_positions[symbol]
             pyramid_config = CONFIG.get('risk_management', {}).get('pyramiding', {})
-            if pyramid_config.get('enabled', False):
-                is_pyramid_attempt = True
-            else:
-                return None # Standard Blocking
+            
+            # 1. Check if Enabled
+            if not pyramid_config.get('enabled', False):
+                return None # Standard Blocking (No pyramiding allowed)
+            
+            # 2. Check Profitability (CRITICAL FIX)
+            try:
+                entry_price = float(pos.get('entry_price', 0.0))
+                sl_price = float(pos.get('sl', 0.0))
+                pos_type = str(pos.get('type', '')).upper()
+                current_price = bar.close
+                
+                # Default "BUY" if type missing (unlikely)
+                if pos_type not in ["BUY", "SELL"]: pos_type = "BUY"
+
+                if entry_price > 0 and sl_price > 0:
+                    risk_dist = abs(entry_price - sl_price)
+                    
+                    current_r = 0.0
+                    if pos_type == "BUY":
+                        pnl_dist = current_price - entry_price
+                        current_r = pnl_dist / risk_dist if risk_dist > 0 else 0
+                    elif pos_type == "SELL":
+                        pnl_dist = entry_price - current_price
+                        current_r = pnl_dist / risk_dist if risk_dist > 0 else 0
+                        
+                    required_r = float(pyramid_config.get('add_on_profit_r', 0.5))
+                    
+                    if current_r < required_r:
+                        # Trade is not profitable enough (or is losing). BLOCK.
+                        # This prevents adding to losers.
+                        return None 
+                    
+                    # If we reach here, trade IS profitable enough. 
+                    # We set the flag and proceed to signal generation.
+                    is_pyramid_attempt = True
+                else:
+                    # Data missing, safe block
+                    return None
+            except Exception:
+                return None
 
         # ============================================================
         # 4. PHOENIX V16.3: AGGRESSOR PROTOCOL WITH NEW GATES
@@ -828,7 +898,10 @@ class MultiAssetPredictor:
                 # return Signal(symbol, "HOLD", 0.0, {"reason": f"Weak Trend (ADX {adx_val:.1f})"})
 
         # 5. ML Confirmation & Calibration
-        pred_proba = model.predict_proba_one(features)
+        # V16.20 FIX: Ensure features are floats
+        clean_features = {k: float(v) for k, v in features.items()}
+        
+        pred_proba = model.predict_proba_one(clean_features)
         
         # Extract probability for the proposed action
         # River returns dict {label: prob}
@@ -839,7 +912,7 @@ class MultiAssetPredictor:
         confidence = 1.0 # Force max confidence to bypass filters
         
         meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.55) 
-        is_profitable = meta_labeler.predict(features, proposed_action, threshold=meta_threshold)
+        is_profitable = meta_labeler.predict(clean_features, proposed_action, threshold=meta_threshold)
 
         # --- EXECUTION WITH DYNAMIC CONFIDENCE ---
         

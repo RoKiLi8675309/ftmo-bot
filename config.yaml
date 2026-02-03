@@ -1,16 +1,16 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V16.9 (RISK REALITY PATCH)
+# config.yaml – PROJECT PHOENIX V16.12 (MARGIN SAFETY & CONFIG REPAIR)
 # STATUS: LIVE TRADING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# REALITY PATCH (V16.9):
-# 1. RISK SAFETY: Increased min_stop_loss_pips to 8.0 to survive Spread+Comm.
-# 2. ACCURACY: Updated Spread assumptions for Cross Pairs.
+# REPAIR PATCH (V16.12):
+# 1. FIXED: Restored full configuration (Features, WFO, Producer settings).
+# 2. SAFETY: Enforced 1:30 Leverage & 150% Margin Level Gate.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
 env:
   initial_balance: 50000.0
-  mode: "RESEARCH" # Options: RESEARCH, PAPER, LIVE
+  mode: "LIVE" # Options: RESEARCH, PAPER, LIVE
 
 # --- LOGGING CONFIGURATION ---
 logging:
@@ -38,13 +38,13 @@ redis:
   candle_stream_key_prefix: "stream:new_candle"
   trade_request_stream: "trade_requests"
   closed_trade_stream_key: "stream:closed_trades"
-  account_info_key: "bot:account_info"
-  position_state_key_prefix: "bot:positions"
+  account_info_key: "account:info"
+  position_state_key_prefix: "positions"
   monitor_features_prefix: "monitor:features:"
   engine_state_key: 'bot:engine_state'
   
   risk_keys:
-    current_equity: "risk:equity"
+    current_equity: "risk:current_equity"
     daily_drawdown: "risk:daily_dd"
     open_positions: "risk:positions"
     daily_pnl: "risk:daily_pnl"
@@ -53,18 +53,14 @@ redis:
     pause_trading_flag: "risk:pause_trading"
     daily_starting_equity: "risk:daily_starting_equity"
     kill_switch_active: "bot:state:kill_switch_active"
-    midnight_freeze: "bot:state:freeze"
+    midnight_freeze: "risk:midnight_freeze"
     last_reset_date: "risk:last_reset_date"
     penalty_box_prefix: "risk:penalty_box:"
   
   heartbeat_key: "producer:heartbeat"
 
 postgres:
-  host: "localhost"
-  port: 5432
-  db: "trading_db"
-  user: "postgres"
-  password: "password"
+  dsn: "postgresql://postgres:password@localhost:5432/trading_bot"
 
 # --- PRODUCER SETTINGS ---
 producer:
@@ -78,7 +74,8 @@ data:
   sampling_method: "imbalance" # Adaptive Imbalance Bars
   volume_bar_threshold: 10.0        
   imbalance_alpha: 0.05        # EWMA Forgetting Factor
-  download_start_date: "2022-01-01" 
+  use_tick_rule: true
+  download_start_date: "2023-01-01" 
   num_candles_producer: 50000
   num_candles_train: 10000000  # 10M Ticks
   num_candles_wfo: 10000
@@ -95,10 +92,10 @@ features:
   use_log_returns: true
   
   # Project Phoenix L1 Proxies
-  use_parkinson_vol: true              
+  use_parkinson_vol: true               
   use_amihud_liquidity: true 
-  use_relative_volume: true              
-  use_aggressor_ratio: true              
+  use_relative_volume: true               
+  use_aggressor_ratio: true               
   
   # Regime Filters (Anti-Chop)
   use_choppiness: true
@@ -161,7 +158,7 @@ phoenix_strategy:
     USD: "NEUTRAL"
 
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true          
+  enable_regime_a_entries: true           
   require_d1_trend: false                          
   require_h4_alignment: false                  
   
@@ -238,14 +235,17 @@ risk_management:
   # --- SIZING METHOD: HYPER-SCALPER PROTOCOL ---
   sizing_method: "fixed_risk"
   
-  # V16.2: 0.8% Base Risk
-  base_risk_per_trade_percent: 0.008 
+  # V16.11 SAFETY: Reduced Base Risk to 0.5%
+  base_risk_per_trade_percent: 0.005
   
   # PROFIT BUFFER LOGIC
   profit_buffer_threshold: 0.02
-  # Scaled risk 1.5% max
-  scaled_risk_percent: 0.015
+  # Scaled risk 1.0% max (Reduced from 1.5%)
+  scaled_risk_percent: 0.010
   
+  # MARGIN LEVEL GATE (V16.11 NEW)
+  min_margin_level_percent: 150.0
+
   # PYRAMIDING (COMPOUNDING)
   pyramiding:
     enabled: true
@@ -256,7 +256,7 @@ risk_management:
   # EQUITY RATCHET
   equity_ratchet:
     enabled: true
-    step_percent: 0.025    # Lock floor every 2.5% gain
+    step_percent: 0.05    # Lock floor every 5% gain
   
   # LIMITS
   max_daily_loss_pct: 0.040        # 4.0% Daily Limit
@@ -268,10 +268,10 @@ risk_management:
   max_risk_percent: 3.0            
   max_open_trades: 5               
   
-  # --- LEVERAGE GUARD ---
+  # --- LEVERAGE GUARD (V16.11 SWING STANDARDS) ---
   leverage:
-    default: 30.0        # Forex Majors
-    minor: 20.0          # Forex Minors
+    default: 30.0        # Forex Majors (Standard)
+    minor: 30.0          # Forex Minors (Standard)
     gold: 20.0           # XAUUSD
     indices: 20.0        # US30, SPX500
     crypto: 2.0          # BTCUSD
@@ -290,11 +290,11 @@ risk_management:
   trailing_stop:
     enabled: true        
     activation_r: 1.0       # Activate earlier (1.0R)
-    trail_trigger_r: 1.0      
+    trail_trigger_r: 1.0       
     trail_dist_r: 0.5       # Tight Trail (0.5R) to bank scalps
   
   risk_timezone: "Europe/Prague"
-  friday_entry_cutoff_hour: 18        
+  friday_entry_cutoff_hour: 16 # No entries after 16:00
   friday_liquidation_hour_server: 21  
   
   commission_per_lot_rt: 5.0
@@ -304,8 +304,8 @@ risk_management:
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
-  # V16.9 SAFETY: Increased to 8.0 pips to cover Spread+Comm drag
-  min_stop_loss_pips: 8.0
+  # V16.10 SAFETY: Increased to 12.0 pips for Cross Pair Safety
+  min_stop_loss_pips: 12.0
 
 # --- TRADING PORTFOLIO (V16.0) ---
 trading:
@@ -340,7 +340,7 @@ trading:
 online_learning:
   model_type: "AdaptiveRandomForest"
   
-  # CONFIGURATION
+  # CONFIGURATION (RESTORED)
   n_models: 50        
   grace_period: 200        
   delta: 0.00001        
@@ -391,16 +391,17 @@ forensic_audit:
   enforce_spread: true
   max_slippage_pips: 2.0
   commission_per_lot: 5.0
+  # V16.10: Updated assumptions for Cross Pairs
   spread_pips:
     default: 0.8  
-    GBPJPY: 1.5    
+    GBPJPY: 2.0    
     USDJPY: 0.8    
-    EURJPY: 1.0    
-    AUDJPY: 1.2    
+    EURJPY: 1.2    
+    AUDJPY: 1.5    
     GBPUSD: 1.0    
-    GBPAUD: 2.5    # V16.9: Updated to reality
-    EURAUD: 2.5    # V16.9: Updated to reality
-    GBPNZD: 3.0    # V16.9: Updated to reality
+    GBPAUD: 4.0    # V16.10: Updated to reality
+    EURAUD: 4.0    # V16.10: Updated to reality
+    GBPNZD: 5.0    # V16.10: Updated to reality
 
 # --- WFO OPTIMIZATION ---
 wfo:

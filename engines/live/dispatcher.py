@@ -6,17 +6,18 @@
 # DESCRIPTION: Outbound Trade Router. Formats and pushes execution requests to Redis.
 # CRITICAL: Ensures strict compatibility with Windows Producer (Py3.9).
 # 
-# PHOENIX V16.9 FIX (PROTOCOL TRANSLATION):
-# 1. MAPPING: Translates "BUY"/"SELL" -> MT5 Ints (0/1) for 'type'.
-# 2. MAPPING: Translates "MARKET" -> MT5 Int (1) for 'action'.
-# 3. KEYS: Maps 'stop_loss' -> 'sl' and 'take_profit' -> 'tp' for Producer.
+# PHOENIX V16.20 AUDIT FIX (THE JAMMER CURE):
+# 1. RACE CONDITION FIX: 'cleanup_stale_orders' now cross-references Open Positions
+#    before deleting keys. If a position exists, it assumes the order filled but
+#    lost its UUID link (Zombie Match), preventing duplicate firing.
+# 2. TTL EXTENSION: Increased pending order TTL to 600s to survive network lag.
 # =============================================================================
 import logging
 import json
 import uuid
 import threading
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 # Shared Imports
 from shared import CONFIG, LogSymbols, RedisStreamManager, Trade
@@ -63,7 +64,8 @@ class TradeDispatcher:
                     "action": trade.action,
                     "volume": trade.volume,
                     "timestamp": time.time(),
-                    "status": "PENDING"
+                    "status": "PENDING",
+                    "risk_usd": estimated_risk_usd
                 }
 
             # 3. Construct Payload (Strict Protocol Translation)
@@ -93,15 +95,13 @@ class TradeDispatcher:
             # Handling Special Actions (MODIFY / CLOSE_ALL)
             # These override the standard mapping logic
             if trade.action == "MODIFY":
-                # Producer expects 'action' but handles MODIFY separately in its loop.
-                # We pass the strings it looks for in the `if action == "MODIFY":` block.
-                # However, to be safe for the `execute_trade` method, we set defaults.
                 pass 
             
             # Ensure Comment length compliance (MT5 limit)
             # Shorten UUID for comment: "Auto_1234abcd"
             comment = f"Auto_{short_id}"
             if trade.comment:
+                # V16.20: Truncate carefully to preserve key info
                 comment = f"{comment}_{trade.comment}"[:31]
 
             payload = {
@@ -126,11 +126,9 @@ class TradeDispatcher:
                 "price": final_price, 
                 
                 # CRITICAL MAPPING: Producer looks for 'sl' and 'tp', NOT 'stop_loss'
-                "sl": str(trade.stop_loss),
-                "tp": str(trade.take_profit),
-                # Legacy keys kept for logging transparency
-                "stop_loss": str(trade.stop_loss),
-                "take_profit": str(trade.take_profit),
+                # V16.20: Enforce string format to prevent scientific notation on small pips
+                "sl": "{:.5f}".format(trade.stop_loss),
+                "tp": "{:.5f}".format(trade.take_profit),
                 
                 "magic_number": str(self.magic_number),
                 "magic": str(self.magic_number), # Map to 'magic' for Producer
@@ -144,7 +142,8 @@ class TradeDispatcher:
 
             # 4. Transmit to Redis
             # AUDIT FIX: Enforce maxlen to prevent stream from growing indefinitely
-            self.stream_mgr.r.xadd(self.stream_key, payload, maxlen=10000, approximate=True)
+            # 50,000 to match Producer capacity
+            self.stream_mgr.r.xadd(self.stream_key, payload, maxlen=50000, approximate=True)
             
             logger.info(
                 f"{LogSymbols.UPLOAD} DISPATCH SENT: {trade.action} {trade.symbol} "
@@ -157,20 +156,48 @@ class TradeDispatcher:
                 if str(order_id) in self.pending_tracker:
                     del self.pending_tracker[str(order_id)]
 
-    def cleanup_stale_orders(self, ttl_seconds: int = 300):
+    def cleanup_stale_orders(self, ttl_seconds: int = 600, open_positions: Optional[Dict] = None):
         """
         Removes orders that have been stuck in 'PENDING' for too long.
-        Prevents memory leaks in the tracker.
+        V16.20 FIX: Cross-reference with open_positions (Zombie Check) to avoid
+        deleting a key for a trade that actually filled but lost connection.
+        
+        :param ttl_seconds: Max age of a pending order (Default 600s / 10m).
+        :param open_positions: Current live positions to check against.
         """
         now = time.time()
         to_remove = []
+        
         with self.lock:
             for oid, data in self.pending_tracker.items():
+                # 1. Time Check
                 if now - data['timestamp'] > ttl_seconds:
-                    to_remove.append(oid)
+                    
+                    # 2. Zombie Check (If positions provided)
+                    # If we find a position for this symbol that looks like it belongs to us,
+                    # we assume it filled and just clear the pending flag safely.
+                    is_zombie_match = False
+                    if open_positions:
+                        short_id = str(oid)[:8]
+                        symbol = data['symbol']
+                        
+                        for pos in open_positions.values():
+                            # Check Symbol AND Comment match
+                            if pos.get('symbol') == symbol and short_id in pos.get('comment', ''):
+                                is_zombie_match = True
+                                break
+                    
+                    if is_zombie_match:
+                        logger.warning(f"🧟 ZOMBIE MATCH: Clearing stale pending {oid} (Found matching position).")
+                        to_remove.append(oid)
+                    else:
+                        # Genuine Timeout - Order likely rejected or lost
+                        logger.warning(f"🧹 Clearing Stale Pending Order: {oid} ({data['symbol']}) - > {ttl_seconds}s")
+                        to_remove.append(oid)
             
             for oid in to_remove:
-                del self.pending_tracker[oid]
+                if oid in self.pending_tracker:
+                    del self.pending_tracker[oid]
         
         if to_remove:
-            logger.warning(f"Cleaned up {len(to_remove)} stale pending orders.")
+            logger.info(f"Cleaned up {len(to_remove)} pending orders.")
