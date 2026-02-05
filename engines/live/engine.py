@@ -6,11 +6,13 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX V16.21 AUDIT FIX (SINGLE TRADE ENFORCER):
-# 1. MAX TRADES GUARD: Added strict pre-check in 'on_bar_complete'. 
-#    If max_open_trades limit is reached, ONLY the active symbol is processed.
-# 2. MARGIN SAFETY: Prevents "No Money" errors by choking signals upstream.
-# 3. STATE RESTORATION: Added warning if restoration stream looks truncated.
+# PHOENIX V16.23 AUDIT FIX (REVENGE KILLER):
+# 1. PRIORITY INVERSION: Moved 'Safety Gap' check to the absolute top of 
+#    'on_bar_complete'.
+# 2. IMMEDIATE HALT: If a closure is detected, the loop executes a hard RETURN,
+#    preventing any signal generation in the same tick.
+# 3. EXTENDED GAP: Increased Safety Gap duration to 5 minutes to ensure 
+#    Performance Monitor has ample time to apply the permanent lock.
 # =============================================================================
 import logging
 import time
@@ -23,7 +25,7 @@ import math
 import pytz
 from datetime import datetime, timedelta, date
 from collections import defaultdict, deque
-from typing import Any, Optional, Dict, List
+from typing import Any, Optional, Dict, List, Set
 
 # Third-Party NLP (Guarded)
 try:
@@ -204,6 +206,10 @@ class LiveTradingEngine:
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
         self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.0) # Lowered for V14
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
+
+        # --- V16.22 FIX: SAFETY GAP STATE ---
+        # Tracks known open positions to detect closures instantly
+        self.known_open_symbols: Set[str] = set()
 
         # V11.1: Active Position Management Thread
         self.mgmt_thread = threading.Thread(target=self._manage_active_positions_loop, daemon=True)
@@ -477,6 +483,7 @@ class LiveTradingEngine:
                                         
                                         # V16.4 FIX: REVENGE TRADING GUARD (PENALTY BOX)
                                         # Lock symbol out for 60 minutes (configurable)
+                                        # NOTE: This overwrites any temporary "Safety Gap" penalty
                                         cooldown = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 60)
                                         self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=cooldown)
                                         logger.warning(f"🚫 {symbol} SENT TO PENALTY BOX for {cooldown}m (Revenge Guard)")
@@ -679,42 +686,7 @@ class LiveTradingEngine:
         V16.10 GHOST BUSTER: Clears 'Pending' status if any position exists for the symbol.
         Robust against broken comment/UUID chains.
         """
-        with self.lock:
-            to_remove = []
-            
-            # 1. Standard UUID Matching
-            for oid, p_data in self.pending_orders.items():
-                short_id = str(oid)[:8]
-                found = False
-                
-                # Check for UUID match (Precision)
-                for pos in open_positions.values():
-                    if short_id in pos.get('comment', ''):
-                        found = True
-                        break
-                
-                if found:
-                    to_remove.append(oid)
-                    continue
-                
-                # 2. Aggressive Symbol Matching (Safety Valve)
-                # If we have an open position for Symbol X, and a pending order for Symbol X,
-                # assume it filled to prevent "Anti-Stacking" deadlocks.
-                # Only apply if pending order is older than 5 seconds (to allow filling time)
-                pending_symbol = p_data.get('symbol')
-                pending_ts = p_data.get('timestamp', 0)
-                
-                if time.time() - pending_ts > 5.0:
-                    for pos in open_positions.values():
-                         if pos.get('symbol') == pending_symbol:
-                             logger.warning(f"👻 GHOST BUSTER: Clearing pending {pending_symbol} (Position exists)")
-                             to_remove.append(oid)
-                             break
-            
-            for oid in to_remove:
-                if oid in self.pending_orders:
-                    del self.pending_orders[oid]
-                    logger.info(f"✅ Order {oid} reconciled (Matched/Cleared).")
+        self.dispatcher.cleanup_stale_orders(ttl_seconds=600, open_positions=open_positions)
 
     def process_tick(self, tick_data: dict):
         """
@@ -816,6 +788,31 @@ class LiveTradingEngine:
         Triggered when a Tick Imbalance Bar (TIB) is closed.
         Executes the Prediction and Dispatch logic.
         """
+        # =====================================================================
+        # V16.23 CRITICAL FIX: SAFETY GAP PRIORITY INVERSION
+        # MOVED TO THE ABSOLUTE TOP TO PREVENT RACE CONDITIONS.
+        # =====================================================================
+        
+        # 1. Fetch Latest Positions Snapshot from Redis (Producer is Authority)
+        open_positions = self._get_open_positions_from_redis()
+        current_open_symbols = set(open_positions.keys())
+        
+        # 2. Detect Closures (Diff between last tick known state vs current state)
+        just_closed = self.known_open_symbols - current_open_symbols
+        
+        # Update state for next tick immediately
+        self.known_open_symbols = current_open_symbols
+
+        # 3. SAFETY GAP ENFORCEMENT
+        # If the symbol we are processing just closed, we MUST ABORT immediately.
+        # This covers the gap between "Trade Closed in MT5" and "Redis Performance Stream updated".
+        if symbol in just_closed:
+            logger.warning(f"🛑 REVENGE KILLER: {symbol} just closed. Applying 5m penalty & ABORTING tick.")
+            # Apply 5-minute cooldown (Extended for safety) to bridge gap until 
+            # Performance Monitor applies the full 60m penalty (if loss).
+            self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=5)
+            return  # <--- CRITICAL: DO NOT PROCEED TO SIGNAL GENERATION
+
         # --- V16.13: EXECUTION THROTTLE (THE MACHINE GUN FIX) ---
         # Forces a hard wait time between orders for the same symbol.
         # This covers the critical "Redis Round Trip" latency window.
@@ -879,27 +876,20 @@ class LiveTradingEngine:
         # 2. Prepare Context
         current_sentiment = self.global_sentiment.get('GLOBAL', 0.0)
         mt5_context = self.latest_context.get(symbol, {})
-        open_positions = self._get_open_positions_from_redis()
         
         # --- V16.7 FIX: RECONCILE PENDING ORDERS ---
         # Check if any "Pending" orders are actually open now
         self._reconcile_pending_orders(open_positions)
 
         # =====================================================================
-        # V16.21: MAX TRADES GUARD (STRICT SINGLE TRADE ENFORCEMENT)
+        # B. MAX TRADES GUARD
         # =====================================================================
-        # To fix "No Money" errors, we strictly limit concurrent trades.
-        # If we are already at capacity (e.g. 1 trade), we REJECT new signals
-        # for other symbols immediately. We only allow logic flow if we are
-        # processing the symbol we currently hold (for exits/management).
         max_open_trades = CONFIG['risk_management'].get('max_open_trades', 1)
         current_open_count = len(open_positions)
 
         if current_open_count >= max_open_trades:
-            # If we are full, only allow processing if this symbol is already open
-            # (Allows for Scale-Outs, Pyramiding if logic allows, or Close signals)
+            # Only allow processing if this symbol is already open (management)
             if symbol not in open_positions:
-                # Log sparsely to avoid spam
                 if self.ticks_processed % 100 == 0:
                     logger.info(f"🛑 MAX TRADES LIMIT ({current_open_count}/{max_open_trades}). Skipping {symbol}.")
                 return

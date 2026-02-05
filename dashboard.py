@@ -2,12 +2,13 @@
 # FILENAME: dashboard.py
 # ENVIRONMENT: Linux/WSL2 (Python 3.11)
 # PATH: dashboard.py
-# DEPENDENCIES: streamlit, pandas, redis, shared
-# DESCRIPTION: Real-time GUI for monitoring the Algorithmic Trading System.
+# DEPENDENCIES: streamlit, pandas, redis, plotly, shared
+# DESCRIPTION: Enhanced Real-time GUI for the Algorithmic Trading System.
 #
-# PHOENIX V13.1 UPDATE (LEVERAGE VISIBILITY):
-# 1. UI UPDATE: Added Free Margin & Margin Level to Risk Cockpit.
-# 2. SPREAD FIX: Maintained correct JPY pip multipliers.
+# PHOENIX V16.5 UI OVERHAUL:
+# 1. UX UPGRADE: Added Active Positions Table, Drawdown Gauge, and Better Metrics.
+# 2. VISIBILITY: Explicitly tracking Free Margin and PnL coloring.
+# 3. SAFETY: Clearer Kill Switch status indicators.
 # =============================================================================
 import streamlit as st
 import pandas as pd
@@ -32,11 +33,25 @@ except ImportError as e:
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="FTMO Forensic Command",
+    page_title="Phoenix Command",
     page_icon="🦅",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# --- CUSTOM CSS ---
+st.markdown("""
+    <style>
+        .block-container { padding-top: 1rem; padding-bottom: 1rem; }
+        div[data-testid="metric-container"] {
+            background-color: #1E1E1E;
+            padding: 10px;
+            border-radius: 5px;
+            border-left: 4px solid #FF4B4B;
+        }
+        div[data-testid="stDataFrame"] { width: 100%; }
+    </style>
+""", unsafe_allow_html=True)
 
 # --- CACHED RESOURCES ---
 @st.cache_resource
@@ -54,7 +69,8 @@ except Exception as e:
     st.error(f"Redis Connection Failed: {e}")
     st.stop()
 
-# --- HELPER FUNCTIONS ---
+# --- DATA FETCHING FUNCTIONS ---
+
 def get_system_health():
     """Checks Redis ping and Producer Heartbeat."""
     try:
@@ -63,50 +79,94 @@ def get_system_health():
         last_beat = r.get(CONFIG.get('producer', {}).get('heartbeat_key', 'producer:heartbeat'))
         
         producer_status = "OFFLINE"
+        status_color = "red"
+        
         if last_beat:
             delta = time.time() - float(last_beat)
             if delta < 15:
                 producer_status = "ONLINE"
+                status_color = "green"
+            elif delta < 60:
+                producer_status = f"LAGGING ({int(delta)}s)"
+                status_color = "orange"
             else:
                 producer_status = f"STALE ({int(delta)}s)"
         
-        return redis_alive, producer_status
+        return redis_alive, producer_status, status_color
     except Exception:
-        return False, "ERROR"
+        return False, "ERROR", "red"
 
 def get_risk_metrics():
     """Fetches equity and drawdown info from Redis keys."""
     try:
         start_eq = float(r.get(CONFIG['redis']['risk_keys']['daily_starting_equity']) or 0.0)
         curr_eq = float(r.get(CONFIG['redis']['risk_keys']['current_equity']) or 0.0)
-        hwm = float(r.get("risk:high_water_mark") or 0.0)
         
+        # Calculate daily PnL
+        daily_pnl = curr_eq - start_eq
+        
+        # Calculate Daily Drawdown % (Only relevant if PnL is negative)
         if start_eq > 0:
-            daily_dd_pct = (start_eq - curr_eq) / start_eq
-            daily_dd_val = start_eq - curr_eq
+            if daily_pnl < 0:
+                daily_dd_pct = abs(daily_pnl) / start_eq
+            else:
+                daily_dd_pct = 0.0
         else:
             daily_dd_pct = 0.0
-            daily_dd_val = 0.0
-        return start_eq, curr_eq, hwm, daily_dd_pct, daily_dd_val
+            
+        return start_eq, curr_eq, daily_pnl, daily_dd_pct
     except Exception:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
 def get_account_margin_info():
-    """
-    V13.1: Fetches Margin info for Leverage Guard visibility.
-    Updated by Windows Producer in 'bot:account_info' hash.
-    """
+    """Fetches Margin info for Leverage Guard visibility."""
     try:
-        key = CONFIG['redis'].get('account_info_key', 'bot:account_info')
+        key = CONFIG['redis'].get('account_info_key', 'account:info')
         info = r.hgetall(key)
         if not info:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0
         
-        free_margin = float(info.get('free_margin', 0.0))
+        equity = float(info.get('equity', 0.0))
         margin = float(info.get('margin', 0.0))
-        return free_margin, margin
+        free_margin = float(info.get('free_margin', 0.0))
+        
+        # Calculate Margin Level
+        margin_level = (equity / margin * 100) if margin > 0 else 9999.0
+        
+        return free_margin, margin, margin_level
     except Exception:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
+
+def get_open_positions():
+    """Fetches the actual open positions from Redis."""
+    try:
+        magic = CONFIG['trading']['magic_number']
+        key = f"{CONFIG['redis']['position_state_key_prefix']}:{magic}"
+        data = r.get(key)
+        if data:
+            return json.loads(data)
+        return []
+    except Exception:
+        return []
+
+def get_recent_signals(limit=10):
+    """Fetches recent signals dispatched to the execution stream."""
+    stream_key = CONFIG['redis']['trade_request_stream']
+    try:
+        raw_trades = r.xrevrange(stream_key, count=limit)
+        trade_list = []
+        for msg_id, payload in raw_trades:
+            item = payload.copy()
+            # Timestamp formatting
+            if 'timestamp' in item:
+                try:
+                    ts = float(item['timestamp'])
+                    item['time'] = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
+                except: pass
+            trade_list.append(item)
+        return trade_list
+    except Exception:
+        return []
 
 def toggle_kill_switch():
     """Toggles the global trading suspension flag (Logic)."""
@@ -116,227 +176,174 @@ def toggle_kill_switch():
     else:
         r.set(key, "1")
 
-# --- UI LAYOUT ---
+# --- UI COMPONENTS ---
+
+def render_gauge(current_val, max_val, title):
+    """Renders a Plotly Gauge chart for Drawdown."""
+    fig = go.Figure(go.Indicator(
+        mode = "gauge+number",
+        value = current_val * 100,
+        domain = {'x': [0, 1], 'y': [0, 1]},
+        title = {'text': title},
+        gauge = {
+            'axis': {'range': [0, max_val * 100], 'tickwidth': 1, 'tickcolor': "white"},
+            'bar': {'color': "#FF4B4B"}, # Red bar for drawdown
+            'bgcolor': "white",
+            'borderwidth': 2,
+            'bordercolor': "gray",
+            'steps': [
+                {'range': [0, max_val * 0.5 * 100], 'color': "#1E3D59"}, # Safe zone
+                {'range': [max_val * 0.5 * 100, max_val * 0.8 * 100], 'color': "#FFC107"}, # Warning
+                {'range': [max_val * 0.8 * 100, max_val * 100], 'color': "#FF4B4B"}], # Danger
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': max_val * 100}
+        }
+    ))
+    fig.update_layout(height=180, margin=dict(l=20, r=20, t=30, b=20), paper_bgcolor="rgba(0,0,0,0)", font={'color': "white"})
+    return fig
+
+# --- MAIN LAYOUT ---
+
 # 1. SIDEBAR
 with st.sidebar:
-    st.title("🦅 Control Panel")
+    st.header("🦅 Control Tower")
     
-    redis_ok, producer_stat = get_system_health()
+    redis_ok, producer_stat, prod_color = get_system_health()
     
-    st.markdown("### System Status")
-    col_s1, col_s2 = st.columns(2)
-    col_s1.metric("Redis", "OK" if redis_ok else "ERR")
-    col_s2.metric("Producer", producer_stat)
+    st.markdown(f"**Redis:** {'✅' if redis_ok else '❌'}")
+    # FIX: variable producer_status -> producer_stat
+    st.markdown(f"**Producer:** :{prod_color}[{producer_stat}]")
     
     st.divider()
     
-    st.markdown("### Emergency Controls")
-      
-    # LOGIC SWITCH (Redis)
+    # KILL SWITCH LOGIC
     kill_switch_key = CONFIG['redis']['risk_keys']['kill_switch_active']
     is_killed = r.exists(kill_switch_key)
     
     if is_killed:
-        st.error("🛑 KILL SWITCH ACTIVE (Logic)")
-        if st.button("RESUME TRADING"):
+        st.error("⛔ BOT PAUSED")
+        if st.button("RESUME TRADING", use_container_width=True):
             toggle_kill_switch()
             st.rerun()
     else:
-        st.success("🟢 SYSTEM ARMED")
-        if st.button("ACTIVATE KILL SWITCH (Logic)", type="primary"):
+        st.success("🟢 BOT ACTIVE")
+        if st.button("PAUSE TRADING", type="primary", use_container_width=True):
             toggle_kill_switch()
             st.rerun()
-      
-    st.markdown("---")
-      
-    # HARD KILL SWITCH (File)
-    KILL_SWITCH_FILE = "kill_switch.lock"
-    file_killed = os.path.exists(KILL_SWITCH_FILE)
-      
-    if file_killed:
-        st.error("💀 HARD KILL ACTIVE (File)")
-        st.caption("Windows Producer should be dead.")
-        if st.button("RESET HARD KILL (Delete File)"):
-            try:
-                os.remove(KILL_SWITCH_FILE)
-                st.success("File deleted.")
-                time.sleep(1)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Failed to delete file: {e}")
-    else:
-        if st.button("ACTIVATE HARD KILL (File)", type="secondary"):
-            try:
-                with open(KILL_SWITCH_FILE, "w") as f:
-                    f.write("KILL")
-                st.error("Hard Kill File Created!")
-                time.sleep(1)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Failed to create file: {e}")
             
-    st.divider()
-    refresh_rate = st.slider("Refresh Rate (s)", 1, 60, 2)
-
-# 2. MAIN HEADER
-st.title("🦅 FTMO Forensic Command")
-st.markdown(f"**Environment:** {sys.platform} | **Python:** {sys.version.split()[0]}")
-
-# 3. RISK COCKPIT (Top Row)
-start_eq, curr_eq, hwm, daily_dd_pct, daily_dd_val = get_risk_metrics()
-free_margin, used_margin = get_account_margin_info() # V13.1 Update
-limit_pct = CONFIG['risk_management']['max_daily_loss_pct']
-
-# Progress Bar for Daily Limit
-st.markdown("#### Daily Risk & Leverage")
-col1, col2, col3, col4, col5 = st.columns(5)
-
-with col1:
-    st.metric("Equity", f"${curr_eq:,.2f}", delta=f"{curr_eq - start_eq:,.2f}")
-with col2:
-    st.metric("Daily Drawdown", f"{daily_dd_pct:.2%}", delta=f"-{daily_dd_val:,.2f}", delta_color="inverse")
-with col3:
-    st.metric("Free Margin", f"${free_margin:,.0f}", f"Used: ${used_margin:,.0f}")
-with col4:
-    st.metric("Daily Limit", f"{limit_pct:.1%}", f"Buffer: {(limit_pct - daily_dd_pct):.2%}")
-with col5:
-    st.metric("High Water Mark", f"${hwm:,.2f}")
-
-progress = min(1.0, max(0.0, daily_dd_pct / limit_pct)) if limit_pct > 0 else 0
-st.progress(progress)
-if progress > 0.8:
-    st.warning(f"⚠️ Warning: {progress:.1%} of Daily Risk Budget consumed!")
-
-# 4. LIVE MARKET DATA (Tabs)
-tab_market, tab_trades, tab_logs = st.tabs(["📊 Live Market", "⚖️ Trade Log", "📜 System Logs"])
-
-with tab_market:
-    # --- MARKET SNAPSHOT (DEDUPLICATED) ---
-    st.subheader("Market Watch (Latest State)")
+    st.markdown("---")
+    refresh_rate = st.select_slider("Refresh Rate", options=[1, 2, 5, 10, 30], value=2)
     
+    st.info(f"Bot Version: 16.5\nMode: {CONFIG['env']['mode']}")
+
+# 2. KPI HEADER
+st.title("Phoenix Algo Dashboard")
+
+start_eq, curr_eq, daily_pnl, daily_dd_pct = get_risk_metrics()
+free_margin, margin, margin_level = get_account_margin_info()
+daily_limit_pct = CONFIG['risk_management']['max_daily_loss_pct']
+
+kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+
+with kpi1:
+    st.metric("Equity", f"${curr_eq:,.2f}", f"${daily_pnl:,.2f} Today")
+
+with kpi2:
+    # Color logic for PnL
+    pnl_color = "normal" if daily_pnl == 0 else ("off" if daily_pnl < 0 else "inverse")
+    st.metric("Daily Return", f"{(daily_pnl/start_eq if start_eq else 0):.2%}", delta_color=pnl_color)
+
+with kpi3:
+    st.metric("Free Margin", f"${free_margin:,.0f}", f"Level: {margin_level:.0f}%")
+
+with kpi4:
+    # Drawdown metric
+    dd_status = "Safe" if daily_dd_pct < daily_limit_pct * 0.5 else "Warning"
+    st.metric("Daily Drawdown", f"{daily_dd_pct:.2%}", f"Limit: {daily_limit_pct:.1%} ({dd_status})", delta_color="inverse")
+
+# 3. VISUALIZATIONS & ACTIVE TRADES
+col_left, col_right = st.columns([2, 1])
+
+with col_left:
+    st.subheader("Active Positions")
+    positions = get_open_positions()
+    
+    if positions:
+        df_pos = pd.DataFrame(positions)
+        # Select and Rename columns for display
+        cols_to_show = ['symbol', 'type', 'volume', 'entry_price', 'profit', 'comment']
+        # Filter existing columns
+        df_pos = df_pos[[c for c in cols_to_show if c in df_pos.columns]]
+        
+        st.dataframe(
+            df_pos,
+            use_container_width=True,
+            column_config={
+                "symbol": "Symbol",
+                "type": "Side",
+                "volume": "Lots",
+                "entry_price": st.column_config.NumberColumn("Entry", format="$%.5f"),
+                "profit": st.column_config.NumberColumn("PnL", format="$%.2f"),
+                "comment": "Tag"
+            },
+            hide_index=True
+        )
+    else:
+        st.info("💤 No active positions. Scanning markets...")
+
+    st.subheader("Recent Signals")
+    signals = get_recent_signals()
+    if signals:
+        df_sig = pd.DataFrame(signals)
+        cols_sig = ['time', 'symbol', 'action', 'volume', 'price', 'confidence']
+        df_sig = df_sig[[c for c in cols_sig if c in df_sig.columns]]
+        st.dataframe(df_sig, use_container_width=True, hide_index=True, height=200)
+
+with col_right:
+    st.subheader("Risk Gauge")
+    # Gauge Chart for Drawdown
+    fig_gauge = render_gauge(daily_dd_pct, daily_limit_pct, "Daily Drawdown Utilization")
+    st.plotly_chart(fig_gauge, use_container_width=True)
+    
+    st.subheader("Market Pulse")
+    # Quick Ticker View
     stream_key = CONFIG['redis']['price_data_stream']
     try:
-        # Read larger chunk to ensure we get all symbols, but deduplicate by ID
-        # xrevrange gives Newest -> Oldest
-        raw_data = r.xrevrange(stream_key, count=1000)
-        
-        snapshot_data = {}
-        tape_data = []
-        seen_symbols = set()
-        
-        for msg_id, payload in raw_data:
+        raw_ticks = r.xrevrange(stream_key, count=20)
+        tick_data = {}
+        for _, payload in raw_ticks:
             sym = payload.get('symbol')
-            ts_raw = payload.get('time', 0)
-            
-            # Format Timestamp
-            try:
-                ts_val = float(ts_raw)
-                if ts_val > 1e10: ts_val /= 1000 # Handle ms
-                dt_str = datetime.fromtimestamp(ts_val).strftime('%H:%M:%S')
-            except:
-                dt_str = str(ts_raw)
-
-            # SNAPSHOT LOGIC: Only take the first (latest) occurrence of each symbol
-            if sym and sym not in seen_symbols:
-                ask = float(payload.get('ask', 0))
-                bid = float(payload.get('bid', 0))
-                
-                # --- SPREAD CALCULATION FIX ---
-                multiplier = 100 if 'JPY' in sym else 10000
-                spread_pips = (ask - bid) * multiplier
-                
-                snapshot_data[sym] = {
-                    "Symbol": sym,
-                    "Time": dt_str,
-                    "Bid": bid,
-                    "Ask": ask,
-                    "Spread": round(spread_pips, 1), 
-                    "Vol": float(payload.get('volume', 0)),
-                    "Bid Vol": float(payload.get('bid_vol', 0)),
-                    "Ask Vol": float(payload.get('ask_vol', 0)),
+            if sym not in tick_data:
+                tick_data[sym] = {
+                    'Price': float(payload.get('price', 0)),
+                    'Vol': float(payload.get('volume', 0))
                 }
-                seen_symbols.add(sym)
-            
-            # TAPE LOGIC: Add to tape list (we can limit this later)
-            tape_row = {
-                "ID": msg_id,
-                "Time": dt_str,
-                "Symbol": sym,
-                "Bid": payload.get('bid'),
-                "Ask": payload.get('ask'),
-                "Vol": payload.get('volume')
-            }
-            tape_data.append(tape_row)
         
-        # Display Snapshot Table
-        if snapshot_data:
-            df_snap = pd.DataFrame(list(snapshot_data.values()))
-            # Sort by Symbol for stability
-            df_snap.sort_values('Symbol', inplace=True)
-            st.dataframe(df_snap, use_container_width=True, hide_index=True)
-        else:
-            st.info("Waiting for tick data...")
+        if tick_data:
+            df_pulse = pd.DataFrame.from_dict(tick_data, orient='index').reset_index()
+            df_pulse.columns = ['Symbol', 'Price', 'Volume']
+            st.dataframe(
+                df_pulse, 
+                use_container_width=True, 
+                hide_index=True,
+                column_config={
+                    "Price": st.column_config.NumberColumn(format="%.3f")
+                }
+            )
+    except Exception:
+        st.caption("Waiting for market data...")
 
-        # --- RAW TAPE (EXPANDER) ---
-        with st.expander("Raw Tick Tape (Last 50)"):
-            if tape_data:
-                df_tape = pd.DataFrame(tape_data[:50]) # Show top 50
-                st.dataframe(df_tape, use_container_width=True)
-            else:
-                st.write("No tape data.")
-                
-    except Exception as e:
-        st.error(f"Error reading stream: {e}")
-
-with tab_trades:
-    st.subheader("Execution Stream")
-    trade_stream = CONFIG['redis']['trade_request_stream']
-    try:
-        raw_trades = r.xrevrange(trade_stream, count=50)
-        trade_list = []
-        for msg_id, payload in raw_trades:
-            # Clean up payload for display
-            display_payload = payload.copy()
-            # Timestamp formatting
-            if 'timestamp' in display_payload:
-                try:
-                    ts = float(display_payload['timestamp'])
-                    display_payload['time'] = datetime.fromtimestamp(ts).strftime('%H:%M:%S')
-                except: pass
-            
-            trade_list.append(display_payload)
-        
-        if trade_list:
-            df_trades = pd.DataFrame(trade_list)
-            st.dataframe(df_trades, use_container_width=True)
-        else:
-            st.info("No recent trades dispatched.")
-    except Exception as e:
-        st.error(f"Error reading trade stream: {e}")
-
-with tab_logs:
-    st.subheader("System Event Log (Simulated Tail)")
+# 4. LOGS & SYSTEM
+with st.expander("📜 System Logs & Audit Trail", expanded=False):
     log_file = "logs/ftmo_bot.log"
     if os.path.exists(log_file):
         with open(log_file, "r") as f:
-            # Read last 50 lines efficiently
-            try:
-                # Seek to end and read backwards approx 50 lines
-                f.seek(0, 2)
-                file_size = f.tell()
-                # Read last 8KB of logs
-                read_size = min(8192, file_size)
-                f.seek(file_size - read_size)
-                lines = f.readlines()
-                # If we read halfway through a line, drop the first one
-                if len(lines) > 1 and read_size < file_size:
-                    lines = lines[1:]
-                
-                # Show last 20 reversed
-                for line in reversed(lines[-20:]):
-                    st.text(line.strip())
-            except Exception as e:
-                st.error(f"Log read error: {e}")
+            lines = f.readlines()
+            # Show last 20 lines
+            for line in reversed(lines[-20:]):
+                st.text(line.strip())
     else:
         st.warning(f"Log file not found at {log_file}")
 
