@@ -1,10 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V16.4 (SURVIVAL PROTOCOL)
+# config.yaml – PROJECT PHOENIX V16.21 (SINGLE TRADE PROTOCOL)
 # STATUS: LIVE TRADING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
 # CRITICAL FIXES:
-# 1. RISK SLASHED: Base Risk reduced to 0.25% to survive drawdowns.
-# 2. COOL-DOWN: Added 60-minute lockout after any loss to prevent revenge trading.
+# 1. SINGLE TRADE MODE: max_open_trades set to 1 to prevent "No Money" errors.
+# 2. RISK DISCIPLINE: Base Risk 0.25%, Scaled 0.5%.
+# 3. COOL-DOWN: 60-minute lockout after any loss.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -268,8 +269,10 @@ risk_management:
   # PORTFOLIO HEAT
   max_currency_exposure: 2         
   
-  max_risk_percent: 1.5            
-  max_open_trades: 5               
+  # V16.21: SINGLE TRADE ENFORCEMENT
+  # Set to 1 to strictly prevent "No Money" margin errors.
+  max_open_trades: 1               
+  max_risk_percent: 1.0            
   
   # --- LEVERAGE GUARD (V16.11 SWING STANDARDS) ---
   leverage:

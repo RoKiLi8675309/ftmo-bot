@@ -6,11 +6,11 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX V16.4.1 AUDIT FIX (DATA BLOCKAGE & AMNESIA CURE):
-# 1. AUX DATA INGESTION: Moved price updates BEFORE Aggregator check.
-#    Ensures conversion pairs (e.g., NZDUSD) update RiskManager even if not traded.
-# 2. STATE RESTORATION: Added warning if restoration stream looks truncated.
-# 3. TIMING AUTHORITY: Hardened server time synchronization.
+# PHOENIX V16.21 AUDIT FIX (SINGLE TRADE ENFORCER):
+# 1. MAX TRADES GUARD: Added strict pre-check in 'on_bar_complete'. 
+#    If max_open_trades limit is reached, ONLY the active symbol is processed.
+# 2. MARGIN SAFETY: Prevents "No Money" errors by choking signals upstream.
+# 3. STATE RESTORATION: Added warning if restoration stream looks truncated.
 # =============================================================================
 import logging
 import time
@@ -884,6 +884,26 @@ class LiveTradingEngine:
         # --- V16.7 FIX: RECONCILE PENDING ORDERS ---
         # Check if any "Pending" orders are actually open now
         self._reconcile_pending_orders(open_positions)
+
+        # =====================================================================
+        # V16.21: MAX TRADES GUARD (STRICT SINGLE TRADE ENFORCEMENT)
+        # =====================================================================
+        # To fix "No Money" errors, we strictly limit concurrent trades.
+        # If we are already at capacity (e.g. 1 trade), we REJECT new signals
+        # for other symbols immediately. We only allow logic flow if we are
+        # processing the symbol we currently hold (for exits/management).
+        max_open_trades = CONFIG['risk_management'].get('max_open_trades', 1)
+        current_open_count = len(open_positions)
+
+        if current_open_count >= max_open_trades:
+            # If we are full, only allow processing if this symbol is already open
+            # (Allows for Scale-Outs, Pyramiding if logic allows, or Close signals)
+            if symbol not in open_positions:
+                # Log sparsely to avoid spam
+                if self.ticks_processed % 100 == 0:
+                    logger.info(f"🛑 MAX TRADES LIMIT ({current_open_count}/{max_open_trades}). Skipping {symbol}.")
+                return
+        # =====================================================================
         
         context_data = {
             'd1': mt5_context.get('d1', {}),

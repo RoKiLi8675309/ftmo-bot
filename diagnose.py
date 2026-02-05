@@ -5,9 +5,9 @@
 # DEPENDENCIES: unittest, numpy, redis, shared
 # DESCRIPTION: Pre-Flight Forensic Diagnostics & PIPELINE VERIFICATION.
 # 
-# PHOENIX V16.4 UPDATE (SURVIVAL PROTOCOL DIAGNOSTICS):
-# 1. RISK CHECK: Updated assertions to match V16.4 (0.25% Base / 0.5% Scaled).
-# 2. LEVERAGE CHECK: Verifies leverage map exists for Margin Guard.
+# PHOENIX V16.4.2 UPDATE (COST SAVING PATCH):
+# 1. NO COST PROBE: Replaced live Limit Order injection with safe Redis Write check.
+# 2. CONFIG ALIGNMENT: Validates V16.4 Survival Mode Risk (0.25%).
 # =============================================================================
 import unittest
 import numpy as np
@@ -117,34 +117,30 @@ class TestInfrastructureAndExecution(unittest.TestCase):
             if delta > 60:
                 print(f"   {LogSymbols.CRITICAL} WARNING: Windows Producer is effectively DEAD (Last beat > 60s ago).")
 
-    def test_3_inject_probe_signal(self):
+    def test_3_verify_redis_write_permissions(self):
         """
-        INJECTS A TEST TRADE to force a reaction from Windows.
-        Target: EURUSD @ 0.50000 (Safe Limit Order).
+        Verifies Redis Write capability WITHOUT sending live orders.
+        Replaces the costly Probe Signal injection.
         """
-        print(f"\n   {LogSymbols.UPLOAD} INJECTING PROBE SIGNAL (PIPELINE CHECK)...")
-        
-        payload = {
-            "id": str(uuid.uuid4()),
-            "uuid": str(uuid.uuid4()),
-            "symbol": "EURUSD",
-            "action": "BUY",
-            "volume": "0.01",
-            "price": "0.50000",
-            "stop_loss": "0.49000",
-            "take_profit": "0.51000",
-            "magic_number": "999999", # Diagnostic Magic
-            "comment": "DIAGNOSE_PROBE",
-            "timestamp": str(time.time()),
-            "type": "LIMIT"
-        }
-        
+        print(f"\n   {LogSymbols.DATABASE} VERIFYING REDIS WRITE PERMISSIONS (NO COST MODE)...")
+        test_key = f"diagnose:write_test:{uuid.uuid4()}"
+        test_val = "WRITE_TEST_OK"
+
         try:
-            msg_id = self.r.xadd(self.stream_key, payload)
-            print(f"   {LogSymbols.SUCCESS} Probe Sent! Msg ID: {msg_id}")
-            print(f"   -> CHECK WINDOWS TERMINAL NOW. It should say 'RECEIVED TRADE REQUEST'.")
+            # 1. Write
+            self.r.setex(test_key, 10, test_val)
+            # 2. Read
+            val = self.r.get(test_key)
+            # 3. Verify
+            self.assertEqual(val, test_val, "Redis Write/Read mismatch")
+            # 4. Clean
+            self.r.delete(test_key)
+
+            print(f"   {LogSymbols.SUCCESS} Redis Write Check: PASSED")
+            print(f"   -> Connectivity is healthy. No Limit Orders sent to Broker.")
+
         except Exception as e:
-            self.fail(f"Failed to inject probe: {e}")
+            self.fail(f"Redis Write Check Failed: {e}")
 
     def test_4_inspect_stream_flow(self):
         """Are signals actually landing in the stream?"""
