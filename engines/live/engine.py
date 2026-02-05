@@ -6,10 +6,11 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX V16.20 AUDIT FIX (THE AMNESIA CURE):
-# 1. ANCHOR AUTHORITY: Daily resets now triggered by BROKER TIME (via Ticks), not Local Time.
-# 2. STATE SYNC: Hard sync of 'daily_starting_equity' from Redis to prevent drift.
-# 3. EXECUTION: Preserved 60s hard throttle to prevent Redis race conditions.
+# PHOENIX V16.4.1 AUDIT FIX (DATA BLOCKAGE & AMNESIA CURE):
+# 1. AUX DATA INGESTION: Moved price updates BEFORE Aggregator check.
+#    Ensures conversion pairs (e.g., NZDUSD) update RiskManager even if not traded.
+# 2. STATE RESTORATION: Added warning if restoration stream looks truncated.
+# 3. TIMING AUTHORITY: Hardened server time synchronization.
 # =============================================================================
 import logging
 import time
@@ -316,8 +317,13 @@ class LiveTradingEngine:
             start_ts_ms = int(start_of_day.timestamp() * 1000)
             
             # Fetch range from start of day until now
+            # AUDIT WARNING: Redis MaxLen may truncate history. Ideally this is a separate persistent stream.
             messages = self.stream_mgr.r.xrange(stream_key, min=start_ts_ms, max='+')
             
+            # Diagnostic for Truncation
+            if len(messages) >= 990: # Near default 1000 limit
+                logger.warning(f"⚠️ RESTORATION WARNING: Stream {stream_key} is near capacity. Early day trades may be lost.")
+
             restored_count = 0
             with self.stats_lock:
                 current_date = now.date()
@@ -420,6 +426,7 @@ class LiveTradingEngine:
         Background thread to listen for CLOSED trades.
         1. Updates SQN stats (performance sizing).
         2. Updates Daily Circuit Breaker (stops trading on bad days).
+        3. V16.4: Enforces REVENGE TRADING GUARD (Penalty Box).
         """
         logger.info(f"{LogSymbols.INFO} Performance Monitor (SQN & Circuit Breaker) Thread Started.")
         stream_key = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
@@ -438,14 +445,14 @@ class LiveTradingEngine:
                             last_id = msg_id
                             symbol = data.get('symbol')
                             net_pnl = float(data.get('net_pnl', 0.0))
-                            ticket = str(data.get('ticket', ''))
+                            ticket = str(data.get('ticket', '')) # Ticket for dedup
                             
                             if symbol:
                                 with self.stats_lock:
                                     # 1. SQN Window Update
                                     self.performance_stats[symbol].append(net_pnl)
                                     
-                                    # 2. Circuit Breaker Update
+                                    # 2. Circuit Breaker & Revenge Guard
                                     # V16.20: Use known server date instead of local time
                                     now_server_date = self.last_known_server_date
                                     
@@ -460,13 +467,20 @@ class LiveTradingEngine:
 
                                     self.daily_execution_stats[symbol]['pnl'] += net_pnl
                                     
+                                    # Mark ticket as seen
+                                    if ticket:
+                                        self.daily_execution_stats[symbol]['tickets'].add(ticket)
+                                    
                                     if net_pnl < 0:
                                         self.daily_execution_stats[symbol]['losses'] += 1
                                         logger.info(f"📉 LOSS DETECTED {symbol}: ${net_pnl:.2f} | Daily Losses: {self.daily_execution_stats[symbol]['losses']}")
-                                    
-                                    if ticket:
-                                        self.daily_execution_stats[symbol]['tickets'].add(ticket)
-                                
+                                        
+                                        # V16.4 FIX: REVENGE TRADING GUARD (PENALTY BOX)
+                                        # Lock symbol out for 60 minutes (configurable)
+                                        cooldown = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 60)
+                                        self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=cooldown)
+                                        logger.warning(f"🚫 {symbol} SENT TO PENALTY BOX for {cooldown}m (Revenge Guard)")
+            
             except Exception as e:
                 logger.error(f"Performance Monitor Error: {e}")
                 time.sleep(5)
@@ -710,7 +724,28 @@ class LiveTradingEngine:
         """
         try:
             symbol = tick_data.get('symbol')
-            if symbol not in self.aggregators: return
+            
+            # --- CRITICAL FIX 16.4.1: UPDATE LATEST PRICE BEFORE BLOCKING ---
+            # Explicit float casting for safety
+            bid = float(tick_data.get('bid', 0.0))
+            ask = float(tick_data.get('ask', 0.0))
+            
+            if 'price' in tick_data:
+                price = float(tick_data['price'])
+            elif bid > 0 and ask > 0:
+                price = (bid + ask) / 2.0
+            else:
+                price = 0.0
+            
+            if price > 0:
+                self.latest_prices[symbol] = price
+            # -----------------------------------------------------------------
+
+            if symbol not in self.aggregators: 
+                # This return is now safe because we updated latest_prices first.
+                # This ensures RiskManager has live prices for conversion pairs (NZDUSD)
+                # even if we aren't actively trading them.
+                return
             
             # --- TIMESTAMP DEDUPLICATION ---
             tick_ts = float(tick_data.get('time', 0.0))
@@ -740,20 +775,6 @@ class LiveTradingEngine:
             if self.ticks_processed % 1000 == 0:
                 logger.info(f"⚡ HEARTBEAT: Processed {self.ticks_processed} ticks... (Last: {symbol})")
 
-            # --- DATA INTEGRITY ---
-            # Explicit float casting for safety
-            bid = float(tick_data.get('bid', 0.0))
-            ask = float(tick_data.get('ask', 0.0))
-            
-            if 'price' in tick_data:
-                price = float(tick_data['price'])
-            elif bid > 0 and ask > 0:
-                price = (bid + ask) / 2.0
-            else:
-                price = 0.0
-            
-            if price <= 0: return
-
             # --- CRITICAL FIX: FORCE VOLUME FLOOR (Synthetic Tick Rule) ---
             raw_vol = float(tick_data.get('volume', 0.0))
             volume = raw_vol if raw_vol > 0 else 1.0
@@ -761,8 +782,6 @@ class LiveTradingEngine:
             bid_vol = float(tick_data.get('bid_vol', 0.0))
             ask_vol = float(tick_data.get('ask_vol', 0.0))
 
-            self.latest_prices[symbol] = price
-            
             # --- CONTEXT EXTRACTION (SAFETY PATCH) ---
             if 'ctx_d1' in tick_data:
                 try: 
@@ -1142,9 +1161,9 @@ class LiveTradingEngine:
         if self.session_guard.is_friday_afternoon():
             return False
 
-        # 6. Penalty Box (Correlation/Volatility penalty)
+        # 6. Penalty Box (Correlation/Volatility penalty OR Revenge Guard)
         if self.portfolio_mgr.check_penalty_box(symbol):
-            logger.warning(f"{LogSymbols.LOCK} {symbol} is in Penalty Box.")
+            logger.warning(f"{LogSymbols.LOCK} {symbol} is in Penalty Box (Cool-down Active).")
             return False
 
         # 7. News Check

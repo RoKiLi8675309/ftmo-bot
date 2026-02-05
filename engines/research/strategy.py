@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX V16.6 UPDATE (RESEARCH PARITY):
-# 1. SYNCHRONIZATION: Matches 'Unshackled' logic of Live Predictor.
-# 2. GATES: Disabled SMA200 & Relaxed ADX to simulate Scalper Mode.
-# 3. RECOVERY: Supports "Probe Sizing" for Toxic Assets.
+# PHOENIX V16.4 UPDATE (RESEARCH PARITY - SURVIVAL MODE):
+# 1. REVENGE GUARD: Implemented 60m Cooldown after any loss (Backtest simulation).
+# 2. RISK DISCIPLINE: Removed "Alpha Squad Boost" to match Live Engine.
+# 3. GATES: Relaxed logic to allow Scalping, but strictly capped risk.
 # =============================================================================
 import logging
 import sys
@@ -47,7 +47,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V16.6 Hyper-Scalper Protocol.
+    Strictly implements the Phoenix V16.4 Survival Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -65,6 +65,7 @@ class ResearchStrategy:
         # V14.0: Standardize risk multiplier
         self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 1.5))
         self.max_currency_exposure = int(self.risk_conf.get('max_currency_exposure', 2)) 
+        self.cooldown_minutes = int(self.risk_conf.get('loss_cooldown_minutes', 60))
         
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
@@ -349,6 +350,36 @@ class ResearchStrategy:
             
         return True
 
+    def _check_revenge_guard(self, broker: BacktestBroker, current_time: datetime) -> bool:
+        """
+        V16.4: SIMULATED PENALTY BOX.
+        Checks the last closed trade for this symbol.
+        If it was a loss, ensures at least 'cooldown_minutes' have passed.
+        """
+        # Get trades for this symbol, sorted by exit time
+        my_closed_trades = [t for t in broker.closed_positions if t.symbol == self.symbol and t.close_time is not None]
+        
+        if not my_closed_trades:
+            return False
+            
+        last_trade = my_closed_trades[-1]
+        
+        # Check if last trade was a loss
+        if last_trade.net_pnl < 0:
+            # Ensure timezone awareness match
+            close_time = last_trade.close_time
+            if close_time.tzinfo is None:
+                close_time = close_time.replace(tzinfo=current_time.tzinfo)
+            else:
+                close_time = close_time.astimezone(current_time.tzinfo)
+                
+            cooldown_expiry = close_time + timedelta(minutes=self.cooldown_minutes)
+            
+            if current_time < cooldown_expiry:
+                return True # Blocked
+                
+        return False
+
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
         Main Event Loop for the Strategy (V16.6 Scalper Mode).
@@ -410,6 +441,11 @@ class ResearchStrategy:
         if self._check_symbol_circuit_breaker(broker, server_time):
             self.rejection_stats["Symbol Circuit Breaker (Loss Limit)"] += 1
             return
+            
+        # --- V16.4: REVENGE TRADING GUARD (PENALTY BOX) ---
+        if self._check_revenge_guard(broker, server_time):
+            self.rejection_stats["Revenge Guard (Cooldown)"] += 1
+            return
 
         self._update_streak_status(broker)
         self._manage_trailing_stops(broker, price, dt_ts)
@@ -423,7 +459,7 @@ class ResearchStrategy:
             # Force close if we have an open position
             for pos in broker.open_positions:
                 if pos.symbol == self.symbol:
-                     broker._close_partial_position(
+                      broker._close_partial_position(
                         pos, 
                         pos.quantity, 
                         price, 
@@ -589,12 +625,12 @@ class ResearchStrategy:
         # We comment this out to allow rapid reversion scalps.
         # trend_bias = self._calculate_trend_bias(price)
         # if regime_label == "TREND_BREAKOUT":
-        #     if (proposed_action == 1 and trend_bias == -1):
-        #         self.rejection_stats["Counter-Trend Block (SMA200)"] += 1
-        #         return
-        #     if (proposed_action == -1 and trend_bias == 1):
-        #         self.rejection_stats["Counter-Trend Block (SMA200)"] += 1
-        #         return
+        #    if (proposed_action == 1 and trend_bias == -1):
+        #        self.rejection_stats["Counter-Trend Block (SMA200)"] += 1
+        #        return
+        #    if (proposed_action == -1 and trend_bias == 1):
+        #        self.rejection_stats["Counter-Trend Block (SMA200)"] += 1
+        #        return
 
         # --- V16.2 GATE: VOLATILITY EXPANSION ---
         # Prevents entries in low-volatility dead zones where time stops kill trades.
@@ -734,7 +770,7 @@ class ResearchStrategy:
         
         # V15.0: Risk Override for Pyramid Trades
         if is_pyramid:
-             risk_override = self.risk_conf.get('pyramiding', {}).get('risk_per_add_percent', 0.005)
+             risk_override = self.risk_conf.get('pyramiding', {}).get('risk_per_add_percent', 0.0025)
         else:
              risk_override = self.params.get('risk_per_trade_percent')
         
@@ -1095,38 +1131,23 @@ class ResearchStrategy:
         trend_aligned = False
         d1_ema = self.current_d1_ema
         
-        # V16.6 UPDATE: DISABLE SMA200 for Scalping
-        # if self.require_d1_trend and d1_ema > 0: 
-        #     if signal == 1: # BUY Signal
-        #         if price > d1_ema: trend_aligned = True
-        #         else:
-        #             self.rejection_stats['Counter_Trend_D1_EMA'] += 1
-        #             return False
-        #     elif signal == -1: # SELL Signal
-        #         if price < d1_ema: trend_aligned = True
-        #         else:
-        #             self.rejection_stats['Counter_Trend_D1_EMA'] += 1
-        #             return False
-        # else:
-        #     trend_aligned = True 
-
         # 3. RSI EXTREME GUARD (V14.0 MOMENTUM IGNITION)
         if signal == 1: # BUY
             if rsi > 80: 
                 # Check for Ignition
                 if current_hurst > 0.60:
-                       pass # IGNITION: ALLOW TRADE
+                        pass # IGNITION: ALLOW TRADE
                 else:
-                       self.rejection_stats['Overbought_RSI_>80'] += 1
-                       return False
+                        self.rejection_stats['Overbought_RSI_>80'] += 1
+                        return False
         elif signal == -1: # SELL
             if rsi < 20: 
                 # Check for Ignition
                 if current_hurst > 0.60:
-                       pass # IGNITION: ALLOW TRADE
+                        pass # IGNITION: ALLOW TRADE
                 else:
-                       self.rejection_stats['Oversold_RSI_<20'] += 1
-                       return False
+                        self.rejection_stats['Oversold_RSI_<20'] += 1
+                        return False
         
         return True
 

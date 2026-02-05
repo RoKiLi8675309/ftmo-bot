@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# PHOENIX V16.0 UPDATE (FOREX HYPER-SCALPER):
-# 1. RISK SPACE: Tightened search to [0.5%, 1.0%, 1.5%] for scalping safety.
-# 2. SIGNIFICANCE: Enforces min_trades from config (100) to filter luck.
-# 3. ALIGNMENT: Ensures optimization objective matches Scalper goals.
+# PHOENIX V16.4 UPDATE (SURVIVAL TRAINING PROTOCOL):
+# 1. RISK SPACE: Restricted optimization to [0.25%, 0.50%] to prevent overfitting risk.
+# 2. SIGNIFICANCE: Enforces min_trades from config (40) to filter luck.
+# 3. ALIGNMENT: Ensures optimization objective matches the new "Survival First" goal.
 # =============================================================================
 import os
 import sys
@@ -261,10 +261,10 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
             
-            # V16.0 HYPER-SCALPER PROTOCOL: Updated Risk Search Space
-            # Includes 0.5% (Base), 1.0% (Strong), 1.5% (Max)
-            # REMOVED 2.0% (Too risky for scalping)
-            risk_options = [0.005, 0.010, 0.015] 
+            # V16.4 HYPER-SCALPER PROTOCOL: TIGHTENED RISK SEARCH
+            # Restrict optimization to 0.25% and 0.50% only.
+            # Prevents AI from "cheating" with high risk that fails in production.
+            risk_options = [0.0025, 0.005] 
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             trial.set_user_attr("risk_pct", params['risk_per_trade_percent'] * 100)
             
@@ -311,7 +311,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 return -10000.0
 
             # V14.0: SIGNIFICANCE FILTER
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 100)
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 40)
             if trades < min_trades:
                 trial.set_user_attr("pruned", True)
                 return 0.0 
@@ -408,9 +408,9 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 }
                 params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
                 
-                # V16.0 AGGRESSOR: Updated Risk Search for WFO
-                # [0.5%, 1.0%, 1.5%]
-                risk_options = [0.005, 0.010, 0.015]
+                # V16.4 HYPER-SCALPER PROTOCOL: UPDATED RISK SEARCH FOR WFO
+                # Strict 0.25% and 0.5% only.
+                risk_options = [0.0025, 0.005]
                 params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
                 
                 pipeline_inst = ResearchPipeline()
@@ -499,7 +499,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
 
         # --- V14.0: ROBUST SELECTION LOGIC ---
         # Filter trials that met the trade count threshold
-        min_trades = CONFIG['wfo'].get('min_trades_optimization', 100)
+        min_trades = CONFIG['wfo'].get('min_trades_optimization', 40)
         
         valid_trials = [
             t for t in study.trials 
@@ -691,10 +691,12 @@ class ResearchPipeline:
             annual_factor = np.sqrt(252 * 24)
             if std_ret > 1e-9:
                 metrics_out['sharpe'] = (avg_ret / std_ret) * annual_factor
+            
             downside_returns = hourly_returns[hourly_returns < 0]
-            downside_std = downside_returns.std()
-            if downside_std > 1e-9:
-                metrics_out['sortino'] = (avg_ret / downside_std) * annual_factor
+            if len(downside_returns) > 0:
+                downside_std = downside_returns.std()
+                if downside_std > 1e-9:
+                    metrics_out['sortino'] = (avg_ret / downside_std) * annual_factor
 
         return metrics_out
 

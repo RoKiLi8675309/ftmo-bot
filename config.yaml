@@ -1,10 +1,10 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V16.12 (MARGIN SAFETY & CONFIG REPAIR)
+# config.yaml – PROJECT PHOENIX V16.4 (SURVIVAL PROTOCOL)
 # STATUS: LIVE TRADING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# REPAIR PATCH (V16.12):
-# 1. FIXED: Restored full configuration (Features, WFO, Producer settings).
-# 2. SAFETY: Enforced 1:30 Leverage & 150% Margin Level Gate.
+# CRITICAL FIXES:
+# 1. RISK SLASHED: Base Risk reduced to 0.25% to survive drawdowns.
+# 2. COOL-DOWN: Added 60-minute lockout after any loss to prevent revenge trading.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -232,16 +232,19 @@ optimization_search_space:
 risk_management:
   account_currency: "USD"
   
-  # --- SIZING METHOD: HYPER-SCALPER PROTOCOL ---
+  # --- SIZING METHOD: SURVIVAL PROTOCOL ---
   sizing_method: "fixed_risk"
   
-  # V16.11 SAFETY: Reduced Base Risk to 0.5%
-  base_risk_per_trade_percent: 0.005
+  # V16.4 FIX: SLASHED TO 0.25% TO PREVENT BLOWUPS
+  base_risk_per_trade_percent: 0.0025
   
   # PROFIT BUFFER LOGIC
   profit_buffer_threshold: 0.02
-  # Scaled risk 1.0% max (Reduced from 1.5%)
-  scaled_risk_percent: 0.010
+  # Scaled risk 0.5% max (V16.4 Cap)
+  scaled_risk_percent: 0.005
+  
+  # REVENGE TRADING GUARD
+  loss_cooldown_minutes: 60  # Lock symbol for 1 hour after a loss
   
   # MARGIN LEVEL GATE (V16.11 NEW)
   min_margin_level_percent: 150.0
@@ -265,7 +268,7 @@ risk_management:
   # PORTFOLIO HEAT
   max_currency_exposure: 2         
   
-  max_risk_percent: 3.0            
+  max_risk_percent: 1.5            
   max_open_trades: 5               
   
   # --- LEVERAGE GUARD (V16.11 SWING STANDARDS) ---
@@ -304,8 +307,10 @@ risk_management:
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
-  # V16.10 SAFETY: Increased to 12.0 pips for Cross Pair Safety
-  min_stop_loss_pips: 12.0
+  
+  # V16.12 SAFETY: Increased to 15.0 pips because GBPNZD spread is 8.2 pips!
+  # If stop is 12 and spread is 8, you have 4 pips of room. That is suicide.
+  min_stop_loss_pips: 15.0
 
 # --- TRADING PORTFOLIO (V16.0) ---
 trading:
@@ -354,7 +359,9 @@ online_learning:
   # Volatility Gate
   volatility_gate:
     enabled: true
-    min_atr_spread_ratio: 0.8  # Relaxed from 1.0 to allow high-spread pair entries
+    # V16.12: Increased to 1.1. 
+    # With spreads this wide, we need SIGNIFICANT volatility to profit.
+    min_atr_spread_ratio: 1.1  
   
   positive_class_weight: 1.5 
   negative_class_weight: 1.0
@@ -391,17 +398,21 @@ forensic_audit:
   enforce_spread: true
   max_slippage_pips: 2.0
   commission_per_lot: 5.0
-  # V16.10: Updated assumptions for Cross Pairs
+  # V16.12: Updated assumptions based on LIVE SCREENSHOT (Forex.com Demo)
+  # Values include small safety buffer over observed points (e.g. 82 pts = 8.2 pips -> 8.5)
   spread_pips:
-    default: 0.8  
-    GBPJPY: 2.0    
-    USDJPY: 0.8    
-    EURJPY: 1.2    
-    AUDJPY: 1.5    
-    GBPUSD: 1.0    
-    GBPAUD: 4.0    # V16.10: Updated to reality
-    EURAUD: 4.0    # V16.10: Updated to reality
-    GBPNZD: 5.0    # V16.10: Updated to reality
+    default: 1.6  
+    GBPJPY: 4.5    # Screen: 4.2
+    USDJPY: 1.8    # Screen: 1.7
+    EURJPY: 2.5    # Screen: 2.3
+    AUDJPY: 3.0    # Screen: 2.8
+    GBPUSD: 2.0    # Screen: 1.9
+    EURUSD: 1.6    # Screen: 1.5
+    GBPAUD: 7.8    # Screen: 7.5
+    EURAUD: 5.5    # Screen: 5.4
+    GBPNZD: 8.5    # Screen: 8.2
+    AUDUSD: 1.8    # Screen: 1.7
+    USDCAD: 2.8    # Screen: 2.6
 
 # --- WFO OPTIMIZATION ---
 wfo:
@@ -409,4 +420,4 @@ wfo:
   train_years: 2
   test_months: 6
   min_trades_optimization: 40  # Lowered from 100 to allow slower pairs to survive
-  risk_per_trade_options: [0.005, 0.010, 0.015] # 0.5%, 1.0%, 1.5%
+  risk_per_trade_options: [0.0025, 0.005] # 0.25%, 0.5%

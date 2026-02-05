@@ -6,10 +6,10 @@
 # DESCRIPTION: Event-Driven Backtesting Broker. Simulates execution, spread,
 # commissions, and PnL tracking for strategy validation.
 #
-# PHOENIX V16.1 MAINTENANCE PATCH:
-# 1. PNL FIX: Removed hardcoded exchange rates. Now uses dynamic MarketSnapshot.
-# 2. ACCURACY: Enforces live conversion rates for Cross-Pairs (e.g. EURJPY -> USD).
-# 3. SAFETY: Added strict Hard Deck and Daily Loss enforcement.
+# PHOENIX V16.3 REALITY PATCH:
+# 1. DYNAMIC SPREAD MAPPING: Strictly enforces 'forensic_audit' spreads (e.g., GBPNZD=8.5).
+# 2. EXECUTION REALISM: BUYs fill at Ask, SELLs fill at Bid.
+# 3. EXIT REALISM: SELLs exit at Ask. SL/TP checked against Spread-adjusted prices.
 # =============================================================================
 from __future__ import annotations
 import pandas as pd
@@ -124,6 +124,7 @@ class BacktestBroker:
     - PnL Tracking (Equity/Balance)
     - Margin Checks (simplified)
     - V10.0: Daily Hard Deck Enforcement
+    - V16.3: Reality Calibration (Strict Spreads)
     """
     def __init__(self, initial_balance: float = 100000.0):
         self.initial_balance = initial_balance
@@ -146,9 +147,9 @@ class BacktestBroker:
         self.is_blown = False
 
         # Load Configured Costs
-        self.commission_per_lot = CONFIG.get('risk_management', {}).get('commission_per_lot_rt', 5.0)
+        self.commission_per_lot = CONFIG.get('forensic_audit', {}).get('commission_per_lot', 5.0)
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
-        self.default_spread = self.spread_map.get('default', 1.5)
+        self.default_spread = self.spread_map.get('default', 1.6)
 
         # Pre-populate price map to prevent initial warnings
         self._inject_aux_data()
@@ -202,6 +203,24 @@ class BacktestBroker:
         for sym, price in defaults.items():
             if sym not in self.last_price_map:
                 self.last_price_map[sym] = price
+
+    def _get_point_value(self, symbol: str) -> float:
+        """Determines pipette size (0.00001 or 0.001 for JPY)."""
+        if "JPY" in symbol:
+            return 0.001
+        return 0.00001
+
+    def _get_spread_for_symbol(self, symbol: str) -> float:
+        """
+        Retrieves the strict spread from config.yaml.
+        Falls back to 'default' if specific pair not found.
+        """
+        # 1. Check direct match (e.g., 'GBPNZD')
+        if symbol in self.spread_map:
+            return float(self.spread_map[symbol])
+        
+        # 2. Check Default
+        return float(self.spread_map.get('default', 1.6))
 
     def _get_simulation_conversion_rate(self, symbol: str, current_price: float) -> float:
         """
@@ -270,16 +289,40 @@ class BacktestBroker:
         floating_pnl = 0.0
         
         for trade in self.open_positions:
-            current_price = snapshot.get_price(trade.symbol, 'close')
+            # Assumption: Snapshot 'close' is the BID price.
+            current_bid = snapshot.get_price(trade.symbol, 'close')
             
-            if current_price <= 0:
+            if current_bid <= 0:
                 active_positions.append(trade)
                 continue
 
+            # Calculate Ask based on Configured Spread
+            point = self._get_point_value(trade.symbol)
+            spread_pips = self._get_spread_for_symbol(trade.symbol)
+            spread_cost_price = spread_pips * (point * 10)
+            current_ask = current_bid + spread_cost_price
+
+            # Determine Valuation Price (Mark-to-Market)
+            if trade.action == "BUY":
+                # Longs are valued at Bid (Selling back to market)
+                valuation_price = current_bid
+                exit_price_candidate = current_bid
+            else:
+                # Shorts are valued at Ask (Buying back from market)
+                valuation_price = current_ask
+                exit_price_candidate = current_ask
+
             # --- Update MAE/MFE ---
-            pip_size = 0.01 if "JPY" in trade.symbol else 0.0001
-            dist = (current_price - trade.entry_price) / pip_size
-            if trade.action == "SELL": dist = -dist
+            # Distance from Entry in Pips
+            # BUY: (CurrentBid - Entry) / Pip
+            # SELL: (Entry - CurrentAsk) / Pip
+            
+            pip_size = point * 10
+            
+            if trade.action == "BUY":
+                dist = (current_bid - trade.entry_price) / pip_size
+            else:
+                dist = (trade.entry_price - current_ask) / pip_size
             
             trade.max_favorable_excursion = max(trade.max_favorable_excursion, dist)
             trade.max_adverse_excursion = min(trade.max_adverse_excursion, dist)
@@ -289,27 +332,35 @@ class BacktestBroker:
             exit_reason = ""
             close_price = 0.0
 
-            bar_high = snapshot.get_high(trade.symbol)
-            bar_low = snapshot.get_low(trade.symbol)
+            bar_high = snapshot.get_high(trade.symbol) # Bid High
+            bar_low = snapshot.get_low(trade.symbol)   # Bid Low
             
-            if bar_high == 0: bar_high = current_price
-            if bar_low == 0: bar_low = current_price
+            if bar_high == 0: bar_high = current_bid
+            if bar_low == 0: bar_low = current_bid
+
+            # Construct Ask High/Low for Short Logic
+            bar_high_ask = bar_high + spread_cost_price
+            bar_low_ask = bar_low + spread_cost_price
 
             if trade.action == "BUY":
+                # Long: Hit SL if Bid Low <= SL
                 if trade.stop_loss > 0 and bar_low <= trade.stop_loss:
                     closed = True
                     exit_reason = "SL_HIT"
                     close_price = trade.stop_loss
+                # Long: Hit TP if Bid High >= TP
                 elif trade.take_profit > 0 and bar_high >= trade.take_profit:
                     closed = True
                     exit_reason = "TP_HIT"
                     close_price = trade.take_profit
             elif trade.action == "SELL":
-                if trade.stop_loss > 0 and bar_high >= trade.stop_loss:
+                # Short: Hit SL if Ask High >= SL
+                if trade.stop_loss > 0 and bar_high_ask >= trade.stop_loss:
                     closed = True
                     exit_reason = "SL_HIT"
                     close_price = trade.stop_loss
-                elif trade.take_profit > 0 and bar_low <= trade.take_profit:
+                # Short: Hit TP if Ask Low <= TP
+                elif trade.take_profit > 0 and bar_low_ask <= trade.take_profit:
                     closed = True
                     exit_reason = "TP_HIT"
                     close_price = trade.take_profit
@@ -318,12 +369,15 @@ class BacktestBroker:
                 self._finalize_trade(trade, close_price, snapshot.timestamp, exit_reason)
             else:
                 # Update Floating PnL
-                contract_size = 100000
-                raw_pnl = (current_price - trade.entry_price) * (trade.quantity * contract_size)
-                if trade.action == "SELL": raw_pnl = -raw_pnl
+                contract_size = self.contract_size if hasattr(self, 'contract_size') else 100000
+                
+                raw_diff = (valuation_price - trade.entry_price)
+                if trade.action == "SELL": raw_diff = -raw_diff
+                
+                raw_pnl = raw_diff * (trade.quantity * contract_size)
                 
                 # V16.1: Use Dynamic Rate
-                rate = self._get_simulation_conversion_rate(trade.symbol, current_price)
+                rate = self._get_simulation_conversion_rate(trade.symbol, valuation_price)
                 comm_drag = trade.quantity * self.commission_per_lot 
                 
                 floating_pnl += (raw_pnl * rate) - comm_drag
@@ -348,7 +402,14 @@ class BacktestBroker:
                 # Liquidate all open positions instantly at current price
                 # This simulates the "Liquidation" action
                 for trade in list(self.open_positions):
+                    # For liquidation, use current snapshot prices
                     curr_p = snapshot.get_price(trade.symbol, 'close')
+                    # Apply spread for Shorts
+                    if trade.action == "SELL":
+                        pt = self._get_point_value(trade.symbol)
+                        sp = self._get_spread_for_symbol(trade.symbol) * (pt * 10)
+                        curr_p += sp
+                        
                     self._finalize_trade(trade, curr_p, snapshot.timestamp, "HARD_DECK_LIQ")
                 self.open_positions = [] # Clear
 
@@ -359,6 +420,7 @@ class BacktestBroker:
     def submit_order(self, order: BacktestOrder) -> Optional[int]:
         """
         Public API called by ResearchStrategy.
+        V16.3: Applies STRICT execution realism.
         """
         if order.quantity <= 0: return None
         if self.is_blown: return None # No trades if blown
@@ -366,16 +428,29 @@ class BacktestBroker:
         order.ticket = self.ticket_counter
         self.ticket_counter += 1
         
+        # Determine Base Price (Bid)
         if order.entry_price <= 0:
              if self.last_snapshot:
                  order.entry_price = self.last_snapshot.get_price(order.symbol)
         
-        # Spread Simulation
-        pip = 0.01 if "JPY" in order.symbol else 0.0001
-        spread_pips = self.spread_map.get(order.symbol, self.default_spread)
-        slippage_cost = spread_pips * pip
+        # Calculate Spread
+        point = self._get_point_value(order.symbol)
+        spread_pips = self._get_spread_for_symbol(order.symbol)
+        spread_cost = spread_pips * (point * 10)
         
-        order.entry_price = order.entry_price + slippage_cost if order.action == "BUY" else order.entry_price - slippage_cost
+        # EXECUTION REALITY (V16.3):
+        # BUY: Fills at Ask (Bid + Spread)
+        # SELL: Fills at Bid (Bid)
+        
+        if order.action == "BUY":
+            # Buy Limit/Market fills at Ask
+            order.entry_price = order.entry_price + spread_cost
+        else:
+            # Sell Limit/Market fills at Bid
+            # No adjustment needed to entry_price (it's already Bid)
+            # The COST appears on Exit (Buyback at Ask)
+            pass
+            
         order.commission = order.quantity * self.commission_per_lot
         
         self.open_positions.append(order)
@@ -395,7 +470,8 @@ class BacktestBroker:
         raw_diff = (close_price - trade.entry_price)
         if trade.action == "SELL": raw_diff = -raw_diff
         
-        raw_profit = raw_diff * (trade.quantity * 100000)
+        contract_size = self.contract_size if hasattr(self, 'contract_size') else 100000
+        raw_profit = raw_diff * (trade.quantity * contract_size)
         
         # 2. Convert to USD (Dynamic Rate)
         rate = self._get_simulation_conversion_rate(trade.symbol, close_price)
