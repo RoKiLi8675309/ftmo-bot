@@ -5,10 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX V16.4 UPDATE (SURVIVAL PROTOCOL):
-# 1. REMOVED ALPHA BOOST: Deleted hardcoded risk multipliers for specific pairs.
-# 2. RISK CAPS: Strict 0.5% hard cap on "Hot Hand" scaling.
-# 3. MARGIN CLAMP: Preserved logic to prevent "Not Enough Money" errors.
+# PHOENIX V16.22 UPDATE (SESSION GUARD):
+# 1. SESSION CONTROL: Added daily start/end hour enforcement.
+# 2. HARD LIQUIDATION: Triggers close logic 3 hours before NY close.
+# 3. SURVIVAL PROTOCOL: Maintained strict 0.5% risk cap.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -403,8 +403,15 @@ class SessionGuard:
         self.rollover_start = dt_time(23, 50)
         self.rollover_end = dt_time(1, 15)
         
+        # Legacy Friday settings
         self.friday_entry_cutoff_hour = risk_conf.get('friday_entry_cutoff_hour', 16)
-        self.liquidation_hour = risk_conf.get('friday_liquidation_hour_server', 21)
+        self.friday_liquidation_hour = risk_conf.get('friday_liquidation_hour_server', 21)
+
+        # V16.22 SESSION CONTROL
+        session_conf = risk_conf.get('session_control', {})
+        self.session_enabled = session_conf.get('enabled', False)
+        self.start_hour = session_conf.get('start_hour_server', 10)
+        self.liq_hour = session_conf.get('liquidate_hour_server', 21)
 
     def is_trading_allowed(self) -> bool:
         """General market hours check."""
@@ -419,6 +426,15 @@ class SessionGuard:
         if current_time >= self.rollover_start or current_time <= self.rollover_end:
             return False
             
+        # V16.22: Daily Session Enforcement
+        if self.session_enabled:
+            # Block before Start Hour (e.g. 10:00 Server)
+            if now_local.hour < self.start_hour:
+                return False
+            # Block after Liquidation Hour (e.g. 21:00 Server)
+            if now_local.hour >= self.liq_hour:
+                return False
+
         return True
 
     def is_friday_afternoon(self, timestamp: Optional[datetime] = None) -> bool:
@@ -436,11 +452,22 @@ class SessionGuard:
         return False
 
     def should_liquidate(self) -> bool:
+        """
+        Checks if we hit the hard liquidation wall (Daily or Friday).
+        """
         now_local = datetime.now(self.market_tz)
         weekday = now_local.weekday()
         
-        if weekday > 4: return True # Weekend
-        if weekday == 4 and now_local.hour >= self.liquidation_hour: return True
+        # 1. Weekend Guard
+        if weekday > 4: return True 
+        
+        # 2. Friday Hard Close
+        if weekday == 4 and now_local.hour >= self.friday_liquidation_hour: return True
+        
+        # 3. V16.22 Daily Hard Close (3h before NY Close)
+        if self.session_enabled:
+            if now_local.hour >= self.liq_hour:
+                return True
             
         return False
 

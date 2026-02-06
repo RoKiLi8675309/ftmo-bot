@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX V16.4 UPDATE (RESEARCH PARITY - SURVIVAL MODE):
-# 1. REVENGE GUARD: Implemented 60m Cooldown after any loss (Backtest simulation).
-# 2. RISK DISCIPLINE: Removed "Alpha Squad Boost" to match Live Engine.
-# 3. GATES: Relaxed logic to allow Scalping, but strictly capped risk.
+# PHOENIX V16.22 UPDATE (RESEARCH SESSION GUARD):
+# 1. SESSION SIMULATION: Enforces London/NY trading window in backtests.
+# 2. DAILY LIQUIDATION: Simulates the 3h pre-NY-close hard exit.
+# 3. SURVIVAL PROTOCOL: Maintains 0.5% risk cap and cooldown logic.
 # =============================================================================
 import logging
 import sys
@@ -157,7 +157,13 @@ class ResearchStrategy:
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.1)
         
-        # Friday Liquidation
+        # --- V16.22 SESSION CONTROL ---
+        session_conf = self.risk_conf.get('session_control', {})
+        self.session_enabled = session_conf.get('enabled', False)
+        self.start_hour = session_conf.get('start_hour_server', 10)
+        self.liq_hour = session_conf.get('liquidate_hour_server', 21)
+        
+        # Legacy Friday Liquidation (Reinforced)
         self.friday_entry_cutoff = self.risk_conf.get('friday_entry_cutoff_hour', 18)
         self.friday_close_hour = self.risk_conf.get('friday_liquidation_hour_server', 21)
         
@@ -451,11 +457,17 @@ class ResearchStrategy:
         self._manage_trailing_stops(broker, price, dt_ts)
         self._manage_time_stops(broker, dt_ts)
 
-        # --- GAP-PROOF WEEKEND LIQUIDATION (V12.5) ---
+        # --- V16.22 GAP-PROOF LIQUIDATION (SESSION & WEEKEND) ---
         is_weekend_hold = (server_time.weekday() > 4) 
         is_friday_close = (server_time.weekday() == 4 and server_time.hour >= self.friday_close_hour)
+        
+        # Daily Session Liquidation (Hard Close 3h before NY Close)
+        is_daily_session_close = False
+        if self.session_enabled:
+            if server_time.hour >= self.liq_hour:
+                is_daily_session_close = True
 
-        if is_weekend_hold or is_friday_close:
+        if is_weekend_hold or is_friday_close or is_daily_session_close:
             # Force close if we have an open position
             for pos in broker.open_positions:
                 if pos.symbol == self.symbol:
@@ -464,10 +476,15 @@ class ResearchStrategy:
                         pos.quantity, 
                         price, 
                         dt_ts, 
-                        "Weekend/Friday Liquidation"
+                        "Session/Friday Liquidation"
                     )
-            return # Stop processing
+            return # Stop processing (Liquidation takes priority)
         
+        # --- SESSION START GUARD ---
+        # Prevent entries before the London Open (e.g. 10:00 Server)
+        if self.session_enabled and server_time.hour < self.start_hour:
+            return 
+
         # Friday Entry Guard (No new trades after cutoff)
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
             return 

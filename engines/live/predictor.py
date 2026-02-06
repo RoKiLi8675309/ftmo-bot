@@ -6,11 +6,10 @@
 # DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
 # Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier).
 #
-# PHOENIX V16.20 AUDIT FIX (THE HALLUCINATOR CURE):
-# 1. GAP BRIDGING: First live bar after warmup is used ONLY for state alignment,
-#    preventing "Gap Return" shocks from triggering false breakout signals.
-# 2. STATE SEPARATION: Strict reset of price references between History and Live.
-# 3. PYRAMID GUARD: Reinforced "Profit Gate" to prevent adding to losers.
+# PHOENIX V16.22 AUDIT FIX (SESSION GUARD INTEGRATION):
+# 1. SESSION WINDOW: Enforces London/NY trading hours defined in config.
+# 2. SIGNAL BLOCKING: Returns HOLD signals outside valid session times.
+# 3. STATE INTEGRITY: Updates internal state even when trading is blocked.
 # =============================================================================
 import logging
 import pickle
@@ -224,6 +223,12 @@ class MultiAssetPredictor:
             self.server_tz = pytz.timezone(tz_str)
         except Exception:
             self.server_tz = pytz.timezone('Europe/Prague')
+
+        # --- V16.22 SESSION CONTROL CONFIG ---
+        session_conf = risk_conf.get('session_control', {})
+        self.session_enabled = session_conf.get('enabled', False)
+        self.start_hour = session_conf.get('start_hour_server', 10)
+        self.liq_hour = session_conf.get('liquidate_hour_server', 21)
 
         # --- REC 1: Dynamic Gate Scaling State ---
         self.ker_drift_detectors = {s: drift.ADWIN(delta=0.01) for s in symbols}
@@ -806,6 +811,16 @@ class MultiAssetPredictor:
         # FRIDAY GUARD
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
              return Signal(symbol, "HOLD", 0.0, {"reason": "Friday Entry Guard"})
+
+        # --- V16.22 SESSION GUARD (DAILY) ---
+        if self.session_enabled:
+            # 1. Before Session Start
+            if server_time.hour < self.start_hour:
+                return Signal(symbol, "HOLD", 0.0, {"reason": f"Before Session Start ({server_time.hour} < {self.start_hour})"})
+            
+            # 2. After Liquidation Hour
+            if server_time.hour >= self.liq_hour:
+                return Signal(symbol, "HOLD", 0.0, {"reason": f"After Session Close ({server_time.hour} >= {self.liq_hour})"})
 
         # G1: EFFICIENCY (KER) - AGGRESSIVE (V16.3)
         # Reduced floor to 0.001 to catch early GBP moves

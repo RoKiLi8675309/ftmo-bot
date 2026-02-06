@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V16.21 (SINGLE TRADE PROTOCOL)
+# config.yaml – PROJECT PHOENIX V16.22 (SESSION GUARD PROTOCOL)
 # STATUS: LIVE TRADING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# CRITICAL FIXES:
-# 1. SINGLE TRADE MODE: max_open_trades set to 1 to prevent "No Money" errors.
-# 2. RISK DISCIPLINE: Base Risk 0.25%, Scaled 0.5%.
-# 3. COOL-DOWN: 60-minute lockout after any loss.
+# CRITICAL UPDATES (SESSION GUARD):
+# 1. TRADING WINDOW: Restricted to London Open -> 3 Hours before NY Close.
+# 2. HARD LIQUIDATION: Force close all positions at Hour 21 (Server Time).
+# 3. VOLATILITY PROTECTION: Avoids EOD wicks and low liquidity roll-over zones.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -300,6 +300,20 @@ risk_management:
     trail_dist_r: 0.5       # Tight Trail (0.5R) to bank scalps
   
   risk_timezone: "Europe/Prague"
+  
+  # --- SESSION & TIME MANAGEMENT (NEW) ---
+  # Enforces trading only during London & New York sessions.
+  # Hard close 3 hours before NY session end to avoid EOD wicks.
+  # Based on FTMO Server Time (EET):
+  # - London Open (~08:00 UK) ~= 10:00 Server
+  # - NY Close (~17:00 NY) ~= 24:00 Server
+  # - Liquidation Target (14:00 NY) ~= 21:00 Server
+  session_control:
+    enabled: true
+    start_hour_server: 10      # Start Trading (London Open)
+    liquidate_hour_server: 21  # Stop & Close All (3h before NY Close)
+  
+  # Legacy Friday settings (Reinforced by session_control)
   friday_entry_cutoff_hour: 16 # No entries after 16:00
   friday_liquidation_hour_server: 21  
   

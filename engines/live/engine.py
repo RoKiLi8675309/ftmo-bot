@@ -6,13 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX V16.23 AUDIT FIX (REVENGE KILLER):
-# 1. PRIORITY INVERSION: Moved 'Safety Gap' check to the absolute top of 
-#    'on_bar_complete'.
-# 2. IMMEDIATE HALT: If a closure is detected, the loop executes a hard RETURN,
-#    preventing any signal generation in the same tick.
-# 3. EXTENDED GAP: Increased Safety Gap duration to 5 minutes to ensure 
-#    Performance Monitor has ample time to apply the permanent lock.
+# PHOENIX V16.22 UPDATE (SESSION GUARD INTEGRATION):
+# - LIQUIDATION: integrated `session_guard.should_liquidate()` to enforce
+#   the 21:00 Server Time hard close (3h before NY Close).
+# - TRADING WINDOW: Blocks entries outside London/NY hours via `_check_risk_gates`.
 # =============================================================================
 import logging
 import time
@@ -159,9 +156,13 @@ class LiveTradingEngine:
         # Tracks last 30 trades per symbol to calculate SQN
         self.performance_stats = defaultdict(lambda: deque(maxlen=30))
         
+        # V16.24: Server-Authority Stats
+        # We store the "last reset timestamp" to detect day changes
+        self.last_reset_ts = 0.0 
+        
         # V12.31: Daily Circuit Breaker State (Realized Execution)
         # Added 'tickets' set to track unique deal IDs and prevent double counting
-        self.daily_execution_stats = defaultdict(lambda: {'date': None, 'losses': 0, 'pnl': 0.0, 'tickets': set()})
+        self.daily_execution_stats = defaultdict(lambda: {'losses': 0, 'pnl': 0.0, 'tickets': set()})
         
         # V14.0 UNSHACKLED: Increased to 5 to prevent early lockout in Aggressor Mode
         self.max_daily_losses_per_symbol = 5
@@ -183,10 +184,6 @@ class LiveTradingEngine:
         self.is_warm = False
         self.last_corr_update = time.time()
         self.latest_prices = {}
-        
-        # --- V16.20 FIX: BROKER TIME AUTHORITY ---
-        # We track the last known server date from Ticks to prevent local clock drift issues
-        self.last_known_server_date = datetime.now(self.server_tz).date()
         
         # --- V16.4 FIX: INJECT FALLBACK PRICES ---
         # Ensures RiskManager has conversion rates before first tick arrives
@@ -289,90 +286,84 @@ class LiveTradingEngine:
         'No Rate' errors before the first tick arrives.
         """
         defaults = {
-            "NZDUSD": 0.60,
-            "AUDUSD": 0.65,
-            "GBPUSD": 1.25,
-            "EURUSD": 1.08,
-            "USDJPY": 150.0,
-            "USDCAD": 1.35,
-            "USDCHF": 0.90,
-            "AUDJPY": 95.0,
-            "EURJPY": 160.0,
-            "GBPJPY": 190.0
+            "NZDUSD": 0.60, "AUDUSD": 0.65, "GBPUSD": 1.25, "EURUSD": 1.08,
+            "USDJPY": 150.0, "USDCAD": 1.35, "USDCHF": 0.90, "AUDJPY": 95.0,
+            "EURJPY": 160.0, "GBPJPY": 190.0
         }
         for sym, price in defaults.items():
-            # Only inject if not already present (though unlikely on init)
             if sym not in self.latest_prices:
                 self.latest_prices[sym] = price
         
         logger.info(f"💉 Injected {len(defaults)} fallback prices for PnL conversion.")
 
+    def _get_producer_anchor_timestamp(self) -> float:
+        """
+        V16.24 FIX: Polls Redis for the AUTHORITATIVE Midnight Timestamp set by Windows Producer.
+        """
+        try:
+            reset_ts = self.stream_mgr.r.get("risk:last_reset_date")
+            if reset_ts:
+                return float(reset_ts)
+        except:
+            pass
+        
+        # Fallback: Midnight UTC today
+        return datetime.now(pytz.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
     def _restore_daily_state(self):
         """
-        CRITICAL: Replays today's closed trades from Redis to reconstruct Daily PnL and Loss Counts.
-        Prevents the bot from 'forgetting' it hit a daily limit if it restarts mid-day.
-        V12.31: Implements Ticket Deduplication to fix double-counting.
+        CRITICAL: Replays today's closed trades from Redis using the Producer's Timestamp Authority.
         """
-        logger.info(f"{LogSymbols.DATABASE} Restoring Daily Execution State...")
+        logger.info(f"{LogSymbols.DATABASE} Restoring Daily Execution State (Server Time Sync)...")
         try:
             stream_key = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
             
-            # Calculate start of day timestamp (approximate to cover timezones)
-            now = datetime.now(self.server_tz)
-            start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            start_ts_ms = int(start_of_day.timestamp() * 1000)
+            # 1. Get Authoritative Start Time
+            self.last_reset_ts = self._get_producer_anchor_timestamp()
             
-            # Fetch range from start of day until now
-            # AUDIT WARNING: Redis MaxLen may truncate history. Ideally this is a separate persistent stream.
-            messages = self.stream_mgr.r.xrange(stream_key, min=start_ts_ms, max='+')
+            # Fetch range from the Anchor point
+            start_id = int(self.last_reset_ts * 1000)
+            messages = self.stream_mgr.r.xrange(stream_key, min=start_id, max='+')
             
-            # Diagnostic for Truncation
-            if len(messages) >= 990: # Near default 1000 limit
-                logger.warning(f"⚠️ RESTORATION WARNING: Stream {stream_key} is near capacity. Early day trades may be lost.")
-
             restored_count = 0
             with self.stats_lock:
-                current_date = now.date()
+                # Clear stats on restore to ensure clean slate
+                self.daily_execution_stats = defaultdict(lambda: {'losses': 0, 'pnl': 0.0, 'tickets': set()})
                 
                 for msg_id, data in messages:
                     symbol = data.get('symbol')
                     net_pnl = float(data.get('net_pnl', 0.0))
                     timestamp_raw = float(data.get('timestamp', 0))
-                    ticket = str(data.get('ticket', '')) # Ticket for dedup
+                    ticket = str(data.get('ticket', '')) 
                     
-                    # Verify timestamp matches today (Server Time)
-                    trade_dt = datetime.fromtimestamp(timestamp_raw, tz=self.server_tz)
-                    if trade_dt.date() != current_date:
-                        continue # Skip old trades if range was loose
-                        
-                    # Initialize if needed
-                    if self.daily_execution_stats[symbol]['date'] != current_date:
-                        self.daily_execution_stats[symbol] = {'date': current_date, 'losses': 0, 'pnl': 0.0, 'tickets': set()}
-                    
-                    # --- DEDUPLICATION CHECK ---
-                    if ticket and ticket in self.daily_execution_stats[symbol]['tickets']:
+                    # STRICT FILTER: Only count trades after the anchor
+                    if timestamp_raw < self.last_reset_ts:
                         continue
-
+                        
                     # Apply Logic
                     self.daily_execution_stats[symbol]['pnl'] += net_pnl
-                    if net_pnl < 0:
-                        self.daily_execution_stats[symbol]['losses'] += 1
                     
-                    # Mark ticket as seen
+                    # Deduplication
+                    if ticket and ticket in self.daily_execution_stats[symbol]['tickets']:
+                        continue
+                    
                     if ticket:
                         self.daily_execution_stats[symbol]['tickets'].add(ticket)
+                    
+                    if net_pnl < 0:
+                        self.daily_execution_stats[symbol]['losses'] += 1
                     
                     # Also restore SQN buffer
                     self.performance_stats[symbol].append(net_pnl)
                     restored_count += 1
             
             if restored_count > 0:
-                logger.info(f"{LogSymbols.SUCCESS} Restored {restored_count} unique trades for today.")
+                logger.info(f"{LogSymbols.SUCCESS} Restored {restored_count} trades since Anchor ({self.last_reset_ts}).")
                 for sym, stats in self.daily_execution_stats.items():
                     if stats['losses'] > 0 or stats['pnl'] != 0:
                         logger.info(f"   -> {sym}: PnL ${stats['pnl']:.2f} | Losses: {stats['losses']}")
             else:
-                logger.info(f"{LogSymbols.INFO} No trades found for today (Fresh Start).")
+                logger.info(f"{LogSymbols.INFO} No trades found for current session (Anchor: {self.last_reset_ts}).")
                 
         except Exception as e:
             logger.error(f"{LogSymbols.ERROR} Failed to restore state: {e}")
@@ -380,11 +371,8 @@ class LiveTradingEngine:
     def _calendar_sync_loop(self):
         """
         Background thread to fetch Economic Calendar and update Compliance Guard.
-        Runs every hour to keep blackout windows fresh.
         """
         logger.info(f"{LogSymbols.NEWS} Economic Calendar Sync Thread Started.")
-        
-        # Initial fetch attempt
         try:
             events = self.news_monitor.fetch_events()
             if events:
@@ -394,7 +382,7 @@ class LiveTradingEngine:
             logger.warning(f"Initial Calendar Fetch Failed: {e}")
 
         while not self.shutdown_flag:
-            time.sleep(3600) # Sleep first, then update
+            time.sleep(3600) 
             try:
                 events = self.news_monitor.fetch_events()
                 if events:
@@ -437,11 +425,19 @@ class LiveTradingEngine:
         logger.info(f"{LogSymbols.INFO} Performance Monitor (SQN & Circuit Breaker) Thread Started.")
         stream_key = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
         
-        # Start reading from current time ($) to avoid re-processing old trades (handled by restore)
+        # Start reading from current time ($)
         last_id = '$' 
         
         while not self.shutdown_flag:
             try:
+                # Check if Day has changed (Anchor Update)
+                current_anchor = self._get_producer_anchor_timestamp()
+                if current_anchor > self.last_reset_ts:
+                    with self.stats_lock:
+                        logger.info(f"⚓ DAILY RESET DETECTED in Monitor (New Anchor: {current_anchor})")
+                        self.last_reset_ts = current_anchor
+                        self.daily_execution_stats.clear()
+                
                 # Block for 1 second waiting for new closed trades
                 response = self.stream_mgr.r.xread({stream_key: last_id}, count=10, block=1000)
                 
@@ -451,7 +447,12 @@ class LiveTradingEngine:
                             last_id = msg_id
                             symbol = data.get('symbol')
                             net_pnl = float(data.get('net_pnl', 0.0))
-                            ticket = str(data.get('ticket', '')) # Ticket for dedup
+                            ticket = str(data.get('ticket', ''))
+                            ts_raw = float(data.get('timestamp', 0))
+                            
+                            # Filter old trades (Safety)
+                            if ts_raw < self.last_reset_ts:
+                                continue
                             
                             if symbol:
                                 with self.stats_lock:
@@ -459,21 +460,12 @@ class LiveTradingEngine:
                                     self.performance_stats[symbol].append(net_pnl)
                                     
                                     # 2. Circuit Breaker & Revenge Guard
-                                    # V16.20: Use known server date instead of local time
-                                    now_server_date = self.last_known_server_date
-                                    
-                                    # Reset if new day
-                                    if self.daily_execution_stats[symbol]['date'] != now_server_date:
-                                        self.daily_execution_stats[symbol] = {'date': now_server_date, 'losses': 0, 'pnl': 0.0, 'tickets': set()}
-                                    
-                                    # --- DEDUPLICATION CHECK ---
+                                    # Deduplication Check
                                     if ticket and ticket in self.daily_execution_stats[symbol]['tickets']:
-                                        logger.warning(f"Duplicate Trade Ignored in Monitor: {ticket}")
                                         continue
 
                                     self.daily_execution_stats[symbol]['pnl'] += net_pnl
                                     
-                                    # Mark ticket as seen
                                     if ticket:
                                         self.daily_execution_stats[symbol]['tickets'].add(ticket)
                                     
@@ -482,8 +474,6 @@ class LiveTradingEngine:
                                         logger.info(f"📉 LOSS DETECTED {symbol}: ${net_pnl:.2f} | Daily Losses: {self.daily_execution_stats[symbol]['losses']}")
                                         
                                         # V16.4 FIX: REVENGE TRADING GUARD (PENALTY BOX)
-                                        # Lock symbol out for 60 minutes (configurable)
-                                        # NOTE: This overwrites any temporary "Safety Gap" penalty
                                         cooldown = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 60)
                                         self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=cooldown)
                                         logger.warning(f"🚫 {symbol} SENT TO PENALTY BOX for {cooldown}m (Revenge Guard)")
@@ -517,18 +507,18 @@ class LiveTradingEngine:
         Checks if the symbol is locked out for the day due to losses.
         Returns TRUE if trading should be BLOCKED.
         """
-        # V16.20 FIX: Use the authoritative Server Date from Producer ticks
-        now_server_date = self.last_known_server_date
+        # Ensure we are using the latest Anchor
+        current_anchor = self._get_producer_anchor_timestamp()
         
         with self.stats_lock:
-            stats = self.daily_execution_stats[symbol]
-            
-            # Auto-reset if accessed on a new day before trade loop hits it
-            if stats['date'] != now_server_date:
-                logger.info(f"⚓ DAILY RESET for {symbol} (Server Date: {now_server_date})")
-                self.daily_execution_stats[symbol] = {'date': now_server_date, 'losses': 0, 'pnl': 0.0, 'tickets': set()}
+            # Auto-reset if accessed on a new day (if loop hasn't caught it yet)
+            if current_anchor > self.last_reset_ts:
+                logger.info(f"⚓ LAZY DAILY RESET for {symbol} (Anchor: {current_anchor})")
+                self.last_reset_ts = current_anchor
+                self.daily_execution_stats.clear()
                 return False
                 
+            stats = self.daily_execution_stats[symbol]
             losses = stats['losses']
             pnl = stats['pnl']
 
@@ -573,6 +563,7 @@ class LiveTradingEngine:
         Enforces:
         1. 8h Time Stop (Hard Exit) - Reduced from 24h for Scalping.
         2. 0.5R Trailing Stop.
+        3. V16.22 UPDATE: Daily Session Liquidation (Redundancy Check).
         """
         logger.info(f"{LogSymbols.INFO} Active Position Manager Started (Time-Stop: 8h, Trail: 0.5R).")
         while not self.shutdown_flag:
@@ -585,32 +576,42 @@ class LiveTradingEngine:
                 now_utc = datetime.now(pytz.utc)
                 hard_stop_seconds = 28800 # 8 Hours (Intraday Focus)
 
+                # V16.22 SESSION CHECK (Redundancy)
+                # If the main loop missed the liquidation time, we catch it here.
+                session_liquidation = self.session_guard.should_liquidate()
+
                 for sym, pos in positions.items():
-                    # --- TIME BASED EXITS ---
-                    entry_ts = float(pos.get('time', 0))
-                    if entry_ts > 0:
-                        entry_dt = datetime.fromtimestamp(entry_ts, pytz.utc)
-                        duration = (now_utc - entry_dt).total_seconds()
+                    exit_reason = None
+
+                    # --- 1. SESSION HARD CLOSE ---
+                    if session_liquidation:
+                        exit_reason = "Session End Guard (3h pre-close)"
+                        logger.warning(f"⌛ SESSION LIQUIDATION: {sym} closed by background manager.")
+
+                    # --- 2. TIME BASED EXITS ---
+                    if not exit_reason:
+                        entry_ts = float(pos.get('time', 0))
+                        if entry_ts > 0:
+                            entry_dt = datetime.fromtimestamp(entry_ts, pytz.utc)
+                            duration = (now_utc - entry_dt).total_seconds()
+                            
+                            # Hard Time Stop (8h)
+                            if duration > hard_stop_seconds:
+                                exit_reason = "Time Stop (8h)"
+                                logger.warning(f"⌛ TIME STOP: {sym} held for {duration/3600:.1f}h. Closing.")
                         
-                        exit_reason = None
-                        
-                        # 1. Hard Time Stop (8h)
-                        if duration > hard_stop_seconds:
-                            exit_reason = "Time Stop (8h)"
-                            logger.warning(f"⌛ TIME STOP: {sym} held for {duration/3600:.1f}h. Closing.")
-                        
-                        if exit_reason:
-                            close_intent = Trade(
-                                symbol=sym, 
-                                action="CLOSE_ALL", 
-                                volume=0.0, 
-                                entry_price=0.0, 
-                                stop_loss=0.0, 
-                                take_profit=0.0, 
-                                comment=exit_reason
-                            )
-                            self.dispatcher.send_order(close_intent, 0.0)
-                            continue
+                    if exit_reason:
+                        close_intent = Trade(
+                            symbol=sym, 
+                            action="CLOSE_ALL", 
+                            volume=0.0, 
+                            entry_price=0.0, 
+                            stop_loss=0.0, 
+                            take_profit=0.0, 
+                            comment=exit_reason
+                        )
+                        self.dispatcher.send_order(close_intent, 0.0)
+                        continue
 
                     # --- TRAILING STOP LOGIC (0.5R) ---
                     current_price = self.latest_prices.get(sym, 0.0)
@@ -725,14 +726,6 @@ class LiveTradingEngine:
             if tick_ts > 100_000_000_000:
                 tick_ts /= 1000.0
             
-            # --- V16.20 FIX: UPDATE BROKER TIME AUTHORITY ---
-            try:
-                # Update our idea of "Server Date" from the tick itself
-                # This keeps the Circuit Breaker synced with the Producer's timezone
-                tick_dt = datetime.fromtimestamp(tick_ts, pytz.utc).astimezone(self.server_tz)
-                self.last_known_server_date = tick_dt.date()
-            except: pass
-
             last_ts = self.processed_ticks.get(symbol, 0.0)
             
             # AUDIT FIX: Relaxed Deduplication (< instead of <=)
@@ -838,24 +831,14 @@ class LiveTradingEngine:
         except Exception as e:
             logger.error(f"Portfolio Update Error: {e}")
         
-        # --- V12.5 GAP-PROOF WEEKEND LIQUIDATION ---
-        if bar.timestamp.tzinfo is None:
-            bar_ts_aware = bar.timestamp.replace(tzinfo=pytz.utc)
-        else:
-            bar_ts_aware = bar.timestamp
-            
-        server_time = bar_ts_aware.astimezone(self.server_tz)
-        
-        # Check for Weekend or Late Friday
-        is_weekend_hold = (server_time.weekday() > 4) # Sat=5, Sun=6
-        
-        # Get Friday Close Hour from Risk config (default 21)
-        friday_close_hour = CONFIG.get('risk_management', {}).get('friday_liquidation_hour_server', 21)
-        is_friday_close = (server_time.weekday() == 4 and server_time.hour >= friday_close_hour)
-
-        if is_weekend_hold or is_friday_close:
+        # --- V16.22 SESSION GUARD & WEEKEND LIQUIDATION ---
+        # This checks:
+        # A. Is it Weekend?
+        # B. Is it Friday Close time?
+        # C. Is it Daily Session Liquidation time (3h before NY Close)?
+        if self.session_guard.should_liquidate():
             if not self.liquidation_triggered_map[symbol]:
-                logger.warning(f"{LogSymbols.CLOSE} WEEKEND/FRIDAY GAP GUARD: Closing {symbol}.")
+                logger.warning(f"{LogSymbols.CLOSE} SESSION END GUARD: Closing {symbol} (Hard Close 3h before NY End).")
                 close_intent = Trade(
                     symbol=symbol, 
                     action="CLOSE_ALL", 
@@ -863,14 +846,14 @@ class LiveTradingEngine:
                     entry_price=0.0, 
                     stop_loss=0.0, 
                     take_profit=0.0, 
-                    comment="Gap-Proof Liquidation"
+                    comment="Session/Gap Liquidation"
                 )
                 self.dispatcher.send_order(close_intent, 0.0)
                 self.liquidation_triggered_map[symbol] = True
-            return # Stop processing
+            return # Stop processing signals
         else:
-            # Reset trigger if we are back in safe hours
-            if self.liquidation_triggered_map[symbol]:
+            # Reset trigger if we are back in safe hours (next day)
+            if self.liquidation_triggered_map[symbol] and self.session_guard.is_trading_allowed():
                 self.liquidation_triggered_map[symbol] = False
         
         # 2. Prepare Context
@@ -882,17 +865,46 @@ class LiveTradingEngine:
         self._reconcile_pending_orders(open_positions)
 
         # =====================================================================
-        # B. MAX TRADES GUARD
+        # B. MAX TRADES GUARD (RACE CONDITION FIX - V16.25)
         # =====================================================================
         max_open_trades = CONFIG['risk_management'].get('max_open_trades', 1)
-        current_open_count = len(open_positions)
+        
+        # V16.25: Count In-Flight Orders (Strict Logic)
+        # We must count ANY pending order that was dispatched recently (<60s)
+        # as a "reserved slot" to prevent firing a second trade while the first is in transit.
+        pending_count = 0
+        now_ts = time.time()
+        
+        symbol_has_pending = False
+        
+        with self.lock:
+            # Iterate copy to be safe
+            for oid, p_data in list(self.pending_orders.items()):
+                # Clean up ancient orders (TTL 60s)
+                if now_ts - p_data.get('timestamp', 0) > 60:
+                    del self.pending_orders[oid]
+                    continue
+                
+                # Count valid pending orders
+                pending_count += 1
+                if p_data.get('symbol') == symbol:
+                    symbol_has_pending = True
 
-        if current_open_count >= max_open_trades:
-            # Only allow processing if this symbol is already open (management)
+        total_utilization = len(open_positions) + pending_count
+
+        # V16.25: BLOCK if Limit Reached
+        if total_utilization >= max_open_trades:
+            # Only allow processing if this symbol is already OPEN (for management/exit)
+            # If it's pending, we also block to avoid duplicate signals for same symbol
             if symbol not in open_positions:
                 if self.ticks_processed % 100 == 0:
-                    logger.info(f"🛑 MAX TRADES LIMIT ({current_open_count}/{max_open_trades}). Skipping {symbol}.")
+                    logger.info(f"🛑 MAX TRADES LIMIT ({total_utilization}/{max_open_trades}) [Open:{len(open_positions)} Pending:{pending_count}]. Skipping {symbol}.")
                 return
+        
+        # V16.25: BLOCK if symbol has pending order (Machine Gun Protection)
+        if symbol_has_pending:
+            logger.info(f"⚠️ Anti-Machine Gun: {symbol} has pending order. Skipping.")
+            return
         # =====================================================================
         
         context_data = {
@@ -933,28 +945,6 @@ class LiveTradingEngine:
         logger.info(f"🛡️ Checking Risk Gates for {symbol}...")
         if not self._check_risk_gates(symbol):
             logger.warning(f"🚫 Risk Gate BLOCKED {symbol}")
-            return
-
-        # --- V12.24 ANTI-STACKING GUARD ---
-        # --- V16.5 FIX: SELF-HEALING ANTI-STACKING ---
-        logger.info(f"🔄 Checking Anti-Stacking for {symbol}...")
-        is_pending_execution = False
-        now_ts = time.time()
-        
-        with self.lock:
-            for oid, p_data in list(self.pending_orders.items()):
-                # Clean up stale orders > 60s
-                if now_ts - p_data.get('timestamp', 0) > 60:
-                    logger.warning(f"🧹 Clearing Stale Pending Order: {oid} ({symbol})")
-                    del self.pending_orders[oid]
-                    continue
-                    
-                if p_data.get('symbol') == symbol:
-                    is_pending_execution = True
-                    logger.warning(f"⚠️ Anti-Stacking: Order {oid} pending for {symbol}. Skipping.")
-                    break
-        
-        if is_pending_execution:
             return
 
         # 6. Calculate Size (Fixed Risk Mode)
@@ -1145,6 +1135,7 @@ class LiveTradingEngine:
         """
         Runs the gauntlet of safety checks.
         V16.11: Includes Margin Level Guard.
+        V16.22: Includes Session Window Guard.
         """
         # 1. Midnight Freeze Check
         if self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['midnight_freeze']):
@@ -1163,12 +1154,14 @@ class LiveTradingEngine:
             logger.warning(f"{LogSymbols.LOCK} FTMO Guard Halted: {log_msg}")
             return False
 
-        # 4. General Market Hours
+        # 4. General Market Hours & SESSION WINDOW (V16.22)
         if not self.session_guard.is_trading_allowed():
+            logger.warning(f"{LogSymbols.LOCK} Session Guard Block: Outside Allowed Window (London/NY).")
             return False
             
         # 5. Friday Entry Guard (No new trades after 16:00)
         if self.session_guard.is_friday_afternoon():
+            logger.warning(f"{LogSymbols.LOCK} Friday Guard Block: No new trades allowed late Friday.")
             return False
 
         # 6. Penalty Box (Correlation/Volatility penalty OR Revenge Guard)
