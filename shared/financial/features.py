@@ -5,7 +5,7 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 # 
-# PHOENIX V16.20 AUDIT FIX (THE MATH BREAKER CURE):
+# PHOENIX V16.4.2 AUDIT FIX (MATH STABILITY):
 # 1. NUMBA STABILITY: Replaced 'np.linalg.lstsq' with explicit linear regression
 #    in 'calculate_hurst'. This fixes the "Tuple vs Array" return crash across 
 #    different Numpy versions.
@@ -1259,8 +1259,9 @@ class VolatilityMonitor:
 def calculate_hurst(ts):
     """
     Calculates the Hurst Exponent using Numba-optimized standard deviation analysis.
-    V16.20 FIX: Uses explicit manual linear regression (O(N)) to replace 
+    V16.4.2 FIX: Uses explicit manual linear regression (O(N)) to replace 
     np.linalg.lstsq, which is unstable across Numpy versions in Numba.
+    This prevents the "Fallback to object mode" warning and ensures high performance.
     """
     n = len(ts)
     if n < 20: return 0.5
@@ -1268,13 +1269,14 @@ def calculate_hurst(ts):
     # 1. Variance Check (Math Guard)
     if np.std(ts) < 1e-9: return 0.5
     
+    # Prepare lags (2..19)
+    # Explicit float64 casting for type stability in JIT
     lags = np.arange(2, 20, dtype=np.float64)
     tau = np.zeros(len(lags), dtype=np.float64)
     
     for i in range(len(lags)):
         lag = int(lags[i])
-        # Manually compute diff to avoid creation of large arrays if possible, 
-        # but here slicing is cleaner.
+        # Calculate diffs for this lag
         diff = ts[lag:] - ts[:-lag]
         std_diff = np.std(diff)
         
@@ -1292,6 +1294,7 @@ def calculate_hurst(ts):
     # 2. MANUAL LINEAR REGRESSION (Least Squares)
     # y = mx + c
     # m = (N * sum(xy) - sum(x) * sum(y)) / (N * sum(x^2) - (sum(x))^2)
+    # This replaces np.polyfit / np.linalg.lstsq
     
     N = float(len(lags))
     sum_x = np.sum(log_lags)

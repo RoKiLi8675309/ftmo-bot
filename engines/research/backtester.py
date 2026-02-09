@@ -6,17 +6,17 @@
 # DESCRIPTION: Event-Driven Backtesting Broker. Simulates execution, spread,
 # commissions, and PnL tracking for strategy validation.
 #
-# PHOENIX V16.3 REALITY PATCH:
-# 1. DYNAMIC SPREAD MAPPING: Strictly enforces 'forensic_audit' spreads (e.g., GBPNZD=8.5).
-# 2. EXECUTION REALISM: BUYs fill at Ask, SELLs fill at Bid.
-# 3. EXIT REALISM: SELLs exit at Ask. SL/TP checked against Spread-adjusted prices.
+# PHOENIX V16.4.1 AUDIT FIX (CALIBRATION PARITY):
+# 1. DATA PARITY: 'process_data_into_bars' now calibrates on a 30-day window
+#    (matching Live Engine) instead of the full history to prevent Lookahead Bias.
+# 2. REALITY CHECK: Retained V16.3 strict spread and execution logic.
 # =============================================================================
 from __future__ import annotations
 import pandas as pd
 import numpy as np
 import logging
 from collections import deque
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Generator, Any
 import pytz
@@ -25,6 +25,7 @@ import pytz
 from shared.financial.risk import RiskManager
 from shared.core.config import CONFIG
 from shared.core.logging_setup import LogSymbols
+from shared.data import load_real_data, AdaptiveImbalanceBarGenerator
 
 # Setup Logger
 logger = logging.getLogger("Backtester")
@@ -620,3 +621,139 @@ class BacktestBroker:
 
     def get_equity_curve(self) -> pd.DataFrame:
         return pd.DataFrame(self.equity_curve, columns=['time', 'equity'])
+
+def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
+    """
+    Helper to Load Ticks -> Aggregate to Tick Imbalance Bars (TIBs) -> Return Clean DataFrame.
+    
+    AUDIT FIX (V16.4.1): CALIBRATION PARITY
+    Modified to prevent Lookahead Bias. The volume threshold is now calibrated
+    using ONLY the first 30 days of the loaded data, matching the Live Engine's
+    behavior (which looks back 30 days). Previously, it scanned the entire dataset.
+    """
+    # 1. Load Massive Amount of Ticks
+    raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2)
+    
+    if raw_ticks.empty:
+        return pd.DataFrame()
+
+    # 2. V10.1 AGGREGATION: ADAPTIVE IMBALANCE BARS WITH AUTO-CALIBRATION
+    config_threshold = CONFIG['data'].get('volume_bar_threshold', 10) 
+    alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
+    
+    # --- AUTO-CALIBRATION LOOP (AUDIT FIX) ---
+    # We restrict the calibration data to the first 30 days to avoid lookahead bias.
+    first_timestamp = raw_ticks.index.min()
+    calibration_cutoff = first_timestamp + timedelta(days=30)
+    
+    calibration_df = raw_ticks[raw_ticks.index < calibration_cutoff]
+    
+    if calibration_df.empty:
+        # Fallback if data is less than 30 days
+        calibration_df = raw_ticks
+        
+    current_threshold = config_threshold
+    min_bars_needed = 500
+    attempts = 0
+    max_attempts = 4
+    
+    final_threshold = config_threshold # Default
+    
+    logger.info(f"🔎 Calibrating {symbol} on first {len(calibration_df)} ticks (30 Days)...")
+
+    while attempts < max_attempts:
+        gen = AdaptiveImbalanceBarGenerator(
+            symbol=symbol,
+            initial_threshold=current_threshold,
+            alpha=alpha
+        )
+        
+        bar_count = 0
+        # Iterate through calibration subset efficiently
+        for row in calibration_df.itertuples():
+            price = getattr(row, 'price', getattr(row, 'close', None))
+            vol = getattr(row, 'volume', 1.0)
+            
+            ts = getattr(row, 'Index', getattr(row, 'time', None))
+            if isinstance(ts, (datetime, pd.Timestamp)):
+                ts_val = ts.timestamp()
+            else:
+                ts_val = float(ts)
+                
+            if price is None: continue
+
+            # Synthetic Flow for Calibration (Same as production logic)
+            b_vol = 0.0
+            s_vol = 0.0
+            
+            bar = gen.process_tick(price, vol, ts_val, b_vol, s_vol)
+            if bar:
+                bar_count += 1
+        
+        if bar_count >= min_bars_needed:
+            final_threshold = current_threshold
+            if attempts > 0:
+                logger.info(f"✅ {symbol}: Auto-Calibrated Threshold to {final_threshold} (Generated {bar_count} bars in 30 days)")
+            break
+        else:
+            # Not enough bars, lower threshold
+            attempts += 1
+            new_threshold = max(5.0, current_threshold * 0.5) # Lower limit
+            logger.warning(f"⚠️ {symbol}: Insufficient bars ({bar_count}). Retrying with threshold {new_threshold}...")
+            current_threshold = new_threshold
+            final_threshold = current_threshold
+
+    # --- PRODUCTION GENERATION ---
+    # Now process the FULL dataset using the calibrated threshold as the starting point.
+    # The generator will adapt from here (EWMA) just like Live.
+    gen = AdaptiveImbalanceBarGenerator(
+        symbol=symbol,
+        initial_threshold=final_threshold,
+        alpha=alpha
+    )
+    
+    bars_list = []
+    
+    for row in raw_ticks.itertuples():
+        price = getattr(row, 'price', getattr(row, 'close', None))
+        vol = getattr(row, 'volume', 1.0)
+        
+        ts = getattr(row, 'Index', getattr(row, 'time', None))
+        if isinstance(ts, (datetime, pd.Timestamp)):
+            ts_val = ts.timestamp()
+        else:
+            ts_val = float(ts)
+            
+        b_vol = 0.0
+        s_vol = 0.0
+        
+        if price is None: continue
+
+        bar = gen.process_tick(price, vol, ts_val, b_vol, s_vol)
+        
+        if bar:
+            bars_list.append({
+                'timestamp': bar.timestamp,
+                'open': bar.open,
+                'high': bar.high,
+                'low': bar.low,
+                'close': bar.close,
+                'volume': bar.volume,
+                'vwap': bar.vwap,
+                'tick_count': bar.tick_count,
+                'buy_vol': bar.buy_vol,
+                'sell_vol': bar.sell_vol
+            })
+
+    if not bars_list:
+        logger.warning(f"❌ {symbol}: Failed to generate bars from full dataset.")
+        return pd.DataFrame()
+
+    # 3. Convert to DataFrame
+    df_bars = pd.DataFrame(bars_list)
+    
+    # 4. Set Index to Datetime for Snapshot compatibility
+    df_bars['time'] = pd.to_datetime(df_bars['timestamp'], unit='s', utc=True)
+    df_bars.set_index('time', inplace=True, drop=False)
+    
+    return df_bars

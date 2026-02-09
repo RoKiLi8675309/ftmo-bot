@@ -6,10 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX V16.22 UPDATE (SESSION GUARD INTEGRATION):
-# - LIQUIDATION: integrated `session_guard.should_liquidate()` to enforce
-#   the 21:00 Server Time hard close (3h before NY Close).
-# - TRADING WINDOW: Blocks entries outside London/NY hours via `_check_risk_gates`.
+# PHOENIX V16.4.1 AUDIT FIX (REVENGE AMNESIA PATCH):
+# - RESTORE STATE: Added `_restore_penalty_box_state` to re-apply cooldowns 
+#   after a restart/crash by scanning recent Redis trade history.
+# - SESSION GUARD: Preserved V16.22 hard liquidation logic.
 # =============================================================================
 import logging
 import time
@@ -20,7 +20,7 @@ import sys
 import numpy as np
 import math
 import pytz
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from collections import defaultdict, deque
 from typing import Any, Optional, Dict, List, Set
 
@@ -176,6 +176,8 @@ class LiveTradingEngine:
 
         # --- STATE RESTORATION (CRITICAL) ---
         self._restore_daily_state()
+        # V16.4.1: Restore Penalty Box to prevent Revenge Trading after restart
+        self._restore_penalty_box_state()
 
         self.perf_thread = threading.Thread(target=self.fetch_performance_loop, daemon=True)
         self.perf_thread.start()
@@ -367,6 +369,50 @@ class LiveTradingEngine:
                 
         except Exception as e:
             logger.error(f"{LogSymbols.ERROR} Failed to restore state: {e}")
+
+    def _restore_penalty_box_state(self):
+        """
+        V16.4.1 AUDIT FIX: REVENGE AMNESIA PATCH.
+        Restores Penalty Box state by scanning recent closed trades from Redis.
+        Prevents "Revenge Trading" if the bot restarts immediately after a loss.
+        """
+        logger.info(f"{LogSymbols.DATABASE} Restoring Penalty Box State (Revenge Guard)...")
+        cooldown_mins = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 60)
+        
+        # Look back slightly longer than cooldown to be safe
+        now_ts = datetime.now(timezone.utc).timestamp()
+        start_ts = now_ts - (cooldown_mins * 60 + 600) # Buffer 10 mins
+        start_id = int(start_ts * 1000)
+        
+        stream_key = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
+        
+        try:
+            # Fetch recent trades
+            messages = self.stream_mgr.r.xrange(stream_key, min=start_id, max='+')
+            
+            restored_count = 0
+            
+            for _, data in messages:
+                symbol = data.get('symbol')
+                net_pnl = float(data.get('net_pnl', 0.0))
+                close_ts = float(data.get('timestamp', 0.0))
+                
+                # Check if it was a loss
+                if net_pnl < 0:
+                    expiry = close_ts + (cooldown_mins * 60)
+                    if expiry > now_ts:
+                        # Trade implies active penalty
+                        remaining = (expiry - now_ts) / 60.0
+                        if remaining > 0:
+                            self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=int(remaining) + 1)
+                            logger.warning(f"🚫 RESTORED PENALTY: {symbol} (Loss ${net_pnl:.2f}) -> Locked for {remaining:.1f}m")
+                            restored_count += 1
+            
+            if restored_count == 0:
+                logger.info("✅ No active penalties found in history.")
+                
+        except Exception as e:
+            logger.error(f"Failed to restore penalty box: {e}")
 
     def _calendar_sync_loop(self):
         """
