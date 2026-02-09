@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
 # DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
 # 
-# PHOENIX V16.4 UPDATE (SURVIVAL TRAINING PROTOCOL):
-# 1. RISK SPACE: Restricted optimization to [0.25%, 0.50%] to prevent overfitting risk.
-# 2. SIGNIFICANCE: Enforces min_trades from config (40) to filter luck.
-# 3. ALIGNMENT: Ensures optimization objective matches the new "Survival First" goal.
+# PHOENIX V16.5 UPDATE (AGGRESSOR ALIGNMENT):
+# 1. DYNAMIC RISK: Removed hardcoded "Survival" risk limits (0.25%).
+#    Now dynamically fetches 'risk_per_trade_options' from config to support
+#    Aggressor sizing (0.5% - 1.0%) during optimization.
 # =============================================================================
 import os
 import sys
@@ -148,12 +148,26 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
     
     # --- AUTO-CALIBRATION LOOP ---
+    # We restrict the calibration data to the first 30 days to avoid lookahead bias.
+    first_timestamp = raw_ticks.index.min()
+    calibration_cutoff = first_timestamp + timedelta(days=30)
+    
+    calibration_df = raw_ticks[raw_ticks.index < calibration_cutoff]
+    
+    if calibration_df.empty:
+        # Fallback if data is less than 30 days
+        calibration_df = raw_ticks
+        
     current_threshold = config_threshold
-    bars_list = []
     min_bars_needed = 500
     attempts = 0
     max_attempts = 4
     
+    final_threshold = config_threshold # Default
+    
+    # Only log calibration if verbose logging needed, else keep clean
+    # log.info(f"🔎 Calibrating {symbol} on first {len(calibration_df)} ticks (30 Days)...")
+
     while attempts < max_attempts:
         gen = AdaptiveImbalanceBarGenerator(
             symbol=symbol,
@@ -161,55 +175,83 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
             alpha=alpha
         )
         
-        temp_bars = []
-        # Iterate through ticks efficiently
-        for row in raw_ticks.itertuples():
+        bar_count = 0
+        # Iterate through calibration subset efficiently
+        for row in calibration_df.itertuples():
             price = getattr(row, 'price', getattr(row, 'close', None))
             vol = getattr(row, 'volume', 1.0)
             
-            # Handle timestamp
             ts = getattr(row, 'Index', getattr(row, 'time', None))
             if isinstance(ts, (datetime, pd.Timestamp)):
                 ts_val = ts.timestamp()
             else:
                 ts_val = float(ts)
                 
-            # L2 Data
+            if price is None: continue
+
+            # Synthetic Flow for Calibration (Same as production logic)
             b_vol = 0.0
             s_vol = 0.0
             
-            if price is None: continue
-
             bar = gen.process_tick(price, vol, ts_val, b_vol, s_vol)
-            
             if bar:
-                temp_bars.append({
-                    'timestamp': bar.timestamp,
-                    'open': bar.open,
-                    'high': bar.high,
-                    'low': bar.low,
-                    'close': bar.close,
-                    'volume': bar.volume,
-                    'vwap': bar.vwap,
-                    'tick_count': bar.tick_count,
-                    'buy_vol': bar.buy_vol,
-                    'sell_vol': bar.sell_vol
-                })
+                bar_count += 1
         
-        if len(temp_bars) >= min_bars_needed:
-            bars_list = temp_bars
-            if attempts > 0:
-                log.info(f"✅ {symbol}: Auto-Calibrated Threshold to {current_threshold} (Generated {len(bars_list)} bars)")
+        if bar_count >= min_bars_needed:
+            final_threshold = current_threshold
+            # log.info(f"✅ {symbol}: Auto-Calibrated Threshold to {final_threshold} (Generated {bar_count} bars in 30 days)")
             break
         else:
             # Not enough bars, lower threshold
             attempts += 1
             new_threshold = max(5.0, current_threshold * 0.5) # Lower limit
-            log.warning(f"⚠️ {symbol}: Insufficient bars ({len(temp_bars)}). Retrying with threshold {new_threshold}...")
+            # log.warning(f"⚠️ {symbol}: Insufficient bars ({bar_count}). Retrying with threshold {new_threshold}...")
             current_threshold = new_threshold
+            final_threshold = current_threshold
+
+    # --- PRODUCTION GENERATION ---
+    # Now process the FULL dataset using the calibrated threshold as the starting point.
+    gen = AdaptiveImbalanceBarGenerator(
+        symbol=symbol,
+        initial_threshold=final_threshold,
+        alpha=alpha
+    )
+    
+    bars_list = []
+    
+    for row in raw_ticks.itertuples():
+        price = getattr(row, 'price', getattr(row, 'close', None))
+        vol = getattr(row, 'volume', 1.0)
+        
+        ts = getattr(row, 'Index', getattr(row, 'time', None))
+        if isinstance(ts, (datetime, pd.Timestamp)):
+            ts_val = ts.timestamp()
+        else:
+            ts_val = float(ts)
             
+        b_vol = 0.0
+        s_vol = 0.0
+        
+        if price is None: continue
+
+        bar = gen.process_tick(price, vol, ts_val, b_vol, s_vol)
+        
+        if bar:
+            bars_list.append({
+                'timestamp': bar.timestamp,
+                'open': bar.open,
+                'high': bar.high,
+                'low': bar.low,
+                'close': bar.close,
+                'volume': bar.volume,
+                'vwap': bar.vwap,
+                'tick_count': bar.tick_count,
+                'buy_vol': bar.buy_vol,
+                'sell_vol': bar.sell_vol
+            })
+
     if not bars_list:
-        log.warning(f"❌ {symbol}: Failed to generate enough bars even after calibration.")
+        log.warning(f"❌ {symbol}: Failed to generate bars from full dataset.")
         return pd.DataFrame()
 
     # 3. Convert to DataFrame
@@ -261,10 +303,9 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
             
-            # V16.4 HYPER-SCALPER PROTOCOL: TIGHTENED RISK SEARCH
-            # Restrict optimization to 0.25% and 0.50% only.
-            # Prevents AI from "cheating" with high risk that fails in production.
-            risk_options = [0.0025, 0.005] 
+            # V16.5 AGGRESSOR PROTOCOL: DYNAMIC RISK SEARCH
+            # Fetch options from config (e.g., [0.005, 0.01]) instead of hardcoded survival values
+            risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.005, 0.01])
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             trial.set_user_attr("risk_pct", params['risk_per_trade_percent'] * 100)
             
@@ -408,9 +449,9 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 }
                 params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
                 
-                # V16.4 HYPER-SCALPER PROTOCOL: UPDATED RISK SEARCH FOR WFO
-                # Strict 0.25% and 0.5% only.
-                risk_options = [0.0025, 0.005]
+                # V16.5 AGGRESSOR PROTOCOL: DYNAMIC RISK SEARCH
+                # Fetch options from config (e.g., [0.005, 0.01])
+                risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.005, 0.01])
                 params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
                 
                 pipeline_inst = ResearchPipeline()

@@ -6,10 +6,10 @@
 # DESCRIPTION: Event-Driven Backtesting Broker. Simulates execution, spread,
 # commissions, and PnL tracking for strategy validation.
 #
-# PHOENIX V16.4.1 AUDIT FIX (CALIBRATION PARITY):
-# 1. DATA PARITY: 'process_data_into_bars' now calibrates on a 30-day window
-#    (matching Live Engine) instead of the full history to prevent Lookahead Bias.
-# 2. REALITY CHECK: Retained V16.3 strict spread and execution logic.
+# PHOENIX V16.23 REALITY INJECTION (THE HUMBLER):
+# 1. VOLATILITY SLIPPAGE: 'submit_order' now applies a dynamic price penalty
+#    based on RVOL. High RVOL (Aggressor) trades execute worse, matching Live.
+# 2. CALIBRATION: Uses 30-day window to prevent lookahead bias.
 # =============================================================================
 from __future__ import annotations
 import pandas as pd
@@ -113,6 +113,7 @@ class BacktestOrder:
     # Metrics
     max_favorable_excursion: float = 0.0
     max_adverse_excursion: float = 0.0
+    slippage_penalty: float = 0.0 # Track the cost of reality
     
     def __post_init__(self):
         if not self.action:
@@ -121,11 +122,10 @@ class BacktestOrder:
 class BacktestBroker:
     """
     Simulates a Broker environment:
-    - Order Execution (Immediate Fill for research, spread simulation)
+    - Order Execution (Immediate Fill with VOLATILITY SLIPPAGE)
     - PnL Tracking (Equity/Balance)
     - Margin Checks (simplified)
-    - V10.0: Daily Hard Deck Enforcement
-    - V16.3: Reality Calibration (Strict Spreads)
+    - Daily Hard Deck Enforcement
     """
     def __init__(self, initial_balance: float = 100000.0):
         self.initial_balance = initial_balance
@@ -232,13 +232,11 @@ class BacktestBroker:
         rate = RiskManager.get_conversion_rate(symbol, current_price, self.last_price_map)
         
         # Sanity Check: If rate is 1.0 but it's clearly a non-USD pair, log a warning
-        # This usually means the auxiliary pair (e.g. USDJPY) is missing from the dataframe.
         if rate == 1.0 and not symbol.endswith("USD") and "USD" in symbol:
              # It is a USD pair (e.g. USDJPY), so rate might be 1/Price or Price
              pass
         elif rate == 1.0 and "USD" not in symbol:
              # Cross pair (e.g. EURGBP) returning 1.0 implies missing conversion data
-             # We let it slide but ideally we should have data
              pass
 
         return rate
@@ -272,7 +270,6 @@ class BacktestBroker:
             self.daily_start_equity = self.equity # New Anchor
             
         # 1. Update Price Map (CRITICAL for PnL Conversion)
-        # We iterate all columns to grab prices for ALL symbols, not just the active one
         for col in snapshot.data.index:
             if isinstance(col, str):
                 try:
@@ -307,17 +304,11 @@ class BacktestBroker:
             if trade.action == "BUY":
                 # Longs are valued at Bid (Selling back to market)
                 valuation_price = current_bid
-                exit_price_candidate = current_bid
             else:
                 # Shorts are valued at Ask (Buying back from market)
                 valuation_price = current_ask
-                exit_price_candidate = current_ask
 
             # --- Update MAE/MFE ---
-            # Distance from Entry in Pips
-            # BUY: (CurrentBid - Entry) / Pip
-            # SELL: (Entry - CurrentAsk) / Pip
-            
             pip_size = point * 10
             
             if trade.action == "BUY":
@@ -401,11 +392,8 @@ class BacktestBroker:
                 self.is_blown = True # Mark as blown for optimizer
                 
                 # Liquidate all open positions instantly at current price
-                # This simulates the "Liquidation" action
                 for trade in list(self.open_positions):
-                    # For liquidation, use current snapshot prices
                     curr_p = snapshot.get_price(trade.symbol, 'close')
-                    # Apply spread for Shorts
                     if trade.action == "SELL":
                         pt = self._get_point_value(trade.symbol)
                         sp = self._get_spread_for_symbol(trade.symbol) * (pt * 10)
@@ -421,7 +409,7 @@ class BacktestBroker:
     def submit_order(self, order: BacktestOrder) -> Optional[int]:
         """
         Public API called by ResearchStrategy.
-        V16.3: Applies STRICT execution realism.
+        V16.23: Applies STRICT REALITY INJECTION (Volatility Penalty).
         """
         if order.quantity <= 0: return None
         if self.is_blown: return None # No trades if blown
@@ -439,18 +427,37 @@ class BacktestBroker:
         spread_pips = self._get_spread_for_symbol(order.symbol)
         spread_cost = spread_pips * (point * 10)
         
-        # EXECUTION REALITY (V16.3):
-        # BUY: Fills at Ask (Bid + Spread)
-        # SELL: Fills at Bid (Bid)
+        # --- CRITICAL FIX: VOLATILITY PENALTY (REALITY INJECTION) ---
+        # If RVOL (Relative Volume) is high, we assume SLIPPAGE is inevitable.
+        # Live market orders NEVER fill at the exact tick price during momentum ignition.
+        rvol = order.metadata.get('rvol', 0.0)
+        vol_penalty = 0.0
+        
+        # Aggressor threshold is roughly 2.0-2.5 RVOL
+        if rvol > 2.0:
+            # Slippage Factor: For every 1.0 above 2.0 RVOL, increase spread cost by 50%
+            # e.g. RVOL 4.0 -> Factor = (4-2)*0.5 = 1.0 -> 100% extra spread penalty
+            # e.g. RVOL 10.0 -> Factor = 4.0 -> 400% extra spread penalty (Reality check for spikes)
+            slippage_factor = (rvol - 2.0) * 0.5
+            vol_penalty = spread_cost * slippage_factor
+            
+            # Log significant slippage for audit
+            if slippage_factor > 1.0:
+                logger.info(f"🛡️ REALITY CHECK {order.symbol}: RVOL {rvol:.1f} -> Volatility Slippage {vol_penalty:.5f}")
+                
+        order.slippage_penalty = vol_penalty
+
+        # EXECUTION REALITY:
+        # BUY: Fills at Ask + Penalty
+        # SELL: Fills at Bid - Penalty (Worse Price)
         
         if order.action == "BUY":
             # Buy Limit/Market fills at Ask
-            order.entry_price = order.entry_price + spread_cost
+            order.entry_price = order.entry_price + spread_cost + vol_penalty
         else:
-            # Sell Limit/Market fills at Bid
-            # No adjustment needed to entry_price (it's already Bid)
-            # The COST appears on Exit (Buyback at Ask)
-            pass
+            # Sell Limit/Market fills at Bid - Penalty (To sell, we cross spread, but we are entering at Bid quote)
+            # Actually, standard sell fills at Bid. But slippage implies we missed the best Bid.
+            order.entry_price = order.entry_price - vol_penalty
             
         order.commission = order.quantity * self.commission_per_lot
         
@@ -495,7 +502,6 @@ class BacktestBroker:
         self.closed_positions.append(trade)
         
         # 6. Log to Trade Log (Enhanced Metadata for V12.6)
-        # Ensure metadata is serializable
         clean_metadata = {}
         for k, v in trade.metadata.items():
             if isinstance(v, (np.float64, np.float32)):
@@ -520,10 +526,11 @@ class BacktestBroker:
             'Comment': reason,
             'MFE_Pips': float(trade.max_favorable_excursion),
             'MAE_Pips': float(trade.max_adverse_excursion),
+            'Vol_Slippage': float(trade.slippage_penalty), # Audit metric
             'Duration_Min': (close_time - trade.timestamp_created).total_seconds() / 60,
             'Regime': clean_metadata.get('regime', 'Unknown'),
             'Confidence': clean_metadata.get('confidence', 0.0),
-            'Tighten_Stops': clean_metadata.get('tighten_stops', False) # New for V12.6
+            'Tighten_Stops': clean_metadata.get('tighten_stops', False)
         })
         
         symbol_icon = "🟢" if net_pnl > 0 else "🔴"
@@ -625,11 +632,6 @@ class BacktestBroker:
 def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     """
     Helper to Load Ticks -> Aggregate to Tick Imbalance Bars (TIBs) -> Return Clean DataFrame.
-    
-    AUDIT FIX (V16.4.1): CALIBRATION PARITY
-    Modified to prevent Lookahead Bias. The volume threshold is now calibrated
-    using ONLY the first 30 days of the loaded data, matching the Live Engine's
-    behavior (which looks back 30 days). Previously, it scanned the entire dataset.
     """
     # 1. Load Massive Amount of Ticks
     raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2)
@@ -642,14 +644,12 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
     
     # --- AUTO-CALIBRATION LOOP (AUDIT FIX) ---
-    # We restrict the calibration data to the first 30 days to avoid lookahead bias.
     first_timestamp = raw_ticks.index.min()
     calibration_cutoff = first_timestamp + timedelta(days=30)
     
     calibration_df = raw_ticks[raw_ticks.index < calibration_cutoff]
     
     if calibration_df.empty:
-        # Fallback if data is less than 30 days
         calibration_df = raw_ticks
         
     current_threshold = config_threshold
@@ -657,7 +657,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     attempts = 0
     max_attempts = 4
     
-    final_threshold = config_threshold # Default
+    final_threshold = config_threshold
     
     logger.info(f"🔎 Calibrating {symbol} on first {len(calibration_df)} ticks (30 Days)...")
 
@@ -669,7 +669,6 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
         )
         
         bar_count = 0
-        # Iterate through calibration subset efficiently
         for row in calibration_df.itertuples():
             price = getattr(row, 'price', getattr(row, 'close', None))
             vol = getattr(row, 'volume', 1.0)
@@ -682,7 +681,6 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
                 
             if price is None: continue
 
-            # Synthetic Flow for Calibration (Same as production logic)
             b_vol = 0.0
             s_vol = 0.0
             
@@ -696,16 +694,13 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
                 logger.info(f"✅ {symbol}: Auto-Calibrated Threshold to {final_threshold} (Generated {bar_count} bars in 30 days)")
             break
         else:
-            # Not enough bars, lower threshold
             attempts += 1
-            new_threshold = max(5.0, current_threshold * 0.5) # Lower limit
+            new_threshold = max(5.0, current_threshold * 0.5) 
             logger.warning(f"⚠️ {symbol}: Insufficient bars ({bar_count}). Retrying with threshold {new_threshold}...")
             current_threshold = new_threshold
             final_threshold = current_threshold
 
     # --- PRODUCTION GENERATION ---
-    # Now process the FULL dataset using the calibrated threshold as the starting point.
-    # The generator will adapt from here (EWMA) just like Live.
     gen = AdaptiveImbalanceBarGenerator(
         symbol=symbol,
         initial_threshold=final_threshold,
@@ -749,10 +744,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
         logger.warning(f"❌ {symbol}: Failed to generate bars from full dataset.")
         return pd.DataFrame()
 
-    # 3. Convert to DataFrame
     df_bars = pd.DataFrame(bars_list)
-    
-    # 4. Set Index to Datetime for Snapshot compatibility
     df_bars['time'] = pd.to_datetime(df_bars['timestamp'], unit='s', utc=True)
     df_bars.set_index('time', inplace=True, drop=False)
     

@@ -5,9 +5,9 @@
 # DEPENDENCIES: unittest, numpy, redis, shared
 # DESCRIPTION: Pre-Flight Forensic Diagnostics & PIPELINE VERIFICATION.
 # 
-# PHOENIX V16.4.2 UPDATE (COST SAVING PATCH):
+# PHOENIX V16.5 UPDATE (AGGRESSOR VALIDATION):
 # 1. NO COST PROBE: Replaced live Limit Order injection with safe Redis Write check.
-# 2. CONFIG ALIGNMENT: Validates V16.4 Survival Mode Risk (0.25%).
+# 2. CONFIG ALIGNMENT: Validates V16.5 Aggressor Mode Risk (0.5% Base, 1.0% Max).
 # =============================================================================
 import unittest
 import numpy as np
@@ -40,28 +40,28 @@ logger = logging.getLogger("Diagnose")
 
 class TestConfigurationIntegrity(unittest.TestCase):
     """
-    V16.4 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
-    with the Survival Protocol parameters.
+    V16.5 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
+    with the Aggressor Protocol parameters.
     """
     def test_aggressor_risk_params(self):
-        """Verify Risk Management is set to 0.25% Base / 0.5% Scaled (V16.4 Survival Protocol)."""
+        """Verify Risk Management is set to 0.5% Base / 1.0% Scaled (V16.5 Aggressor Protocol)."""
         risk_conf = CONFIG.get('risk_management', {})
         base_risk = risk_conf.get('base_risk_per_trade_percent')
         scaled_risk = risk_conf.get('scaled_risk_percent')
         
-        print(f"   [CONF] Base Risk: {base_risk*100:.2f}% | Scaled Risk: {scaled_risk*100:.2f}%")
+        print(f"    [CONF] Base Risk: {base_risk*100:.2f}% | Scaled Risk: {scaled_risk*100:.2f}%")
         
-        # V16.4 UPDATE: Base Risk slashed to 0.25% (0.0025) to survive drawdowns
-        self.assertEqual(base_risk, 0.0025, "CRITICAL: Base Risk must be 0.25% (0.0025) for V16.4 Mode")
+        # V16.5 UPDATE: Base Risk must be 0.5% (0.005) for Aggressor Mode
+        self.assertEqual(base_risk, 0.005, "CRITICAL: Base Risk must be 0.5% (0.005) for Aggressor Mode")
         
-        # V16.4 UPDATE: Scaled Risk capped at 0.5% (0.005) to prevent ruin
-        self.assertEqual(scaled_risk, 0.005, "CRITICAL: Scaled Risk must be 0.5% (0.005) for Survival Mode")
+        # V16.5 UPDATE: Scaled Risk capped at 1.0% (0.01) for Hot Hand
+        self.assertEqual(scaled_risk, 0.01, "CRITICAL: Scaled Risk must be 1.0% (0.01) for Aggressor Mode")
 
     def test_regime_settings(self):
         """Verify Regime Enforcement is DISABLED for maximum AI adaptability."""
         phx_conf = CONFIG.get('phoenix_strategy', {})
         regime_mode = phx_conf.get('regime_enforcement')
-        print(f"   [CONF] Regime Mode: {regime_mode}")
+        print(f"    [CONF] Regime Mode: {regime_mode}")
         self.assertEqual(regime_mode, "DISABLED", "CRITICAL: Regime Enforcement must be DISABLED")
 
     def test_leverage_map_integrity(self):
@@ -70,7 +70,7 @@ class TestConfigurationIntegrity(unittest.TestCase):
         lev_map = risk_conf.get('leverage', {})
         required_keys = ['default', 'minor', 'gold', 'indices', 'crypto']
         
-        print(f"   [CONF] Leverage Keys: {list(lev_map.keys())}")
+        print(f"    [CONF] Leverage Keys: {list(lev_map.keys())}")
         for k in required_keys:
             self.assertIn(k, lev_map, f"CRITICAL: Missing leverage config for '{k}'")
 
@@ -92,7 +92,7 @@ class TestInfrastructureAndExecution(unittest.TestCase):
         """Can we talk to the database?"""
         try:
             self.r.ping()
-            print(f"   {LogSymbols.ONLINE} Redis Connection: ESTABLISHED ({CONFIG['redis']['host']})")
+            print(f"    {LogSymbols.ONLINE} Redis Connection: ESTABLISHED ({CONFIG['redis']['host']})")
         except redis.ConnectionError:
             self.fail(f"{LogSymbols.CRITICAL} CRITICAL: Cannot connect to Redis. Check 'redis' container.")
 
@@ -105,24 +105,24 @@ class TestInfrastructureAndExecution(unittest.TestCase):
         last_beat = self.r.get(heartbeat_key)
         
         if not last_beat:
-            print(f"   {LogSymbols.OFFLINE} HEARTBEAT MISSING: Windows Producer has NOT written to key '{heartbeat_key}'.")
-            print("   -> CAUSE: Windows is either offline OR connecting to a different Redis IP.")
+            print(f"    {LogSymbols.OFFLINE} HEARTBEAT MISSING: Windows Producer has NOT written to key '{heartbeat_key}'.")
+            print("    -> CAUSE: Windows is either offline OR connecting to a different Redis IP.")
             # We don't fail, but we warn LOUDLY
         else:
             delta = time.time() - float(last_beat)
             status = "ALIVE" if delta < 30 else f"STALE ({int(delta)}s ago)"
             icon = LogSymbols.ONLINE if delta < 30 else LogSymbols.WARNING
-            print(f"   {icon} Windows Producer Status: {status}")
+            print(f"    {icon} Windows Producer Status: {status}")
             
             if delta > 60:
-                print(f"   {LogSymbols.CRITICAL} WARNING: Windows Producer is effectively DEAD (Last beat > 60s ago).")
+                print(f"    {LogSymbols.CRITICAL} WARNING: Windows Producer is effectively DEAD (Last beat > 60s ago).")
 
     def test_3_verify_redis_write_permissions(self):
         """
         Verifies Redis Write capability WITHOUT sending live orders.
         Replaces the costly Probe Signal injection.
         """
-        print(f"\n   {LogSymbols.DATABASE} VERIFYING REDIS WRITE PERMISSIONS (NO COST MODE)...")
+        print(f"\n    {LogSymbols.DATABASE} VERIFYING REDIS WRITE PERMISSIONS (NO COST MODE)...")
         test_key = f"diagnose:write_test:{uuid.uuid4()}"
         test_val = "WRITE_TEST_OK"
 
@@ -136,8 +136,8 @@ class TestInfrastructureAndExecution(unittest.TestCase):
             # 4. Clean
             self.r.delete(test_key)
 
-            print(f"   {LogSymbols.SUCCESS} Redis Write Check: PASSED")
-            print(f"   -> Connectivity is healthy. No Limit Orders sent to Broker.")
+            print(f"    {LogSymbols.SUCCESS} Redis Write Check: PASSED")
+            print(f"    -> Connectivity is healthy. No Limit Orders sent to Broker.")
 
         except Exception as e:
             self.fail(f"Redis Write Check Failed: {e}")
@@ -145,13 +145,13 @@ class TestInfrastructureAndExecution(unittest.TestCase):
     def test_4_inspect_stream_flow(self):
         """Are signals actually landing in the stream?"""
         slen = self.r.xlen(self.stream_key)
-        print(f"   {LogSymbols.VPIN} Stream '{self.stream_key}' Depth: {slen} messages")
+        print(f"    {LogSymbols.VPIN} Stream '{self.stream_key}' Depth: {slen} messages")
         
         if slen > 0:
             last = self.r.xrevrange(self.stream_key, count=1)
-            print(f"   -> Latest Message: {last[0][1]}")
+            print(f"    -> Latest Message: {last[0][1]}")
         else:
-            print("   -> Stream is empty.")
+            print("    -> Stream is empty.")
 
 class TestFeatureEngineering(unittest.TestCase):
     """Validates the 'Golden Six' feature calculations."""
@@ -215,5 +215,5 @@ class TestRiskCalculations(unittest.TestCase):
         self.assertEqual(digits, 2, "Crypto heuristic should work")
 
 if __name__ == '__main__':
-    print(f"\n🔍 RUNNING PHOENIX V16.4 PIPELINE DIAGNOSTICS...")
+    print(f"\n🔍 RUNNING PHOENIX V16.5 PIPELINE DIAGNOSTICS...")
     unittest.main(verbosity=2)

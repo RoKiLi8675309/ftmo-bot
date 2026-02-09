@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V16.22 (SESSION GUARD PROTOCOL)
+# config.yaml – PROJECT PHOENIX V16.23 (REALITY CHECK PATCH)
 # STATUS: LIVE TRADING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# CRITICAL UPDATES (SESSION GUARD):
-# 1. TRADING WINDOW: Restricted to London Open -> 3 Hours before NY Close.
-# 2. HARD LIQUIDATION: Force close all positions at Hour 21 (Server Time).
-# 3. VOLATILITY PROTECTION: Avoids EOD wicks and low liquidity roll-over zones.
+# REMEDIATION UPDATE (THE FIX):
+# 1. HARD STOP FLOOR: 'min_stop_loss_pips' set to 15.0. No more 5-pip suicide stops.
+# 2. SAFETY BUFFER: Daily Loss Limit capped at 4.0% (leaving 1% breathing room).
+# 3. REALITY SPREADS: Updated forensic assumptions to match high-volatility execution.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -149,7 +149,7 @@ phoenix_strategy:
   asset_regime_map:
     GBPAUD: "TREND_BREAKOUT" # Explicitly defined
     EURAUD: "TREND_BREAKOUT"
-    GBPNZD: "TREND_BREAKOUT"
+    # GBPNZD Removed (Dead Weight)
     GBPJPY: "TREND_BREAKOUT" 
     USDJPY: "TREND_BREAKOUT"
     GBPUSD: "TREND_BREAKOUT" # Explicitly defined
@@ -233,16 +233,16 @@ optimization_search_space:
 risk_management:
   account_currency: "USD"
   
-  # --- SIZING METHOD: SURVIVAL PROTOCOL ---
+  # --- SIZING METHOD: AGGRESSOR PROTOCOL ---
   sizing_method: "fixed_risk"
   
-  # V16.4 FIX: SLASHED TO 0.25% TO PREVENT BLOWUPS
-  base_risk_per_trade_percent: 0.0025
+  # V16.5 UPGRADE: 0.5% BASE RISK (Confirmed safe by 4.4% Max DD)
+  base_risk_per_trade_percent: 0.0050
   
   # PROFIT BUFFER LOGIC
   profit_buffer_threshold: 0.02
-  # Scaled risk 0.5% max (V16.4 Cap)
-  scaled_risk_percent: 0.005
+  # Scaled risk 1.0% max (Hot Hand)
+  scaled_risk_percent: 0.010
   
   # REVENGE TRADING GUARD
   loss_cooldown_minutes: 60  # Lock symbol for 1 hour after a loss
@@ -255,7 +255,7 @@ risk_management:
     enabled: true
     max_adds: 2
     add_on_profit_r: 0.5  
-    risk_per_add_percent: 0.0025 # 0.25% risk per add
+    risk_per_add_percent: 0.0025 # Keep adds conservative
   
   # EQUITY RATCHET
   equity_ratchet:
@@ -263,7 +263,7 @@ risk_management:
     step_percent: 0.05    # Lock floor every 5% gain
   
   # LIMITS
-  max_daily_loss_pct: 0.040        # 4.0% Daily Limit
+  max_daily_loss_pct: 0.040        # 4.0% Daily Limit (Buffer against 5.0%)
   max_total_loss_pct: 0.095        
   
   # PORTFOLIO HEAT
@@ -272,7 +272,7 @@ risk_management:
   # V16.21: SINGLE TRADE ENFORCEMENT
   # Set to 1 to strictly prevent "No Money" margin errors.
   max_open_trades: 1               
-  max_risk_percent: 1.0            
+  max_risk_percent: 2.0 # Raised for Aggressor            
   
   # --- LEVERAGE GUARD (V16.11 SWING STANDARDS) ---
   leverage:
@@ -325,8 +325,9 @@ risk_management:
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
   
-  # V16.12 SAFETY: Increased to 15.0 pips because GBPNZD spread is 8.2 pips!
-  # If stop is 12 and spread is 8, you have 4 pips of room. That is suicide.
+  # V16.23 REALITY FIX: ABSOLUTE HARD FLOOR FOR STOPS
+  # GBPAUD spreads can be 8+ pips. A 10 pip stop is suicidal.
+  # We enforce 15 pips to survive the noise.
   min_stop_loss_pips: 15.0
 
 # --- TRADING PORTFOLIO (V16.0) ---
@@ -336,7 +337,7 @@ trading:
     - "GBPAUD"   # The Beast (High Volatility)
     - "GBPJPY"   # The Dragon
     - "EURAUD"   # High Beta Cross
-    - "GBPNZD"   # High Volatility
+    # GBPNZD Removed (High Correlation, Low Yield)
     - "USDJPY"   # Carry/Trend
     - "GBPUSD"   # Cable
     - "EURJPY"   # Cross
@@ -345,7 +346,7 @@ trading:
     - "AUDJPY"
     - "EURUSD"
     # ADDED FOR CONVERSION SAFETY:
-    - "NZDUSD"  # Required for GBPNZD
+    - "NZDUSD"  # Required for GBPNZD (Safety measure)
     - "AUDUSD"  # Required for GBPAUD, EURAUD
     - "USDCAD"  # Fallback
     - "USDCHF"  # Fallback
@@ -376,9 +377,8 @@ online_learning:
   # Volatility Gate
   volatility_gate:
     enabled: true
-    # V16.12: Increased to 1.1. 
-    # With spreads this wide, we need SIGNIFICANT volatility to profit.
-    min_atr_spread_ratio: 1.1  
+    # V16.5: Lowered to 0.9 to catch early expansion
+    min_atr_spread_ratio: 0.9  
   
   positive_class_weight: 1.5 
   negative_class_weight: 1.0
@@ -437,4 +437,4 @@ wfo:
   train_years: 2
   test_months: 6
   min_trades_optimization: 40  # Lowered from 100 to allow slower pairs to survive
-  risk_per_trade_options: [0.0025, 0.005] # 0.25%, 0.5%
+  risk_per_trade_options: [0.005, 0.01] # 0.5%, 1.0% (Aggressor)

@@ -6,9 +6,10 @@
 # DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
 # and generates signals via the Golden Trio Predictor.
 #
-# PHOENIX V16.4.1 AUDIT FIX (REVENGE AMNESIA PATCH):
-# - RESTORE STATE: Added `_restore_penalty_box_state` to re-apply cooldowns 
-#   after a restart/crash by scanning recent Redis trade history.
+# PHOENIX V16.5 UPDATE (AGGRESSOR ROTATION):
+# - TIME STOP: Updated `_manage_active_positions_loop` to use dynamic `horizon_minutes`
+#   (4h/240m) instead of hardcoded 8h limit.
+# - REVENGE GUARD: Preserved V16.4.1 Penalty Box restoration logic.
 # - SESSION GUARD: Preserved V16.22 hard liquidation logic.
 # =============================================================================
 import logging
@@ -607,11 +608,18 @@ class LiveTradingEngine:
         """
         V16.0 UPDATE: Active Position Management Thread.
         Enforces:
-        1. 8h Time Stop (Hard Exit) - Reduced from 24h for Scalping.
+        1. 4h Time Stop (Hard Exit) - Dynamic Config.
         2. 0.5R Trailing Stop.
         3. V16.22 UPDATE: Daily Session Liquidation (Redundancy Check).
         """
-        logger.info(f"{LogSymbols.INFO} Active Position Manager Started (Time-Stop: 8h, Trail: 0.5R).")
+        logger.info(f"{LogSymbols.INFO} Active Position Manager Started (Trail: 0.5R, Time-Stop: Dynamic).")
+        
+        # V16.5: Dynamic Horizon Fetch (Default 240m)
+        tbm_conf = CONFIG.get('online_learning', {}).get('tbm', {})
+        horizon_minutes = int(tbm_conf.get('horizon_minutes', 240))
+        hard_stop_seconds = horizon_minutes * 60
+        logger.info(f"{LogSymbols.TIME} Dynamic Time Stop Set to: {horizon_minutes} minutes ({horizon_minutes/60:.1f}h)")
+
         while not self.shutdown_flag:
             try:
                 positions = self._get_open_positions_from_redis()
@@ -620,7 +628,6 @@ class LiveTradingEngine:
                     continue
 
                 now_utc = datetime.now(pytz.utc)
-                hard_stop_seconds = 28800 # 8 Hours (Intraday Focus)
 
                 # V16.22 SESSION CHECK (Redundancy)
                 # If the main loop missed the liquidation time, we catch it here.
@@ -634,16 +641,17 @@ class LiveTradingEngine:
                         exit_reason = "Session End Guard (3h pre-close)"
                         logger.warning(f"⌛ SESSION LIQUIDATION: {sym} closed by background manager.")
 
-                    # --- 2. TIME BASED EXITS ---
+                    # --- 2. TIME BASED EXITS (DYNAMIC) ---
                     if not exit_reason:
                         entry_ts = float(pos.get('time', 0))
                         if entry_ts > 0:
                             entry_dt = datetime.fromtimestamp(entry_ts, pytz.utc)
                             duration = (now_utc - entry_dt).total_seconds()
                             
-                            # Hard Time Stop (8h)
+                            # Hard Time Stop (Configured Horizon)
                             if duration > hard_stop_seconds:
-                                exit_reason = "Time Stop (8h)"
+                                hours = int(horizon_minutes / 60)
+                                exit_reason = f"Time Stop ({hours}h)"
                                 logger.warning(f"⌛ TIME STOP: {sym} held for {duration/3600:.1f}h. Closing.")
                         
                     if exit_reason:

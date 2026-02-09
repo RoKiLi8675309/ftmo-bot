@@ -5,10 +5,9 @@
 # DEPENDENCIES: shared, river, engines.research.backtester
 # DESCRIPTION: The Adaptive Strategy Kernel (Backtesting Version).
 # 
-# PHOENIX V16.22 UPDATE (RESEARCH SESSION GUARD):
-# 1. SESSION SIMULATION: Enforces London/NY trading window in backtests.
-# 2. DAILY LIQUIDATION: Simulates the 3h pre-NY-close hard exit.
-# 3. SURVIVAL PROTOCOL: Maintains 0.5% risk cap and cooldown logic.
+# PHOENIX V16.5 UPDATE (AGGRESSOR ROTATION):
+# 1. TIME STOP: Now strictly enforcing 4-Hour limit (240m) from config.
+# 2. SURVIVAL PROTOCOL: Maintains 0.5% risk cap and cooldown logic.
 # =============================================================================
 import logging
 import sys
@@ -47,7 +46,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Phoenix V16.4 Survival Protocol.
+    Strictly implements the Phoenix V16.5 Aggressor Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -932,10 +931,14 @@ class ResearchStrategy:
 
     def _manage_time_stops(self, broker: BacktestBroker, current_time: datetime):
         """
-        V16.0 FEATURE: Managed Time Exits.
-        1. Hard Time Stop (8h): Closes position regardless of PnL to force intraday rotation.
+        V16.5 UPDATE: Managed Time Exits.
+        1. Dynamic Time Stop: Closes position based on Configured Horizon (default 4h) 
+           to force capital rotation.
         """
-        hard_stop_seconds = 28800  # 8 Hours (Intraday Focus)
+        # Fetch dynamic horizon from config (default 240m / 4h)
+        tbm_conf = self.params.get('tbm', {})
+        horizon_minutes = int(tbm_conf.get('horizon_minutes', 240))
+        hard_stop_seconds = horizon_minutes * 60
         
         to_close = []
         for pos in broker.open_positions:
@@ -954,9 +957,10 @@ class ResearchStrategy:
             
             duration = (curr_time_aware - pos_time).total_seconds()
             
-            # 1. Hard Time Stop (8h)
+            # 1. Hard Time Stop
             if duration > hard_stop_seconds:
-                to_close.append((pos, "Time Stop (8h)"))
+                hours = int(horizon_minutes / 60)
+                to_close.append((pos, f"Time Stop ({hours}h)"))
             
         for pos, reason in to_close:
             broker._close_partial_position(

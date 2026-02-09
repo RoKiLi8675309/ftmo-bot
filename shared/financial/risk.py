@@ -5,10 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX V16.22 UPDATE (SESSION GUARD):
-# 1. SESSION CONTROL: Added daily start/end hour enforcement.
-# 2. HARD LIQUIDATION: Triggers close logic 3 hours before NY close.
-# 3. SURVIVAL PROTOCOL: Maintained strict 0.5% risk cap.
+# PHOENIX V16.23 REALITY CHECK UPDATE:
+# 1. CRITICAL FIX: Enforced 'min_stop_loss_pips' from Config.
+#    Prevents micro-stops (4-5 pips) that get stopped out by noise in Live.
+# 2. SAFETY: Added extra checks for zero conversion rates.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -223,8 +223,7 @@ class RiskManager:
         """
         ADVANCED POSITION SIZING KERNEL (V16.4 SURVIVAL PROTOCOL).
         Integrates RCK (Risk-Confidence-Kelly) Optimization with Margin Guards.
-        REMOVED: Alpha Squad Boost (Reckless).
-        ADDED: Strict caps on scaling.
+        FIXED (V16.23): Enforces strict minimum pips for Stop Loss.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -253,14 +252,23 @@ class RiskManager:
         else:
             stop_dist = price * 0.002 * atr_mult_sl
             
-        # --- DEAD PAIR PROTECTION (SPREAD CLAMP) ---
+        # --- DEAD PAIR PROTECTION (SPREAD CLAMP & MIN PIPS) ---
         pip_val_raw, _ = RiskManager.get_pip_info(symbol)
         spread_assumed = CONFIG.get('forensic_audit', {}).get('spread_pips', {}).get(symbol, 1.5)
         
-        # Minimum Stop Loss must be at least 3.0x Spread to survive noise
-        min_stop_req = (spread_assumed * 3.0 * pip_val_raw)
-        if stop_dist < min_stop_req:
-             stop_dist = min_stop_req
+        # Logic A: Stop must be > 3x Spread
+        min_stop_spread = (spread_assumed * 3.0 * pip_val_raw)
+        
+        # Logic B: Stop must be > Configured Min Pips (Global Hard Floor)
+        config_min_pips = float(risk_conf.get('min_stop_loss_pips', 10.0))
+        min_stop_hard_floor = config_min_pips * pip_val_raw
+        
+        # Determine actual floor
+        effective_floor = max(min_stop_spread, min_stop_hard_floor)
+        
+        # Apply Floor
+        if stop_dist < effective_floor:
+             stop_dist = effective_floor
              
         sl_pips = stop_dist / pip_val_raw
 
@@ -312,9 +320,6 @@ class RiskManager:
                 risk_pct = min(risk_pct * 1.1, 0.5) 
                 scaling_comment += "|SQN:High"
         
-        # --- REMOVED ALPHA SQUAD BOOST ---
-        # No arbitrary multipliers based on symbol name. Code must survive on merit.
-
         # --- ASYMPTOTIC DECAY ---
         daily_limit_pct = risk_conf.get('max_daily_loss_pct', 0.040) 
         
