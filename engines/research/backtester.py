@@ -1,16 +1,3 @@
-# =============================================================================
-# FILENAME: engines/research/backtester.py
-# ENVIRONMENT: Linux/WSL2 (Python 3.11)
-# PATH: engines/research/backtester.py
-# DEPENDENCIES: shared
-# DESCRIPTION: Event-Driven Backtesting Broker. Simulates execution, spread,
-# commissions, and PnL tracking for strategy validation.
-#
-# PHOENIX V16.23 REALITY INJECTION (THE HUMBLER):
-# 1. VOLATILITY SLIPPAGE: 'submit_order' now applies a dynamic price penalty
-#    based on RVOL. High RVOL (Aggressor) trades execute worse, matching Live.
-# 2. CALIBRATION: Uses 30-day window to prevent lookahead bias.
-# =============================================================================
 from __future__ import annotations
 import pandas as pd
 import numpy as np
@@ -155,7 +142,7 @@ class BacktestBroker:
         # Pre-populate price map to prevent initial warnings
         self._inject_aux_data()
         
-        # --- V10.0 DAILY ANCHOR TRACKING ---
+        # --- DAILY ANCHOR TRACKING ---
         self.daily_start_equity = initial_balance
         self.current_day_date = None
         # Max Daily Loss Pct (e.g., 0.045 for 4.5%)
@@ -180,7 +167,7 @@ class BacktestBroker:
 
     def get_daily_pnl_pct(self) -> float:
         """
-        V12.0: Calculates the current Daily PnL % relative to the Daily Start Equity.
+        Calculates the current Daily PnL % relative to the Daily Start Equity.
         Used for Profit Buffer Scaling (Earn to Burn).
         """
         if self.daily_start_equity <= 0:
@@ -192,12 +179,11 @@ class BacktestBroker:
     def _inject_aux_data(self):
         """
         Injects synthetic cross-rates into the price map.
-        V16.0: Added High-Beta Pairs (GBPAUD, GBPNZD, EURAUD) to prevent crashes.
+        Added High-Beta Pairs (GBPAUD, GBPNZD, EURAUD) to prevent crashes.
         """
         defaults = {
             "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
             "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
-            # V16.0 Additions
             "GBPAUD": 1.95, "EURAUD": 1.65, "GBPNZD": 2.10,
             "EURJPY": 162.0, "GBPJPY": 190.0, "AUDJPY": 97.0
         }
@@ -225,13 +211,12 @@ class BacktestBroker:
 
     def _get_simulation_conversion_rate(self, symbol: str, current_price: float) -> float:
         """
-        V16.1 FIX: Robust wrapper for RiskManager.get_conversion_rate.
-        REMOVED: Hardcoded static values (0.0065 for JPY etc).
-        ADDED: Dynamic lookup via self.last_price_map to ensure PnL accuracy during volatility.
+        Robust wrapper for RiskManager.get_conversion_rate.
+        Dynamic lookup via self.last_price_map to ensure PnL accuracy during volatility.
         """
         rate = RiskManager.get_conversion_rate(symbol, current_price, self.last_price_map)
         
-        # Sanity Check: If rate is 1.0 but it's clearly a non-USD pair, log a warning
+        # Sanity Check: If rate is 1.0 but it's clearly a non-USD pair
         if rate == 1.0 and not symbol.endswith("USD") and "USD" in symbol:
              # It is a USD pair (e.g. USDJPY), so rate might be 1/Price or Price
              pass
@@ -368,7 +353,7 @@ class BacktestBroker:
                 
                 raw_pnl = raw_diff * (trade.quantity * contract_size)
                 
-                # V16.1: Use Dynamic Rate
+                # Use Dynamic Rate
                 rate = self._get_simulation_conversion_rate(trade.symbol, valuation_price)
                 comm_drag = trade.quantity * self.commission_per_lot 
                 
@@ -381,7 +366,7 @@ class BacktestBroker:
         self.equity = self.balance + floating_pnl
         self.equity_curve.append((snapshot.timestamp, self.equity))
         
-        # 4. HARD DECK ENFORCEMENT (V10.0)
+        # 4. HARD DECK ENFORCEMENT
         # Check Daily Drawdown relative to Anchor
         if self.daily_start_equity > 0:
             daily_loss_amount = self.daily_start_equity - self.equity
@@ -409,7 +394,7 @@ class BacktestBroker:
     def submit_order(self, order: BacktestOrder) -> Optional[int]:
         """
         Public API called by ResearchStrategy.
-        V16.23: Applies STRICT REALITY INJECTION (Volatility Penalty).
+        Applies STRICT REALITY INJECTION (Volatility Penalty).
         """
         if order.quantity <= 0: return None
         if self.is_blown: return None # No trades if blown
@@ -427,7 +412,7 @@ class BacktestBroker:
         spread_pips = self._get_spread_for_symbol(order.symbol)
         spread_cost = spread_pips * (point * 10)
         
-        # --- CRITICAL FIX: VOLATILITY PENALTY (REALITY INJECTION) ---
+        # --- VOLATILITY PENALTY (REALITY INJECTION) ---
         # If RVOL (Relative Volume) is high, we assume SLIPPAGE is inevitable.
         # Live market orders NEVER fill at the exact tick price during momentum ignition.
         rvol = order.metadata.get('rvol', 0.0)
@@ -501,7 +486,7 @@ class BacktestBroker:
         
         self.closed_positions.append(trade)
         
-        # 6. Log to Trade Log (Enhanced Metadata for V12.6)
+        # 6. Log to Trade Log (Enhanced Metadata)
         clean_metadata = {}
         for k, v in trade.metadata.items():
             if isinstance(v, (np.float64, np.float32)):
@@ -639,11 +624,11 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     if raw_ticks.empty:
         return pd.DataFrame()
 
-    # 2. V10.1 AGGREGATION: ADAPTIVE IMBALANCE BARS WITH AUTO-CALIBRATION
+    # 2. AGGREGATION: ADAPTIVE IMBALANCE BARS WITH AUTO-CALIBRATION
     config_threshold = CONFIG['data'].get('volume_bar_threshold', 10) 
     alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
     
-    # --- AUTO-CALIBRATION LOOP (AUDIT FIX) ---
+    # --- AUTO-CALIBRATION LOOP ---
     first_timestamp = raw_ticks.index.min()
     calibration_cutoff = first_timestamp + timedelta(days=30)
     

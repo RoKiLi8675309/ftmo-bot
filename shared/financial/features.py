@@ -1,17 +1,3 @@
-# =============================================================================
-# FILENAME: shared/financial/features.py
-# ENVIRONMENT: DUAL COMPATIBILITY (Windows Py3.9 & Linux Py3.11)
-# PATH: shared/financial/features.py
-# DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
-# DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
-# 
-# PHOENIX V16.4.2 AUDIT FIX (MATH STABILITY):
-# 1. NUMBA STABILITY: Replaced 'np.linalg.lstsq' with explicit linear regression
-#    in 'calculate_hurst'. This fixes the "Tuple vs Array" return crash across 
-#    different Numpy versions.
-# 2. TYPE SAFETY: Enforced float64 casting in JIT blocks.
-# 3. ROBUSTNESS: Preserved HMM variance checks and zero-division guards.
-# =============================================================================
 from __future__ import annotations
 import math
 import logging
@@ -116,11 +102,11 @@ class RecursiveEMA:
     def get(self) -> float:
         return self.value if self.value is not None else 0.0
 
-# --- 1. PROJECT PHOENIX V9.0 MOMENTUM INDICATORS ---
+# --- 1. MOMENTUM INDICATORS ---
 
 class StreamingBollingerBands:
     """
-    V12.4 UPDATE: Sniper Mode Breakout Indicator.
+    Sniper Mode Breakout Indicator.
     Calculates Upper/Lower Bands and Width for Breakout & Squeeze Detection.
     Defaults adjusted to 1.5 Std Dev for Aggressor entries.
     """
@@ -708,7 +694,7 @@ class AdaptiveTripleBarrier:
     Updated for FTMO Sniper Mode: Extended horizon to capture Swing moves.
     """
     def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.75):
-        # V12.4 ALIGNMENT: Default horizon increased to ~12 hours (144 ticks @ M5)
+        # Default horizon increased to ~12 hours (144 ticks @ M5)
         # matches the winning "Alpha Asset" profile from backtesting.
         self.buffer = deque()
         self.time_limit = horizon_ticks
@@ -868,7 +854,7 @@ class MetaLabeler:
                 clean[k] = 0.0
         return clean
 
-# --- 7. ONLINE FEATURE ENGINEER (PROJECT PHOENIX V9.0) ---
+# --- 7. ONLINE FEATURE ENGINEER ---
 
 class OnlineFeatureEngineer:
     def __init__(self, window_size: int = 50):
@@ -892,13 +878,13 @@ class OnlineFeatureEngineer:
         self.vortex = StreamingVortex(period=14)
         self.choppiness = StreamingChoppiness(period=14)
         
-        # Project Phoenix L1 Proxies
+        # L1 Proxies
         self.parkinson = StreamingParkinsonVolatility(alpha=0.1)
         self.amihud = StreamingAmihudLiquidity(alpha=0.05)
         self.rvol = StreamingRelativeVolume(window=20)
         self.aggressor = StreamingAggressorRatio()
         
-        # V12.4 MOMENTUM LOGIC: Bollinger Bands
+        # Momentum Logic: Bollinger Bands
         self.bb = StreamingBollingerBands(window=20, num_std=1.5)
 
         # Microstructure & Math Engines
@@ -955,13 +941,13 @@ class OnlineFeatureEngineer:
         vi_plus, vi_minus = self.vortex.update(high, low, price)
         chop_index = self.choppiness.update(high, low, price)
         
-        # Update L1 Proxies (Project Phoenix)
+        # Update L1 Proxies
         parkinson_val = self.parkinson.update(high, low)
         amihud_val = self.amihud.update(abs(ret_log), price, volume)
         rvol_val = self.rvol.update(timestamp) # Fuel Gauge (Duration Intensity)
         aggressor_val = self.aggressor.update(high, low, price)
         
-        # Update V9 Momentum
+        # Update Momentum
         bb_feats = self.bb.update(price)
 
         # Update Other Metrics
@@ -984,6 +970,7 @@ class OnlineFeatureEngineer:
         # Hurst
         hurst_val = 0.5
         if len(self.returns) >= 20:
+            # Explicit float64 for JIT stability
             ret_arr = np.array(list(self.returns), dtype=np.float64)
             hurst_val = calculate_hurst(ret_arr)
 
@@ -1046,7 +1033,7 @@ class OnlineFeatureEngineer:
             if d1_trend != 0 and (d1_trend == h4_trend == m5_trend):
                 mtf_align = 1.0
 
-        # --- FLOW IMBALANCE FEATURES (AGGRESSOR) ---
+        # --- FLOW IMBALANCE FEATURES ---
         safe_total_vol = buy_vol + sell_vol
         flow_imbalance = (buy_vol - sell_vol) / safe_total_vol if safe_total_vol > 0 else 0.0
         
@@ -1060,7 +1047,7 @@ class OnlineFeatureEngineer:
             'atr': current_atr,
             'atr_pct': current_atr / price,
             
-            # Project Phoenix L1 Proxies
+            # L1 Proxies
             'parkinson_vol': parkinson_val,
             'amihud': amihud_val,
             'rvol': rvol_val,
@@ -1068,7 +1055,7 @@ class OnlineFeatureEngineer:
             'flow_imbalance': flow_imbalance, 
             'flow_ratio': flow_ratio,           
             
-            # V9 Momentum Features (NEW)
+            # V9 Momentum Features
             'bb_breakout': bb_feats['bb_breakout'],
             'bb_width': bb_feats['bb_width'],
             'bb_pct_b': bb_feats['bb_pct_b'],
@@ -1081,10 +1068,10 @@ class OnlineFeatureEngineer:
             'hurst': hurst_val,
             'frac_diff': fd_price,
             'vpin': vpin_val,
-            'choppiness': chop_index,    # NEW: 0-100 (50+ = Chop)
-            'vortex_spread': vi_plus - vi_minus, # NEW: >0 Bullish, <0 Bearish
+            'choppiness': chop_index,    # 0-100 (50+ = Chop)
+            'vortex_spread': vi_plus - vi_minus, # >0 Bullish, <0 Bearish
             
-            # Technicals (Trend Focused)
+            # Technicals
             'rsi_norm': rsi_norm,
             'macd_norm': macd_norm,
             'macd_hist_norm': tech_feats['macd_hist'] / price,
@@ -1259,9 +1246,8 @@ class VolatilityMonitor:
 def calculate_hurst(ts):
     """
     Calculates the Hurst Exponent using Numba-optimized standard deviation analysis.
-    V16.4.2 FIX: Uses explicit manual linear regression (O(N)) to replace 
-    np.linalg.lstsq, which is unstable across Numpy versions in Numba.
-    This prevents the "Fallback to object mode" warning and ensures high performance.
+    Uses explicit manual linear regression (O(N)) to replace np.linalg.lstsq, 
+    ensuring stability across Numpy versions in Numba.
     """
     n = len(ts)
     if n < 20: return 0.5
@@ -1294,7 +1280,6 @@ def calculate_hurst(ts):
     # 2. MANUAL LINEAR REGRESSION (Least Squares)
     # y = mx + c
     # m = (N * sum(xy) - sum(x) * sum(y)) / (N * sum(x^2) - (sum(x))^2)
-    # This replaces np.polyfit / np.linalg.lstsq
     
     N = float(len(lags))
     sum_x = np.sum(log_lags)

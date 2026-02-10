@@ -1,16 +1,3 @@
-# =============================================================================
-# FILENAME: engines/live/predictor.py
-# ENVIRONMENT: Linux/WSL2 (Python 3.11)
-# PATH: engines/live/predictor.py
-# DEPENDENCIES: shared, river, numpy, pandas
-# DESCRIPTION: Online Learning Kernel. Manages Ensemble Models (Bagging ARF),
-# Feature Engineering (Golden Trio), Labeling (Adaptive Triple Barrier).
-#
-# PHOENIX V16.22 AUDIT FIX (SESSION GUARD INTEGRATION):
-# 1. SESSION WINDOW: Enforces London/NY trading hours defined in config.
-# 2. SIGNAL BLOCKING: Returns HOLD signals outside valid session times.
-# 3. STATE INTEGRITY: Updates internal state even when trading is blocked.
-# =============================================================================
 import logging
 import pickle
 import os
@@ -68,7 +55,7 @@ class MultiAssetPredictor:
     """
     def __init__(self, symbols: List[str], threshold_map: Optional[Dict[str, float]] = None):
         """
-        V16.7 UPDATE: Accepts threshold_map to enforce sampling consistency.
+        Accepts threshold_map to enforce sampling consistency.
         """
         self.symbols = symbols
         self.models_dir = Path("models")
@@ -84,16 +71,16 @@ class MultiAssetPredictor:
         tbm_conf = CONFIG['online_learning']['tbm']
         risk_conf = CONFIG.get('risk_management', {})
         
-        # V14.0: Standardize risk multiplier
+        # Standardize risk multiplier
         risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 1.5))
         
-        # V16.0: Stricter Portfolio Heat (Max 2 correlated pairs)
+        # Stricter Portfolio Heat (Max 2 correlated pairs)
         self.max_currency_exposure = int(risk_conf.get('max_currency_exposure', 2))
         
         self.labelers = {}
         self.optimized_params = {} # Cache for gates
         
-        # --- V11.0 MOMENTUM & GOLDEN TRIO BUFFERS ---
+        # --- MOMENTUM & GOLDEN TRIO BUFFERS ---
         # We maintain local buffers to calculate Hurst, KER, and RVOL accurately on the fly
         self.window_size_trio = 100
         self.closes_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
@@ -106,7 +93,7 @@ class MultiAssetPredictor:
         self.sniper_closes = {s: deque(maxlen=200) for s in symbols} # For SMA 200
         self.sniper_rsi = {s: deque(maxlen=15) for s in symbols}      # For RSI 14
 
-        # --- V16.2 NEW FILTERS ---
+        # --- NEW FILTERS ---
         # SMA 200 Trend Filter Buffer
         self.sma_window = {s: deque(maxlen=200) for s in symbols}
         # Volatility Gate Buffer (Returns)
@@ -115,9 +102,9 @@ class MultiAssetPredictor:
         for s in symbols:
             # Default from Config
             s_risk = risk_mult_conf
-            s_reward = tbm_conf.get('barrier_width', 2.5) # V16.2: Tightened to 2.5 for faster rotation
+            s_reward = tbm_conf.get('barrier_width', 2.5) # Tightened to 2.5 for faster rotation
             
-            # V16.0: Default Horizon Reduced to 240m (4h)
+            # Default Horizon Reduced to 240m (4h)
             s_horizon = tbm_conf.get('horizon_minutes', 240) 
             
             # --- DYNAMIC PARAMETER LOADING ---
@@ -155,10 +142,10 @@ class MultiAssetPredictor:
         
         # 4. Warm-up State
         self.burn_in_counters = {s: 0 for s in symbols}
-        # V16.6: Reduced burn-in limit since we do Pre-Training
+        # Reduced burn-in limit since we do Pre-Training
         self.burn_in_limit = 5
         
-        # V16.20 FIX: HALLUCINATION GUARD
+        # HALLUCINATION GUARD
         # Flag to indicate warmup just finished, so we can bridge the gap safely
         self.warmup_gap_bridge = {s: False for s in symbols}
         
@@ -172,10 +159,10 @@ class MultiAssetPredictor:
         self.consecutive_losses = {s: 0 for s in symbols}
         self.active_signals = {s: deque() for s in symbols} 
         
-        # V10.0: Daily Performance Tracking (Symbol Circuit Breaker)
+        # Daily Performance Tracking (Symbol Circuit Breaker)
         self.daily_performance = {s: {'date': None, 'losses': 0, 'pnl': 0.0} for s in symbols}
         
-        # V16.0: Scalper Allowance (5 Losses)
+        # Scalper Allowance (5 Losses)
         self.daily_max_losses = 5 
         
         # 7. Architecture: Auto-Save Timer
@@ -185,14 +172,14 @@ class MultiAssetPredictor:
         # --- Gating Params ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 0.8) # V16.3: Relaxed
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 0.8) # Relaxed
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS (V16.3) ---
+        # --- PHOENIX STRATEGY PARAMETERS ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # V16.3 Logic Thresholds (Scalper Tuned)
+        # Logic Thresholds (Scalper Tuned)
         self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.001)) # Relaxed from 0.002
         self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.42)) # Relaxed from 0.45
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 2.5)) 
@@ -200,16 +187,16 @@ class MultiAssetPredictor:
         
         self.default_max_rvol = float(phx_conf.get('max_relative_volume', 25.0))
         
-        # V12.3: Regime Enforcement Mode (HARD vs SOFT)
+        # Regime Enforcement Mode (HARD vs SOFT)
         self.regime_enforcement = phx_conf.get('regime_enforcement', 'DISABLED').upper()
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
         
         # Friday Guard
         self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 18)
         
-        # V12.7: ADX Threshold (Cached for Logging)
+        # ADX Threshold (Cached for Logging)
         adx_cfg = CONFIG.get('features', {}).get('adx', {})
-        # V16.6: RELAXED ADX for Scalping (Default to 10 if not set)
+        # RELAXED ADX for Scalping (Default to 10 if not set)
         self.adx_threshold = float(adx_cfg.get('threshold', 10.0))
 
         # Fallback Tracking
@@ -224,13 +211,13 @@ class MultiAssetPredictor:
         except Exception:
             self.server_tz = pytz.timezone('Europe/Prague')
 
-        # --- V16.22 SESSION CONTROL CONFIG ---
+        # --- SESSION CONTROL CONFIG ---
         session_conf = risk_conf.get('session_control', {})
         self.session_enabled = session_conf.get('enabled', False)
         self.start_hour = session_conf.get('start_hour_server', 10)
         self.liq_hour = session_conf.get('liquidate_hour_server', 21)
 
-        # --- REC 1: Dynamic Gate Scaling State ---
+        # --- Dynamic Gate Scaling State ---
         self.ker_drift_detectors = {s: drift.ADWIN(delta=0.01) for s in symbols}
         self.dynamic_ker_offsets = {s: 0.0 for s in symbols}
 
@@ -241,20 +228,20 @@ class MultiAssetPredictor:
         self._init_models()
         self._load_state()
         
-        # V16.6: PRE-TRAINING WARMUP (CRITICAL)
+        # PRE-TRAINING WARMUP (CRITICAL)
         self._perform_warmup()
 
     def _init_models(self):
         """
         Initializes the machine learning pipelines.
-        V10.0: Uses AdaptiveRandomForestClassifier with ADWIN drift detection.
+        Uses AdaptiveRandomForestClassifier with ADWIN drift detection.
         """
         conf = CONFIG['online_learning']
         metric_map = {"LogLoss": metrics.LogLoss(), "F1": metrics.F1(), "Accuracy": metrics.Accuracy(), "ROCAUC": metrics.ROCAUC()}
         selected_metric = metric_map.get(conf.get('metric', 'LogLoss'), metrics.LogLoss())
         
         for sym in self.symbols:
-            # V10.0 Upgrade: Adaptive Random Forest
+            # Adaptive Random Forest
             base_clf = forest.ARFClassifier(
                 n_models=conf.get('n_models', 50),
                 grace_period=conf['grace_period'],
@@ -278,7 +265,7 @@ class MultiAssetPredictor:
 
     def _perform_warmup(self):
         """
-        V16.7 PATCH: Synchronized Warm-Up.
+        Synchronized Warm-Up.
         Uses the EXACT same threshold as the Live Engine to prevent data distribution shift.
         Loads 5,000 ticks from DB and pre-trains the model.
         """
@@ -292,7 +279,7 @@ class MultiAssetPredictor:
                     logger.warning(f"⚠️ No historical data for {sym}. Model will start cold.")
                     continue
                 
-                # 2. Setup Generator (V16.7 SYNC FIX)
+                # 2. Setup Generator (SYNC FIX)
                 calibrated_thresh = self.threshold_map.get(sym)
                 config_thresh = CONFIG['data'].get('volume_bar_threshold', 10.0)
                 
@@ -330,7 +317,7 @@ class MultiAssetPredictor:
                         self._train_on_bar(sym, bar)
                         bars_trained += 1
                 
-                # V16.20 FIX: THE HALLUCINATOR CURE
+                # THE HALLUCINATOR CURE
                 # Mark this symbol as requiring a "Gap Bridge".
                 # The first live bar will update EMAs but NOT trigger a signal.
                 # This prevents the model from seeing a massive return jump from Historical End -> Live Start.
@@ -358,6 +345,7 @@ class MultiAssetPredictor:
         self.closes_buffer[symbol].append(bar.close)
         self.volume_buffer[symbol].append(bar.volume)
         self.bb_buffers[symbol].append(bar.close)
+        self.sma_window[symbol].append(bar.close)
         
         # Simple Flow assumption
         buy_vol = getattr(bar, 'buy_vol', bar.volume/2)
@@ -407,7 +395,7 @@ class MultiAssetPredictor:
 
         prices = np.array(closes)
         
-        # 1. Simple Hurst (Rescaled Range Proxy)
+        # 1. Simple Hurst (Rescaled Range Proxy) - MATH PARITY FIX
         try:
             if np.var(prices) < 1e-9:
                 hurst = 0.5
@@ -420,8 +408,11 @@ class MultiAssetPredictor:
                     tau.append(std if std > 1e-9 else 1e-9)
                 
                 # Polyfit on log-log
-                # V13.1 FIX: Slope = H. Removed legacy scalar.
-                poly = np.polyfit(np.log(lags), np.log(tau), 1)
+                # Slope = H. Removed legacy scalar.
+                # Safe regression
+                log_lags = np.log(lags)
+                log_tau = np.log(tau)
+                poly = np.polyfit(log_lags, log_tau, 1)
                 hurst = poly[0] 
                 hurst = max(0.0, min(1.0, hurst))
         except:
@@ -432,7 +423,7 @@ class MultiAssetPredictor:
             diffs = np.diff(prices)
             net_change = abs(prices[-1] - prices[0])
             sum_changes = np.sum(np.abs(diffs))
-            # V13.1 FIX: Strict Zero Division Guard
+            # Strict Zero Division Guard
             if sum_changes > 1e-9:
                 ker = net_change / sum_changes
             else:
@@ -444,7 +435,7 @@ class MultiAssetPredictor:
         if len(vols) > 10:
             curr_vol = vols[-1]
             avg_vol = np.mean(list(vols)[:-1]) # Exclude current
-            # V13.1 FIX: Strict Zero Division Guard
+            # Strict Zero Division Guard
             if avg_vol > 1e-9:
                 rvol = curr_vol / avg_vol
             else:
@@ -454,7 +445,7 @@ class MultiAssetPredictor:
 
     def _calculate_trend_bias(self, symbol: str, current_price: float) -> int:
         """
-        V16.2: Returns 1 (Bullish), -1 (Bearish), or 0 (Neutral).
+        Returns 1 (Bullish), -1 (Bearish), or 0 (Neutral).
         Based on Price vs SMA(200). Helps align Scalps with Macro Trend.
         """
         buffer = self.sma_window[symbol]
@@ -475,7 +466,7 @@ class MultiAssetPredictor:
 
     def _check_volatility_condition(self, symbol: str, current_price: float) -> bool:
         """
-        V16.2: Ensures distinct market movement exists before entering.
+        Ensures distinct market movement exists before entering.
         Prevents entering during dead zones where spreads kill profit.
         """
         buffer = self.returns_window[symbol]
@@ -504,7 +495,7 @@ class MultiAssetPredictor:
 
     def _get_preferred_regime(self, symbol: str) -> str:
         """
-        V12.2: ROBUST ASSET PERSONALITY DETECTION.
+        ROBUST ASSET PERSONALITY DETECTION.
         Prevents 'USD' (Neutral) from overriding 'CAD' (MeanRev) in USDCAD.
         Logic: Trend > MeanReversion > Neutral.
         """
@@ -531,7 +522,7 @@ class MultiAssetPredictor:
 
     def _check_currency_exposure(self, symbol: str, open_positions: Dict[str, Any]) -> bool:
         """
-        V12.3: Enforces Portfolio Heat Limits.
+        Enforces Portfolio Heat Limits.
         Prevents stacking too much risk on one currency (e.g. max 2 USD pairs).
         """
         base_ccy = symbol[:3]
@@ -562,7 +553,7 @@ class MultiAssetPredictor:
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         """
         Actual entry point called by Engine.
-        Executes the Learn-Predict Loop with Project Phoenix V16.3 Logic.
+        Executes the Learn-Predict Loop with Project Phoenix Logic.
         Enforces Asset-Specific Regimes (The "Personality Filter").
         """
         if symbol not in self.symbols: return None
@@ -581,7 +572,7 @@ class MultiAssetPredictor:
         
         self.bar_counters[symbol] += 1
         
-        # V16.20 FIX: GAP BRIDGING (HALLUCINATOR CURE)
+        # GAP BRIDGING (HALLUCINATOR CURE)
         # If we just finished warmup, the 'last_price' in FE is stale (from history).
         # We must treat this bar as a bridge: update state, but DO NOT predict.
         is_bridging_gap = False
@@ -601,10 +592,10 @@ class MultiAssetPredictor:
         self.closes_buffer[symbol].append(bar.close)
         self.volume_buffer[symbol].append(bar.volume)
         
-        # V16.2: Update Trend Filter Buffer
+        # Update Trend Filter Buffer
         self.sma_window[symbol].append(bar.close)
         
-        # V16.2: Update Returns Buffer for Volatility Gate
+        # Update Returns Buffer for Volatility Gate
         if len(self.sma_window[symbol]) >= 2:
              prev_p = self.sma_window[symbol][-2]
              if prev_p > 0:
@@ -657,7 +648,7 @@ class MultiAssetPredictor:
         
         if features is None: return None
         
-        # --- V12.0: GOLDEN TRIO CALCULATION ---
+        # --- GOLDEN TRIO CALCULATION ---
         hurst, ker_val, rvol_val = self._calculate_golden_trio(symbol)
         
         # Inject into features for model training
@@ -683,7 +674,7 @@ class MultiAssetPredictor:
             self.burn_in_counters[symbol] += 1
             return Signal(symbol, "WARMUP", 0.0, {})
 
-        # --- V16.20 GAP BRIDGE EXECUTION ---
+        # --- GAP BRIDGE EXECUTION ---
         if is_bridging_gap:
             # We processed the features to update EMAs, but we RETURN now.
             # This ensures the model logic never sees the "gap return".
@@ -697,7 +688,7 @@ class MultiAssetPredictor:
         if self.daily_performance[symbol]['date'] != current_date:
             self.daily_performance[symbol] = {'date': current_date, 'losses': 0, 'pnl': 0.0}
 
-        # --- V14.0 CIRCUIT BREAKER (Aggressor) ---
+        # --- CIRCUIT BREAKER (Aggressor) ---
         # Increased to 5 losses to prevent early lockout
         if self.daily_performance[symbol]['losses'] >= self.daily_max_losses:
             stats["Circuit Breaker (Daily Losses)"] += 1
@@ -737,7 +728,7 @@ class MultiAssetPredictor:
                 
                 final_weight = base_weight * ret_scalar * ker_weight
                 
-                # V16.20 FIX: Ensure features are strictly floats for River
+                # Ensure features are strictly floats for River
                 clean_stored = {k: float(v) for k, v in stored_feats.items()}
                 
                 model.learn_one(clean_stored, outcome_label, sample_weight=final_weight)
@@ -754,7 +745,7 @@ class MultiAssetPredictor:
         # D. ACTIVE TRADE MANAGEMENT (Local check)
         open_positions = context_data.get('positions', {}) if context_data else {}
         
-        # V16.14 FIX: PROFITABILITY CHECK FOR PYRAMIDING
+        # PROFITABILITY CHECK FOR PYRAMIDING
         is_pyramid_attempt = False
         
         if symbol in open_positions:
@@ -765,7 +756,7 @@ class MultiAssetPredictor:
             if not pyramid_config.get('enabled', False):
                 return None # Standard Blocking (No pyramiding allowed)
             
-            # 2. Check Profitability (CRITICAL FIX)
+            # 2. Check Profitability
             try:
                 entry_price = float(pos.get('entry_price', 0.0))
                 sl_price = float(pos.get('sl', 0.0))
@@ -790,7 +781,6 @@ class MultiAssetPredictor:
                     
                     if current_r < required_r:
                         # Trade is not profitable enough (or is losing). BLOCK.
-                        # This prevents adding to losers.
                         return None 
                     
                     # If we reach here, trade IS profitable enough. 
@@ -803,7 +793,7 @@ class MultiAssetPredictor:
                 return None
 
         # ============================================================
-        # 4. PHOENIX V16.3: AGGRESSOR PROTOCOL WITH NEW GATES
+        # 4. AGGRESSOR PROTOCOL WITH NEW GATES
         # ============================================================
         
         max_rvol_thresh = self.default_max_rvol
@@ -812,7 +802,7 @@ class MultiAssetPredictor:
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
              return Signal(symbol, "HOLD", 0.0, {"reason": "Friday Entry Guard"})
 
-        # --- V16.22 SESSION GUARD (DAILY) ---
+        # --- SESSION GUARD (DAILY) ---
         if self.session_enabled:
             # 1. Before Session Start
             if server_time.hour < self.start_hour:
@@ -822,7 +812,7 @@ class MultiAssetPredictor:
             if server_time.hour >= self.liq_hour:
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"After Session Close ({server_time.hour} >= {self.liq_hour})"})
 
-        # G1: EFFICIENCY (KER) - AGGRESSIVE (V16.3)
+        # G1: EFFICIENCY (KER) - AGGRESSIVE
         # Reduced floor to 0.001 to catch early GBP moves
         base_thresh = self.ker_floor 
         effective_ker_thresh = max(0.001, base_thresh + self.dynamic_ker_offsets[symbol])
@@ -832,7 +822,7 @@ class MultiAssetPredictor:
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (KER {ker_val:.3f} < {effective_ker_thresh:.3f})"})
 
         # G2: REGIME IDENTIFICATION (UNSHACKLED)
-        # V16.6: If Regime Enforcement is DISABLED, we treat this purely as a technical filter (BB)
+        # If Regime Enforcement is DISABLED, we treat this purely as a technical filter (BB)
         preferred_regime = self._get_preferred_regime(symbol)
         regime_label = "Neutral"
         proposed_action = 0 # 0=Hold, 1=Buy, -1=Sell
@@ -849,7 +839,7 @@ class MultiAssetPredictor:
         upper_bb = bb_mu + (bb_mult * bb_std)
         lower_bb = bb_mu - (bb_mult * bb_std)
         
-        # --- V14.0 LOGIC MAPPING: TREND ONLY ---
+        # --- LOGIC MAPPING: TREND ONLY ---
         is_trending = hurst > self.hurst_breakout
         
         if is_trending:
@@ -865,7 +855,7 @@ class MultiAssetPredictor:
                 
         else:
             # NEUTRAL ZONE / MEAN REVERSION POTENTIAL
-            # V16.6: If we disable regime enforcement, allow Mean Reversion on Low Hurst
+            # If we disable regime enforcement, allow Mean Reversion on Low Hurst
             if self.regime_enforcement == "DISABLED":
                  # Low Hurst = Reversion. If hitting bands, fade it.
                  regime_label = "MEAN_REVERSION"
@@ -881,7 +871,7 @@ class MultiAssetPredictor:
             stats["No Trigger"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "No BB Trigger in Regime"})
             
-        # --- V16.2 GATE: VOLATILITY EXPANSION ---
+        # --- GATE: VOLATILITY EXPANSION ---
         # Prevents entries in low-volatility dead zones where time stops kill trades.
         if not self._check_volatility_condition(symbol, bar.close):
             stats["Low Volatility (Dead Zone)"] += 1
@@ -893,7 +883,7 @@ class MultiAssetPredictor:
                 stats["Personality Clash (Hard Block)"] += 1
                 return Signal(symbol, "HOLD", 0.0, {"reason": "Asset Personality Clash"})
             elif self.regime_enforcement == "DISABLED":
-                 # V14.0: Bypass clash flag to allow full adaptability
+                 # Bypass clash flag to allow full adaptability
                  is_regime_clash = False 
             else:
                 # SOFT Mode: Mark for high confidence check later
@@ -908,21 +898,19 @@ class MultiAssetPredictor:
         if regime_label == "TREND_BREAKOUT":
             adx_val = features.get('adx', 0.0)
             if adx_val < self.adx_threshold: 
-                # V16.6 UPDATE: Just log warning, don't block hard if other signals strong
+                # Just log warning, don't block hard if other signals strong
                 stats[f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
-                # return Signal(symbol, "HOLD", 0.0, {"reason": f"Weak Trend (ADX {adx_val:.1f})"})
 
         # 5. ML Confirmation & Calibration
-        # V16.20 FIX: Ensure features are floats
+        # Ensure features are floats
         clean_features = {k: float(v) for k, v in features.items()}
         
         pred_proba = model.predict_proba_one(clean_features)
         
         # Extract probability for the proposed action
-        # River returns dict {label: prob}
         prob_success = pred_proba.get(proposed_action, 0.0)
         
-        # V14.0 SURVIVAL: Bypass Calibration/Confidence Check
+        # SURVIVAL: Bypass Calibration/Confidence Check
         # We trust the Meta Labeler and Regime Filters entirely.
         confidence = 1.0 # Force max confidence to bypass filters
         
@@ -931,10 +919,7 @@ class MultiAssetPredictor:
 
         # --- EXECUTION WITH DYNAMIC CONFIDENCE ---
         
-        if is_regime_clash:
-            pass 
-
-        # --- SNIPER PROTOCOL: FINAL FILTER GATE (V14.0 MOMENTUM IGNITION) ---
+        # --- SNIPER PROTOCOL: FINAL FILTER GATE ---
         d1_ema = context_data.get('d1', {}).get('ema200', 0.0) if context_data else 0.0
         
         # NOTE: Passing 'hurst' now to check for Ignition
@@ -943,7 +928,7 @@ class MultiAssetPredictor:
             return Signal(symbol, "HOLD", confidence, {"reason": "Sniper Filter Reject"})
         # ------------------------------------------
 
-        # --- V12.3: PORTFOLIO HEAT CHECK ---
+        # --- PORTFOLIO HEAT CHECK ---
         if not self._check_currency_exposure(symbol, open_positions):
             return Signal(symbol, "HOLD", confidence, {"reason": "Max Currency Exposure"})
 
@@ -961,14 +946,14 @@ class MultiAssetPredictor:
                 
                 opt_rr = self.labelers[symbol].reward_mult
                 
-                # V14.0 DYNAMIC REWARD: HIGH FUEL = HIGH REWARD
+                # DYNAMIC REWARD: HIGH FUEL = HIGH REWARD
                 # If Volume is exploding (Ignition), aim for 4R
                 if rvol_val > 3.0:
                     opt_rr = max(opt_rr, 4.0)
 
                 opt_risk = self.optimized_params.get(symbol, {}).get('risk_per_trade_percent')
                 
-                # V10.2: Tighten Stops Logic (RVOL Trigger)
+                # Tighten Stops Logic (RVOL Trigger)
                 tighten_stops = (rvol_val > self.rvol_trigger)
 
                 return Signal(symbol, action_str, confidence, {
@@ -984,12 +969,12 @@ class MultiAssetPredictor:
                     "drivers": imp_feats,
                     "optimized_rr": opt_rr,
                     "risk_percent_override": opt_risk,
-                    "pyramid": is_pyramid_attempt, # V15.0 Flag
+                    "pyramid": is_pyramid_attempt, 
                     "tighten_stops": tighten_stops 
                 })
         else:
             stats['Meta Rejected'] += 1
-            # V16.7 DIAGNOSTIC LOGGING: Log Shadow Mode probability
+            # DIAGNOSTIC LOGGING: Log Shadow Mode probability
             if self.bar_counters[symbol] % 50 == 0:
                 logger.info(f"🔎 SHADOW MODE {symbol}: Rejected {proposed_action} (Meta Prob: {prob_success:.2f} < {meta_threshold})")
             return Signal(symbol, "HOLD", confidence, {"reason": f"Meta Rejected (Prob {prob_success:.2f})"})
@@ -1003,7 +988,7 @@ class MultiAssetPredictor:
 
     def _check_sniper_filters(self, symbol: str, signal: int, price: float, d1_ema: float, current_hurst: float) -> bool:
         """
-        V14.0 SNIPER PROTOCOL (AGGRESSOR UPDATE):
+        SNIPER PROTOCOL (AGGRESSOR UPDATE):
         1. Trend Filter: D1 Alignment (DISABLED in Config).
         2. RSI Guard: UNLOCKED via Momentum Ignition.
            - If RSI > 80 AND Hurst > 0.60, Trade is ALLOWED (Ignition).
@@ -1020,18 +1005,14 @@ class MultiAssetPredictor:
             rs = avg_gain / avg_loss
             rsi = 100 - (100 / (1 + rs))
 
-        # 2. TREND FILTER (D1 Bias)
-        # V16.6: Explicitly Disabled check to allow Mean Reversion scalps
-        # if self.require_d1_trend and d1_ema > 0: ... (Commented out logic)
-        
-        # 3. RSI EXTREME GUARD (V14.0 MOMENTUM IGNITION)
+        # 2. RSI EXTREME GUARD (MOMENTUM IGNITION)
         # We invert the logic: High RSI + High Hurst = IGNITION (Buy!)
         if "JPY" in symbol:
             pass # JPY pairs trend hard, ignore RSI extremes
         else:
             if signal == 1: # BUY
                 if rsi > 80: 
-                    # V14.0 CHECK: Is this Exhaustion or Ignition?
+                    # CHECK: Is this Exhaustion or Ignition?
                     if current_hurst > 0.60:
                         pass # IGNITION: ALLOW TRADE (Momentum is huge)
                     else:
@@ -1039,7 +1020,7 @@ class MultiAssetPredictor:
             
             elif signal == -1: # SELL
                 if rsi < 20: 
-                    # V14.0 CHECK: Ignition?
+                    # CHECK: Ignition?
                     if current_hurst > 0.60:
                         pass # IGNITION: ALLOW TRADE (Crash mode)
                     else:
@@ -1049,14 +1030,14 @@ class MultiAssetPredictor:
 
     def _inject_auxiliary_data(self):
         """Injects static approximations ONLY if missing."""
-        # V16.0: Added High-Beta Crosses (EURAUD, GBPNZD) for fallback
         defaults = {
+            # Majors (Conversion Anchors)
             "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
             "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
-            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0, 
-            "GBPAUD": 1.95, 
-            "EURAUD": 1.65, # Added
-            "GBPNZD": 2.05  # Added
+            # Golden Basket Crosses
+            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0,
+            # Legacy/Safety
+            "GBPAUD": 1.95, "EURAUD": 1.65, "GBPNZD": 2.05
         }
         for sym, price in defaults.items():
             if sym not in self.last_close_prices or self.last_close_prices[sym] == 0:

@@ -1,15 +1,3 @@
-# =============================================================================
-# FILENAME: shared/data.py
-# ENVIRONMENT: DUAL COMPATIBILITY (Windows Py3.9 & Linux Py3.11)
-# PATH: shared/data.py
-# DEPENDENCIES: pandas, numpy, psycopg2 (optional), sqlalchemy
-# DESCRIPTION: Data loading with Adaptive Volume Normalization.
-#
-# PHOENIX STRATEGY V12.4 (FTMO SNIPER MODE):
-# 1. SYNCHRONIZATION: Aligned with V12.4 Strategy Kernels.
-# 2. SNIPER STABILITY: Reduced EWMA alpha (0.025) for stable bar generation.
-# 3. NOISE FILTERING: Raised minimum imbalance threshold to filter dead zones.
-# =============================================================================
 from __future__ import annotations
 import warnings
 import pandas as pd
@@ -57,7 +45,7 @@ class TemporalPipeline:
 class AdaptiveVolumeNormalizer:
     """
     Calculates dynamic volume thresholds based on historical activity.
-    Solves JPY bias (Problem #4) by normalizing volume across different liquidity regimes.
+    Solves JPY bias by normalizing volume across different liquidity regimes.
     """
     def __init__(self, target_bars_per_day: int = 50, lookback_days: int = 20):
         self.target_bars = target_bars_per_day
@@ -97,8 +85,7 @@ class AdaptiveVolumeNormalizer:
 
 class AdaptiveImbalanceBarGenerator:
     """
-    V12.4 CORE UPGRADE: Generates Tick Imbalance Bars (TIBs).
-    SNIPER MODE: Lower alpha (0.025) for more stable, significant bars.
+    Generates Tick Imbalance Bars (TIBs).
     Replaces time-based sampling with information-driven sampling.
     """
     def __init__(self, symbol: str, initial_threshold: float = 1000, alpha: float = 0.025):
@@ -216,7 +203,7 @@ class AdaptiveImbalanceBarGenerator:
                                   ((1 - self.alpha) * self.expected_imbalance)
         
         # Clamp threshold to avoid sampling every tick or never sampling
-        # V12.4: Lower bound raised to 10.0 to filter micro-noise
+        # Lower bound raised to 10.0 to filter micro-noise
         self.expected_imbalance = max(10.0, min(self.expected_imbalance, 10000.0))
 
         # Reset State
@@ -473,7 +460,7 @@ def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 
     """
     bars = []
     # Use the new generator for batch processing to ensure training data matches live data
-    # V12.4 SNIPER UPDATE: alpha reduced to 0.025
+    # SNIPER UPDATE: alpha reduced to 0.025
     gen = AdaptiveImbalanceBarGenerator(symbol="BATCH", initial_threshold=volume_threshold, alpha=0.025)
     
     for row in tick_df.itertuples():

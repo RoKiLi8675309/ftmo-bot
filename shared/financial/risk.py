@@ -1,15 +1,3 @@
-# =============================================================================
-# FILENAME: shared/financial/risk.py
-# ENVIRONMENT: DUAL COMPATIBILITY (Windows Py3.9 & Linux Py3.11)
-# PATH: shared/financial/risk.py
-# DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
-# DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
-#
-# PHOENIX V16.23 REALITY CHECK UPDATE:
-# 1. CRITICAL FIX: Enforced 'min_stop_loss_pips' from Config.
-#    Prevents micro-stops (4-5 pips) that get stopped out by noise in Live.
-# 2. SAFETY: Added extra checks for zero conversion rates.
-# =============================================================================
 from __future__ import annotations
 import logging
 import math
@@ -43,6 +31,33 @@ class RiskManager:
     """
     # Default fallback, but logic now prefers config/override
     DEFAULT_CONTRACT_SIZE = 100_000
+
+    @staticmethod
+    def get_contract_size(symbol: str) -> float:
+        """
+        Determines the standard contract size for a given symbol based on asset class.
+        Crucial for correct Margin and Risk calculations across Forex, Indices, and Crypto.
+        """
+        s = symbol.upper()
+        
+        # 1. Metals (Gold/Silver) - Standard Lot is usually 100 oz
+        if "XAU" in s or "XAG" in s:
+            return 100.0
+            
+        # 2. Crypto - Standard Lot is usually 1 coin
+        if "BTC" in s or "ETH" in s or "LTC" in s or "XRP" in s:
+            return 1.0
+            
+        # 3. Indices - Standard Lot is usually 1 contract
+        if any(idx in s for idx in ["US30", "GER30", "GER40", "NAS100", "SPX500", "US500", "DJI", "DAX", "UK100", "JP225"]):
+            return 1.0
+            
+        # 4. Oil - Standard Lot is usually 100 or 1000 barrels. Assuming 100 for safety.
+        if "WTI" in s or "BRENT" in s or "OIL" in s:
+            return 100.0
+
+        # 5. Forex - Standard Lot is 100,000 units
+        return 100_000.0
 
     @staticmethod
     def get_pip_info(symbol: str) -> Tuple[float, int]:
@@ -124,7 +139,7 @@ class RiskManager:
     @staticmethod
     def calculate_required_margin(symbol: str, lots: float, price: float, contract_size: float, conversion_rate: float) -> float:
         """
-        V16.11 FIX: Enforce correct leverage tiers for FTMO/Prop Firms.
+        Enforce correct leverage tiers for FTMO/Prop Firms.
         Formula: (Lots * Contract_Size * Price * Conversion_Rate) / Leverage
         """
         # 1. Identify Asset Class Leverage
@@ -165,7 +180,7 @@ class RiskManager:
     @staticmethod
     def _calculate_max_margin_volume(symbol: str, free_margin: float, contract_size: float, price: float, conversion_rate: float) -> float:
         """
-        V16.11: MARGIN CLAMP.
+        MARGIN CLAMP.
         Calculates the maximum lot size allowed by available free margin.
         Formula: MaxVol = (FreeMargin * Leverage) / (ContractSize * Price * ConvRate)
         """
@@ -221,9 +236,9 @@ class RiskManager:
         free_margin: float = 999999.0 
     ) -> Tuple[Trade, float]:
         """
-        ADVANCED POSITION SIZING KERNEL (V16.4 SURVIVAL PROTOCOL).
+        ADVANCED POSITION SIZING KERNEL (SURVIVAL PROTOCOL).
         Integrates RCK (Risk-Confidence-Kelly) Optimization with Margin Guards.
-        FIXED (V16.23): Enforces strict minimum pips for Stop Loss.
+        Enforces strict minimum pips for Stop Loss.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -236,15 +251,20 @@ class RiskManager:
         # 1. Retrieve Config Parameters
         risk_conf = CONFIG.get('risk_management', {})
         
-        # Determine Contract Size
-        c_size = contract_size_override if contract_size_override else risk_conf.get('contract_size', RiskManager.DEFAULT_CONTRACT_SIZE)
+        # Determine Contract Size for the NEW trade
+        # Prioritize Override -> Config -> Default
+        if contract_size_override:
+            c_size = contract_size_override
+        else:
+            # If not overridden, try to fetch specific size or default
+            c_size = RiskManager.get_contract_size(symbol)
         
         # USE DETECTED ACCOUNT SIZE (if available), else default to Config
         start_equity = account_size if account_size else float(CONFIG.get('env', {}).get('initial_balance', 100000.0))
         
         # --- SNIPER PROTOCOL: VOLATILITY-ADJUSTED STOPS ---
         atr_mult_sl = float(risk_conf.get('stop_loss_atr_mult', 1.5)) 
-        atr_mult_tp = float(risk_conf.get('take_profit_atr_mult', 3.0)) # V16.0: 3R Target for Scalping
+        atr_mult_tp = float(risk_conf.get('take_profit_atr_mult', 3.0)) # 3R Target for Scalping
         
         # ATR Fallback Logic
         if atr and atr > 0:
@@ -254,6 +274,8 @@ class RiskManager:
             
         # --- DEAD PAIR PROTECTION (SPREAD CLAMP & MIN PIPS) ---
         pip_val_raw, _ = RiskManager.get_pip_info(symbol)
+        if pip_val_raw <= 0: pip_val_raw = 0.0001 # Safety
+        
         spread_assumed = CONFIG.get('forensic_audit', {}).get('spread_pips', {}).get(symbol, 1.5)
         
         # Logic A: Stop must be > 3x Spread
@@ -282,10 +304,15 @@ class RiskManager:
         usd_per_pip_per_lot = c_size * pip_val_raw * conversion_rate
         loss_per_lot_usd = sl_pips * usd_per_pip_per_lot
         
+        # CRITICAL ZERO DIVISION GUARD
+        if loss_per_lot_usd <= 1e-9:
+            logger.error(f"CRITICAL: Zero Risk Per Lot for {symbol}. SL:{sl_pips:.1f} pips. Blocked to prevent crash.")
+            return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, "Zero Risk Calc Error"), 0.0
+        
         lots = 0.0
         calculated_risk_usd = 0.0
         
-        # --- V16.4: SURVIVAL RISK PARAMETERS ---
+        # --- SURVIVAL RISK PARAMETERS ---
         default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.0025) # 0.25%
         buffer_threshold = risk_conf.get('profit_buffer_threshold', 0.02)
         scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.005) # 0.5% Cap
@@ -303,7 +330,7 @@ class RiskManager:
             else:
                 risk_pct = default_base_risk * 100.0
         
-        # --- SQN PERFORMANCE SCALING (V16.4: CAPPED) ---
+        # --- SQN PERFORMANCE SCALING (CAPPED) ---
         if performance_score != 0.0:
             if performance_score < -2.0:
                 # TOXIC ASSET RECOVERY PROTOCOL
@@ -355,15 +382,15 @@ class RiskManager:
         calculated_risk_usd *= ker_scalar
         
         # Calculate Lots
-        if loss_per_lot_usd > 0:
-            lots = calculated_risk_usd / loss_per_lot_usd
+        # loss_per_lot_usd is guaranteed > 0 by earlier check
+        lots = calculated_risk_usd / loss_per_lot_usd
 
         # --- CORRELATION PENALTY ---
         if active_correlations > 0:
             penalty_factor = 1.0 / (1.0 + (0.5 * active_correlations))
             lots *= penalty_factor
 
-        # --- MARGIN CLAMP (V16.11) ---
+        # --- MARGIN CLAMP ---
         # Calculate max volume allowed by Free Margin
         max_margin_lots = RiskManager._calculate_max_margin_volume(symbol, free_margin, c_size, price, conversion_rate)
 
@@ -412,7 +439,7 @@ class SessionGuard:
         self.friday_entry_cutoff_hour = risk_conf.get('friday_entry_cutoff_hour', 16)
         self.friday_liquidation_hour = risk_conf.get('friday_liquidation_hour_server', 21)
 
-        # V16.22 SESSION CONTROL
+        # SESSION CONTROL
         session_conf = risk_conf.get('session_control', {})
         self.session_enabled = session_conf.get('enabled', False)
         self.start_hour = session_conf.get('start_hour_server', 10)
@@ -431,7 +458,7 @@ class SessionGuard:
         if current_time >= self.rollover_start or current_time <= self.rollover_end:
             return False
             
-        # V16.22: Daily Session Enforcement
+        # Daily Session Enforcement
         if self.session_enabled:
             # Block before Start Hour (e.g. 10:00 Server)
             if now_local.hour < self.start_hour:
@@ -469,7 +496,7 @@ class SessionGuard:
         # 2. Friday Hard Close
         if weekday == 4 and now_local.hour >= self.friday_liquidation_hour: return True
         
-        # 3. V16.22 Daily Hard Close (3h before NY Close)
+        # 3. Daily Hard Close (3h before NY Close)
         if self.session_enabled:
             if now_local.hour >= self.liq_hour:
                 return True
@@ -486,7 +513,7 @@ class FTMORiskMonitor:
         self.equity = initial_balance
         self.profit_target = initial_balance * 1.10
         
-        # V15.0: Ratcheting State
+        # Ratcheting State
         self.ratchet_floor = 0.0
         self.ratchet_step_pct = CONFIG.get('risk_management', {}).get('equity_ratchet', {}).get('step_percent', 0.05)
 
@@ -496,7 +523,7 @@ class FTMORiskMonitor:
         # 1. Total Drawdown Check (10% Max)
         total_dd_limit = self.initial_balance * 0.90
         
-        # V15.0: Ratchet Logic Override
+        # Ratchet Logic Override
         # If we have locked in a floor, that becomes the new "hard deck"
         effective_floor = max(total_dd_limit, self.ratchet_floor)
         
@@ -519,7 +546,7 @@ class FTMORiskMonitor:
     def update_equity(self, current_equity: float):
         self.equity = current_equity
         
-        # V15.0: Check Ratchet
+        # Check Ratchet
         # If equity grows 5% above initial, lock the floor at Init + 2.5% (Trailing)
         # Or simplistic: Every 5% gain locks the previous 5% level
         gain_pct = (self.equity - self.initial_balance) / self.initial_balance
@@ -530,7 +557,6 @@ class FTMORiskMonitor:
                  new_floor = self.initial_balance * (1.0 + ((steps - 1) * self.ratchet_step_pct))
                  if new_floor > self.ratchet_floor:
                      self.ratchet_floor = new_floor
-                     # Log implicitly via caller or separate mechanism if needed
 
     def check_circuit_breakers(self) -> str:
         if self.equity <= 0:

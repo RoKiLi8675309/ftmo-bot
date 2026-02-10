@@ -1,13 +1,3 @@
-# =============================================================================
-# FILENAME: shared/core/infrastructure.py
-# ENVIRONMENT: DUAL COMPATIBILITY (Windows Py3.9 & Linux Py3.11)
-# PATH: shared/core/infrastructure.py
-# DEPENDENCIES: redis
-# DESCRIPTION: Manages Redis connections, Streams, and Retry policies.
-# CRITICAL: Python 3.9 Compatible. Handles Network partitions gracefully.
-# AUDIT REMEDIATION (2025-12-20):
-# - Enforced strict MAXLEN=5000 on all streams to prevent OOM.
-# =============================================================================
 import logging
 import time
 from typing import Optional, Any, Dict
@@ -18,7 +8,6 @@ from redis.exceptions import (
     ConnectionError,
     TimeoutError,
     BusyLoadingError
-    # ConnectionResetError is NOT in redis.exceptions, it is a Python built-in.
 )
 
 class RedisStreamManager:
@@ -102,7 +91,7 @@ class RedisStreamManager:
 
     def add_event(self, stream_key: str, data: Dict[str, Any], maxlen: int = 5000) -> str:
         """
-        AUDIT FIX: Helper to safely add events to a stream with strict memory capping.
+        Helper to safely add events to a stream with strict memory capping.
         Prevents Redis OOM crashes by enforcing maxlen (Default 5000).
         """
         try:

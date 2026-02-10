@@ -1,17 +1,3 @@
-# =============================================================================
-# FILENAME: engines/live/engine.py
-# ENVIRONMENT: Linux/WSL2 (Python 3.11)
-# PATH: engines/live/engine.py
-# DEPENDENCIES: shared, engines.live.dispatcher, engines.live.predictor
-# DESCRIPTION: Core Event Loop. Ingests ticks, aggregates Tick Imbalance Bars (TIBs),
-# and generates signals via the Golden Trio Predictor.
-#
-# PHOENIX V16.5 UPDATE (AGGRESSOR ROTATION):
-# - TIME STOP: Updated `_manage_active_positions_loop` to use dynamic `horizon_minutes`
-#   (4h/240m) instead of hardcoded 8h limit.
-# - REVENGE GUARD: Preserved V16.4.1 Penalty Box restoration logic.
-# - SESSION GUARD: Preserved V16.22 hard liquidation logic.
-# =============================================================================
 import logging
 import time
 import json
@@ -34,7 +20,7 @@ except ImportError:
     NLP_AVAILABLE = False
     print("WARNING: NLP libraries not found (newspaper3k, textblob). Sentiment features disabled.")
 
-# Shared Imports (Modularized Architecture)
+# Shared Imports
 from shared import (
     CONFIG,
     setup_logging,
@@ -50,12 +36,12 @@ from shared import (
     Trade,
     RiskManager,
     TradeContext,
-    load_real_data # Required for Calibration
+    load_real_data 
 )
 
 # Local Engine Modules
 from engines.live.dispatcher import TradeDispatcher
-from engines.live.predictor import MultiAssetPredictor
+from engines.live.predictor import MultiAssetPredictor, Signal
 
 setup_logging("LiveEngine")
 logger = logging.getLogger("LiveEngine")
@@ -68,9 +54,9 @@ class LiveTradingEngine:
     The Central Logic Unit for the Linux Consumer.
     1. Consumes Ticks from Redis.
     2. Aggregates Ticks into Adaptive Imbalance Bars (TIBs).
-    3. Feeds Bars to Golden Trio Predictor (V16.0 Logic).
+    3. Feeds Bars to Golden Trio Predictor.
     4. Manages Active Positions (Time Stop / Trailing).
-    5. Dispatches Orders to Windows.
+    5. Dispatches Orders to Windows via Redis.
     """
     def __init__(self):
         self.shutdown_flag = False
@@ -102,7 +88,7 @@ class LiveTradingEngine:
         self.calendar_thread = threading.Thread(target=self._calendar_sync_loop, daemon=True)
         self.calendar_thread.start()
         
-        # 3. Data Aggregation & Calibration (V16.7 SYNC FIX)
+        # 3. Data Aggregation & Calibration
         # We must calibrate thresholds BEFORE initializing aggregators/predictor
         self.threshold_map = self._calibrate_thresholds()
         
@@ -122,7 +108,7 @@ class LiveTradingEngine:
             logger.info(f"Initialized TIB Generator for {sym} (Start: {thresh:.1f}, Alpha: {alpha})")
 
         # 4. AI Predictor (Golden Trio / ARF)
-        # V16.7: Pass the calibrated map so Predictor warms up with SAME data
+        # Pass the calibrated map so Predictor warms up with SAME data
         self.predictor = MultiAssetPredictor(
             symbols=CONFIG['trading']['symbols'],
             threshold_map=self.threshold_map
@@ -137,7 +123,7 @@ class LiveTradingEngine:
             lock=self.lock
         )
         
-        # V16.13: EXECUTION THROTTLE STATE
+        # EXECUTION THROTTLE STATE
         self.last_dispatch_time = defaultdict(float)
         
         # DEBUG FIX: Force clear pending orders on startup to remove ghosts
@@ -157,15 +143,15 @@ class LiveTradingEngine:
         # Tracks last 30 trades per symbol to calculate SQN
         self.performance_stats = defaultdict(lambda: deque(maxlen=30))
         
-        # V16.24: Server-Authority Stats
+        # Server-Authority Stats
         # We store the "last reset timestamp" to detect day changes
         self.last_reset_ts = 0.0 
         
-        # V12.31: Daily Circuit Breaker State (Realized Execution)
+        # Daily Circuit Breaker State (Realized Execution)
         # Added 'tickets' set to track unique deal IDs and prevent double counting
         self.daily_execution_stats = defaultdict(lambda: {'losses': 0, 'pnl': 0.0, 'tickets': set()})
         
-        # V14.0 UNSHACKLED: Increased to 5 to prevent early lockout in Aggressor Mode
+        # Increased to 5 to prevent early lockout in Aggressor Mode
         self.max_daily_losses_per_symbol = 5
         
         # --- TIMEZONE INIT ---
@@ -177,7 +163,7 @@ class LiveTradingEngine:
 
         # --- STATE RESTORATION (CRITICAL) ---
         self._restore_daily_state()
-        # V16.4.1: Restore Penalty Box to prevent Revenge Trading after restart
+        # Restore Penalty Box to prevent Revenge Trading after restart
         self._restore_penalty_box_state()
 
         self.perf_thread = threading.Thread(target=self.fetch_performance_loop, daemon=True)
@@ -188,7 +174,7 @@ class LiveTradingEngine:
         self.last_corr_update = time.time()
         self.latest_prices = {}
         
-        # --- V16.4 FIX: INJECT FALLBACK PRICES ---
+        # --- INJECT FALLBACK PRICES ---
         # Ensures RiskManager has conversion rates before first tick arrives
         self._inject_fallback_prices()
         
@@ -204,20 +190,20 @@ class LiveTradingEngine:
         # --- Volatility Gate Config ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.0) # Lowered for V14
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 1.0) 
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
 
-        # --- V16.22 FIX: SAFETY GAP STATE ---
+        # --- SAFETY GAP STATE ---
         # Tracks known open positions to detect closures instantly
         self.known_open_symbols: Set[str] = set()
 
-        # V11.1: Active Position Management Thread
+        # Active Position Management Thread
         self.mgmt_thread = threading.Thread(target=self._manage_active_positions_loop, daemon=True)
         self.mgmt_thread.start()
 
     def _calibrate_thresholds(self) -> Dict[str, float]:
         """
-        V16.7 NEW: Analyzes historical data to determine optimal bar thresholds.
+        Analyzes historical data to determine optimal bar thresholds.
         Replicates the Backtester's logic exactly to ensure the Live model sees
         the same data distribution it was trained on.
         """
@@ -231,8 +217,13 @@ class LiveTradingEngine:
         for sym in CONFIG['trading']['symbols']:
             try:
                 # 1. Load Data (Last 30 Days)
-                df = load_real_data(sym, n_candles=50000, days=30)
-                if df.empty:
+                # Ensure the DB query doesn't crash if empty
+                try:
+                    df = load_real_data(sym, n_candles=50000, days=30)
+                except Exception:
+                    df = None
+
+                if df is None or df.empty:
                     logger.warning(f"⚠️ Calibration: No data for {sym}. Using default {config_thresh}.")
                     threshold_map[sym] = config_thresh
                     continue
@@ -287,11 +278,18 @@ class LiveTradingEngine:
         """
         Injects static fallback prices for conversion pairs to prevent
         'No Rate' errors before the first tick arrives.
+        Updated for Golden Basket V16.30.
         """
         defaults = {
-            "NZDUSD": 0.60, "AUDUSD": 0.65, "GBPUSD": 1.25, "EURUSD": 1.08,
-            "USDJPY": 150.0, "USDCAD": 1.35, "USDCHF": 0.90, "AUDJPY": 95.0,
-            "EURJPY": 160.0, "GBPJPY": 190.0
+            # --- MAJORS (Primary Conversion) ---
+            "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
+            "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
+            
+            # --- GOLDEN BASKET CROSSES (Fallbacks) ---
+            "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0,
+            
+            # --- LEGACY (Low Priority) ---
+            "GBPAUD": 1.95, "EURAUD": 1.65, "GBPNZD": 2.05
         }
         for sym, price in defaults.items():
             if sym not in self.latest_prices:
@@ -301,21 +299,24 @@ class LiveTradingEngine:
 
     def _get_producer_anchor_timestamp(self) -> float:
         """
-        V16.24 FIX: Polls Redis for the AUTHORITATIVE Midnight Timestamp set by Windows Producer.
+        Polls Redis for the AUTHORITATIVE Midnight Timestamp set by Windows Producer.
+        AUDIT FIX: Do not guess. Trust the producer. If producer is dead, we wait.
         """
         try:
+            # This key is set by windows_producer.py during midnight rollover
             reset_ts = self.stream_mgr.r.get("risk:last_reset_date")
             if reset_ts:
                 return float(reset_ts)
         except:
             pass
         
-        # Fallback: Midnight UTC today
+        # Fallback: Midnight UTC today - Only use if absolutely necessary
+        # This is risky if Broker is EET, but better than crashing.
         return datetime.now(pytz.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
     def _restore_daily_state(self):
         """
-        CRITICAL: Replays today's closed trades from Redis using the Producer's Timestamp Authority.
+        Replays today's closed trades from Redis using the Producer's Timestamp Authority.
         """
         logger.info(f"{LogSymbols.DATABASE} Restoring Daily Execution State (Server Time Sync)...")
         try:
@@ -373,7 +374,6 @@ class LiveTradingEngine:
 
     def _restore_penalty_box_state(self):
         """
-        V16.4.1 AUDIT FIX: REVENGE AMNESIA PATCH.
         Restores Penalty Box state by scanning recent closed trades from Redis.
         Prevents "Revenge Trading" if the bot restarts immediately after a loss.
         """
@@ -467,7 +467,7 @@ class LiveTradingEngine:
         Background thread to listen for CLOSED trades.
         1. Updates SQN stats (performance sizing).
         2. Updates Daily Circuit Breaker (stops trading on bad days).
-        3. V16.4: Enforces REVENGE TRADING GUARD (Penalty Box).
+        3. Enforces REVENGE TRADING GUARD (Penalty Box).
         """
         logger.info(f"{LogSymbols.INFO} Performance Monitor (SQN & Circuit Breaker) Thread Started.")
         stream_key = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
@@ -520,7 +520,7 @@ class LiveTradingEngine:
                                         self.daily_execution_stats[symbol]['losses'] += 1
                                         logger.info(f"📉 LOSS DETECTED {symbol}: ${net_pnl:.2f} | Daily Losses: {self.daily_execution_stats[symbol]['losses']}")
                                         
-                                        # V16.4 FIX: REVENGE TRADING GUARD (PENALTY BOX)
+                                        # REVENGE TRADING GUARD (PENALTY BOX)
                                         cooldown = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 60)
                                         self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=cooldown)
                                         logger.warning(f"🚫 {symbol} SENT TO PENALTY BOX for {cooldown}m (Revenge Guard)")
@@ -606,15 +606,15 @@ class LiveTradingEngine:
 
     def _manage_active_positions_loop(self):
         """
-        V16.0 UPDATE: Active Position Management Thread.
+        Active Position Management Thread.
         Enforces:
         1. 4h Time Stop (Hard Exit) - Dynamic Config.
         2. 0.5R Trailing Stop.
-        3. V16.22 UPDATE: Daily Session Liquidation (Redundancy Check).
+        3. Daily Session Liquidation (Redundancy Check).
         """
         logger.info(f"{LogSymbols.INFO} Active Position Manager Started (Trail: 0.5R, Time-Stop: Dynamic).")
         
-        # V16.5: Dynamic Horizon Fetch (Default 240m)
+        # Dynamic Horizon Fetch (Default 240m)
         tbm_conf = CONFIG.get('online_learning', {}).get('tbm', {})
         horizon_minutes = int(tbm_conf.get('horizon_minutes', 240))
         hard_stop_seconds = horizon_minutes * 60
@@ -629,7 +629,7 @@ class LiveTradingEngine:
 
                 now_utc = datetime.now(pytz.utc)
 
-                # V16.22 SESSION CHECK (Redundancy)
+                # SESSION CHECK (Redundancy)
                 # If the main loop missed the liquidation time, we catch it here.
                 session_liquidation = self.session_guard.should_liquidate()
 
@@ -734,11 +734,11 @@ class LiveTradingEngine:
             except Exception as e:
                 logger.error(f"Position Manager Error: {e}")
             
-            time.sleep(1) # V16.10: Faster checking (1s) to clear ghosts immediately
+            time.sleep(1) 
 
     def _reconcile_pending_orders(self, open_positions: Dict[str, Dict]):
         """
-        V16.10 GHOST BUSTER: Clears 'Pending' status if any position exists for the symbol.
+        Clears 'Pending' status if any position exists for the symbol.
         Robust against broken comment/UUID chains.
         """
         self.dispatcher.cleanup_stale_orders(ttl_seconds=600, open_positions=open_positions)
@@ -752,7 +752,7 @@ class LiveTradingEngine:
         try:
             symbol = tick_data.get('symbol')
             
-            # --- CRITICAL FIX 16.4.1: UPDATE LATEST PRICE BEFORE BLOCKING ---
+            # --- CRITICAL: UPDATE LATEST PRICE BEFORE BLOCKING ---
             # Explicit float casting for safety
             bid = float(tick_data.get('bid', 0.0))
             ask = float(tick_data.get('ask', 0.0))
@@ -774,7 +774,7 @@ class LiveTradingEngine:
                 # even if we aren't actively trading them.
                 return
             
-            # --- TIMESTAMP DEDUPLICATION ---
+            # --- TIMESTAMP DEDUPLICATION & LATENCY GUARD ---
             tick_ts = float(tick_data.get('time', 0.0))
             # Normalize ms to seconds if needed
             if tick_ts > 100_000_000_000:
@@ -782,11 +782,18 @@ class LiveTradingEngine:
             
             last_ts = self.processed_ticks.get(symbol, 0.0)
             
-            # AUDIT FIX: Relaxed Deduplication (< instead of <=)
-            # Allows same-millisecond bursts (HFT/Volume Aggregation)
-            if tick_ts < last_ts:
+            # Strict Deduplication: If tick is older or same as last processed, DROP IT.
+            if tick_ts <= last_ts:
                 return 
             
+            # Stale Tick Guard: If tick is too old (> 45s), dropping prevents "Catch Up" hallucinations
+            # This happens if Redis backs up or Linux pauses.
+            if abs(time.time() - tick_ts) > MAX_TICK_LATENCY_SEC:
+                if self.ticks_processed % 100 == 0:
+                    logger.warning(f"⚠️ Dropping Stale Tick {symbol}: Latency {time.time()-tick_ts:.1f}s > {MAX_TICK_LATENCY_SEC}s")
+                self.processed_ticks[symbol] = tick_ts # Mark as seen so we move forward
+                return
+
             self.processed_ticks[symbol] = tick_ts
 
             # --- VISUAL HEARTBEAT ---
@@ -794,14 +801,14 @@ class LiveTradingEngine:
             if self.ticks_processed % 1000 == 0:
                 logger.info(f"⚡ HEARTBEAT: Processed {self.ticks_processed} ticks... (Last: {symbol})")
 
-            # --- CRITICAL FIX: FORCE VOLUME FLOOR (Synthetic Tick Rule) ---
+            # --- FORCE VOLUME FLOOR (Synthetic Tick Rule) ---
             raw_vol = float(tick_data.get('volume', 0.0))
             volume = raw_vol if raw_vol > 0 else 1.0
 
             bid_vol = float(tick_data.get('bid_vol', 0.0))
             ask_vol = float(tick_data.get('ask_vol', 0.0))
 
-            # --- CONTEXT EXTRACTION (SAFETY PATCH) ---
+            # --- CONTEXT EXTRACTION ---
             if 'ctx_d1' in tick_data:
                 try: 
                     self.latest_context[symbol]['d1'] = json.loads(tick_data['ctx_d1'])
@@ -836,7 +843,7 @@ class LiveTradingEngine:
         Executes the Prediction and Dispatch logic.
         """
         # =====================================================================
-        # V16.23 CRITICAL FIX: SAFETY GAP PRIORITY INVERSION
+        # SAFETY GAP PRIORITY INVERSION
         # MOVED TO THE ABSOLUTE TOP TO PREVENT RACE CONDITIONS.
         # =====================================================================
         
@@ -860,7 +867,7 @@ class LiveTradingEngine:
             self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=5)
             return  # <--- CRITICAL: DO NOT PROCEED TO SIGNAL GENERATION
 
-        # --- V16.13: EXECUTION THROTTLE (THE MACHINE GUN FIX) ---
+        # --- EXECUTION THROTTLE ---
         # Forces a hard wait time between orders for the same symbol.
         # This covers the critical "Redis Round Trip" latency window.
         ttl_sec = CONFIG['trading'].get('limit_order_ttl_seconds', 60)
@@ -870,7 +877,7 @@ class LiveTradingEngine:
             logger.info(f"⏳ {symbol} in Execution Cool-down ({ttl_sec}s). Skipping.")
             return
 
-        # --- V10.0 EXECUTION CIRCUIT BREAKER ---
+        # --- EXECUTION CIRCUIT BREAKER ---
         if self._check_circuit_breaker(symbol):
             return
 
@@ -885,11 +892,7 @@ class LiveTradingEngine:
         except Exception as e:
             logger.error(f"Portfolio Update Error: {e}")
         
-        # --- V16.22 SESSION GUARD & WEEKEND LIQUIDATION ---
-        # This checks:
-        # A. Is it Weekend?
-        # B. Is it Friday Close time?
-        # C. Is it Daily Session Liquidation time (3h before NY Close)?
+        # --- SESSION GUARD & WEEKEND LIQUIDATION ---
         if self.session_guard.should_liquidate():
             if not self.liquidation_triggered_map[symbol]:
                 logger.warning(f"{LogSymbols.CLOSE} SESSION END GUARD: Closing {symbol} (Hard Close 3h before NY End).")
@@ -914,16 +917,16 @@ class LiveTradingEngine:
         current_sentiment = self.global_sentiment.get('GLOBAL', 0.0)
         mt5_context = self.latest_context.get(symbol, {})
         
-        # --- V16.7 FIX: RECONCILE PENDING ORDERS ---
+        # --- RECONCILE PENDING ORDERS ---
         # Check if any "Pending" orders are actually open now
         self._reconcile_pending_orders(open_positions)
 
         # =====================================================================
-        # B. MAX TRADES GUARD (RACE CONDITION FIX - V16.25)
+        # B. MAX TRADES GUARD (RACE CONDITION FIX)
         # =====================================================================
         max_open_trades = CONFIG['risk_management'].get('max_open_trades', 1)
         
-        # V16.25: Count In-Flight Orders (Strict Logic)
+        # Count In-Flight Orders (Strict Logic)
         # We must count ANY pending order that was dispatched recently (<60s)
         # as a "reserved slot" to prevent firing a second trade while the first is in transit.
         pending_count = 0
@@ -946,7 +949,7 @@ class LiveTradingEngine:
 
         total_utilization = len(open_positions) + pending_count
 
-        # V16.25: BLOCK if Limit Reached
+        # BLOCK if Limit Reached
         if total_utilization >= max_open_trades:
             # Only allow processing if this symbol is already OPEN (for management/exit)
             # If it's pending, we also block to avoid duplicate signals for same symbol
@@ -955,7 +958,7 @@ class LiveTradingEngine:
                     logger.info(f"🛑 MAX TRADES LIMIT ({total_utilization}/{max_open_trades}) [Open:{len(open_positions)} Pending:{pending_count}]. Skipping {symbol}.")
                 return
         
-        # V16.25: BLOCK if symbol has pending order (Machine Gun Protection)
+        # BLOCK if symbol has pending order (Machine Gun Protection)
         if symbol_has_pending:
             logger.info(f"⚠️ Anti-Machine Gun: {symbol} has pending order. Skipping.")
             return
@@ -969,6 +972,7 @@ class LiveTradingEngine:
         }
         
         # 3. Get Signal (Golden Trio / ARF)
+        # HALLUCINATION GUARD: If Predictor detects gap, it will bridge and return None
         signal = self.predictor.process_bar(symbol, bar, context_data=context_data)
         
         if not signal: return
@@ -1034,7 +1038,7 @@ class LiveTradingEngine:
             risk_reward_ratio=2.0 
         )
 
-        # --- V12.0: CALCULATE DAILY PNL FOR BUFFER SCALING ---
+        # --- CALCULATE DAILY PNL FOR BUFFER SCALING ---
         try:
             start_eq = float(self.stream_mgr.r.get(CONFIG['redis']['risk_keys']['daily_starting_equity']) or 0.0)
             if start_eq > 0:
@@ -1044,11 +1048,11 @@ class LiveTradingEngine:
         except:
             daily_pnl_pct = 0.0
 
-        # --- V13.0: CALCULATE TOTAL OPEN RISK % (LIVE) ---
+        # --- CALCULATE TOTAL OPEN RISK % (LIVE) ---
         current_open_risk_usd = 0.0
         contract_size = 100000
         
-        # --- V16.11 MARGIN SAFETY: Calculate Used Margin Locally ---
+        # --- MARGIN SAFETY: Calculate Used Margin Locally ---
         # Fallback if Redis data is missing or stale.
         local_used_margin = 0.0
         
@@ -1079,7 +1083,7 @@ class LiveTradingEngine:
         else:
             current_open_risk_pct = 0.0
 
-        # --- V16.11: FETCH REAL FREE MARGIN WITH LOCAL FALLBACK ---
+        # --- FETCH REAL FREE MARGIN WITH LOCAL FALLBACK ---
         real_free_margin = 0.0
         try:
             acc_info_raw = self.stream_mgr.r.hgetall(CONFIG['redis']['account_info_key'])
@@ -1125,7 +1129,7 @@ class LiveTradingEngine:
 
         trade_intent.action = signal.action
 
-        # --- V10.2: VOLATILITY TRIGGER (TIGHTEN STOPS) ---
+        # --- VOLATILITY TRIGGER (TIGHTEN STOPS) ---
         tighten = signal.meta_data.get('tighten_stops', False)
         
         # Current SL/TP are Distances
@@ -1137,7 +1141,7 @@ class LiveTradingEngine:
             trade_intent.comment += "|Tightened"
             logger.info(f"🛡️ STOP TIGHTENED: {symbol} (High Volatility) -> SL Dist {sl_dist:.5f}")
 
-        # --- V16.8: STOP DISTANCE CLAMP (THE FIX) ---
+        # --- STOP DISTANCE CLAMP ---
         # Ensure SL/TP are not inside the spread (min 5 pips)
         pip_size, _ = RiskManager.get_pip_info(symbol)
         min_pips = CONFIG['risk_management'].get('min_stop_loss_pips', 5.0)
@@ -1152,7 +1156,7 @@ class LiveTradingEngine:
             trade_intent.comment += "|MinTP"
 
         # --- DYNAMIC R:R OVERRIDE ---
-        # V14.0 UPDATE: Check for Momentum Ignition reward boost
+        # Check for Momentum Ignition reward boost
         optimized_rr = signal.meta_data.get('optimized_rr')
         if optimized_rr and optimized_rr > 0 and current_atr > 0:
             tp_dist = current_atr * optimized_rr
@@ -1182,14 +1186,13 @@ class LiveTradingEngine:
         logger.info(f"📤 Dispatching Order: {trade_intent.action} {trade_intent.symbol} {trade_intent.volume} Lots")
         self.dispatcher.send_order(trade_intent, risk_usd)
         
-        # V16.13: UPDATE DISPATCH TIMER
+        # UPDATE DISPATCH TIMER
         self.last_dispatch_time[symbol] = time.time()
 
     def _check_risk_gates(self, symbol: str) -> bool:
         """
         Runs the gauntlet of safety checks.
-        V16.11: Includes Margin Level Guard.
-        V16.22: Includes Session Window Guard.
+        Includes Margin Level Guard & Session Window Guard.
         """
         # 1. Midnight Freeze Check
         if self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['midnight_freeze']):
@@ -1208,7 +1211,7 @@ class LiveTradingEngine:
             logger.warning(f"{LogSymbols.LOCK} FTMO Guard Halted: {log_msg}")
             return False
 
-        # 4. General Market Hours & SESSION WINDOW (V16.22)
+        # 4. General Market Hours & SESSION WINDOW
         if not self.session_guard.is_trading_allowed():
             logger.warning(f"{LogSymbols.LOCK} Session Guard Block: Outside Allowed Window (London/NY).")
             return False
@@ -1227,7 +1230,7 @@ class LiveTradingEngine:
         if not self.compliance_guard.check_trade_permission(symbol):
              return False
 
-        # --- 8. MARGIN LEVEL GUARD (V16.11) ---
+        # --- 8. MARGIN LEVEL GUARD ---
         # Fetch current margin health from Redis
         try:
             acc_info = self.stream_mgr.r.hgetall(CONFIG['redis']['account_info_key'])
@@ -1266,6 +1269,14 @@ class LiveTradingEngine:
 
         while not self.shutdown_flag:
             try:
+                # AUDIT FIX: PAUSE ON MIDNIGHT FREEZE
+                # If the Producer is doing a rollover sync, we must pause tick processing
+                # to prevent risk state desynchronization.
+                if self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['midnight_freeze']):
+                    logger.info("❄️ Midnight Freeze Detected. Pausing Tick Consumption...")
+                    time.sleep(1)
+                    continue
+
                 response = self.stream_mgr.r.xreadgroup(
                     groupname=group,
                     consumername=consumer,

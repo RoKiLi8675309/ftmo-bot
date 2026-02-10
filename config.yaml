@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V16.23 (REALITY CHECK PATCH)
+# config.yaml – PROJECT PHOENIX V16.23 (GOLDEN BASKET OPTIMIZATION)
 # STATUS: LIVE TRADING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# REMEDIATION UPDATE (THE FIX):
-# 1. HARD STOP FLOOR: 'min_stop_loss_pips' set to 15.0. No more 5-pip suicide stops.
-# 2. SAFETY BUFFER: Daily Loss Limit capped at 4.0% (leaving 1% breathing room).
-# 3. REALITY SPREADS: Updated forensic assumptions to match high-volatility execution.
+# REMEDIATION UPDATE (PORTFOLIO ROTATION):
+# 1. GOLDEN BASKET: Shifted to High-Liquidity/Low-Spread Majors + JPY Crosses.
+# 2. BLACKLIST: Removed GBPAUD/GBPNZD due to poor Spread-to-Vol ratio.
+# 3. SAFETY: Enforced Max Currency Exposure of 2 to prevent USD stacking.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -133,7 +133,7 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 10.0 # V16.6: RELAXED to 10.0 for Scalping
+    threshold: 10.0 # RELAXED to 10.0 for Scalping
   
   cyclical_time: true
   session_awareness: true
@@ -147,13 +147,14 @@ phoenix_strategy:
   regime_enforcement: "DISABLED" 
   
   asset_regime_map:
-    GBPAUD: "TREND_BREAKOUT" # Explicitly defined
-    EURAUD: "TREND_BREAKOUT"
-    # GBPNZD Removed (Dead Weight)
     GBPJPY: "TREND_BREAKOUT" 
     USDJPY: "TREND_BREAKOUT"
-    GBPUSD: "TREND_BREAKOUT" # Explicitly defined
+    GBPUSD: "TREND_BREAKOUT"
+    EURUSD: "NEUTRAL"
+    AUDUSD: "NEUTRAL"
+    USDCAD: "MEAN_REVERSION" # CAD often mean reverts on Oil
     EURJPY: "TREND_BREAKOUT"
+    AUDJPY: "TREND_BREAKOUT"
     CAD: "NEUTRAL"    
     CHF: "NEUTRAL"    
     USD: "NEUTRAL"
@@ -267,10 +268,12 @@ risk_management:
   max_total_loss_pct: 0.095        
   
   # PORTFOLIO HEAT
+  # Strict limit: Only 2 pairs of the same currency (e.g. 2 USD pairs) allowed at once.
+  # With the new balanced basket, this allows reasonable concurrency.
   max_currency_exposure: 2         
   
   # V16.21: SINGLE TRADE ENFORCEMENT
-  # Set to 1 to strictly prevent "No Money" margin errors.
+  # Set to 1 to strictly prevent "No Money" margin errors per symbol.
   max_open_trades: 1               
   max_risk_percent: 2.0 # Raised for Aggressor            
   
@@ -326,30 +329,30 @@ risk_management:
   hard_stop_equity_usd: 80000.0
   
   # V16.23 REALITY FIX: ABSOLUTE HARD FLOOR FOR STOPS
-  # GBPAUD spreads can be 8+ pips. A 10 pip stop is suicidal.
-  # We enforce 15 pips to survive the noise.
+  # Enforce 15 pips to survive the noise, especially on crosses.
   min_stop_loss_pips: 15.0
 
-# --- TRADING PORTFOLIO (V16.0) ---
+# --- TRADING PORTFOLIO (V16.30 GOLDEN BASKET) ---
 trading:
-  # HYPER-SCALPER FOREX PORTFOLIO (High Volatility Crosses):
+  # THE GOLDEN BASKET: OPTIMAL SPREAD-TO-VOLATILITY RATIO
+  # Removing High-Cost Pairs (GBPAUD/GBPNZD) to restore ML Edge.
   symbols:
-    - "GBPAUD"   # The Beast (High Volatility)
-    - "GBPJPY"   # The Dragon
-    - "EURAUD"   # High Beta Cross
-    # GBPNZD Removed (High Correlation, Low Yield)
-    - "USDJPY"   # Carry/Trend
-    - "GBPUSD"   # Cable
-    - "EURJPY"   # Cross
+    # --- MAJORS (Low Cost / High Liquidity) ---
+    - "EURUSD"   # The Anchor (Spread ~1.5)
+    - "GBPUSD"   # Trend King (Spread ~2.0)
+    - "USDJPY"   # Carry/Trend (Spread ~1.8)
+    - "AUDUSD"   # Commodity Proxy (Spread ~1.8)
+    - "USDCAD"   # Mean Reversion Proxy (Spread ~2.8)
+    
+    # --- CROSSES (High Volatility / Reasonable Cost) ---
+    - "GBPJPY"   # The Dragon (Vol compensates for ~4.5 spread)
+    - "EURJPY"   # Cross Liquidity (Spread ~2.5)
+    - "AUDJPY"   # Risk-On/Off Proxy (Spread ~3.0)
   
   auxiliary_symbols:
-    - "AUDJPY"
-    - "EURUSD"
-    # ADDED FOR CONVERSION SAFETY:
-    - "NZDUSD"  # Required for GBPNZD (Safety measure)
-    - "AUDUSD"  # Required for GBPAUD, EURAUD
-    - "USDCAD"  # Fallback
-    - "USDCHF"  # Fallback
+    # Pairs needed for PnL conversion but not traded actively
+    - "NZDUSD"  # Keep for safety if we ever add NZD pairs back
+    - "USDCHF"  # Keep for correlation calculations
     
   timeframe: "M5"
   magic_number: 621001
@@ -409,27 +412,31 @@ news_filter:
     GBP: ["BOE", "CPI"]
     JPY: ["BOJ"]
     AUD: ["RBA", "CPI"]
+    EUR: ["ECB", "CPI"]
+    CAD: ["BOC", "CPI"]
 
 # --- FORENSIC AUDIT ASSUMPTIONS ---
 forensic_audit:
   enforce_spread: true
   max_slippage_pips: 2.0
   commission_per_lot: 5.0
-  # V16.12: Updated assumptions based on LIVE SCREENSHOT (Forex.com Demo)
-  # Values include small safety buffer over observed points (e.g. 82 pts = 8.2 pips -> 8.5)
+  # V16.30: Updated assumptions based on GOLDEN BASKET (Standard FTMO Spreads)
+  # Values include small safety buffer.
   spread_pips:
     default: 1.6  
-    GBPJPY: 4.5    # Screen: 4.2
-    USDJPY: 1.8    # Screen: 1.7
-    EURJPY: 2.5    # Screen: 2.3
-    AUDJPY: 3.0    # Screen: 2.8
-    GBPUSD: 2.0    # Screen: 1.9
-    EURUSD: 1.6    # Screen: 1.5
-    GBPAUD: 7.8    # Screen: 7.5
-    EURAUD: 5.5    # Screen: 5.4
-    GBPNZD: 8.5    # Screen: 8.2
-    AUDUSD: 1.8    # Screen: 1.7
-    USDCAD: 2.8    # Screen: 2.6
+    GBPJPY: 4.5    # Accepted High Spread (High Vol)
+    USDJPY: 1.8    # Low
+    EURJPY: 2.5    # Medium
+    AUDJPY: 3.0    # Medium
+    GBPUSD: 2.0    # Low
+    EURUSD: 1.6    # Lowest
+    AUDUSD: 1.8    # Low
+    USDCAD: 2.8    # Medium
+    
+    # Legacy/Blacklisted (Kept for historical audit if needed)
+    GBPAUD: 8.0    # AVOID
+    EURAUD: 6.0    # AVOID
+    GBPNZD: 9.0    # AVOID
 
 # --- WFO OPTIMIZATION ---
 wfo:

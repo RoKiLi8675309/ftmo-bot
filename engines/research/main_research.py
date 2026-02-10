@@ -1,15 +1,3 @@
-# =============================================================================
-# FILENAME: engines/research/main_research.py
-# ENVIRONMENT: Linux/WSL2 (Python 3.11)
-# PATH: engines/research/main_research.py
-# DEPENDENCIES: shared, engines.research.backtester, engines.research.strategy, pyyaml
-# DESCRIPTION: CLI Entry point for Research, Training, and Backtesting.
-# 
-# PHOENIX V16.5 UPDATE (AGGRESSOR ALIGNMENT):
-# 1. DYNAMIC RISK: Removed hardcoded "Survival" risk limits (0.25%).
-#    Now dynamically fetches 'risk_per_trade_options' from config to support
-#    Aggressor sizing (0.5% - 1.0%) during optimization.
-# =============================================================================
 import os
 import sys
 
@@ -142,8 +130,8 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     if raw_ticks.empty:
         return pd.DataFrame()
 
-    # 2. V10.1 AGGREGATION: ADAPTIVE IMBALANCE BARS WITH AUTO-CALIBRATION
-    # Fetch params from config (now defaults to 10 in V12.5)
+    # 2. AGGREGATION: ADAPTIVE IMBALANCE BARS WITH AUTO-CALIBRATION
+    # Fetch params from config (now defaults to 10)
     config_threshold = CONFIG['data'].get('volume_bar_threshold', 10) 
     alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
     
@@ -303,7 +291,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
             
-            # V16.5 AGGRESSOR PROTOCOL: DYNAMIC RISK SEARCH
+            # DYNAMIC RISK SEARCH
             # Fetch options from config (e.g., [0.005, 0.01]) instead of hardcoded survival values
             risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.005, 0.01])
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
@@ -342,7 +330,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("calmar", calmar)
 
-            # V12.3: HARD 8% DRAWDOWN LIMIT
+            # HARD 8% DRAWDOWN LIMIT
             if max_dd_pct > 0.08: 
                 trial.set_user_attr("blown", True)
                 return -10000.0 
@@ -351,7 +339,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 trial.set_user_attr("blown", True)
                 return -10000.0
 
-            # V14.0: SIGNIFICANCE FILTER
+            # SIGNIFICANCE FILTER
             min_trades = CONFIG['wfo'].get('min_trades_optimization', 40)
             if trades < min_trades:
                 trial.set_user_attr("pruned", True)
@@ -449,7 +437,7 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 }
                 params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
                 
-                # V16.5 AGGRESSOR PROTOCOL: DYNAMIC RISK SEARCH
+                # DYNAMIC RISK SEARCH
                 # Fetch options from config (e.g., [0.005, 0.01])
                 risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.005, 0.01])
                 params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
@@ -474,7 +462,7 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 safe_dd = max_dd_pct if max_dd_pct > 0.001 else 0.001
                 calmar = (total_return / 100000.0) / safe_dd
                 
-                # V12.3: HARD 8% DRAWDOWN LIMIT
+                # HARD 8% DRAWDOWN LIMIT
                 if max_dd_pct > 0.08 or broker.is_blown: return -10000.0
                 if trades < 10: return 0.0 
                 
@@ -520,7 +508,7 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
 def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_dir: Path) -> None:
     """
     Trains the Final Production Model using the Best Params found.
-    V12.2 UPDATE: Filters for Statistical Significance (min_trades).
+    Filters for Statistical Significance (min_trades).
     """
     os.environ["OMP_NUM_THREADS"] = "1"
     setup_logging(f"Worker_Final_{symbol}")
@@ -538,7 +526,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
             log.warning(f"No trials found for {symbol}. Skipping finalization.")
             return
 
-        # --- V14.0: ROBUST SELECTION LOGIC ---
+        # ROBUST SELECTION LOGIC
         # Filter trials that met the trade count threshold
         min_trades = CONFIG['wfo'].get('min_trades_optimization', 40)
         
@@ -600,7 +588,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
 
 class ResearchPipeline:
     def __init__(self):
-        # V12.4: Safe Get for Symbols (Pruned list)
+        # Safe Get for Symbols (Pruned list)
         self.symbols = CONFIG['trading'].get('symbols', [])
         self.models_dir = Path("models")
         self.models_dir.mkdir(exist_ok=True)
@@ -753,10 +741,8 @@ class ResearchPipeline:
     def _purge_models(self):
         """
         Deletes all existing model files to ensure a clean slate for retraining.
-        Crucial after logic changes (e.g., Hurst fix).
         """
-        # FIX: Replaced LogSymbols.trash with literal emoji to prevent AttributeError
-        log.warning(f"🗑️ PURGING OLD MODELS...")
+        log.warning(f"{LogSymbols.TRASH} PURGING OLD MODELS...")
         for p in self.models_dir.glob("*.pkl"):
             try:
                 p.unlink()
@@ -765,12 +751,10 @@ class ResearchPipeline:
                 log.error(f"Failed to delete {p.name}: {e}")
 
     def run_training(self, fresh_start: bool = False):
-        # FIX: LogSymbols.training -> literal
-        log.info(f"🏋️ STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
+        log.info(f"{LogSymbols.TRAINING} STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
         log.info(f"OBJECTIVE: PROFIT IS KING (Total PnL + Efficiency Tie-Breaker)")
         log.info(f"HARDWARE DETECTED: {psutil.cpu_count(logical=True)} Cores. Using {self.total_cores} workers (Configured).")
         
-        # --- V12.33: FRESH START LOGIC ---
         if fresh_start:
             self._purge_models()
 
@@ -807,9 +791,8 @@ class ResearchPipeline:
         )
         
         duration = time.time() - start_time
-        # FIX: LogSymbols.success -> literal
-        log.info(f"✅ Swarm Optimization Complete in {duration:.2f}s")
-        log.info(f"💾 Finalizing Models & Artifacts...")
+        log.info(f"{LogSymbols.SUCCESS} Swarm Optimization Complete in {duration:.2f}s")
+        log.info(f"{LogSymbols.SAVE} Finalizing Models & Artifacts...")
         
         Parallel(n_jobs=len(self.symbols), backend="loky")(
             delayed(_worker_finalize_task)(
@@ -819,7 +802,7 @@ class ResearchPipeline:
                 self.models_dir
             ) for sym in self.symbols
         )
-        log.info(f"✅ Training Pipeline Completed.")
+        log.info(f"{LogSymbols.SUCCESS} Training Pipeline Completed.")
 
     def run_wfo(self):
         log.info(f"{LogSymbols.TIME} STARTING WALK-FORWARD OPTIMIZATION (WFO)...")
@@ -834,11 +817,10 @@ class ResearchPipeline:
                 self.db_url
             ) for sym in self.symbols
         )
-        log.info(f"✅ WFO Pipeline Completed.")
+        log.info(f"{LogSymbols.SUCCESS} WFO Pipeline Completed.")
 
     def run_backtest(self):
-        # FIX: LogSymbols.backtest -> literal
-        log.info(f"📉 Starting BACKTEST verification...")
+        log.info(f"{LogSymbols.BACKTEST} Starting BACKTEST verification...")
         
         results = Parallel(n_jobs=len(self.symbols), backend="loky")(
             delayed(self._run_backtest_symbol)(sym) for sym in self.symbols
@@ -942,8 +924,6 @@ class ResearchPipeline:
         sqn = (math.sqrt(total_trades) * (df['Net_PnL'].mean() / returns_std)) if returns_std > 0 else 0.0
         sqn_rating = self._get_sqn_rating(sqn)
         
-        # Correctly calculate duration in minutes
-        # Ensure Duration_Min exists or calculate it
         if 'Duration_Min' not in df.columns:
              df['Duration_Min'] = (df['Exit_Time'] - df['Entry_Time']).dt.total_seconds() / 60.0
         
@@ -983,30 +963,33 @@ class ResearchPipeline:
             log.warning(f"Could not generate plot: {e}")
 
     def _plot_equity_curve(self, df_equity: pd.DataFrame, timestamp_str: str):
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                            vertical_spacing=0.05, row_heights=[0.7, 0.3],
-                            subplot_titles=("Equity Curve", "Drawdown"))
+        try:
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                vertical_spacing=0.05, row_heights=[0.7, 0.3],
+                                subplot_titles=("Equity Curve", "Drawdown"))
 
-        fig.add_trace(
-            go.Scatter(x=df_equity['Entry_Time'], y=df_equity['Equity'], mode='lines', name='Equity', line=dict(color='#00ff00')),
-            row=1, col=1
-        )
-        
-        fig.add_trace(
-            go.Scatter(x=df_equity['Entry_Time'], y=df_equity['Drawdown_Pct'], mode='lines', name='Drawdown %', fill='tozeroy', line=dict(color='#ff0000')),
-            row=2, col=1
-        )
+            fig.add_trace(
+                go.Scatter(x=df_equity['Entry_Time'], y=df_equity['Equity'], mode='lines', name='Equity', line=dict(color='#00ff00')),
+                row=1, col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(x=df_equity['Entry_Time'], y=df_equity['Drawdown_Pct'], mode='lines', name='Drawdown %', fill='tozeroy', line=dict(color='#ff0000')),
+                row=2, col=1
+            )
 
-        fig.update_layout(
-            title="Backtest Performance (Aggregate)",
-            xaxis_title="Time",
-            template="plotly_dark",
-            height=800
-        )
-        
-        output_file = self.reports_dir / f"backtest_report_{timestamp_str}.html"
-        fig.write_html(output_file)
-        log.info(f"✅ HTML Report saved to: {output_file}")
+            fig.update_layout(
+                title="Backtest Performance (Aggregate)",
+                xaxis_title="Time",
+                template="plotly_dark",
+                height=800
+            )
+            
+            output_file = self.reports_dir / f"backtest_report_{timestamp_str}.html"
+            fig.write_html(output_file)
+            log.info(f"✅ HTML Report saved to: {output_file}")
+        except ImportError:
+            log.warning("Plotly not installed or import error. Skipping plot.")
 
 def main():
     optuna.logging.set_verbosity(optuna.logging.WARN)

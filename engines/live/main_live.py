@@ -1,11 +1,3 @@
-# =============================================================================
-# FILENAME: engines/live/main_live.py
-# ENVIRONMENT: Linux/WSL2 (Python 3.11)
-# PATH: engines/live/main_live.py
-# DEPENDENCIES: engines.live.engine
-# DESCRIPTION: Entry point for the Live Trading Consumer.
-# CRITICAL: Python 3.11 Compatible. Handles Graceful Shutdowns.
-# =============================================================================
 import sys
 import os
 import signal

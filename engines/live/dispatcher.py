@@ -1,17 +1,3 @@
-# =============================================================================
-# FILENAME: engines/live/dispatcher.py
-# ENVIRONMENT: Linux/WSL2 (Python 3.11)
-# PATH: engines/live/dispatcher.py
-# DEPENDENCIES: shared
-# DESCRIPTION: Outbound Trade Router. Formats and pushes execution requests to Redis.
-# CRITICAL: Ensures strict compatibility with Windows Producer (Py3.9).
-# 
-# PHOENIX V16.20 AUDIT FIX (THE JAMMER CURE):
-# 1. RACE CONDITION FIX: 'cleanup_stale_orders' now cross-references Open Positions
-#    before deleting keys. If a position exists, it assumes the order filled but
-#    lost its UUID link (Zombie Match), preventing duplicate firing.
-# 2. TTL EXTENSION: Increased pending order TTL to 600s to survive network lag.
-# =============================================================================
 import logging
 import json
 import uuid
@@ -26,6 +12,7 @@ logger = logging.getLogger("TradeDispatcher")
 
 # --- MT5 CONSTANTS (HARDCODED FOR LINUX) ---
 # Since we cannot import MetaTrader5 on Linux, we define the standard constants here.
+# These MUST match the Windows Producer's expectation.
 MT5_ORDER_TYPE_BUY = 0
 MT5_ORDER_TYPE_SELL = 1
 MT5_TRADE_ACTION_DEAL = 1
@@ -34,7 +21,7 @@ MT5_TRADE_ACTION_PENDING = 5
 class TradeDispatcher:
     """
     Handles the reliable transmission of trade orders from the Logic Engine
-    to the Execution Engine (Windows Producer).
+    to the Execution Engine (Windows Producer) via Redis Streams.
     """
     def __init__(self, stream_mgr: RedisStreamManager, pending_tracker: dict[str, Any], lock: threading.RLock):
         """
@@ -101,7 +88,7 @@ class TradeDispatcher:
             # Shorten UUID for comment: "Auto_1234abcd"
             comment = f"Auto_{short_id}"
             if trade.comment:
-                # V16.20: Truncate carefully to preserve key info
+                # Truncate carefully to preserve key info within 31 chars
                 comment = f"{comment}_{trade.comment}"[:31]
 
             payload = {
@@ -119,14 +106,15 @@ class TradeDispatcher:
                 "type": str(mt5_type),
                 # ----------------------------------
 
+                # Explicit formatting to prevent float precision errors
                 "volume": "{:.2f}".format(float(trade.volume)),
                 
-                # V12.19 FIX: Send both legacy 'entry_price' and new 'price' keys
+                # Send both legacy 'entry_price' and new 'price' keys
                 "entry_price": final_price,
                 "price": final_price, 
                 
                 # CRITICAL MAPPING: Producer looks for 'sl' and 'tp', NOT 'stop_loss'
-                # V16.20: Enforce string format to prevent scientific notation on small pips
+                # Enforce string format to prevent scientific notation on small pips (e.g. 1e-5)
                 "sl": "{:.5f}".format(trade.stop_loss),
                 "tp": "{:.5f}".format(trade.take_profit),
                 
@@ -141,8 +129,7 @@ class TradeDispatcher:
             }
 
             # 4. Transmit to Redis
-            # AUDIT FIX: Enforce maxlen to prevent stream from growing indefinitely
-            # 50,000 to match Producer capacity
+            # Enforce maxlen to prevent stream from growing indefinitely
             self.stream_mgr.r.xadd(self.stream_key, payload, maxlen=50000, approximate=True)
             
             logger.info(
@@ -159,7 +146,7 @@ class TradeDispatcher:
     def cleanup_stale_orders(self, ttl_seconds: int = 600, open_positions: Optional[Dict] = None):
         """
         Removes orders that have been stuck in 'PENDING' for too long.
-        V16.20 FIX: Cross-reference with open_positions (Zombie Check) to avoid
+        Cross-reference with open_positions (Zombie Check) to avoid
         deleting a key for a trade that actually filled but lost connection.
         
         :param ttl_seconds: Max age of a pending order (Default 600s / 10m).
