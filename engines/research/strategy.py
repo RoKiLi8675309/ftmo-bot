@@ -346,9 +346,9 @@ class ResearchStrategy:
 
     def _check_revenge_guard(self, broker: BacktestBroker, current_time: datetime) -> bool:
         """
-        SIMULATED PENALTY BOX.
+        MANDATORY COOLDOWN PROTOCOL.
         Checks the last closed trade for this symbol.
-        If it was a loss, ensures at least 'cooldown_minutes' have passed.
+        Triggers cooldown for BOTH Wins and Losses to prevent machine-gun execution.
         """
         # Get trades for this symbol, sorted by exit time
         my_closed_trades = [t for t in broker.closed_positions if t.symbol == self.symbol and t.close_time is not None]
@@ -358,20 +358,21 @@ class ResearchStrategy:
             
         last_trade = my_closed_trades[-1]
         
-        # Check if last trade was a loss
-        if last_trade.net_pnl < 0:
-            # Ensure timezone awareness match
-            close_time = last_trade.close_time
-            if close_time.tzinfo is None:
-                close_time = close_time.replace(tzinfo=current_time.tzinfo)
-            else:
-                close_time = close_time.astimezone(current_time.tzinfo)
-                
-            cooldown_expiry = close_time + timedelta(minutes=self.cooldown_minutes)
+        # Ensure timezone awareness match
+        close_time = last_trade.close_time
+        if close_time.tzinfo is None:
+            close_time = close_time.replace(tzinfo=current_time.tzinfo)
+        else:
+            close_time = close_time.astimezone(current_time.tzinfo)
             
-            if current_time < cooldown_expiry:
-                return True # Blocked
-                
+        cooldown_expiry = close_time + timedelta(minutes=self.cooldown_minutes)
+        
+        if current_time < cooldown_expiry:
+            # Log whether it was a Win or Loss trigger
+            reason = "Revenge Guard" if last_trade.net_pnl < 0 else "Mandatory Cooldown"
+            # In backtesting we might not log every tick, but this return blocks the trade
+            return True 
+            
         return False
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
@@ -436,9 +437,9 @@ class ResearchStrategy:
             self.rejection_stats["Symbol Circuit Breaker (Loss Limit)"] += 1
             return
             
-        # --- REVENGE TRADING GUARD (PENALTY BOX) ---
+        # --- REVENGE TRADING GUARD (MANDATORY COOLDOWN) ---
         if self._check_revenge_guard(broker, server_time):
-            self.rejection_stats["Revenge Guard (Cooldown)"] += 1
+            self.rejection_stats["Mandatory Cooldown (Revenge Guard)"] += 1
             return
 
         self._update_streak_status(broker)

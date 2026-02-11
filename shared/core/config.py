@@ -6,6 +6,10 @@
 # DESCRIPTION: Loads configuration from YAML and injects Environment secrets.
 # Supports path resolution for both Monolithic and Modular layouts.
 # CRITICAL: Python 3.9 Compatible (No '|' unions).
+#
+# UPDATES (Rec 4 - Survival Mode):
+# 1. RISK ENFORCEMENT: Programmatically clamps Base Risk to 0.25% in _sanitize_config.
+# 2. HOT HAND CAP: Clamps Scaled Risk to 0.50% to prevent over-leveraging.
 # =============================================================================
 
 import os
@@ -38,10 +42,58 @@ def load_environment_variables() -> None:
 # Load env vars immediately on module import
 load_environment_variables()
 
+def _sanitize_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Injects default values for new features and enforces Safety Protocols.
+    """
+    # 1. Ensure online_learning exists
+    if 'online_learning' not in config:
+        config['online_learning'] = {}
+
+    # 2. Triple Barrier Defaults (Rec 3: Volatility Horizon)
+    if 'tbm' not in config['online_learning']:
+        config['online_learning']['tbm'] = {}
+    
+    tbm = config['online_learning']['tbm']
+    # Default to TIME for safety, but enable code to see VOLUME/VOLATILITY
+    if 'horizon_type' not in tbm:
+        tbm['horizon_type'] = 'TIME' 
+    if 'horizon_threshold' not in tbm:
+        tbm['horizon_threshold'] = 0.0 # 0.0 implies auto-calculation or config default
+
+    # 3. Latency Guard Defaults (Rec 2)
+    # We inject these into the 'producer' section or a new 'system' section
+    if 'producer' not in config:
+        config['producer'] = {}
+    
+    # These can be used by the Engine/Worker to tune the dynamic guard
+    if 'latency_guard' not in config['producer']:
+        config['producer']['latency_guard'] = {
+            'strict_limit': 2.0,
+            'relaxed_limit': 30.0,
+            'volatility_threshold': 0.0005
+        }
+
+    # 4. SURVIVAL MODE: Aggressor Protocol Risk Clamp (Rec 4)
+    # We programmatically enforce the lower risk limits to ensure survival
+    # even if config.yaml is outdated or misconfigured.
+    if 'risk_management' not in config:
+        config['risk_management'] = {}
+        
+    # Enforce 0.25% Base Risk (Allows ~20 losses before daily limit)
+    # This addresses the "risking way too much" issue directly.
+    config['risk_management']['base_risk_per_trade_percent'] = 0.0025
+    
+    # Enforce 0.50% Scaled Risk (Hot Hand Cap)
+    # Even on a winning streak, we cap risk to 0.5% to preserve drawdown.
+    config['risk_management']['scaled_risk_percent'] = 0.005
+
+    return config
+
 def get_config() -> Optional[Dict[str, Any]]:
     """
-    Locates config.yaml, loads it, and overrides sensitive values 
-    with Environment Variables.
+    Locates config.yaml, loads it, overrides sensitive values 
+    with Environment Variables, and sanitizes new feature flags.
     """
     # 1. Determine Path to config.yaml
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -134,9 +186,12 @@ def get_config() -> Optional[Dict[str, Any]]:
     if env_mt5_path:
         config['mt5']['path'] = env_mt5_path
 
+    # 4. Sanitize and Polyfill Defaults (Rec 2 & 3 Support)
+    config = _sanitize_config(config)
+
     return config
 
-# 4. Initialize Global Singleton
+# 5. Initialize Global Singleton
 CONFIG: Optional[Dict[str, Any]] = get_config()
 
 if CONFIG is None:

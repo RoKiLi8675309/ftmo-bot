@@ -6,9 +6,9 @@
 # DESCRIPTION: Fetches Economic News and enforces FTMO trading blackouts.
 # CRITICAL: Python 3.9 Compatible. Implements Fail-Safe locking.
 #
-# PHOENIX V12.13 COMPLIANCE UPDATE:
-# 1. FAIL-SAFE: Guard now explicitly blocks trading on "CRITICAL" events.
-# 2. ROBUSTNESS: Error handling for missing dependencies.
+# PHOENIX V16.24 COMPLIANCE UPDATE:
+# 1. TIMEZONE FIX: Switched base interpretation to UTC to match feed behavior.
+# 2. VISIBILITY: Logs now include DATE to prevent user panic.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -140,18 +140,20 @@ class NewsEventMonitor:
             return None
 
     def _normalize_time(self, date_str: str, time_str: str) -> Optional[datetime]:
-        """Converts FF time strings to UTC datetime."""
-        # FF XML uses "MM-DD-YYYY" and "HH:MMam/pm" usually in US/Eastern context depending on link
-        # But the XML feed is often raw. Standardizing usually requires assumption.
-        
+        """
+        Converts FF time strings to UTC datetime.
+        AUDIT FIX: The XML feed appears to return UTC-aligned times (e.g., 1:30pm for CPI).
+        We now parse assuming UTC to avoid the +5h shift error.
+        """
         if "Day" in time_str or not time_str: return None  # All Day event
         try:
             dt_str = f"{date_str} {time_str}"
             naive_dt = datetime.strptime(dt_str, "%m-%d-%Y %I:%M%p")
             
-            # Assume New York time for Forex Factory XML default
-            eastern = pytz.timezone('US/Eastern')
-            localized_dt = eastern.localize(naive_dt)
+            # V16.24 CHANGE: Assume Feed is UTC to fix the 18:30 vs 13:30 discrepancy.
+            # Historically FF was EST, but current behavior indicates UTC.
+            base_tz = pytz.utc
+            localized_dt = base_tz.localize(naive_dt)
             
             return localized_dt.astimezone(pytz.utc)
         except ValueError:
@@ -176,6 +178,7 @@ class FTMOComplianceGuard:
         """
         Pre-calculates time windows where trading is forbidden.
         V12.13 FIX: Explicitly handles FAIL-SAFE/CRITICAL events.
+        V16.24 FIX: Added Date to logs to clarify schedule.
         """
         for event in self.events:
             is_restricted = False
@@ -204,7 +207,8 @@ class FTMOComplianceGuard:
                     'end': end,
                     'reason': event.title
                 })
-                self.logger.info(f"Blackout Window Created: {event.country} | {start.strftime('%H:%M')} - {end.strftime('%H:%M')} | {event.title}")
+                # VISIBILITY FIX: Include Date in log
+                self.logger.info(f"Blackout Window Created: {event.country} | {start.strftime('%Y-%m-%d %H:%M')} - {end.strftime('%H:%M')} | {event.title}")
 
     def check_trade_permission(self, symbol: str) -> bool:
         """

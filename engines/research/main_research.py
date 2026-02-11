@@ -291,9 +291,9 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
             
-            # DYNAMIC RISK SEARCH
-            # Fetch options from config (e.g., [0.005, 0.01]) instead of hardcoded survival values
-            risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.005, 0.01])
+            # DYNAMIC RISK SEARCH (SURVIVAL MODE UPDATE)
+            # Default to low risk if config is missing, to enforce survival during optimization
+            risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0025, 0.005])
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             trial.set_user_attr("risk_pct", params['risk_per_trade_percent'] * 100)
             
@@ -437,9 +437,8 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 }
                 params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
                 
-                # DYNAMIC RISK SEARCH
-                # Fetch options from config (e.g., [0.005, 0.01])
-                risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.005, 0.01])
+                # DYNAMIC RISK SEARCH (SURVIVAL MODE UPDATE)
+                risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0025, 0.005])
                 params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
                 
                 pipeline_inst = ResearchPipeline()

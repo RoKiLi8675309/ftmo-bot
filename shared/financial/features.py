@@ -691,16 +691,27 @@ class StreamingIndicators:
 class AdaptiveTripleBarrier:
     """
     Labeling engine.
-    Updated for FTMO Sniper Mode: Extended horizon to capture Swing moves.
+    Updated for Rec 3: Volatility-Based Horizon Transition.
+    Replaces static time expiry with dynamic Volume or Volatility limits.
     """
-    def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.0, reward_mult: float = 2.0, drift_threshold: float = 0.75):
-        # Default horizon increased to ~12 hours (144 ticks @ M5)
-        # matches the winning "Alpha Asset" profile from backtesting.
+    def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.0, reward_mult: float = 2.0, 
+                 drift_threshold: float = 0.75, horizon_type: str = 'TIME', horizon_value: float = 0.0):
+        """
+        :param horizon_type: 'TIME' (ticks), 'VOLUME' (cum_vol), 'VOLATILITY' (cum_sq_ret)
+        :param horizon_value: The threshold for VOLUME or VOLATILITY horizons. If 0, uses config defaults.
+        """
         self.buffer = deque()
         self.time_limit = horizon_ticks
         self.risk_mult = risk_mult
         self.reward_mult = reward_mult
         self.drift_threshold = drift_threshold
+        
+        # Strategic Rec 3: Dynamic Horizon Support
+        self.horizon_type = horizon_type.upper()
+        self.horizon_threshold = horizon_value
+        
+        if self.horizon_type == 'TIME' and self.horizon_threshold == 0:
+            self.horizon_threshold = horizon_ticks
 
     def add_trade_opportunity(self, features: Dict[str, float], entry_price: float, current_atr: float, timestamp: float, parkinson_vol: float = 0.0):
         if current_atr <= 0: current_atr = entry_price * 0.0001
@@ -729,10 +740,17 @@ class AdaptiveTripleBarrier:
             'sl': lower_barrier,
             'atr': current_atr,
             'start_time': timestamp,
-            'age': 0
+            'age': 0,
+            'cum_vol': 0.0,         # For Volume Horizon
+            'cum_volatility': 0.0   # For Volatility Horizon (sum of squared returns)
         })
 
-    def resolve_labels(self, current_high: float, current_low: float, current_close: float = None) -> List[Tuple[Dict[str, float], int, float]]:
+    def resolve_labels(self, current_high: float, current_low: float, current_close: float = None, 
+                       current_volume: float = 0.0, current_log_ret: float = 0.0) -> List[Tuple[Dict[str, float], int, float]]:
+        """
+        Checks active labels for barrier hits or expiry.
+        Now supports Volume and Volatility based expiry.
+        """
         resolved = []
         active = deque()
         
@@ -741,18 +759,38 @@ class AdaptiveTripleBarrier:
 
         while self.buffer:
             trade = self.buffer.popleft()
+            
+            # Update cumulative metrics
             trade['age'] += 1
+            trade['cum_vol'] += current_volume
+            trade['cum_volatility'] += (current_log_ret ** 2)
             
             label = None
             realized_ret = 0.0
             
+            # 1. Vertical Barrier Check (Expiry)
+            is_expired = False
+            if self.horizon_type == 'TIME':
+                if trade['age'] >= self.time_limit: is_expired = True
+            elif self.horizon_type == 'VOLUME':
+                # Threshold default to 100x current bar vol if not set (simple heuristic fallback)
+                thresh = self.horizon_threshold if self.horizon_threshold > 0 else current_volume * 100
+                if trade['cum_vol'] >= thresh: is_expired = True
+            elif self.horizon_type == 'VOLATILITY':
+                # Threshold default to 5x daily var if not set
+                thresh = self.horizon_threshold if self.horizon_threshold > 0 else 0.0005
+                if trade['cum_volatility'] >= thresh: is_expired = True
+            
+            # 2. Horizontal Barrier Checks (TP/SL)
             if current_high >= trade['tp']:
                 label = 1  # BUY
                 realized_ret = (trade['tp'] - trade['entry']) / trade['entry']
             elif current_low <= trade['sl']:
                 label = -1 # SELL
                 realized_ret = (trade['entry'] - trade['sl']) / trade['entry']
-            elif trade['age'] >= self.time_limit:
+            
+            # 3. Expiry Resolution
+            elif is_expired:
                 drift = current_close - trade['entry']
                 drift_req = trade['atr'] * self.drift_threshold
                 
@@ -1053,7 +1091,7 @@ class OnlineFeatureEngineer:
             'rvol': rvol_val,
             'aggressor': aggressor_val,
             'flow_imbalance': flow_imbalance, 
-            'flow_ratio': flow_ratio,           
+            'flow_ratio': flow_ratio,            
             
             # V9 Momentum Features
             'bb_breakout': bb_feats['bb_breakout'],
@@ -1238,6 +1276,12 @@ class VolatilityMonitor:
     
     def update(self, ret: float) -> float:
         self.returns.append(ret)
+        if len(self.returns) < 5: return 0.001
+        val = np.std(self.returns)
+        return val if math.isfinite(val) else 0.001
+
+    def get(self) -> float:
+        """Supported by Rec 2: Allow external querying of current volatility for latency checks."""
         if len(self.returns) < 5: return 0.001
         val = np.std(self.returns)
         return val if math.isfinite(val) else 0.001

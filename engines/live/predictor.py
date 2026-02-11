@@ -52,6 +52,7 @@ class MultiAssetPredictor:
     """
     Manages a dictionary of Online Models (one per symbol).
     Performs 'Inference -> Train' loop on every Volume Bar.
+    Updated for Rec 3: Volatility-Based Horizons.
     """
     def __init__(self, symbols: List[str], threshold_map: Optional[Dict[str, float]] = None):
         """
@@ -107,6 +108,10 @@ class MultiAssetPredictor:
             # Default Horizon Reduced to 240m (4h)
             s_horizon = tbm_conf.get('horizon_minutes', 240) 
             
+            # Rec 3: Fetch Horizon Type (TIME/VOLUME/VOLATILITY)
+            s_horizon_type = tbm_conf.get('horizon_type', 'TIME')
+            s_horizon_val = float(tbm_conf.get('horizon_threshold', 0.0))
+            
             # --- DYNAMIC PARAMETER LOADING ---
             params_path = self.models_dir / f"best_params_{s}.json"
             if params_path.exists():
@@ -127,12 +132,14 @@ class MultiAssetPredictor:
                 except Exception as e:
                     logger.warning(f"Failed to load optimized params for {s}: {e}")
 
-            # Initialize Labeler with SPECIFIC params
+            # Initialize Labeler with SPECIFIC params and Horizon Type
             self.labelers[s] = AdaptiveTripleBarrier(
                 horizon_ticks=s_horizon,
                 risk_mult=s_risk,
                 reward_mult=s_reward,
-                drift_threshold=tbm_conf.get('drift_threshold', 1.5)
+                drift_threshold=tbm_conf.get('drift_threshold', 1.5),
+                horizon_type=s_horizon_type,
+                horizon_value=s_horizon_val
             )
 
         # 3. Models (River Ensembles)
@@ -335,6 +342,7 @@ class MultiAssetPredictor:
         """
         Internal method to update Model/FE state without generating trading signals.
         Used exclusively for Warm-Up.
+        Updated for Rec 3: Pass Volume/Returns to Labeler.
         """
         # Feature Engineering
         fe = self.feature_engineers[symbol]
@@ -365,8 +373,15 @@ class MultiAssetPredictor:
         features['ker'] = ker_val
         features['rvol'] = rvol_val
         
-        # Resolve Labels & Train
-        resolved_labels = labeler.resolve_labels(bar.high, bar.low)
+        # Extract returns for Volatility Horizon
+        log_ret = features.get('log_ret', 0.0)
+
+        # Resolve Labels & Train (Rec 3 Updated Signature)
+        resolved_labels = labeler.resolve_labels(
+            bar.high, bar.low, current_close=bar.close,
+            current_volume=bar.volume, current_log_ret=log_ret
+        )
+        
         if resolved_labels:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
                 model.learn_one(stored_feats, outcome_label)
@@ -375,7 +390,8 @@ class MultiAssetPredictor:
         
         # Add Opportunity
         current_atr = features.get('atr', 0.001)
-        labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp())
+        parkinson = features.get('parkinson_vol', 0.0)
+        labeler.add_trade_opportunity(features, bar.close, current_atr, bar.timestamp.timestamp(), parkinson_vol=parkinson)
 
     def _calculate_golden_trio(self, symbol: str) -> Tuple[float, float, float]:
         """
@@ -555,6 +571,7 @@ class MultiAssetPredictor:
         Actual entry point called by Engine.
         Executes the Learn-Predict Loop with Project Phoenix Logic.
         Enforces Asset-Specific Regimes (The "Personality Filter").
+        Updated for Rec 3: Passing Volume/Returns for Horizon.
         """
         if symbol not in self.symbols: return None
         
@@ -658,6 +675,7 @@ class MultiAssetPredictor:
         
         # Extract for Gates
         parkinson = features.get('parkinson_vol', 0.0)
+        log_ret = features.get('log_ret', 0.0)
 
         # --- REC 1: DYNAMIC GATE SCALING ---
         self.ker_drift_detectors[symbol].update(ker_val)
@@ -695,7 +713,13 @@ class MultiAssetPredictor:
             return Signal(symbol, "HOLD", 0.0, {"reason": "Circuit Breaker Active"})
 
         # 2. Delayed Training (Label Resolution)
-        resolved_labels = labeler.resolve_labels(bar.high, bar.low)
+        # Rec 3: Pass Volume and Returns for dynamic horizon
+        resolved_labels = labeler.resolve_labels(
+            bar.high, bar.low, 
+            current_close=bar.close,
+            current_volume=bar.volume,
+            current_log_ret=log_ret
+        )
         
         if resolved_labels:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
@@ -1044,9 +1068,10 @@ class MultiAssetPredictor:
                 self.last_close_prices[sym] = price
 
     def save_state(self):
-        """Saves models AND Feature Engineers to disk."""
+        """Saves models, Feature Engineers, AND RAW BUFFERS to disk."""
         try:
             for sym in self.symbols:
+                # Save ML Models
                 with open(self.models_dir / f"river_pipeline_{sym}.pkl", "wb") as f:
                     pickle.dump(self.models[sym], f)
                 with open(self.models_dir / f"meta_model_{sym}.pkl", "wb") as f:
@@ -1054,21 +1079,38 @@ class MultiAssetPredictor:
                 with open(self.models_dir / f"calibrators_{sym}.pkl", "wb") as f:
                     pickle.dump(self.calibrators[sym], f)
                 
+                # Save Feature Engineers
                 with open(self.models_dir / f"feature_engineer_{sym}.pkl", "wb") as f:
                     pickle.dump(self.feature_engineers[sym], f)
+                
+                # --- SAVE BUFFERS (CRITICAL FIX) ---
+                # We save all deque buffers to prevent "Cold Start Blindness"
+                buffer_state = {
+                    'closes': self.closes_buffer[sym],
+                    'volumes': self.volume_buffer[sym],
+                    'bb': self.bb_buffers[sym],
+                    'sniper_closes': self.sniper_closes[sym],
+                    'sniper_rsi': self.sniper_rsi[sym],
+                    'sma_window': self.sma_window[sym],
+                    'returns': self.returns_window[sym]
+                }
+                with open(self.models_dir / f"buffers_{sym}.pkl", "wb") as f:
+                    pickle.dump(buffer_state, f)
                     
             logger.info(f"{LogSymbols.DATABASE} Models & State Auto-Saved.")
         except Exception as e:
             logger.error(f"{LogSymbols.ERROR} Failed to save models: {e}")
 
     def _load_state(self):
-        """Loads models AND Feature Engineers from disk."""
+        """Loads models, Feature Engineers, AND RAW BUFFERS from disk."""
         loaded_count = 0
         for sym in self.symbols:
             model_path = self.models_dir / f"river_pipeline_{sym}.pkl"
             meta_path = self.models_dir / f"meta_model_{sym}.pkl"
             fe_path = self.models_dir / f"feature_engineer_{sym}.pkl"
+            buf_path = self.models_dir / f"buffers_{sym}.pkl"
             
+            # Load ML
             if model_path.exists():
                 try:
                     with open(model_path, "rb") as f: self.models[sym] = pickle.load(f)
@@ -1080,11 +1122,30 @@ class MultiAssetPredictor:
                     with open(meta_path, "rb") as f: self.meta_labelers[sym] = pickle.load(f)
                 except Exception: pass
             
+            # Load Feature Engineers
             if fe_path.exists():
                 try:
                     with open(fe_path, "rb") as f: self.feature_engineers[sym] = pickle.load(f)
                     logger.info(f"Loaded Feature State for {sym}")
                 except Exception: pass
+
+            # --- LOAD BUFFERS (CRITICAL FIX) ---
+            if buf_path.exists():
+                try:
+                    with open(buf_path, "rb") as f:
+                        buf_state = pickle.load(f)
+                        # Restore deques safely (maxlens are preserved by __init__)
+                        self.closes_buffer[sym].extend(buf_state.get('closes', []))
+                        self.volume_buffer[sym].extend(buf_state.get('volumes', []))
+                        self.bb_buffers[sym].extend(buf_state.get('bb', []))
+                        self.sniper_closes[sym].extend(buf_state.get('sniper_closes', []))
+                        self.sniper_rsi[sym].extend(buf_state.get('sniper_rsi', []))
+                        self.sma_window[sym].extend(buf_state.get('sma_window', []))
+                        self.returns_window[sym].extend(buf_state.get('returns', []))
+                        
+                        logger.info(f"Loaded Data Buffers for {sym} (History preserved)")
+                except Exception as e:
+                    logger.warning(f"Failed to load buffers for {sym}: {e}")
             
         if loaded_count > 0:
             logger.info(f"{LogSymbols.SUCCESS} Loaded {loaded_count} existing models.")

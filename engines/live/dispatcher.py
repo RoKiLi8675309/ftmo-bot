@@ -17,11 +17,16 @@ MT5_ORDER_TYPE_BUY = 0
 MT5_ORDER_TYPE_SELL = 1
 MT5_TRADE_ACTION_DEAL = 1
 MT5_TRADE_ACTION_PENDING = 5
+MT5_TRADE_ACTION_SLTP = 6 
+MT5_TRADE_ACTION_MODIFY = 6
+MT5_TRADE_ACTION_REMOVE = 8
 
 class TradeDispatcher:
     """
     Handles the reliable transmission of trade orders from the Logic Engine
     to the Execution Engine (Windows Producer) via Redis Streams.
+    
+    UPDATED: FORCE MARKET EXECUTION ONLY.
     """
     def __init__(self, stream_mgr: RedisStreamManager, pending_tracker: dict[str, Any], lock: threading.RLock):
         """
@@ -38,6 +43,7 @@ class TradeDispatcher:
     def send_order(self, trade: Trade, estimated_risk_usd: float = 0.0) -> None:
         """
         Formats and dispatches a Trade object to Redis.
+        Strictly enforces Market Execution (Deal) protocol.
         """
         try:
             # 1. Generate IDs
@@ -67,23 +73,20 @@ class TradeDispatcher:
                 # Fallback for "CLOSE_ALL" or "MODIFY" which handle their own logic in Producer
                 # But for standard entry, this is required.
                 mt5_type = MT5_ORDER_TYPE_BUY # Default dummy
-
-            # B. Translate Entry Type (MARKET -> DEAL, LIMIT -> PENDING) to 'action' field
-            # Windows Producer expects 'action' to be the execution method.
-            entry_type_str = str(trade.entry_type).upper()
-            final_price = str(trade.entry_price)
             
-            if "MARKET" in entry_type_str:
+            # B. FORCE MARKET EXECUTION
+            # We ignore trade.entry_type and force TRADE_ACTION_DEAL (1)
+            # Price must be 0.0 for Instant/Market Execution in MT5
+            if trade.action in ["BUY", "SELL"]:
                 mt5_action = MT5_TRADE_ACTION_DEAL
-                final_price = "0.0" # Force zero for Market Execution
+                final_price = "0.0" 
             else:
-                mt5_action = MT5_TRADE_ACTION_PENDING
+                # MODIFY / CLOSE_ALL are handled specifically by Producer strings
+                # But strictly speaking, they don't map to standard DEAL/PENDING here
+                # We pass the string action through, Producer handles the switch
+                mt5_action = MT5_TRADE_ACTION_DEAL 
+                final_price = "0.0"
 
-            # Handling Special Actions (MODIFY / CLOSE_ALL)
-            # These override the standard mapping logic
-            if trade.action == "MODIFY":
-                pass 
-            
             # Ensure Comment length compliance (MT5 limit)
             # Shorten UUID for comment: "Auto_1234abcd"
             comment = f"Auto_{short_id}"
@@ -91,35 +94,36 @@ class TradeDispatcher:
                 # Truncate carefully to preserve key info within 31 chars
                 comment = f"{comment}_{trade.comment}"[:31]
 
+            # Determine Action String for Producer Logic
+            # If standard trade, send integer. If special command, send string.
+            if trade.action in ["MODIFY", "CLOSE_ALL"]:
+                action_payload = str(trade.action)
+            else:
+                action_payload = str(mt5_action)
+
             payload = {
                 "id": str(order_id),
                 "uuid": str(order_id),  # CRITICAL for Producer Deduplication
                 "symbol": str(trade.symbol),
                 
-                # --- PROTOCOL TRANSLATION START ---
-                # Producer: request['action'] (Deal/Pending)
-                # Producer: request['type'] (Buy/Sell)
-                # We send them as strings, Producer casts to int.
-                
-                # Special Case: MODIFY/CLOSE_ALL are high-level commands trapped by Producer before casting
-                "action": str(trade.action) if trade.action in ["MODIFY", "CLOSE_ALL"] else str(mt5_action),
+                # --- PROTOCOL TRANSLATION ---
+                "action": action_payload,
                 "type": str(mt5_type),
-                # ----------------------------------
-
+                
                 # Explicit formatting to prevent float precision errors
                 "volume": "{:.2f}".format(float(trade.volume)),
                 
-                # Send both legacy 'entry_price' and new 'price' keys
+                # FORCE ZERO PRICE for Market Execution
                 "entry_price": final_price,
                 "price": final_price, 
                 
                 # CRITICAL MAPPING: Producer looks for 'sl' and 'tp', NOT 'stop_loss'
-                # Enforce string format to prevent scientific notation on small pips (e.g. 1e-5)
+                # Enforce string format to prevent scientific notation (e.g. 1e-5)
                 "sl": "{:.5f}".format(trade.stop_loss),
                 "tp": "{:.5f}".format(trade.take_profit),
                 
                 "magic_number": str(self.magic_number),
-                "magic": str(self.magic_number), # Map to 'magic' for Producer
+                "magic": str(self.magic_number), 
                 
                 "comment": comment,
                 "timestamp": str(time.time()),  # ZOMBIE CHECK: High precision time
@@ -134,7 +138,7 @@ class TradeDispatcher:
             
             logger.info(
                 f"{LogSymbols.UPLOAD} DISPATCH SENT: {trade.action} {trade.symbol} "
-                f"| Vol: {trade.volume:.2f} | Price: {final_price} | Type: {mt5_type} (MT5) | Risk: ${estimated_risk_usd:.2f}"
+                f"| Vol: {trade.volume:.2f} | Market Order (Price=0.0) | Risk: ${estimated_risk_usd:.2f}"
             )
         except Exception as e:
             logger.error(f"{LogSymbols.ERROR} Dispatch Failed for {trade.symbol}: {e}")

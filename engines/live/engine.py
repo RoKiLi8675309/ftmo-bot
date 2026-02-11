@@ -4,6 +4,9 @@ import json
 import threading
 import signal
 import sys
+import os
+import multiprocessing
+import queue
 import numpy as np
 import math
 import pytz
@@ -18,7 +21,7 @@ try:
     NLP_AVAILABLE = True
 except ImportError:
     NLP_AVAILABLE = False
-    print("WARNING: NLP libraries not found (newspaper3k, textblob). Sentiment features disabled.")
+    # print("WARNING: NLP libraries not found (newspaper3k, textblob). Sentiment features disabled.")
 
 # Shared Imports
 from shared import (
@@ -47,19 +50,233 @@ setup_logging("LiveEngine")
 logger = logging.getLogger("LiveEngine")
 
 # CONSTANTS
-MAX_TICK_LATENCY_SEC = 45.0  # RELAXED: Increased to accommodate network jitter
+MAX_TICK_LATENCY_SEC = 45.0 
+
+# --- WORKER PROCESS FOR OFF-MAIN-THREAD COMPUTE ---
+class LogicWorker(multiprocessing.Process):
+    """
+    Rec 1: Asynchronous Parallelism.
+    Handles Feature Engineering, Bar Aggregation, and River Model Inference
+    in a dedicated CPU process to prevent blocking the Redis Consumer.
+    """
+    def __init__(self, tick_queue: multiprocessing.Queue, signal_queue: multiprocessing.Queue, 
+                 config: Dict, symbols: List[str]):
+        super().__init__()
+        self.tick_queue = tick_queue
+        self.signal_queue = signal_queue
+        self.config = config
+        self.symbols = symbols
+        self.running = True
+        
+        # Latency Params (Rec 2)
+        self.max_latency_strict = 2.0
+        self.max_latency_relaxed = 30.0
+        self.vol_threshold = 0.0005 # ~5 pips volatility triggers strict mode
+
+    def run(self):
+        """
+        Main Loop for the Logic Process.
+        Owns the Predictor and Aggregators to ensure state isolation.
+        """
+        # Re-setup logging for this process
+        setup_logging("LogicWorker")
+        worker_log = logging.getLogger("LogicWorker")
+        worker_log.info(f"{LogSymbols.ONLINE} Logic Worker Started (PID: {os.getpid()})")
+        
+        # 1. Initialize State (Local to Process)
+        # We must calibrate/init aggregators here to avoid pickling issues across processes
+        threshold_map = self._calibrate_thresholds(worker_log)
+        
+        aggregators = {}
+        alpha = self.config['data'].get('imbalance_alpha', 0.05)
+        
+        for sym in self.symbols:
+            # Use calibrated threshold or default
+            thresh = threshold_map.get(sym, self.config['data'].get('volume_bar_threshold', 10.0))
+            aggregators[sym] = AdaptiveImbalanceBarGenerator(
+                symbol=sym,
+                initial_threshold=thresh,
+                alpha=alpha
+            )
+            
+        # Initialize Predictor (Heavy Lift)
+        # Rec 3: Predictor internally handles Volatility-Based Horizons via its config/labeler logic
+        predictor = MultiAssetPredictor(self.symbols, threshold_map=threshold_map)
+        
+        # Context Cache (D1/H4 updates passed from Main)
+        latest_context = defaultdict(dict)
+        
+        while self.running:
+            try:
+                # 1. Fetch Tick (Blocking with timeout for graceful shutdown)
+                try:
+                    tick_data = self.tick_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                
+                if tick_data == "STOP":
+                    worker_log.info("Logic Worker received STOP signal.")
+                    break
+
+                symbol = tick_data.get('symbol')
+                if symbol not in self.symbols: continue
+
+                # 2. Hardened Latency Guard (Rec 2)
+                # We check latency HERE, using the locally maintained Volatility state
+                if not self._check_latency(tick_data, predictor, worker_log):
+                    continue
+
+                # 3. Update Context (if present in payload)
+                if 'ctx_d1' in tick_data:
+                    try: latest_context[symbol]['d1'] = json.loads(tick_data['ctx_d1'])
+                    except: pass
+                if 'ctx_h4' in tick_data:
+                    try: latest_context[symbol]['h4'] = json.loads(tick_data['ctx_h4'])
+                    except: pass
+
+                # 4. Process Tick -> Bar
+                # Parse data
+                try:
+                    price = float(tick_data.get('price', 0.0))
+                    volume = float(tick_data.get('volume', 1.0))
+                    ts = float(tick_data.get('time', 0.0))
+                    if ts > 100_000_000_000: ts /= 1000.0 # Normalize ms
+                    
+                    bid_vol = float(tick_data.get('bid_vol', 0.0))
+                    ask_vol = float(tick_data.get('ask_vol', 0.0))
+                except (ValueError, TypeError):
+                    continue
+
+                # Aggregate
+                bar = aggregators[symbol].process_tick(
+                    price=price,
+                    volume=volume,
+                    timestamp=ts,
+                    external_buy_vol=bid_vol,
+                    external_sell_vol=ask_vol
+                )
+
+                # 5. Predict (if Bar closed)
+                if bar:
+                    # Prepare context
+                    ctx = {
+                        'd1': latest_context[symbol].get('d1', {}),
+                        'h4': latest_context[symbol].get('h4', {}),
+                        'positions': tick_data.get('positions', {}) # Passed from Main thread
+                    }
+                    
+                    # Generate Signal
+                    signal = predictor.process_bar(symbol, bar, context_data=ctx)
+                    
+                    if signal:
+                        # Push to Execution Queue for Main Thread Dispatcher
+                        self.signal_queue.put(signal)
+                        worker_log.info(f"{LogSymbols.SIGNAL} Generated Signal: {signal.action} {symbol} ({signal.confidence:.2f})")
+
+            except Exception as e:
+                worker_log.error(f"Logic Worker Error: {e}", exc_info=True)
+        
+        # Cleanup
+        predictor.save_state()
+        worker_log.info("Logic Worker Shutdown Complete.")
+
+    def _check_latency(self, tick_data: Dict, predictor: MultiAssetPredictor, log: logging.Logger) -> bool:
+        """
+        Rec 2: Dynamic Latency Guard.
+        Checks volatility to determine acceptable latency.
+        """
+        try:
+            ts = float(tick_data.get('time', 0.0))
+            if ts > 100_000_000_000: ts /= 1000.0
+            
+            now = time.time()
+            latency = abs(now - ts)
+            symbol = tick_data.get('symbol')
+            
+            # Query Volatility Monitor (Thread-safe read from local predictor instance)
+            current_vol = 0.001
+            if symbol in predictor.feature_engineers:
+                # Direct access to the monitor's getter
+                current_vol = predictor.feature_engineers[symbol].vol_monitor.get()
+            
+            # Dynamic Limit: Strict if Volatility is High, Relaxed if Low
+            limit = self.max_latency_strict if current_vol > self.vol_threshold else self.max_latency_relaxed
+            
+            if latency > limit:
+                # Log only occasional warnings to avoid spam during lags
+                if latency > 10.0:
+                    log.warning(f"⚠️ Latency Guard: Dropped {symbol} (Lat: {latency:.2f}s > Limit: {limit:.1f}s | Vol: {current_vol:.5f})")
+                return False
+                
+            return True
+        except Exception:
+            return True # Fail open if check fails
+
+    def _calibrate_thresholds(self, log: logging.Logger) -> Dict[str, float]:
+        """
+        Internal calibration logic for the worker process.
+        Reproduces the logic from the original Engine but inside the worker.
+        """
+        log.info(f"{LogSymbols.TRAINING} Logic Worker: Auto-Calibrating Thresholds...")
+        threshold_map = {}
+        alpha = self.config['data'].get('imbalance_alpha', 0.05)
+        config_thresh = self.config['data'].get('volume_bar_threshold', 10.0)
+        
+        for sym in self.symbols:
+            try:
+                # Load Data (Last 30 Days)
+                df = load_real_data(sym, n_candles=50000, days=30)
+                
+                if df is None or df.empty:
+                    threshold_map[sym] = config_thresh
+                    continue
+                
+                current_threshold = config_thresh
+                attempts = 0
+                max_attempts = 4
+                
+                while attempts < max_attempts:
+                    gen = AdaptiveImbalanceBarGenerator(sym, initial_threshold=current_threshold, alpha=alpha)
+                    bar_count = 0
+                    
+                    for row in df.itertuples():
+                        price = getattr(row, 'price', getattr(row, 'close', None))
+                        vol = getattr(row, 'volume', 1.0)
+                        ts_val = getattr(row, 'Index', None).timestamp()
+                        if price is None: continue
+                        
+                        b_vol = vol / 2
+                        s_vol = vol / 2
+                        if gen.process_tick(price, vol, ts_val, b_vol, s_vol):
+                            bar_count += 1
+                    
+                    if bar_count >= 500:
+                        threshold_map[sym] = current_threshold
+                        break
+                    else:
+                        attempts += 1
+                        current_threshold = max(5.0, current_threshold * 0.5)
+                        threshold_map[sym] = current_threshold
+                
+                log.info(f"✅ {sym} Worker Calibrated: {threshold_map[sym]:.1f}")
+            except Exception as e:
+                log.error(f"Worker Calibration Error {sym}: {e}")
+                threshold_map[sym] = config_thresh
+        
+        return threshold_map
+
 
 class LiveTradingEngine:
     """
-    The Central Logic Unit for the Linux Consumer.
-    1. Consumes Ticks from Redis.
-    2. Aggregates Ticks into Adaptive Imbalance Bars (TIBs).
-    3. Feeds Bars to Golden Trio Predictor.
-    4. Manages Active Positions (Time Stop / Trailing).
-    5. Dispatches Orders to Windows via Redis.
+    The Central Orchestrator.
+    1. Consumes Ticks from Redis (IO Bound).
+    2. Feeds LogicWorker via Queue (Compute Bound).
+    3. Consumes Signals from LogicWorker (Execution Bound).
+    4. Dispatches Orders to Windows via Redis.
     """
     def __init__(self):
         self.shutdown_flag = False
+        self.symbols = CONFIG['trading']['symbols']
         
         # 1. Infrastructure
         self.stream_mgr = RedisStreamManager(
@@ -76,7 +293,7 @@ class LiveTradingEngine:
             max_daily_loss_pct=CONFIG['risk_management']['max_daily_loss_pct'],
             redis_client=self.stream_mgr.r
         )
-        self.portfolio_mgr = PortfolioRiskManager(symbols=CONFIG['trading']['symbols'])
+        self.portfolio_mgr = PortfolioRiskManager(symbols=self.symbols)
         self.session_guard = SessionGuard()
         
         # --- COMPLIANCE SETUP ---
@@ -88,33 +305,7 @@ class LiveTradingEngine:
         self.calendar_thread = threading.Thread(target=self._calendar_sync_loop, daemon=True)
         self.calendar_thread.start()
         
-        # 3. Data Aggregation & Calibration
-        # We must calibrate thresholds BEFORE initializing aggregators/predictor
-        self.threshold_map = self._calibrate_thresholds()
-        
-        self.aggregators = {}
-        # Default alpha 0.05 if not in config
-        alpha = CONFIG['data'].get('imbalance_alpha', 0.05) 
-
-        for sym in CONFIG['trading']['symbols']:
-            # Use the calibrated threshold if found, else config default
-            thresh = self.threshold_map.get(sym, CONFIG['data'].get('volume_bar_threshold', 10.0))
-            
-            self.aggregators[sym] = AdaptiveImbalanceBarGenerator(
-                symbol=sym,
-                initial_threshold=thresh,
-                alpha=alpha
-            )
-            logger.info(f"Initialized TIB Generator for {sym} (Start: {thresh:.1f}, Alpha: {alpha})")
-
-        # 4. AI Predictor (Golden Trio / ARF)
-        # Pass the calibrated map so Predictor warms up with SAME data
-        self.predictor = MultiAssetPredictor(
-            symbols=CONFIG['trading']['symbols'],
-            threshold_map=self.threshold_map
-        )
-        
-        # 5. Execution Dispatcher
+        # 3. Execution Dispatcher
         self.pending_orders = {}  # Track orders to prevent dupes
         self.lock = threading.RLock()
         self.dispatcher = TradeDispatcher(
@@ -126,17 +317,25 @@ class LiveTradingEngine:
         # EXECUTION THROTTLE STATE
         self.last_dispatch_time = defaultdict(float)
         
-        # DEBUG FIX: Force clear pending orders on startup to remove ghosts
-        with self.lock:
-            self.pending_orders.clear()
-
-        # 6. Sentiment Engine
+        # 4. Logic Worker Setup (Rec 1: Async Parallelism)
+        # Use multiprocessing Queues to communicate with the worker process
+        self.tick_queue = multiprocessing.Queue(maxsize=10000)
+        self.signal_queue = multiprocessing.Queue(maxsize=1000)
+        
+        self.logic_worker = LogicWorker(
+            tick_queue=self.tick_queue,
+            signal_queue=self.signal_queue,
+            config=CONFIG,
+            symbols=self.symbols
+        )
+        
+        # 5. Sentiment Engine
         self.global_sentiment = {} # {symbol: score} or {'GLOBAL': score}
         if NLP_AVAILABLE:
             self.news_thread = threading.Thread(target=self.fetch_news_loop, daemon=True)
             self.news_thread.start()
 
-        # 7. Performance Monitor (Circuit Breaker & SQN)
+        # 6. Performance Monitor (Circuit Breaker & SQN)
         # THREAD SAFETY: Lock for statistics updated by background thread
         self.stats_lock = threading.Lock()
 
@@ -148,7 +347,6 @@ class LiveTradingEngine:
         self.last_reset_ts = 0.0 
         
         # Daily Circuit Breaker State (Realized Execution)
-        # Added 'tickets' set to track unique deal IDs and prevent double counting
         self.daily_execution_stats = defaultdict(lambda: {'losses': 0, 'pnl': 0.0, 'tickets': set()})
         
         # Increased to 5 to prevent early lockout in Aggressor Mode
@@ -168,14 +366,20 @@ class LiveTradingEngine:
 
         self.perf_thread = threading.Thread(target=self.fetch_performance_loop, daemon=True)
         self.perf_thread.start()
+        
+        # NEW: Signal Listener Thread (Rec 1)
+        self.signal_thread = threading.Thread(target=self._signal_listener, daemon=True)
+        self.signal_thread.start()
 
         # State
         self.is_warm = False
         self.last_corr_update = time.time()
         self.latest_prices = {}
         
+        # Position Cache (for passing to LogicWorker)
+        self.latest_positions = {}
+        
         # --- INJECT FALLBACK PRICES ---
-        # Ensures RiskManager has conversion rates before first tick arrives
         self._inject_fallback_prices()
         
         self.liquidation_triggered_map = {sym: False for sym in CONFIG['trading']['symbols']}
@@ -194,85 +398,11 @@ class LiveTradingEngine:
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
 
         # --- SAFETY GAP STATE ---
-        # Tracks known open positions to detect closures instantly
         self.known_open_symbols: Set[str] = set()
 
         # Active Position Management Thread
         self.mgmt_thread = threading.Thread(target=self._manage_active_positions_loop, daemon=True)
         self.mgmt_thread.start()
-
-    def _calibrate_thresholds(self) -> Dict[str, float]:
-        """
-        Analyzes historical data to determine optimal bar thresholds.
-        Replicates the Backtester's logic exactly to ensure the Live model sees
-        the same data distribution it was trained on.
-        """
-        logger.info(f"{LogSymbols.TRAINING} Starting Threshold Auto-Calibration...")
-        threshold_map = {}
-        alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
-        config_thresh = CONFIG['data'].get('volume_bar_threshold', 10.0)
-        
-        min_bars_needed = 500
-        
-        for sym in CONFIG['trading']['symbols']:
-            try:
-                # 1. Load Data (Last 30 Days)
-                # Ensure the DB query doesn't crash if empty
-                try:
-                    df = load_real_data(sym, n_candles=50000, days=30)
-                except Exception:
-                    df = None
-
-                if df is None or df.empty:
-                    logger.warning(f"⚠️ Calibration: No data for {sym}. Using default {config_thresh}.")
-                    threshold_map[sym] = config_thresh
-                    continue
-                
-                # 2. Calibration Loop
-                current_threshold = config_thresh
-                attempts = 0
-                max_attempts = 4
-                
-                final_bars = 0
-                
-                while attempts < max_attempts:
-                    gen = AdaptiveImbalanceBarGenerator(sym, initial_threshold=current_threshold, alpha=alpha)
-                    bar_count = 0
-                    
-                    for row in df.itertuples():
-                        price = getattr(row, 'price', getattr(row, 'close', None))
-                        vol = getattr(row, 'volume', 1.0)
-                        ts_val = getattr(row, 'Index', None).timestamp()
-                        if price is None: continue
-                        
-                        # Synthetic flow for calibration estimate
-                        b_vol = vol / 2
-                        s_vol = vol / 2
-                        
-                        if gen.process_tick(price, vol, ts_val, b_vol, s_vol):
-                            bar_count += 1
-                    
-                    if bar_count >= min_bars_needed:
-                        # Found a good threshold
-                        threshold_map[sym] = current_threshold
-                        final_bars = bar_count
-                        break
-                    else:
-                        # Too few bars -> Threshold too high -> Lower it
-                        attempts += 1
-                        new_threshold = max(5.0, current_threshold * 0.5)
-                        logger.info(f"🔎 {sym}: Calibrating... {bar_count} bars (Threshold {current_threshold:.1f} -> {new_threshold:.1f})")
-                        current_threshold = new_threshold
-                        # Fallback if max attempts reached, use the lowest tested
-                        threshold_map[sym] = current_threshold
-                
-                logger.info(f"✅ {sym} Calibrated: Threshold {threshold_map[sym]:.1f} (~{final_bars} bars/month)")
-                
-            except Exception as e:
-                logger.error(f"❌ Calibration Error {sym}: {e}")
-                threshold_map[sym] = config_thresh
-        
-        return threshold_map
 
     def _inject_fallback_prices(self):
         """
@@ -284,10 +414,8 @@ class LiveTradingEngine:
             # --- MAJORS (Primary Conversion) ---
             "USDJPY": 150.0, "GBPUSD": 1.25, "EURUSD": 1.08,
             "USDCAD": 1.35, "USDCHF": 0.90, "AUDUSD": 0.65, "NZDUSD": 0.60,
-            
             # --- GOLDEN BASKET CROSSES (Fallbacks) ---
             "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0,
-            
             # --- LEGACY (Low Priority) ---
             "GBPAUD": 1.95, "EURAUD": 1.65, "GBPNZD": 2.05
         }
@@ -300,7 +428,6 @@ class LiveTradingEngine:
     def _get_producer_anchor_timestamp(self) -> float:
         """
         Polls Redis for the AUTHORITATIVE Midnight Timestamp set by Windows Producer.
-        AUDIT FIX: Do not guess. Trust the producer. If producer is dead, we wait.
         """
         try:
             # This key is set by windows_producer.py during midnight rollover
@@ -310,8 +437,7 @@ class LiveTradingEngine:
         except:
             pass
         
-        # Fallback: Midnight UTC today - Only use if absolutely necessary
-        # This is risky if Broker is EET, but better than crashing.
+        # Fallback: Midnight UTC today
         return datetime.now(pytz.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
     def _restore_daily_state(self):
@@ -398,16 +524,19 @@ class LiveTradingEngine:
                 net_pnl = float(data.get('net_pnl', 0.0))
                 close_ts = float(data.get('timestamp', 0.0))
                 
-                # Check if it was a loss
-                if net_pnl < 0:
-                    expiry = close_ts + (cooldown_mins * 60)
-                    if expiry > now_ts:
-                        # Trade implies active penalty
-                        remaining = (expiry - now_ts) / 60.0
-                        if remaining > 0:
-                            self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=int(remaining) + 1)
+                # UPDATE: Apply penalty box for ANY trade (Win OR Loss)
+                # This ensures consistent cooldown logic persists across restarts.
+                expiry = close_ts + (cooldown_mins * 60)
+                if expiry > now_ts:
+                    # Trade implies active penalty
+                    remaining = (expiry - now_ts) / 60.0
+                    if remaining > 0:
+                        self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=int(remaining) + 1)
+                        if net_pnl < 0:
                             logger.warning(f"🚫 RESTORED PENALTY: {symbol} (Loss ${net_pnl:.2f}) -> Locked for {remaining:.1f}m")
-                            restored_count += 1
+                        else:
+                            logger.info(f"🛡️ RESTORED COOLDOWN: {symbol} (Win ${net_pnl:.2f}) -> Resting for {remaining:.1f}m")
+                        restored_count += 1
             
             if restored_count == 0:
                 logger.info("✅ No active penalties found in history.")
@@ -467,7 +596,7 @@ class LiveTradingEngine:
         Background thread to listen for CLOSED trades.
         1. Updates SQN stats (performance sizing).
         2. Updates Daily Circuit Breaker (stops trading on bad days).
-        3. Enforces REVENGE TRADING GUARD (Penalty Box).
+        3. Enforces MANDATORY COOLDOWN (prevents machine-gun trading).
         """
         logger.info(f"{LogSymbols.INFO} Performance Monitor (SQN & Circuit Breaker) Thread Started.")
         stream_key = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
@@ -475,6 +604,9 @@ class LiveTradingEngine:
         # Start reading from current time ($)
         last_id = '$' 
         
+        # Load cooldown duration from config
+        cooldown_mins = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 60)
+
         while not self.shutdown_flag:
             try:
                 # Check if Day has changed (Anchor Update)
@@ -506,24 +638,27 @@ class LiveTradingEngine:
                                     # 1. SQN Window Update
                                     self.performance_stats[symbol].append(net_pnl)
                                     
-                                    # 2. Circuit Breaker & Revenge Guard
-                                    # Deduplication Check
-                                    if ticket and ticket in self.daily_execution_stats[symbol]['tickets']:
-                                        continue
+                                    # 2. Update Daily Stats (Deduplicated)
+                                    if ticket and ticket not in self.daily_execution_stats[symbol]['tickets']:
+                                        self.daily_execution_stats[symbol]['pnl'] += net_pnl
+                                        if ticket:
+                                            self.daily_execution_stats[symbol]['tickets'].add(ticket)
+                                        
+                                        if net_pnl < 0:
+                                            self.daily_execution_stats[symbol]['losses'] += 1
+                                            logger.info(f"📉 LOSS DETECTED {symbol}: ${net_pnl:.2f} | Daily Losses: {self.daily_execution_stats[symbol]['losses']}")
+                                        else:
+                                            logger.info(f"💰 PROFIT DETECTED {symbol}: ${net_pnl:.2f}")
 
-                                    self.daily_execution_stats[symbol]['pnl'] += net_pnl
-                                    
-                                    if ticket:
-                                        self.daily_execution_stats[symbol]['tickets'].add(ticket)
+                                    # 3. GLOBAL MANDATORY COOLDOWN (Fixes "Machine Gun" Re-entry)
+                                    # Apply penalty box to ALL closed trades (Win or Loss).
+                                    # This forces the strategy to re-evaluate after a break, preventing tilt/overtrading.
+                                    self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=cooldown_mins)
                                     
                                     if net_pnl < 0:
-                                        self.daily_execution_stats[symbol]['losses'] += 1
-                                        logger.info(f"📉 LOSS DETECTED {symbol}: ${net_pnl:.2f} | Daily Losses: {self.daily_execution_stats[symbol]['losses']}")
-                                        
-                                        # REVENGE TRADING GUARD (PENALTY BOX)
-                                        cooldown = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 60)
-                                        self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=cooldown)
-                                        logger.warning(f"🚫 {symbol} SENT TO PENALTY BOX for {cooldown}m (Revenge Guard)")
+                                        logger.warning(f"🚫 {symbol} REVENGE GUARD: Locked for {cooldown_mins}m (Loss)")
+                                    else:
+                                        logger.info(f"🛡️ {symbol} MANDATORY COOLDOWN: Locked for {cooldown_mins}m (Win/Break-even)")
             
             except Exception as e:
                 logger.error(f"Performance Monitor Error: {e}")
@@ -600,9 +735,175 @@ class LiveTradingEngine:
                 sym = p.get('symbol')
                 if sym:
                     pos_map[sym] = p
+            
+            # Cache for Worker Process injection
+            self.latest_positions = pos_map
             return pos_map
         except Exception:
             return {}
+
+    def _signal_listener(self):
+        """
+        Consumes signals from LogicWorker and dispatches orders.
+        This runs in the Main Process to handle Redis IO and Risk Checks.
+        Rec 1 Implementation.
+        """
+        logger.info(f"{LogSymbols.SIGNAL} Signal Dispatcher Thread Active.")
+        
+        while not self.shutdown_flag:
+            try:
+                # 1. Pop Signal from Queue
+                try:
+                    signal = self.signal_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                
+                # --- FIX: IGNORE WARMUP SIGNALS ---
+                # "WARMUP" signals are for model training only, not execution.
+                # If we dispatch them, they default to "BUY" and cause invalid stops.
+                if signal.action == "WARMUP":
+                    continue
+                # ----------------------------------
+                
+                symbol = signal.symbol
+                
+                # 2. Re-Validate Risk (State might have changed since Worker processing)
+                if not self._check_risk_gates(symbol):
+                    continue
+                
+                # 3. Execution Throttle
+                ttl_sec = CONFIG['trading'].get('limit_order_ttl_seconds', 60)
+                if time.time() - self.last_dispatch_time.get(symbol, 0) < ttl_sec:
+                    continue
+                
+                # 4. Construct Trade Intent
+                # NOTE: Re-calculate size locally to ensure Thread Safety on Balance
+                
+                open_positions = self._get_open_positions_from_redis()
+                
+                # Retrieve Meta Data
+                current_atr = signal.meta_data.get('atr', 0.001)
+                ker_val = signal.meta_data.get('ker', 1.0)
+                volatility = signal.meta_data.get('volatility', 0.001)
+                risk_percent_override = signal.meta_data.get('risk_percent_override')
+                
+                # Calculate SQN
+                sqn_score = self._calculate_sqn(symbol)
+                
+                # Calculate Daily PnL Pct
+                try:
+                    start_eq = float(self.stream_mgr.r.get(CONFIG['redis']['risk_keys']['daily_starting_equity']) or 0.0)
+                    if start_eq > 0:
+                        daily_pnl_pct = (self.ftmo_guard.equity - start_eq) / start_eq
+                    else:
+                        daily_pnl_pct = 0.0
+                except:
+                    daily_pnl_pct = 0.0
+                
+                # Portfolio Heat
+                active_corrs = self.portfolio_mgr.get_correlation_count(symbol)
+                
+                # Current Open Risk
+                current_open_risk_pct = 0.0 # Simplified for listener, RiskManager handles margin checks
+                
+                # Get CURRENT PRICE for accurate calculation
+                current_price = self.latest_prices.get(symbol, 0.0)
+                if current_price <= 0:
+                    logger.warning(f"⚠️ {symbol}: No price data for execution. Skipping.")
+                    continue
+
+                # Calculate Trade Size
+                trade_intent, risk_usd = RiskManager.calculate_rck_size(
+                    context=TradeContext(
+                        symbol=symbol,
+                        price=current_price, # Use actual live price
+                        stop_loss_price=0.0,
+                        account_equity=self.ftmo_guard.equity
+                    ),
+                    conf=signal.confidence,
+                    volatility=volatility,
+                    active_correlations=active_corrs,
+                    market_prices=self.latest_prices,
+                    atr=current_atr, 
+                    ker=ker_val,
+                    account_size=self.ftmo_guard.equity,
+                    risk_percent_override=risk_percent_override,
+                    performance_score=sqn_score,
+                    daily_pnl_pct=daily_pnl_pct,
+                    current_open_risk_pct=0.0 # Let RiskManager handle defaults or calc if needed
+                )
+                
+                if trade_intent.volume <= 0: continue
+                
+                # Apply Signal Actions
+                trade_intent.action = signal.action
+                
+                # --- MARKET EXECUTION LOGIC (FORCE ENTRY PRICE = CURRENT MARKET) ---
+                
+                # Apply Signal-Specific SL/TP Logic (Tighten Stops, Pyramid, etc.)
+                tighten_stops = signal.meta_data.get('tighten_stops', False)
+                optimized_rr = signal.meta_data.get('optimized_rr', 2.0)
+                
+                atr_mult_sl = float(CONFIG['risk_management'].get('stop_loss_atr_mult', 1.5))
+                if tighten_stops:
+                    atr_mult_sl = max(1.0, atr_mult_sl * 0.75)
+                    trade_intent.comment += "|Tightened"
+                
+                # --- ROBUST PIP VALUE DETECTION ---
+                pip_val, _ = RiskManager.get_pip_info(symbol)
+                
+                # FORCE JPY FIX: If symbol has JPY, pip MUST be 0.01
+                if "JPY" in symbol and pip_val < 0.01:
+                     pip_val = 0.01
+                
+                # Calculate Distances
+                stop_dist = current_atr * atr_mult_sl
+                
+                # ENFORCE HARD FLOOR
+                # Default to 15 pips if config missing or too small
+                min_pips = float(CONFIG['risk_management'].get('min_stop_loss_pips', 15.0))
+                hard_floor_dist = min_pips * pip_val
+                
+                # Log Geometry for Debugging
+                logger.info(f"📉 SL GEOMETRY: ATR={current_atr:.5f} | Floor={hard_floor_dist:.5f} ({min_pips} pips) | Calc={stop_dist:.5f}")
+                
+                # Apply Floor
+                stop_dist = max(stop_dist, hard_floor_dist)
+                
+                dynamic_tp_dist = stop_dist * optimized_rr
+                
+                # Calculate Absolute Prices relative to ENTRY PRICE (Current Market)
+                entry_ref = current_price
+                
+                if signal.action == "BUY":
+                    abs_sl = entry_ref - stop_dist
+                    abs_tp = entry_ref + dynamic_tp_dist
+                elif signal.action == "SELL":
+                    abs_sl = entry_ref + stop_dist
+                    abs_tp = entry_ref - dynamic_tp_dist
+                else:
+                    abs_sl = 0.0
+                    abs_tp = 0.0
+
+                # --- VALIDATION GATE ---
+                if abs_sl <= 0 or abs_tp <= 0:
+                    logger.error(f"🛑 INVALID SL/TP CALCULATION: {symbol} Action:{signal.action} Price:{entry_ref} SL:{abs_sl} TP:{abs_tp}. Trade Blocked.")
+                    continue
+
+                # Update Trade Object with Absolute Prices
+                trade_intent.entry_price = entry_ref # Force Entry Price to Match Market Ref
+                trade_intent.stop_loss = abs_sl
+                trade_intent.take_profit = abs_tp
+                
+                # ------------------------------------------------
+                
+                # 5. Dispatch
+                logger.info(f"📤 Dispatching MARKET {trade_intent.action} {symbol} ({trade_intent.volume} lots) @ ~{entry_ref:.5f} | SL: {abs_sl:.5f} | TP: {abs_tp:.5f}")
+                self.dispatcher.send_order(trade_intent, risk_usd)
+                self.last_dispatch_time[symbol] = time.time()
+                
+            except Exception as e:
+                logger.error(f"Signal Listener Error: {e}", exc_info=True)
 
     def _manage_active_positions_loop(self):
         """
@@ -745,18 +1046,17 @@ class LiveTradingEngine:
 
     def process_tick(self, tick_data: dict):
         """
-        Handles a single raw tick from Redis.
-        Feeds the Adaptive Imbalance Bar Generator.
-        Includes Strict Deduplication and VOLUME REPAIR.
+        Main Thread Tick Handler.
+        Simply unpacks and pushes to LogicWorker Queue.
+        Minimal latency. Rec 1.
         """
         try:
             symbol = tick_data.get('symbol')
+            if not symbol: return
             
-            # --- CRITICAL: UPDATE LATEST PRICE BEFORE BLOCKING ---
-            # Explicit float casting for safety
+            # --- CRITICAL: UPDATE LATEST PRICE ---
             bid = float(tick_data.get('bid', 0.0))
             ask = float(tick_data.get('ask', 0.0))
-            
             if 'price' in tick_data:
                 price = float(tick_data['price'])
             elif bid > 0 and ask > 0:
@@ -766,428 +1066,31 @@ class LiveTradingEngine:
             
             if price > 0:
                 self.latest_prices[symbol] = price
-            # -----------------------------------------------------------------
 
-            if symbol not in self.aggregators: 
-                # This return is now safe because we updated latest_prices first.
-                # This ensures RiskManager has live prices for conversion pairs (NZDUSD)
-                # even if we aren't actively trading them.
-                return
+            if symbol not in self.symbols: return
             
-            # --- TIMESTAMP DEDUPLICATION & LATENCY GUARD ---
-            tick_ts = float(tick_data.get('time', 0.0))
-            # Normalize ms to seconds if needed
-            if tick_ts > 100_000_000_000:
-                tick_ts /= 1000.0
+            # Deduplication check
+            ts = float(tick_data.get('time', 0.0))
+            if ts <= self.processed_ticks[symbol]: return
+            self.processed_ticks[symbol] = ts
             
-            last_ts = self.processed_ticks.get(symbol, 0.0)
-            
-            # Strict Deduplication: If tick is older or same as last processed, DROP IT.
-            if tick_ts <= last_ts:
-                return 
-            
-            # Stale Tick Guard: If tick is too old (> 45s), dropping prevents "Catch Up" hallucinations
-            # This happens if Redis backs up or Linux pauses.
-            if abs(time.time() - tick_ts) > MAX_TICK_LATENCY_SEC:
-                if self.ticks_processed % 100 == 0:
-                    logger.warning(f"⚠️ Dropping Stale Tick {symbol}: Latency {time.time()-tick_ts:.1f}s > {MAX_TICK_LATENCY_SEC}s")
-                self.processed_ticks[symbol] = tick_ts # Mark as seen so we move forward
-                return
-
-            self.processed_ticks[symbol] = tick_ts
-
-            # --- VISUAL HEARTBEAT ---
+            # Visual Heartbeat
             self.ticks_processed += 1
             if self.ticks_processed % 1000 == 0:
                 logger.info(f"⚡ HEARTBEAT: Processed {self.ticks_processed} ticks... (Last: {symbol})")
 
-            # --- FORCE VOLUME FLOOR (Synthetic Tick Rule) ---
-            raw_vol = float(tick_data.get('volume', 0.0))
-            volume = raw_vol if raw_vol > 0 else 1.0
-
-            bid_vol = float(tick_data.get('bid_vol', 0.0))
-            ask_vol = float(tick_data.get('ask_vol', 0.0))
-
-            # --- CONTEXT EXTRACTION ---
-            if 'ctx_d1' in tick_data:
-                try: 
-                    self.latest_context[symbol]['d1'] = json.loads(tick_data['ctx_d1'])
-                except (json.JSONDecodeError, TypeError): 
-                    pass
+            # Inject latest positions into tick data so Worker has context
+            # This is critical for context-aware features without Redis IO in worker
+            tick_data['positions'] = self.latest_positions.copy()
             
-            if 'ctx_h4' in tick_data:
-                try: 
-                    self.latest_context[symbol]['h4'] = json.loads(tick_data['ctx_h4'])
-                except (json.JSONDecodeError, TypeError): 
-                    pass
-
-            # 1. Feed Adaptive Aggregator
-            bar = self.aggregators[symbol].process_tick(
-                price=price, 
-                volume=volume, 
-                timestamp=tick_ts, 
-                external_buy_vol=bid_vol, 
-                external_sell_vol=ask_vol
-            )
-            
-            # 2. If Bar Complete -> Predict
-            if bar:
-                self.on_bar_complete(bar, symbol)
+            # Non-blocking Push to LogicWorker
+            try:
+                self.tick_queue.put(tick_data, block=False)
+            except queue.Full:
+                logger.warning("⚠️ Tick Queue Full! Dropping tick to maintain real-time edge.")
                 
         except Exception as e:
-            logger.error(f"Tick Processing Error: {e}")
-
-    def on_bar_complete(self, bar: VolumeBar, symbol: str):
-        """
-        Triggered when a Tick Imbalance Bar (TIB) is closed.
-        Executes the Prediction and Dispatch logic.
-        """
-        # =====================================================================
-        # SAFETY GAP PRIORITY INVERSION
-        # MOVED TO THE ABSOLUTE TOP TO PREVENT RACE CONDITIONS.
-        # =====================================================================
-        
-        # 1. Fetch Latest Positions Snapshot from Redis (Producer is Authority)
-        open_positions = self._get_open_positions_from_redis()
-        current_open_symbols = set(open_positions.keys())
-        
-        # 2. Detect Closures (Diff between last tick known state vs current state)
-        just_closed = self.known_open_symbols - current_open_symbols
-        
-        # Update state for next tick immediately
-        self.known_open_symbols = current_open_symbols
-
-        # 3. SAFETY GAP ENFORCEMENT
-        # If the symbol we are processing just closed, we MUST ABORT immediately.
-        # This covers the gap between "Trade Closed in MT5" and "Redis Performance Stream updated".
-        if symbol in just_closed:
-            logger.warning(f"🛑 REVENGE KILLER: {symbol} just closed. Applying 5m penalty & ABORTING tick.")
-            # Apply 5-minute cooldown (Extended for safety) to bridge gap until 
-            # Performance Monitor applies the full 60m penalty (if loss).
-            self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=5)
-            return  # <--- CRITICAL: DO NOT PROCEED TO SIGNAL GENERATION
-
-        # --- EXECUTION THROTTLE ---
-        # Forces a hard wait time between orders for the same symbol.
-        # This covers the critical "Redis Round Trip" latency window.
-        ttl_sec = CONFIG['trading'].get('limit_order_ttl_seconds', 60)
-        last_time = self.last_dispatch_time.get(symbol, 0)
-        
-        if time.time() - last_time < ttl_sec:
-            logger.info(f"⏳ {symbol} in Execution Cool-down ({ttl_sec}s). Skipping.")
-            return
-
-        # --- EXECUTION CIRCUIT BREAKER ---
-        if self._check_circuit_breaker(symbol):
-            return
-
-        # 1. Update Portfolio Risk State
-        try:
-            ret = (bar.close - bar.open) / bar.open if bar.open > 0 else 0.0
-            self.portfolio_mgr.update_returns(symbol, ret)
-            
-            if time.time() - self.last_corr_update > 60:
-                self.portfolio_mgr.update_correlation_matrix()
-                self.last_corr_update = time.time()
-        except Exception as e:
-            logger.error(f"Portfolio Update Error: {e}")
-        
-        # --- SESSION GUARD & WEEKEND LIQUIDATION ---
-        if self.session_guard.should_liquidate():
-            if not self.liquidation_triggered_map[symbol]:
-                logger.warning(f"{LogSymbols.CLOSE} SESSION END GUARD: Closing {symbol} (Hard Close 3h before NY End).")
-                close_intent = Trade(
-                    symbol=symbol, 
-                    action="CLOSE_ALL", 
-                    volume=0.0, 
-                    entry_price=0.0, 
-                    stop_loss=0.0, 
-                    take_profit=0.0, 
-                    comment="Session/Gap Liquidation"
-                )
-                self.dispatcher.send_order(close_intent, 0.0)
-                self.liquidation_triggered_map[symbol] = True
-            return # Stop processing signals
-        else:
-            # Reset trigger if we are back in safe hours (next day)
-            if self.liquidation_triggered_map[symbol] and self.session_guard.is_trading_allowed():
-                self.liquidation_triggered_map[symbol] = False
-        
-        # 2. Prepare Context
-        current_sentiment = self.global_sentiment.get('GLOBAL', 0.0)
-        mt5_context = self.latest_context.get(symbol, {})
-        
-        # --- RECONCILE PENDING ORDERS ---
-        # Check if any "Pending" orders are actually open now
-        self._reconcile_pending_orders(open_positions)
-
-        # =====================================================================
-        # B. MAX TRADES GUARD (RACE CONDITION FIX)
-        # =====================================================================
-        max_open_trades = CONFIG['risk_management'].get('max_open_trades', 1)
-        
-        # Count In-Flight Orders (Strict Logic)
-        # We must count ANY pending order that was dispatched recently (<60s)
-        # as a "reserved slot" to prevent firing a second trade while the first is in transit.
-        pending_count = 0
-        now_ts = time.time()
-        
-        symbol_has_pending = False
-        
-        with self.lock:
-            # Iterate copy to be safe
-            for oid, p_data in list(self.pending_orders.items()):
-                # Clean up ancient orders (TTL 60s)
-                if now_ts - p_data.get('timestamp', 0) > 60:
-                    del self.pending_orders[oid]
-                    continue
-                
-                # Count valid pending orders
-                pending_count += 1
-                if p_data.get('symbol') == symbol:
-                    symbol_has_pending = True
-
-        total_utilization = len(open_positions) + pending_count
-
-        # BLOCK if Limit Reached
-        if total_utilization >= max_open_trades:
-            # Only allow processing if this symbol is already OPEN (for management/exit)
-            # If it's pending, we also block to avoid duplicate signals for same symbol
-            if symbol not in open_positions:
-                if self.ticks_processed % 100 == 0:
-                    logger.info(f"🛑 MAX TRADES LIMIT ({total_utilization}/{max_open_trades}) [Open:{len(open_positions)} Pending:{pending_count}]. Skipping {symbol}.")
-                return
-        
-        # BLOCK if symbol has pending order (Machine Gun Protection)
-        if symbol_has_pending:
-            logger.info(f"⚠️ Anti-Machine Gun: {symbol} has pending order. Skipping.")
-            return
-        # =====================================================================
-        
-        context_data = {
-            'd1': mt5_context.get('d1', {}),
-            'h4': mt5_context.get('h4', {}),
-            'sentiment': current_sentiment,
-            'positions': open_positions
-        }
-        
-        # 3. Get Signal (Golden Trio / ARF)
-        # HALLUCINATION GUARD: If Predictor detects gap, it will bridge and return None
-        signal = self.predictor.process_bar(symbol, bar, context_data=context_data)
-        
-        if not signal: return
-
-        # --- PHASE 2: WARM-UP GATE ---
-        if signal.action == "WARMUP":
-            return
-
-        # 4. Validate Signal
-        if signal.action == "HOLD":
-            return
-            
-        logger.info(f"{LogSymbols.SIGNAL} SIGNAL: {signal.action} {symbol} (Conf: {signal.confidence:.2f})")
-
-        # --- VOLATILITY GATE ---
-        current_atr = signal.meta_data.get('atr', 0.0)
-        if self.use_vol_gate:
-            pip_size, _ = RiskManager.get_pip_info(symbol)
-            spread_pips = self.spread_map.get(symbol, 1.5)
-            spread_cost = spread_pips * pip_size
-            
-            if current_atr < (spread_cost * self.min_atr_spread_ratio):
-                logger.warning(f"{LogSymbols.LOCK} Vol Gate: {symbol} Rejected. Low Volatility.")
-                return
-
-        # 5. Check Risk & Compliance Gates
-        # DEBUG: Verbose logging for Gate Checks
-        logger.info(f"🛡️ Checking Risk Gates for {symbol}...")
-        if not self._check_risk_gates(symbol):
-            logger.warning(f"🚫 Risk Gate BLOCKED {symbol}")
-            return
-
-        # 6. Calculate Size (Fixed Risk Mode)
-        volatility = signal.meta_data.get('volatility', 0.001)
-        active_corrs = self.portfolio_mgr.get_correlation_count(
-            symbol, 
-            threshold=CONFIG['risk_management']['correlation_penalty_threshold']
-        )
-
-        try:
-            cached_size = self.stream_mgr.r.get("bot:account_size")
-            account_size = float(cached_size) if cached_size else self.ftmo_guard.equity
-        except:
-            account_size = self.ftmo_guard.equity
-
-        # Retrieve Risk Override from Predictor (Optimized)
-        risk_percent_override = signal.meta_data.get('risk_percent_override')
-        
-        # Retrieve KER for Risk Scaling (Sniper Protocol)
-        ker_val = signal.meta_data.get('ker', 1.0)
-        
-        # --- DYNAMIC SQN PERFORMANCE SCORE ---
-        sqn_score = self._calculate_sqn(symbol)
-
-        # Initial Context
-        ctx = TradeContext(
-            symbol=symbol,
-            price=bar.close,
-            stop_loss_price=0.0,
-            account_equity=self.ftmo_guard.equity,
-            account_currency="USD",
-            win_rate=0.45, 
-            risk_reward_ratio=2.0 
-        )
-
-        # --- CALCULATE DAILY PNL FOR BUFFER SCALING ---
-        try:
-            start_eq = float(self.stream_mgr.r.get(CONFIG['redis']['risk_keys']['daily_starting_equity']) or 0.0)
-            if start_eq > 0:
-                daily_pnl_pct = (self.ftmo_guard.equity - start_eq) / start_eq
-            else:
-                daily_pnl_pct = 0.0
-        except:
-            daily_pnl_pct = 0.0
-
-        # --- CALCULATE TOTAL OPEN RISK % (LIVE) ---
-        current_open_risk_usd = 0.0
-        contract_size = 100000
-        
-        # --- MARGIN SAFETY: Calculate Used Margin Locally ---
-        # Fallback if Redis data is missing or stale.
-        local_used_margin = 0.0
-        
-        for sym, pos in open_positions.items():
-            entry = float(pos.get('entry_price', 0.0))
-            sl = float(pos.get('sl', 0.0))
-            vol = float(pos.get('volume', 0.0))
-            
-            # Risk Calculation
-            if sl > 0 and entry > 0:
-                price_dist = abs(entry - sl)
-                curr_p = self.latest_prices.get(sym, entry)
-                rate = RiskManager.get_conversion_rate(sym, curr_p, self.latest_prices)
-                
-                risk_val = price_dist * vol * contract_size * rate
-                current_open_risk_usd += risk_val
-                
-                # Margin Calculation (Estimated)
-                # IMPORTANT: We use conservative leverage logic here (RiskManager handles 1:30 fallback)
-                margin_req = RiskManager.calculate_required_margin(
-                    symbol=sym, lots=vol, price=curr_p, contract_size=contract_size, conversion_rate=rate
-                )
-                local_used_margin += margin_req
-                
-        equity = self.ftmo_guard.equity
-        if equity > 0:
-            current_open_risk_pct = (current_open_risk_usd / equity) * 100.0
-        else:
-            current_open_risk_pct = 0.0
-
-        # --- FETCH REAL FREE MARGIN WITH LOCAL FALLBACK ---
-        real_free_margin = 0.0
-        try:
-            acc_info_raw = self.stream_mgr.r.hgetall(CONFIG['redis']['account_info_key'])
-            if acc_info_raw and 'free_margin' in acc_info_raw:
-                redis_free_margin = float(acc_info_raw['free_margin'])
-                
-                # If Redis reports suspiciously high margin (== Equity) while we know we have positions,
-                # TRUST LOCAL CALCULATION. This happens if the Broker isn't sending Margin updates fast enough.
-                if len(open_positions) > 0 and redis_free_margin >= (equity * 0.99):
-                    logger.warning(f"⚠️ Suspicious Redis Free Margin ({redis_free_margin:.2f}). Using Local Estimate.")
-                    real_free_margin = max(0.0, equity - local_used_margin)
-                else:
-                    real_free_margin = redis_free_margin
-            else:
-                real_free_margin = max(0.0, equity - local_used_margin)
-        except:
-            real_free_margin = max(0.0, equity - local_used_margin)
-
-        # DEBUG: Verbose Sizing Log
-        logger.info(f"📐 Calculating Size for {symbol}: Equity={account_size}, Margin={real_free_margin:.2f}, Risk%= {risk_percent_override}")
-
-        # Get Base Trade Intent with Buffer Scaling
-        trade_intent, risk_usd = RiskManager.calculate_rck_size(
-            context=ctx,
-            conf=signal.confidence,
-            volatility=volatility,
-            active_correlations=active_corrs,
-            market_prices=self.latest_prices,
-            atr=current_atr,
-            account_size=account_size,
-            contract_size_override=None,
-            ker=ker_val,
-            risk_percent_override=risk_percent_override,
-            performance_score=sqn_score,
-            daily_pnl_pct=daily_pnl_pct,
-            current_open_risk_pct=current_open_risk_pct,
-            free_margin=real_free_margin 
-        )
-
-        if trade_intent.volume <= 0:
-            logger.warning(f"❌ Trade Size 0 for {symbol}: {trade_intent.comment}")
-            return
-
-        trade_intent.action = signal.action
-
-        # --- VOLATILITY TRIGGER (TIGHTEN STOPS) ---
-        tighten = signal.meta_data.get('tighten_stops', False)
-        
-        # Current SL/TP are Distances
-        sl_dist = trade_intent.stop_loss
-        tp_dist = trade_intent.take_profit
-        
-        if tighten:
-            sl_dist *= 0.75 # Compress Stop by 25%
-            trade_intent.comment += "|Tightened"
-            logger.info(f"🛡️ STOP TIGHTENED: {symbol} (High Volatility) -> SL Dist {sl_dist:.5f}")
-
-        # --- STOP DISTANCE CLAMP ---
-        # Ensure SL/TP are not inside the spread (min 5 pips)
-        pip_size, _ = RiskManager.get_pip_info(symbol)
-        min_pips = CONFIG['risk_management'].get('min_stop_loss_pips', 5.0)
-        min_dist = min_pips * pip_size
-        
-        if sl_dist < min_dist:
-            sl_dist = min_dist
-            trade_intent.comment += "|MinSL"
-            
-        if tp_dist < min_dist:
-            tp_dist = min_dist
-            trade_intent.comment += "|MinTP"
-
-        # --- DYNAMIC R:R OVERRIDE ---
-        # Check for Momentum Ignition reward boost
-        optimized_rr = signal.meta_data.get('optimized_rr')
-        if optimized_rr and optimized_rr > 0 and current_atr > 0:
-            tp_dist = current_atr * optimized_rr
-            # Re-check min dist after boost
-            if tp_dist < min_dist: tp_dist = min_dist
-            trade_intent.comment += f"|OptRR:{optimized_rr:.2f}"
-
-        # --- CONVERT DISTANCES TO ABSOLUTE PRICES ---
-        if trade_intent.action == "BUY":
-            trade_intent.stop_loss = bar.close - sl_dist
-            trade_intent.take_profit = bar.close + tp_dist
-        elif trade_intent.action == "SELL":
-            trade_intent.stop_loss = bar.close + sl_dist
-            trade_intent.take_profit = bar.close - tp_dist
-
-        # --- PYRAMIDING LOGIC ---
-        is_pyramid = signal.meta_data.get('pyramid', False)
-        if is_pyramid:
-            original_volume = trade_intent.volume
-            trade_intent.volume = round(original_volume * 0.5, 2)
-            min_lot = CONFIG['risk_management'].get('min_lot_size', 0.01)
-            if trade_intent.volume < min_lot: trade_intent.volume = min_lot
-            trade_intent.comment += "|PYRAMID"
-            logger.info(f"⚡ PYRAMID: Scaling In {trade_intent.volume} lots")
-
-        # 7. Dispatch
-        logger.info(f"📤 Dispatching Order: {trade_intent.action} {trade_intent.symbol} {trade_intent.volume} Lots")
-        self.dispatcher.send_order(trade_intent, risk_usd)
-        
-        # UPDATE DISPATCH TIMER
-        self.last_dispatch_time[symbol] = time.time()
+            logger.error(f"Main Process Tick Error: {e}")
 
     def _check_risk_gates(self, symbol: str) -> bool:
         """
@@ -1258,6 +1161,9 @@ class LiveTradingEngine:
         logger.info(f"{LogSymbols.SUCCESS} Engine Loop Started. Waiting for Ticks on '{CONFIG['redis']['price_data_stream']}'...")
         self.is_warm = True
         
+        # Start Logic Worker (Rec 1)
+        self.logic_worker.start()
+        
         stream_key = CONFIG['redis']['price_data_stream']
         group = self.stream_mgr.group_name
         consumer = f"engine-{CONFIG['trading']['magic_number']}"
@@ -1269,9 +1175,15 @@ class LiveTradingEngine:
 
         while not self.shutdown_flag:
             try:
+                # Check Worker Health
+                if not self.logic_worker.is_alive():
+                    logger.critical("🚨 Logic Worker DIED! Restarting...")
+                    # Cleanup old queues if needed, or re-instantiate worker
+                    self.logic_worker = LogicWorker(self.tick_queue, self.signal_queue, CONFIG, self.symbols)
+                    self.logic_worker.start()
+
                 # AUDIT FIX: PAUSE ON MIDNIGHT FREEZE
                 # If the Producer is doing a rollover sync, we must pause tick processing
-                # to prevent risk state desynchronization.
                 if self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['midnight_freeze']):
                     logger.info("❄️ Midnight Freeze Detected. Pausing Tick Consumption...")
                     time.sleep(1)
@@ -1309,7 +1221,6 @@ class LiveTradingEngine:
                         self.ftmo_guard.initial_balance = float(cached_size)
                         
                 except Exception as e:
-                    # Transient Redis errors ignored in tight loop
                     pass
                 
             except Exception as e:
@@ -1318,8 +1229,15 @@ class LiveTradingEngine:
 
     def shutdown(self) -> None:
         logger.info(f"{LogSymbols.CLOSE} Engine Shutting Down...")
-        self.predictor.save_state()
         self.shutdown_flag = True
+        
+        # Shutdown Worker
+        self.tick_queue.put("STOP")
+        self.logic_worker.join(timeout=5)
+        if self.logic_worker.is_alive():
+            self.logic_worker.terminate()
+            
+        logger.info("Logic Worker Terminated.")
 
 if __name__ == "__main__":
     engine = LiveTradingEngine()

@@ -454,14 +454,21 @@ def load_real_data(
         print(f"ERROR: Database load failed for {symbol}: {e}")
         return pd.DataFrame()
 
-def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 1000) -> List[Dict[str, Any]]:
+def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 1000, alpha: Optional[float] = None) -> List[Dict[str, Any]]:
     """
     Offline batch processor using AdaptiveImbalanceBarGenerator Logic.
+    
+    AUDIT FIX (2025-12-25): Removed hardcoded alpha=0.025. 
+    Now defaults to CONFIG['data']['imbalance_alpha'] (0.05) to match Live Engine.
     """
     bars = []
+    
+    # Determine Alpha (Dynamic > Config > Default)
+    if alpha is None:
+        alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
+
     # Use the new generator for batch processing to ensure training data matches live data
-    # SNIPER UPDATE: alpha reduced to 0.025
-    gen = AdaptiveImbalanceBarGenerator(symbol="BATCH", initial_threshold=volume_threshold, alpha=0.025)
+    gen = AdaptiveImbalanceBarGenerator(symbol="BATCH", initial_threshold=volume_threshold, alpha=alpha)
     
     for row in tick_df.itertuples():
         price = getattr(row, 'price', getattr(row, 'close', None))
