@@ -2,6 +2,7 @@ import os
 import sys
 
 # --- CRITICAL STABILITY FIX: FORCE SINGLE THREADING FOR MATH LIBS ---
+# This must happen before ANY numpy/pandas/scikit-learn imports
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -153,9 +154,6 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     
     final_threshold = config_threshold # Default
     
-    # Only log calibration if verbose logging needed, else keep clean
-    # log.info(f"🔎 Calibrating {symbol} on first {len(calibration_df)} ticks (30 Days)...")
-
     while attempts < max_attempts:
         gen = AdaptiveImbalanceBarGenerator(
             symbol=symbol,
@@ -187,13 +185,11 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
         
         if bar_count >= min_bars_needed:
             final_threshold = current_threshold
-            # log.info(f"✅ {symbol}: Auto-Calibrated Threshold to {final_threshold} (Generated {bar_count} bars in 30 days)")
             break
         else:
             # Not enough bars, lower threshold
             attempts += 1
             new_threshold = max(5.0, current_threshold * 0.5) # Lower limit
-            # log.warning(f"⚠️ {symbol}: Insufficient bars ({bar_count}). Retrying with threshold {new_threshold}...")
             current_threshold = new_threshold
             final_threshold = current_threshold
 
@@ -258,6 +254,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
     ISOLATED WORKER FUNCTION: Runs in a separate process.
     Executes Global Optimization using "PROFIT IS KING" Logic.
     """
+    # Double ensure single threading inside worker
     os.environ["OMP_NUM_THREADS"] = "1"
     setup_logging(f"Worker_{symbol}")
     log = logging.getLogger(f"Worker_{symbol}")
@@ -339,8 +336,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 trial.set_user_attr("blown", True)
                 return -10000.0
 
-            # SIGNIFICANCE FILTER
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 40)
+            # SIGNIFICANCE FILTER (V17.0: Lowered to 20 for stricter filters)
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 20)
             if trades < min_trades:
                 trial.set_user_attr("pruned", True)
                 return 0.0 
@@ -437,7 +434,7 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 }
                 params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
                 
-                # DYNAMIC RISK SEARCH (SURVIVAL MODE UPDATE)
+                # DYNAMIC RISK SEARCH
                 risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0025, 0.005])
                 params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
                 
@@ -527,7 +524,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
 
         # ROBUST SELECTION LOGIC
         # Filter trials that met the trade count threshold
-        min_trades = CONFIG['wfo'].get('min_trades_optimization', 40)
+        min_trades = CONFIG['wfo'].get('min_trades_optimization', 20)
         
         valid_trials = [
             t for t in study.trials 

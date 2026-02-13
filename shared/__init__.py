@@ -2,7 +2,7 @@
 shared/__init__.py
 Exposes all shared components.
 COMPATIBILITY: Python 3.9 (Windows) & 3.11 (Linux)
-AUDIT FIX: Lazy/Guarded imports to prevent Windows Producer crash on missing Linux ML libs.
+AUDIT FIX: Removed circular imports from 'engines'. Shared is a foundation library.
 """
 
 from shared.core.config import CONFIG

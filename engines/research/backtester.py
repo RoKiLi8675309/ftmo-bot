@@ -215,15 +215,6 @@ class BacktestBroker:
         Dynamic lookup via self.last_price_map to ensure PnL accuracy during volatility.
         """
         rate = RiskManager.get_conversion_rate(symbol, current_price, self.last_price_map)
-        
-        # Sanity Check: If rate is 1.0 but it's clearly a non-USD pair
-        if rate == 1.0 and not symbol.endswith("USD") and "USD" in symbol:
-             # It is a USD pair (e.g. USDJPY), so rate might be 1/Price or Price
-             pass
-        elif rate == 1.0 and "USD" not in symbol:
-             # Cross pair (e.g. EURGBP) returning 1.0 implies missing conversion data
-             pass
-
         return rate
 
     def process_pending(self, snapshot: MarketSnapshot):
@@ -394,8 +385,18 @@ class BacktestBroker:
     def submit_order(self, order: BacktestOrder) -> Optional[int]:
         """
         Public API called by ResearchStrategy.
-        Applies STRICT REALITY INJECTION (Volatility Penalty).
+        Applies STRICT REALITY INJECTION (Volatility Penalty) AND FIXED LOT CLAMP.
         """
+        # V17.0 FIX: Enforce Fixed Lots if configured
+        risk_conf = CONFIG.get('risk_management', {})
+        if risk_conf.get('sizing_method') == 'fixed_lots':
+             fixed_size = float(risk_conf.get('fixed_lot_size', 0.01))
+             # Clamp order quantity to fixed size. 
+             # Even if strategy asked for 4.09, we force 0.01.
+             if order.quantity > fixed_size:
+                 logger.warning(f"🛑 SIZE CLAMP: Requested {order.quantity} -> Forced {fixed_size}")
+                 order.quantity = fixed_size
+        
         if order.quantity <= 0: return None
         if self.is_blown: return None # No trades if blown
         
@@ -413,35 +414,25 @@ class BacktestBroker:
         spread_cost = spread_pips * (point * 10)
         
         # --- VOLATILITY PENALTY (REALITY INJECTION) ---
-        # If RVOL (Relative Volume) is high, we assume SLIPPAGE is inevitable.
-        # Live market orders NEVER fill at the exact tick price during momentum ignition.
         rvol = order.metadata.get('rvol', 0.0)
         vol_penalty = 0.0
         
         # Aggressor threshold is roughly 2.0-2.5 RVOL
         if rvol > 2.0:
-            # Slippage Factor: For every 1.0 above 2.0 RVOL, increase spread cost by 50%
-            # e.g. RVOL 4.0 -> Factor = (4-2)*0.5 = 1.0 -> 100% extra spread penalty
-            # e.g. RVOL 10.0 -> Factor = 4.0 -> 400% extra spread penalty (Reality check for spikes)
             slippage_factor = (rvol - 2.0) * 0.5
             vol_penalty = spread_cost * slippage_factor
             
-            # Log significant slippage for audit
             if slippage_factor > 1.0:
                 logger.info(f"🛡️ REALITY CHECK {order.symbol}: RVOL {rvol:.1f} -> Volatility Slippage {vol_penalty:.5f}")
                 
         order.slippage_penalty = vol_penalty
 
         # EXECUTION REALITY:
-        # BUY: Fills at Ask + Penalty
-        # SELL: Fills at Bid - Penalty (Worse Price)
-        
         if order.action == "BUY":
             # Buy Limit/Market fills at Ask
             order.entry_price = order.entry_price + spread_cost + vol_penalty
         else:
-            # Sell Limit/Market fills at Bid - Penalty (To sell, we cross spread, but we are entering at Bid quote)
-            # Actually, standard sell fills at Bid. But slippage implies we missed the best Bid.
+            # Sell Limit/Market fills at Bid - Penalty
             order.entry_price = order.entry_price - vol_penalty
             
         order.commission = order.quantity * self.commission_per_lot

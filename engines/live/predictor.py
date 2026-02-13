@@ -87,7 +87,7 @@ class MultiAssetPredictor:
         self.closes_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         self.volume_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         self.bb_window = 20
-        self.bb_std = CONFIG['phoenix_strategy'].get('bb_std_dev', 1.0) # V16.3: Relaxed to 1.0 for Scalping
+        self.bb_std = CONFIG['phoenix_strategy'].get('bb_std_dev', 1.0) 
         self.bb_buffers = {s: deque(maxlen=self.bb_window) for s in symbols}
         
         # --- SNIPER PROTOCOL BUFFERS ---
@@ -100,10 +100,22 @@ class MultiAssetPredictor:
         # Volatility Gate Buffer (Returns)
         self.returns_window = {s: deque(maxlen=20) for s in symbols}
 
+        # --- STRATEGY THRESHOLDS (CACHED) ---
+        phx_conf = CONFIG.get('phoenix_strategy', {})
+        self.regime_enforcement = phx_conf.get('regime_enforcement', 'DISABLED').upper()
+        self.asset_regime_map = phx_conf.get('asset_regime_map', {})
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.001)) 
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.45)) 
+        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 2.5))
+        self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 25.0))
+        
+        adx_cfg = CONFIG.get('features', {}).get('adx', {})
+        self.adx_threshold = float(adx_cfg.get('threshold', 20.0)) # Hard floor
+
         for s in symbols:
             # Default from Config
             s_risk = risk_mult_conf
-            s_reward = tbm_conf.get('barrier_width', 2.5) # Tightened to 2.5 for faster rotation
+            s_reward = tbm_conf.get('barrier_width', 2.5) 
             
             # Default Horizon Reduced to 240m (4h)
             s_horizon = tbm_conf.get('horizon_minutes', 240) 
@@ -179,50 +191,19 @@ class MultiAssetPredictor:
         # --- Gating Params ---
         self.vol_gate_conf = CONFIG['online_learning'].get('volatility_gate', {})
         self.use_vol_gate = self.vol_gate_conf.get('enabled', True)
-        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 0.8) # Relaxed
+        self.min_atr_spread_ratio = self.vol_gate_conf.get('min_atr_spread_ratio', 0.8) 
         
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         
-        # --- PHOENIX STRATEGY PARAMETERS ---
-        phx_conf = CONFIG.get('phoenix_strategy', {})
-        
-        # Logic Thresholds (Scalper Tuned)
-        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.001)) # Relaxed from 0.002
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.42)) # Relaxed from 0.45
-        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 2.5)) 
-        self.require_d1_trend = phx_conf.get('require_d1_trend', False)
-        
-        self.default_max_rvol = float(phx_conf.get('max_relative_volume', 25.0))
-        
-        # Regime Enforcement Mode (HARD vs SOFT)
-        self.regime_enforcement = phx_conf.get('regime_enforcement', 'DISABLED').upper()
-        self.asset_regime_map = phx_conf.get('asset_regime_map', {})
-        
-        # Friday Guard
-        self.friday_entry_cutoff = CONFIG['risk_management'].get('friday_entry_cutoff_hour', 18)
-        
-        # ADX Threshold (Cached for Logging)
-        adx_cfg = CONFIG.get('features', {}).get('adx', {})
-        # RELAXED ADX for Scalping (Default to 10 if not set)
-        self.adx_threshold = float(adx_cfg.get('threshold', 10.0))
-
         # Fallback Tracking
         self.l2_missing_warned = {s: False for s in symbols}
         self.last_close_prices = {s: 0.0 for s in symbols}
         
         # Timezone for Guard
-        risk_conf = CONFIG.get('risk_management', {})
-        tz_str = risk_conf.get('risk_timezone', 'Europe/Prague')
         try:
-            self.server_tz = pytz.timezone(tz_str)
+            self.server_tz = pytz.timezone(risk_conf.get('risk_timezone', 'Europe/Prague'))
         except Exception:
             self.server_tz = pytz.timezone('Europe/Prague')
-
-        # --- SESSION CONTROL CONFIG ---
-        session_conf = risk_conf.get('session_control', {})
-        self.session_enabled = session_conf.get('enabled', False)
-        self.start_hour = session_conf.get('start_hour_server', 10)
-        self.liq_hour = session_conf.get('liquidate_hour_server', 21)
 
         # --- Dynamic Gate Scaling State ---
         self.ker_drift_detectors = {s: drift.ADWIN(delta=0.01) for s in symbols}
@@ -325,9 +306,6 @@ class MultiAssetPredictor:
                         bars_trained += 1
                 
                 # THE HALLUCINATOR CURE
-                # Mark this symbol as requiring a "Gap Bridge".
-                # The first live bar will update EMAs but NOT trigger a signal.
-                # This prevents the model from seeing a massive return jump from Historical End -> Live Start.
                 self.warmup_gap_bridge[sym] = True
                 
                 # Force reset of price reference to prevent drift
@@ -341,8 +319,6 @@ class MultiAssetPredictor:
     def _train_on_bar(self, symbol: str, bar: VolumeBar):
         """
         Internal method to update Model/FE state without generating trading signals.
-        Used exclusively for Warm-Up.
-        Updated for Rec 3: Pass Volume/Returns to Labeler.
         """
         # Feature Engineering
         fe = self.feature_engineers[symbol]
@@ -396,12 +372,10 @@ class MultiAssetPredictor:
     def _calculate_golden_trio(self, symbol: str) -> Tuple[float, float, float]:
         """
         Calculates the "Golden Trio" of features locally using accurate buffers.
-        Includes robust math guards against zero-division and log(0).
         """
         closes = self.closes_buffer[symbol]
         vols = self.volume_buffer[symbol]
         
-        # Defaults
         hurst = 0.5
         ker = 0.5
         rvol = 1.0
@@ -424,8 +398,6 @@ class MultiAssetPredictor:
                     tau.append(std if std > 1e-9 else 1e-9)
                 
                 # Polyfit on log-log
-                # Slope = H. Removed legacy scalar.
-                # Safe regression
                 log_lags = np.log(lags)
                 log_tau = np.log(tau)
                 poly = np.polyfit(log_lags, log_tau, 1)
@@ -462,7 +434,6 @@ class MultiAssetPredictor:
     def _calculate_trend_bias(self, symbol: str, current_price: float) -> int:
         """
         Returns 1 (Bullish), -1 (Bearish), or 0 (Neutral).
-        Based on Price vs SMA(200). Helps align Scalps with Macro Trend.
         """
         buffer = self.sma_window[symbol]
         if len(buffer) < 200:
@@ -483,7 +454,6 @@ class MultiAssetPredictor:
     def _check_volatility_condition(self, symbol: str, current_price: float) -> bool:
         """
         Ensures distinct market movement exists before entering.
-        Prevents entering during dead zones where spreads kill profit.
         """
         buffer = self.returns_window[symbol]
         if len(buffer) < 10:
@@ -504,7 +474,6 @@ class MultiAssetPredictor:
         """
         Calibrates raw model probability to a more reliable confidence score.
         """
-        # Center around 0.5
         x = (raw_conf - 0.5) * 10.0 
         calibrated = 1 / (1 + np.exp(-x))
         return calibrated
@@ -512,8 +481,6 @@ class MultiAssetPredictor:
     def _get_preferred_regime(self, symbol: str) -> str:
         """
         ROBUST ASSET PERSONALITY DETECTION.
-        Prevents 'USD' (Neutral) from overriding 'CAD' (MeanRev) in USDCAD.
-        Logic: Trend > MeanReversion > Neutral.
         """
         # 1. Check for Exact Match
         if symbol in self.asset_regime_map:
@@ -539,7 +506,6 @@ class MultiAssetPredictor:
     def _check_currency_exposure(self, symbol: str, open_positions: Dict[str, Any]) -> bool:
         """
         Enforces Portfolio Heat Limits.
-        Prevents stacking too much risk on one currency (e.g. max 2 USD pairs).
         """
         base_ccy = symbol[:3]
         quote_ccy = symbol[3:]
@@ -570,8 +536,6 @@ class MultiAssetPredictor:
         """
         Actual entry point called by Engine.
         Executes the Learn-Predict Loop with Project Phoenix Logic.
-        Enforces Asset-Specific Regimes (The "Personality Filter").
-        Updated for Rec 3: Passing Volume/Returns for Horizon.
         """
         if symbol not in self.symbols: return None
         
@@ -590,18 +554,13 @@ class MultiAssetPredictor:
         self.bar_counters[symbol] += 1
         
         # GAP BRIDGING (HALLUCINATOR CURE)
-        # If we just finished warmup, the 'last_price' in FE is stale (from history).
-        # We must treat this bar as a bridge: update state, but DO NOT predict.
         is_bridging_gap = False
         if self.warmup_gap_bridge[symbol]:
             is_bridging_gap = True
             logger.info(f"🌉 BRIDGING GAP {symbol}: Syncing Live Price {bar.close:.5f} (Skipping Signal)")
-            # Turn off the flag so next bar is normal
             self.warmup_gap_bridge[symbol] = False
-            # Force update last_price to current, so next return is valid
             self.last_close_prices[symbol] = bar.close
         
-        # Capture previous close before updating with current bar
         prev_close = self.last_close_prices.get(symbol, bar.close)
         self.last_close_prices[symbol] = bar.close
 
@@ -694,8 +653,6 @@ class MultiAssetPredictor:
 
         # --- GAP BRIDGE EXECUTION ---
         if is_bridging_gap:
-            # We processed the features to update EMAs, but we RETURN now.
-            # This ensures the model logic never sees the "gap return".
             return Signal(symbol, "HOLD", 0.0, {"reason": "Bridging Gap"})
 
         # --- SERVER TIME & DAILY STATS MANAGEMENT ---
@@ -707,13 +664,11 @@ class MultiAssetPredictor:
             self.daily_performance[symbol] = {'date': current_date, 'losses': 0, 'pnl': 0.0}
 
         # --- CIRCUIT BREAKER (Aggressor) ---
-        # Increased to 5 losses to prevent early lockout
         if self.daily_performance[symbol]['losses'] >= self.daily_max_losses:
             stats["Circuit Breaker (Daily Losses)"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Circuit Breaker Active"})
 
         # 2. Delayed Training (Label Resolution)
-        # Rec 3: Pass Volume and Returns for dynamic horizon
         resolved_labels = labeler.resolve_labels(
             bar.high, bar.low, 
             current_close=bar.close,
@@ -746,7 +701,6 @@ class MultiAssetPredictor:
                 ret_scalar = math.log1p(abs(realized_ret) * 100.0)
                 ret_scalar = max(0.5, min(ret_scalar, 5.0))
                 
-                # Use Historical KER for weighting
                 hist_ker = stored_feats.get('ker', 0.5)
                 ker_weight = hist_ker * 2.0 
                 
@@ -804,14 +758,10 @@ class MultiAssetPredictor:
                     required_r = float(pyramid_config.get('add_on_profit_r', 0.5))
                     
                     if current_r < required_r:
-                        # Trade is not profitable enough (or is losing). BLOCK.
                         return None 
                     
-                    # If we reach here, trade IS profitable enough. 
-                    # We set the flag and proceed to signal generation.
                     is_pyramid_attempt = True
                 else:
-                    # Data missing, safe block
                     return None
             except Exception:
                 return None
@@ -918,12 +868,13 @@ class MultiAssetPredictor:
             stats[f"Volume Climax"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
             
-        # G4: TREND STRENGTH (ADX) - Only for Trend Regime
+        # G4: TREND STRENGTH (ADX) - HARD BLOCK
+        # V17.0 FIX: If we want to trade trend, we MUST have ADX > 20. No compromises.
         if regime_label == "TREND_BREAKOUT":
             adx_val = features.get('adx', 0.0)
-            if adx_val < self.adx_threshold: 
-                # Just log warning, don't block hard if other signals strong
-                stats[f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
+            if adx_val < self.adx_threshold: # Threshold is now 20.0 in config
+                self.rejection_stats[symbol][f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
+                return Signal(symbol, "HOLD", 1.0, {"reason": f"Weak Trend (ADX {adx_val:.1f})"})
 
         # 5. ML Confirmation & Calibration
         # Ensure features are floats
@@ -1013,10 +964,7 @@ class MultiAssetPredictor:
     def _check_sniper_filters(self, symbol: str, signal: int, price: float, d1_ema: float, current_hurst: float) -> bool:
         """
         SNIPER PROTOCOL (AGGRESSOR UPDATE):
-        1. Trend Filter: D1 Alignment (DISABLED in Config).
-        2. RSI Guard: UNLOCKED via Momentum Ignition.
-           - If RSI > 80 AND Hurst > 0.60, Trade is ALLOWED (Ignition).
-           - Only blocks if RSI > 80 and Hurst < 0.60 (Exhaustion).
+        1. RSI Guard: Strict Overbought/Oversold Rejection.
         """
         # 1. RSI CALCULATION (M5 Extension)
         if len(self.sniper_rsi[symbol]) < 14:
@@ -1029,26 +977,19 @@ class MultiAssetPredictor:
             rs = avg_gain / avg_loss
             rsi = 100 - (100 / (1 + rs))
 
-        # 2. RSI EXTREME GUARD (MOMENTUM IGNITION)
-        # We invert the logic: High RSI + High Hurst = IGNITION (Buy!)
-        if "JPY" in symbol:
-            pass # JPY pairs trend hard, ignore RSI extremes
-        else:
-            if signal == 1: # BUY
-                if rsi > 80: 
-                    # CHECK: Is this Exhaustion or Ignition?
-                    if current_hurst > 0.60:
-                        pass # IGNITION: ALLOW TRADE (Momentum is huge)
-                    else:
-                        return False # EXHAUSTION: Reject Overbought
+        # 2. RSI EXTREME GUARD (STRICT SAFETY)
+        # We REJECT trades that are buying the top or selling the bottom.
+        # This fixes the low win rate by filtering out exhaustion trades.
+        
+        if signal == 1: # BUY
+            if rsi > 75: 
+                # REJECT: Market is overextended. Do not buy tops.
+                return False 
             
-            elif signal == -1: # SELL
-                if rsi < 20: 
-                    # CHECK: Ignition?
-                    if current_hurst > 0.60:
-                        pass # IGNITION: ALLOW TRADE (Crash mode)
-                    else:
-                        return False # EXHAUSTION: Reject Oversold
+        elif signal == -1: # SELL
+            if rsi < 25: 
+                # REJECT: Market is oversold. Do not sell bottoms.
+                return False 
         
         return True
 

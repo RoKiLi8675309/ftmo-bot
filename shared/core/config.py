@@ -7,9 +7,9 @@
 # Supports path resolution for both Monolithic and Modular layouts.
 # CRITICAL: Python 3.9 Compatible (No '|' unions).
 #
-# UPDATES (Rec 4 - Survival Mode):
-# 1. RISK ENFORCEMENT: Programmatically clamps Base Risk to 0.25% in _sanitize_config.
-# 2. HOT HAND CAP: Clamps Scaled Risk to 0.50% to prevent over-leveraging.
+# UPDATES (Rec 5 - Timezone & Risk Fix):
+# 1. TIMEZONE: Switched default to 'Europe/Athens' (EET) to align with FTMO Server.
+# 2. RISK CLAMP: Enforced 0.25% Base Risk to allow 20+ losses/day.
 # =============================================================================
 
 import os
@@ -75,17 +75,17 @@ def _sanitize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     # 4. SURVIVAL MODE: Aggressor Protocol Risk Clamp (Rec 4)
-    # We programmatically enforce the lower risk limits to ensure survival
-    # even if config.yaml is outdated or misconfigured.
     if 'risk_management' not in config:
         config['risk_management'] = {}
         
-    # Enforce 0.25% Base Risk (Allows ~20 losses before daily limit)
-    # This addresses the "risking way too much" issue directly.
+    # TIMEZONE FIX: Enforce Europe/Athens (EET) to match Broker Server
+    # This ensures 10:00 AM matches Server Time, not Local Time
+    config['risk_management']['risk_timezone'] = "Europe/Athens"
+
+    # RISK FIX: Enforce 0.25% Base Risk (Allows ~20 losses before daily limit)
     config['risk_management']['base_risk_per_trade_percent'] = 0.0025
     
     # Enforce 0.50% Scaled Risk (Hot Hand Cap)
-    # Even on a winning streak, we cap risk to 0.5% to preserve drawdown.
     config['risk_management']['scaled_risk_percent'] = 0.005
 
     return config

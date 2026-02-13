@@ -1,11 +1,12 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V16.23 (GOLDEN BASKET OPTIMIZATION)
+# config.yaml – PROJECT PHOENIX V17.0 (SURVIVAL SNIPER PROTOCOL)
 # STATUS: LIVE TRADING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# REMEDIATION UPDATE (PORTFOLIO ROTATION):
-# 1. GOLDEN BASKET: Shifted to High-Liquidity/Low-Spread Majors + JPY Crosses.
-# 2. BLACKLIST: Removed GBPAUD/GBPNZD due to poor Spread-to-Vol ratio.
-# 3. SAFETY: Enforced Max Currency Exposure of 2 to prevent USD stacking.
+# CRITICAL FIXES (V17.0):
+# 1. SIZING: Forced 0.01 LOTS (Fixed Size).
+# 2. CONCURRENCY: 1 Trade Per Pair, Max 8 Total.
+# 3. STRATEGY: Tightened Filters (ADX>20, Hurst>0.48) to fix Win Rate.
+# 4. STOPS: Widened to 4.0 ATR to prevent noise stop-outs.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -61,7 +62,7 @@ redis:
   heartbeat_key: "producer:heartbeat"
 
 postgres:
-  dsn: "postgresql://postgres:password@localhost:5432/trading_bot"
+  dsn: "postgresql://postgres:password@localhost:5432/trading_db"
 
 # --- PRODUCER SETTINGS ---
 producer:
@@ -133,7 +134,7 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 10.0 # RELAXED to 10.0 for Scalping
+    threshold: 20.0 # V17.0: STRICTER Trend requirement (Was 10.0)
   
   cyclical_time: true
   session_awareness: true
@@ -164,21 +165,21 @@ phoenix_strategy:
   require_d1_trend: false                          
   require_h4_alignment: false                  
   
-  # --- LOGIC MAPPING THRESHOLDS (V16.3 TUNING) ---
-  hurst_breakout_threshold: 0.42      # Relaxed from 0.45 to catch GBP moves
+  # --- LOGIC MAPPING THRESHOLDS (V17.0 STRICT TUNING) ---
+  hurst_breakout_threshold: 0.48      # STRICT: Was 0.42. Only trade clear trends.
   hurst_mean_reversion_threshold: 0.00    
-  ker_trend_threshold: 0.001          # Relaxed from 0.002
+  ker_trend_threshold: 0.003          # STRICT: Was 0.001. Demand efficiency.
   
-  bb_std_dev: 1.0                     # Relaxed from 1.2 to trigger more signals
+  bb_std_dev: 1.5                     # STRICT: Was 1.0. Demand stronger breakout.
   
-  rvol_volatility_trigger: 2.5        
+  rvol_volatility_trigger: 3.0        # Was 2.5
   
   # --- FILTER THRESHOLDS ---
   max_relative_volume: 25.0        
   volume_gate_ratio: 0.8            
   aggressor_threshold: 0.51        
-  ml_confirmation_threshold: 0.55  
-  choppiness_threshold: 65.0        
+  ml_confirmation_threshold: 0.60  # STRICT: Was 0.55. Higher confidence required.
+  choppiness_threshold: 60.0       # STRICT: Was 65.0. Reject more chop.
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -215,8 +216,8 @@ optimization_search_space:
   
   # Triple Barrier Method (Labeling)
   tbm_barrier_width:
-    min: 1.5  # Tighter for scalping
-    max: 3.5  
+    min: 2.0  # Wider barriers for survival
+    max: 4.0  
   tbm_horizon_minutes:
     min: 60   # 1 Hour
     max: 360  # 6 Hours
@@ -227,36 +228,33 @@ optimization_search_space:
   
   # Strategy Execution
   min_calibrated_probability:
-    min: 0.00 
-    max: 0.01
+    min: 0.55 
+    max: 0.65
 
 # --- RISK MANAGEMENT (FTMO COMPLIANCE) ---
 risk_management:
   account_currency: "USD"
   
-  # --- SIZING METHOD: AGGRESSOR PROTOCOL ---
-  sizing_method: "fixed_risk"
+  # --- SIZING METHOD: V17.0 FIXED MICRO ---
+  sizing_method: "fixed_lots" # FORCE SMALL SIZE
+  fixed_lot_size: 0.01        # SMALLEST POSSIBLE SIZE
   
-  # V16.5 UPGRADE: 0.5% BASE RISK (Confirmed safe by 4.4% Max DD)
-  base_risk_per_trade_percent: 0.0050
-  
-  # PROFIT BUFFER LOGIC
-  profit_buffer_threshold: 0.02
-  # Scaled risk 1.0% max (Hot Hand)
-  scaled_risk_percent: 0.010
+  # Legacy Risk % (Ignored by fixed_lots but kept for reference)
+  base_risk_per_trade_percent: 0.0025
+  scaled_risk_percent: 0.005
   
   # REVENGE TRADING GUARD
-  loss_cooldown_minutes: 60  # Lock symbol for 1 hour after a loss
+  loss_cooldown_minutes: 120  # INCREASED: Lock symbol for 2 hours after a loss
   
-  # MARGIN LEVEL GATE (V16.11 NEW)
-  min_margin_level_percent: 150.0
+  # MARGIN LEVEL GATE
+  min_margin_level_percent: 200.0 # Safer margin buffer
 
   # PYRAMIDING (COMPOUNDING)
   pyramiding:
     enabled: true
-    max_adds: 2
-    add_on_profit_r: 0.5  
-    risk_per_add_percent: 0.0025 # Keep adds conservative
+    max_adds: 1 # Reduced to 1 add
+    add_on_profit_r: 1.0  
+    risk_per_add_percent: 0.00 # Zero risk adds (Fixed lot handling needed)
   
   # EQUITY RATCHET
   equity_ratchet:
@@ -264,18 +262,18 @@ risk_management:
     step_percent: 0.05    # Lock floor every 5% gain
   
   # LIMITS
-  max_daily_loss_pct: 0.040        # 4.0% Daily Limit (Buffer against 5.0%)
+  max_daily_loss_pct: 0.045        # 4.5% Daily Limit
   max_total_loss_pct: 0.095        
   
   # PORTFOLIO HEAT
-  # Strict limit: Only 2 pairs of the same currency (e.g. 2 USD pairs) allowed at once.
-  # With the new balanced basket, this allows reasonable concurrency.
-  max_currency_exposure: 2         
+  # Relaxed to 8 to allow "1 trade per pair" logic without currency blocking
+  # Since lots are 0.01, high exposure is acceptable.
+  max_currency_exposure: 8       
   
-  # V16.21: SINGLE TRADE ENFORCEMENT
-  # Set to 1 to strictly prevent "No Money" margin errors per symbol.
-  max_open_trades: 1               
-  max_risk_percent: 2.0 # Raised for Aggressor            
+  # V17.0: CONCURRENCY UPDATE
+  # Allow 8 trades total (1 per pair for the 8 watched pairs)
+  max_open_trades: 8              
+  max_risk_percent: 5.0           
   
   # --- LEVERAGE GUARD (V16.11 SWING STANDARDS) ---
   leverage:
@@ -288,29 +286,23 @@ risk_management:
   leverage_safety_divisor: 1.5
   
   max_leverage: 30.0
-  max_lot_size: 50.0 
+  max_lot_size: 0.01 # Hard Cap
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC
-  stop_loss_atr_mult: 1.5                
-  take_profit_atr_mult: 3.0              
+  stop_loss_atr_mult: 4.0        # WIDENED: Give 0.01 lots room to breathe
+  take_profit_atr_mult: 6.0      # Target big swings
   
   # ACTIVE TRAILING STOP
   trailing_stop:
     enabled: true        
-    activation_r: 1.0       # Activate earlier (1.0R)
-    trail_trigger_r: 1.0       
-    trail_dist_r: 0.5       # Tight Trail (0.5R) to bank scalps
+    activation_r: 1.5       # Wait for 1.5R profit before trailing
+    trail_trigger_r: 1.5       
+    trail_dist_r: 1.0       # Loose trail (1.0R)
   
   risk_timezone: "Europe/Prague"
   
-  # --- SESSION & TIME MANAGEMENT (NEW) ---
-  # Enforces trading only during London & New York sessions.
-  # Hard close 3 hours before NY session end to avoid EOD wicks.
-  # Based on FTMO Server Time (EET):
-  # - London Open (~08:00 UK) ~= 10:00 Server
-  # - NY Close (~17:00 NY) ~= 24:00 Server
-  # - Liquidation Target (14:00 NY) ~= 21:00 Server
+  # --- SESSION & TIME MANAGEMENT ---
   session_control:
     enabled: true
     start_hour_server: 10      # Start Trading (London Open)
@@ -323,19 +315,18 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 100          
+  max_trades_per_day: 50          
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
   
-  # V16.23 REALITY FIX: ABSOLUTE HARD FLOOR FOR STOPS
-  # Enforce 15 pips to survive the noise, especially on crosses.
-  min_stop_loss_pips: 15.0
+  # V17.0 REALITY FIX: ABSOLUTE HARD FLOOR FOR STOPS
+  # Enforce 25 pips to survive the noise.
+  min_stop_loss_pips: 25.0
 
 # --- TRADING PORTFOLIO (V16.30 GOLDEN BASKET) ---
 trading:
-  # THE GOLDEN BASKET: OPTIMAL SPREAD-TO-VOLATILITY RATIO
-  # Removing High-Cost Pairs (GBPAUD/GBPNZD) to restore ML Edge.
+  # THE GOLDEN BASKET: 8 Pairs
   symbols:
     # --- MAJORS (Low Cost / High Liquidity) ---
     - "EURUSD"   # The Anchor (Spread ~1.5)
@@ -386,29 +377,30 @@ online_learning:
   positive_class_weight: 1.5 
   negative_class_weight: 1.0
   
-  meta_labeling_threshold: 0.55
+  meta_labeling_threshold: 0.60 # STRICTER
   
   tbm:
     # HORIZON: 4 Hours (Scalper)
     horizon_minutes: 240        
     barrier_width: 2.5        
-    min_profit_pips: 5.0        
+    min_profit_pips: 10.0       # Was 5.0 
     drift_threshold: 1.5 
   
   learning_horizon_sec: 300
   
   # AGGRESSOR PROTOCOL
-  min_calibrated_probability: 0.00 
+  # Filter low confidence signals
+  min_calibrated_probability: 0.55 
 
 # --- NEWS FILTER ---
 news_filter:
   enabled: true
   primary_url: "http://nfs.faireconomy.media/ff_calendar_thisweek.xml"
   backup_url: "https://www.forexfactory.com/calendar"
-  buffer_minutes_before: 5   # Minimal buffer for Scalping
-  buffer_minutes_after: 5    # Minimal buffer
+  buffer_minutes_before: 15   # Increased buffer
+  buffer_minutes_after: 15    # Increased buffer
   restricted_events:
-    USD: ["FOMC", "NFP", "CPI"] 
+    USD: ["FOMC", "NFP", "CPI", "PPI", "GDP"] 
     GBP: ["BOE", "CPI"]
     JPY: ["BOJ"]
     AUD: ["RBA", "CPI"]
@@ -443,5 +435,5 @@ wfo:
   n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 40  # Lowered from 100 to allow slower pairs to survive
-  risk_per_trade_options: [0.005, 0.01] # 0.5%, 1.0% (Aggressor)
+  min_trades_optimization: 20  # Lowered significantly as we filter heavily
+  risk_per_trade_options: [0.0025]

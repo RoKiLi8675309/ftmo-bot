@@ -524,19 +524,16 @@ class LiveTradingEngine:
                 net_pnl = float(data.get('net_pnl', 0.0))
                 close_ts = float(data.get('timestamp', 0.0))
                 
-                # UPDATE: Apply penalty box for ANY trade (Win OR Loss)
-                # This ensures consistent cooldown logic persists across restarts.
-                expiry = close_ts + (cooldown_mins * 60)
-                if expiry > now_ts:
-                    # Trade implies active penalty
-                    remaining = (expiry - now_ts) / 60.0
-                    if remaining > 0:
-                        self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=int(remaining) + 1)
-                        if net_pnl < 0:
+                # Check if it was a loss
+                if net_pnl < 0:
+                    expiry = close_ts + (cooldown_mins * 60)
+                    if expiry > now_ts:
+                        # Trade implies active penalty
+                        remaining = (expiry - now_ts) / 60.0
+                        if remaining > 0:
+                            self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=int(remaining) + 1)
                             logger.warning(f"🚫 RESTORED PENALTY: {symbol} (Loss ${net_pnl:.2f}) -> Locked for {remaining:.1f}m")
-                        else:
-                            logger.info(f"🛡️ RESTORED COOLDOWN: {symbol} (Win ${net_pnl:.2f}) -> Resting for {remaining:.1f}m")
-                        restored_count += 1
+                            restored_count += 1
             
             if restored_count == 0:
                 logger.info("✅ No active penalties found in history.")
@@ -742,6 +739,27 @@ class LiveTradingEngine:
         except Exception:
             return {}
 
+    def _check_symbol_concurrency(self, symbol: str) -> bool:
+        """
+        V17.0 FIX: Enforces 1 Trade Per Pair, up to Global Max.
+        Instead of blocking if total > 8, we check if specific symbol is already active.
+        """
+        # 1. Fetch current positions
+        open_positions = self._get_open_positions_from_redis()
+        
+        # 2. Check if THIS symbol is already active
+        if symbol in open_positions:
+            logger.warning(f"🚫 {symbol} already active. Concurrency Limit (1 per pair).")
+            return False
+            
+        # 3. Check Global Limit (8)
+        max_global = CONFIG['risk_management'].get('max_open_trades', 8)
+        if len(open_positions) >= max_global:
+            logger.warning(f"🚫 Global Trade Limit Reached ({len(open_positions)}/{max_global}).")
+            return False
+            
+        return True
+
     def _signal_listener(self):
         """
         Consumes signals from LogicWorker and dispatches orders.
@@ -776,7 +794,11 @@ class LiveTradingEngine:
                 if time.time() - self.last_dispatch_time.get(symbol, 0) < ttl_sec:
                     continue
                 
-                # 4. Construct Trade Intent
+                # 4. CONCURRENCY CHECK (V17.0)
+                if not self._check_symbol_concurrency(symbol):
+                    continue
+
+                # 5. Construct Trade Intent
                 # NOTE: Re-calculate size locally to ensure Thread Safety on Balance
                 
                 open_positions = self._get_open_positions_from_redis()
@@ -812,6 +834,15 @@ class LiveTradingEngine:
                     logger.warning(f"⚠️ {symbol}: No price data for execution. Skipping.")
                     continue
 
+                # --- V17.0 FIX: Fetch Margin Info for Leverage Guard ---
+                estimated_free_margin = 100000.0 # Default fallback
+                try:
+                    acc_info = self.stream_mgr.r.hgetall(CONFIG['redis']['account_info_key'])
+                    if acc_info:
+                        estimated_free_margin = float(acc_info.get('free_margin', 100000.0))
+                except Exception:
+                    pass
+
                 # Calculate Trade Size
                 trade_intent, risk_usd = RiskManager.calculate_rck_size(
                     context=TradeContext(
@@ -830,7 +861,8 @@ class LiveTradingEngine:
                     risk_percent_override=risk_percent_override,
                     performance_score=sqn_score,
                     daily_pnl_pct=daily_pnl_pct,
-                    current_open_risk_pct=0.0 # Let RiskManager handle defaults or calc if needed
+                    current_open_risk_pct=0.0, # Let RiskManager handle defaults or calc if needed
+                    free_margin=estimated_free_margin # Pass explicit free margin
                 )
                 
                 if trade_intent.volume <= 0: continue
@@ -854,7 +886,7 @@ class LiveTradingEngine:
                 
                 # FORCE JPY FIX: If symbol has JPY, pip MUST be 0.01
                 if "JPY" in symbol and pip_val < 0.01:
-                     pip_val = 0.01
+                      pip_val = 0.01
                 
                 # Calculate Distances
                 stop_dist = current_atr * atr_mult_sl
@@ -897,7 +929,7 @@ class LiveTradingEngine:
                 
                 # ------------------------------------------------
                 
-                # 5. Dispatch
+                # 6. Dispatch
                 logger.info(f"📤 Dispatching MARKET {trade_intent.action} {symbol} ({trade_intent.volume} lots) @ ~{entry_ref:.5f} | SL: {abs_sl:.5f} | TP: {abs_tp:.5f}")
                 self.dispatcher.send_order(trade_intent, risk_usd)
                 self.last_dispatch_time[symbol] = time.time()
@@ -1116,7 +1148,9 @@ class LiveTradingEngine:
 
         # 4. General Market Hours & SESSION WINDOW
         if not self.session_guard.is_trading_allowed():
-            logger.warning(f"{LogSymbols.LOCK} Session Guard Block: Outside Allowed Window (London/NY).")
+            # DIAGNOSTIC LOGGING FOR TIMEZONE ISSUES
+            srv_time = datetime.now(self.session_guard.market_tz)
+            logger.warning(f"{LogSymbols.LOCK} Session Guard Block: Server Time {srv_time.strftime('%H:%M')} (TZ: {self.session_guard.market_tz}) < Start Hour {self.session_guard.start_hour} or > End {self.session_guard.liq_hour}")
             return False
             
         # 5. Friday Entry Guard (No new trades after 16:00)
