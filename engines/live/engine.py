@@ -742,21 +742,28 @@ class LiveTradingEngine:
     def _check_symbol_concurrency(self, symbol: str) -> bool:
         """
         V17.0 FIX: Enforces 1 Trade Per Pair, up to Global Max.
-        Instead of blocking if total > 8, we check if specific symbol is already active.
+        UPDATED: Checks for Pyramiding configuration to allow adding to winners.
         """
         # 1. Fetch current positions
         open_positions = self._get_open_positions_from_redis()
         
-        # 2. Check if THIS symbol is already active
-        if symbol in open_positions:
-            logger.warning(f"🚫 {symbol} already active. Concurrency Limit (1 per pair).")
-            return False
-            
-        # 3. Check Global Limit (8)
+        # 2. Check Global Limit (8)
         max_global = CONFIG['risk_management'].get('max_open_trades', 8)
         if len(open_positions) >= max_global:
             logger.warning(f"🚫 Global Trade Limit Reached ({len(open_positions)}/{max_global}).")
             return False
+
+        # 3. Check if THIS symbol is already active
+        if symbol in open_positions:
+            # CHECK PYRAMIDING CONFIG
+            is_pyramid_on = CONFIG['risk_management'].get('pyramiding', {}).get('enabled', False)
+            if is_pyramid_on:
+                # If Pyramiding is enabled, we DO NOT block here.
+                # We allow the signal to proceed to RiskManager, which validates the specific "Add" criteria (Profitability, R-Multiple).
+                return True
+            else:
+                logger.warning(f"🚫 {symbol} already active. Concurrency Limit (1 per pair).")
+                return False
             
         return True
 
@@ -943,7 +950,7 @@ class LiveTradingEngine:
         Enforces:
         1. 4h Time Stop (Hard Exit) - Dynamic Config.
         2. 0.5R Trailing Stop.
-        3. Daily Session Liquidation (Redundancy Check).
+        3. Daily Session Liquidation (Redundancy Check) - Uses authoritative NY Time.
         """
         logger.info(f"{LogSymbols.INFO} Active Position Manager Started (Trail: 0.5R, Time-Stop: Dynamic).")
         
@@ -963,8 +970,8 @@ class LiveTradingEngine:
                 now_utc = datetime.now(pytz.utc)
 
                 # SESSION CHECK (Redundancy)
-                # If the main loop missed the liquidation time, we catch it here.
-                session_liquidation = self.session_guard.should_liquidate()
+                # Pass UTC time explicitly to ensure NY conversion works correctly within the guard
+                session_liquidation = self.session_guard.should_liquidate(timestamp=now_utc)
 
                 for sym, pos in positions.items():
                     exit_reason = None
@@ -1147,15 +1154,16 @@ class LiveTradingEngine:
             return False
 
         # 4. General Market Hours & SESSION WINDOW
+        # V17.5: Using internal time check which handles TZ correct
         if not self.session_guard.is_trading_allowed():
             # DIAGNOSTIC LOGGING FOR TIMEZONE ISSUES
             srv_time = datetime.now(self.session_guard.market_tz)
             logger.warning(f"{LogSymbols.LOCK} Session Guard Block: Server Time {srv_time.strftime('%H:%M')} (TZ: {self.session_guard.market_tz}) < Start Hour {self.session_guard.start_hour} or > End {self.session_guard.liq_hour}")
             return False
             
-        # 5. Friday Entry Guard (No new trades after 16:00)
+        # 5. Friday Entry Guard (No new trades after Noon NY Time)
         if self.session_guard.is_friday_afternoon():
-            logger.warning(f"{LogSymbols.LOCK} Friday Guard Block: No new trades allowed late Friday.")
+            logger.warning(f"{LogSymbols.LOCK} Friday Guard Block: No new trades allowed late Friday (NY Noon).")
             return False
 
         # 6. Penalty Box (Correlation/Volatility penalty OR Revenge Guard)

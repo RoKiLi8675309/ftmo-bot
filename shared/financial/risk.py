@@ -347,6 +347,10 @@ class RiskManager:
         return trade, final_risk_usd
 
 class SessionGuard:
+    """
+    Enforces trading windows based on Server Time and New York Time.
+    V17.5 FIX: STRICT FRIDAY CLOSING using NY Timezone to avoid Server Offset drift.
+    """
     def __init__(self):
         risk_conf = CONFIG.get('risk_management', {})
         tz_str = risk_conf.get('risk_timezone', 'Europe/Prague')
@@ -355,11 +359,15 @@ class SessionGuard:
         except Exception:
             self.market_tz = pytz.timezone('Europe/Prague')
             
+        # V17.5: NY Timezone for Robust Friday Guard
+        self.ny_tz = pytz.timezone('America/New_York')
+            
         self.friday_cutoff = dt_time(19, 0)
         self.monday_start = dt_time(1, 0)
         self.rollover_start = dt_time(23, 50)
         self.rollover_end = dt_time(1, 15)
         
+        # Legacy config read (Kept for compatibility, but NY logic overrides for Friday)
         self.friday_entry_cutoff_hour = risk_conf.get('friday_entry_cutoff_hour', 16)
         self.friday_liquidation_hour = risk_conf.get('friday_liquidation_hour_server', 21)
 
@@ -369,6 +377,7 @@ class SessionGuard:
         self.liq_hour = session_conf.get('liquidate_hour_server', 21)
 
     def is_trading_allowed(self) -> bool:
+        """Check standard daily session limits."""
         now_local = datetime.now(self.market_tz)
         weekday = now_local.weekday()
         current_time = now_local.time()
@@ -387,26 +396,58 @@ class SessionGuard:
         return True
 
     def is_friday_afternoon(self, timestamp: Optional[datetime] = None) -> bool:
+        """
+        PREVENTS ENTRIES late on Friday.
+        Uses NY Time: Cutoff at 12:00 PM NY (Noon).
+        """
         if timestamp:
             if timestamp.tzinfo is None:
-                dt = timestamp
+                utc_dt = timestamp.replace(tzinfo=pytz.utc)
             else:
-                dt = timestamp.astimezone(self.market_tz)
+                utc_dt = timestamp.astimezone(pytz.utc)
         else:
-            dt = datetime.now(self.market_tz)
+            utc_dt = datetime.now(pytz.utc)
             
-        if dt.weekday() == 4 and dt.hour >= self.friday_entry_cutoff_hour:
+        ny_dt = utc_dt.astimezone(self.ny_tz)
+        
+        # Friday (4) and Hour >= 12 (Noon NY)
+        if ny_dt.weekday() == 4 and ny_dt.hour >= 12:
             return True
+            
         return False
 
-    def should_liquidate(self) -> bool:
-        now_local = datetime.now(self.market_tz)
-        weekday = now_local.weekday()
+    def should_liquidate(self, timestamp: Optional[datetime] = None) -> bool:
+        """
+        TRIGGERS LIQUIDATION on Friday 3 hours before close.
+        NY Close = 17:00. Trigger = 14:00 (2 PM NY).
+        Also respects daily session end (Server Time).
+        """
+        # 1. Resolve Timestamps
+        if timestamp:
+            if timestamp.tzinfo is None:
+                utc_dt = timestamp.replace(tzinfo=pytz.utc)
+            else:
+                utc_dt = timestamp.astimezone(pytz.utc)
+        else:
+            utc_dt = datetime.now(pytz.utc)
+            
+        ny_dt = utc_dt.astimezone(self.ny_tz)
         
-        if weekday > 4: return True 
-        if weekday == 4 and now_local.hour >= self.friday_liquidation_hour: return True
+        # 2. FRIDAY HARD CLOSE (NY TIME)
+        if ny_dt.weekday() == 4:
+            # 14:00 NY is strictly 3 hours before 17:00 NY Close
+            if ny_dt.hour >= 14:
+                return True
+        elif ny_dt.weekday() > 4: 
+            return True # Weekend
+            
+        # 3. DAILY SESSION CLOSE (SERVER TIME)
+        # Use provided timestamp aligned to Market TZ
+        market_dt = utc_dt.astimezone(self.market_tz)
+        
         if self.session_enabled:
-            if now_local.hour >= self.liq_hour: return True
+            if market_dt.hour >= self.liq_hour:
+                return True
             
         return False
 

@@ -30,11 +30,9 @@ from shared import (
     VolumeBar,
     RiskManager,
     load_real_data,             # Required for Warm-up
-    AdaptiveImbalanceBarGenerator # Required for Warm-up
+    AdaptiveImbalanceBarGenerator, # Required for Warm-up
+    MetaLabeler
 )
-
-# New Feature Import
-from shared.financial.features import MetaLabeler
 
 logger = logging.getLogger("Predictor")
 
@@ -52,7 +50,7 @@ class MultiAssetPredictor:
     """
     Manages a dictionary of Online Models (one per symbol).
     Performs 'Inference -> Train' loop on every Volume Bar.
-    Updated for Rec 3: Volatility-Based Horizons.
+    Updated for V17.0: Sniper Survival Protocol & Ignition Bypass.
     """
     def __init__(self, symbols: List[str], threshold_map: Optional[Dict[str, float]] = None):
         """
@@ -73,21 +71,23 @@ class MultiAssetPredictor:
         risk_conf = CONFIG.get('risk_management', {})
         
         # Standardize risk multiplier
-        risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 1.5))
+        risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 4.0))
         
-        # Stricter Portfolio Heat (Max 2 correlated pairs)
-        self.max_currency_exposure = int(risk_conf.get('max_currency_exposure', 2))
+        # Stricter Portfolio Heat
+        self.max_currency_exposure = int(risk_conf.get('max_currency_exposure', 8))
         
         self.labelers = {}
         self.optimized_params = {} # Cache for gates
         
         # --- MOMENTUM & GOLDEN TRIO BUFFERS ---
         # We maintain local buffers to calculate Hurst, KER, and RVOL accurately on the fly
+        # This mirrors ResearchStrategy logic for 1:1 parity
         self.window_size_trio = 100
         self.closes_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         self.volume_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
+        
         self.bb_window = 20
-        self.bb_std = CONFIG['phoenix_strategy'].get('bb_std_dev', 1.0) 
+        self.bb_std = CONFIG['phoenix_strategy'].get('bb_std_dev', 1.5) 
         self.bb_buffers = {s: deque(maxlen=self.bb_window) for s in symbols}
         
         # --- SNIPER PROTOCOL BUFFERS ---
@@ -104,10 +104,13 @@ class MultiAssetPredictor:
         phx_conf = CONFIG.get('phoenix_strategy', {})
         self.regime_enforcement = phx_conf.get('regime_enforcement', 'DISABLED').upper()
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
-        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.001)) 
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.45)) 
-        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 2.5))
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.003)) 
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.48)) 
+        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
+        
+        # Initialize default_max_rvol explicitly
         self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 25.0))
+        self.default_max_rvol = self.max_rvol_thresh
         
         adx_cfg = CONFIG.get('features', {}).get('adx', {})
         self.adx_threshold = float(adx_cfg.get('threshold', 20.0)) # Hard floor
@@ -670,10 +673,8 @@ class MultiAssetPredictor:
 
         # 2. Delayed Training (Label Resolution)
         resolved_labels = labeler.resolve_labels(
-            bar.high, bar.low, 
-            current_close=bar.close,
-            current_volume=bar.volume,
-            current_log_ret=log_ret
+            bar.high, bar.low, current_close=bar.close,
+            current_volume=bar.volume, current_log_ret=log_ret
         )
         
         if resolved_labels:
@@ -770,6 +771,7 @@ class MultiAssetPredictor:
         # 4. AGGRESSOR PROTOCOL WITH NEW GATES
         # ============================================================
         
+        # FIX: Ensure default_max_rvol is available and used
         max_rvol_thresh = self.default_max_rvol
         
         # FRIDAY GUARD
@@ -965,6 +967,7 @@ class MultiAssetPredictor:
         """
         SNIPER PROTOCOL (AGGRESSOR UPDATE):
         1. RSI Guard: Strict Overbought/Oversold Rejection.
+        2. Ignition Bypass: If Hurst > 0.6, ignore RSI overbought signals to catch strong trends.
         """
         # 1. RSI CALCULATION (M5 Extension)
         if len(self.sniper_rsi[symbol]) < 14:
@@ -977,17 +980,27 @@ class MultiAssetPredictor:
             rs = avg_gain / avg_loss
             rsi = 100 - (100 / (1 + rs))
 
-        # 2. RSI EXTREME GUARD (STRICT SAFETY)
-        # We REJECT trades that are buying the top or selling the bottom.
-        # This fixes the low win rate by filtering out exhaustion trades.
+        # 2. IGNITION BYPASS
+        # High Hurst (>0.6) implies persistence. High RSI here is a feature, not a bug.
+        if current_hurst > 0.6:
+            return True
+
+        # 3. EXHAUSTION GUARD (Relaxed)
+        # Only block if we are NOT in a super-trend and RSI is screaming extreme.
+        upper = 85
+        lower = 15
         
+        if "JPY" in symbol:
+             upper = 90
+             lower = 10
+
         if signal == 1: # BUY
-            if rsi > 75: 
+            if rsi > upper: 
                 # REJECT: Market is overextended. Do not buy tops.
                 return False 
             
         elif signal == -1: # SELL
-            if rsi < 25: 
+            if rsi < lower: 
                 # REJECT: Market is oversold. Do not sell bottoms.
                 return False 
         

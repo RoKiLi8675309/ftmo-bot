@@ -1074,9 +1074,9 @@ class ResearchStrategy:
 
     def _check_sniper_filters(self, signal: int, price: float, current_hurst: float) -> bool:
         """
-        V17.0 UPDATE:
-        - REMOVED 'Ignition' Bypass.
-        - Strict RSI logic: Buy Low, Sell High.
+        SNIPER PROTOCOL (AGGRESSOR UPDATE):
+        1. RSI Guard: Rejects EXTREME exhaustion, but allows high momentum "Ignition".
+        2. Ignition Bypass: If Hurst > 0.6, we assume trend is strong enough to ignore RSI.
         """
         # 1. RSI CALCULATION (M5 Extension)
         if len(self.sniper_rsi) < 14:
@@ -1089,25 +1089,29 @@ class ResearchStrategy:
             rs = avg_gain / avg_loss
             rsi = 100 - (100 / (1 + rs))
 
-        # 2. RSI EXTREME GUARD (STRICT)
-        # Prevent buying the top or selling the bottom.
+        # 2. IGNITION BYPASS
+        # High Hurst (>0.6) implies persistence. High RSI here is a feature, not a bug.
+        if current_hurst > 0.6:
+            return True
+
+        # 3. EXHAUSTION GUARD (Relaxed)
+        # Only block if we are NOT in a super-trend and RSI is screaming extreme.
+        upper = 85
+        lower = 15
+        
         if "JPY" in self.symbol:
-             # JPY pairs can trend harder, allow wider RSI
-             upper = 80
-             lower = 20
-        else:
-             upper = 75
-             lower = 25
+             upper = 90
+             lower = 10
 
         if signal == 1: # BUY
             if rsi > upper: 
                 self.rejection_stats['Overbought_RSI'] += 1
-                return False # Exhaustion
-                
+                return False 
+            
         elif signal == -1: # SELL
             if rsi < lower: 
                 self.rejection_stats['Oversold_RSI'] += 1
-                return False # Exhaustion
+                return False 
         
         return True
 
