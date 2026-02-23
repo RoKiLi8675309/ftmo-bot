@@ -60,16 +60,20 @@ do
     esac
 done
 
-# --- ENVIRONMENT SETUP ---
+# --- ENVIRONMENT SETUP (CRITICAL FIX FOR CONDA) ---
 # Smart detection of Python interpreter
-if [ -n "$VIRTUAL_ENV" ]; then
+if [ -n "$CONDA_PREFIX" ]; then
+    TARGET_PYTHON="$CONDA_PREFIX/bin/python" # CRITICAL FIX: Use active Conda env
+elif [ -n "$VIRTUAL_ENV" ]; then
     TARGET_PYTHON="python" # Use active venv
 elif [ -f "venv/bin/python" ]; then
     TARGET_PYTHON="venv/bin/python"
 elif [ -f "anaconda3/envs/algo_env_stable/bin/python" ]; then
     TARGET_PYTHON="anaconda3/envs/algo_env_stable/bin/python"
-else
+elif command -v python3 &> /dev/null; then
     TARGET_PYTHON="python3"
+else
+    TARGET_PYTHON="python"
 fi
 
 echo "Using Python Interpreter: $TARGET_PYTHON"

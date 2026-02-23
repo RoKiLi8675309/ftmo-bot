@@ -375,6 +375,7 @@ def load_real_data(
 ) -> pd.DataFrame:
     """
     Loads historical data from Postgres using SQLAlchemy for stability.
+    Includes V17.1 Telemetry upgrade to identify active Python environment on failure.
     """
     if db_config is None:
         db_config = CONFIG.get('postgres')
@@ -447,8 +448,11 @@ def load_real_data(
         df.set_index('time', inplace=True, drop=False)
         
         return df
-    except ImportError:
-        print("ERROR: sqlalchemy/psycopg2 not installed. Cannot load real data.")
+        
+    except ImportError as e:
+        print(f"❌ ERROR: Missing required database dependencies: {e}")
+        print(f"🔎 FORENSIC TELEMETRY: Python Interpreter is currently: {sys.executable}")
+        print(f"💡 FIX: Activate your conda environment and run: pip install sqlalchemy psycopg2-binary")
         return pd.DataFrame()
     except Exception as e:
         print(f"ERROR: Database load failed for {symbol}: {e}")
