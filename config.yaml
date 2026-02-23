@@ -1,12 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V17.0 (SURVIVAL SNIPER PROTOCOL)
+# config.yaml – PROJECT PHOENIX V17.1 (PROFIT MAXIMIZATION PROTOCOL)
 # STATUS: LIVE TRADING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# CRITICAL FIXES (V17.0):
-# 1. SIZING: Forced 0.01 LOTS (Fixed Size).
-# 2. CONCURRENCY: 1 Trade Per Pair, Max 8 Total.
-# 3. STRATEGY: Tightened Filters (ADX>20, Hurst>0.48) to fix Win Rate.
-# 4. STOPS: Widened to 4.0 ATR to prevent noise stop-outs.
+# CRITICAL FIXES (V17.1):
+# 1. SIZING: Switched from fixed_lots to risk_percentage (0.25% per trade).
+# 2. GATES: Relaxed ADX (15) and Hurst (0.45) to increase trade frequency.
+# 3. EXITS: Loosened trailing stop activation to 2.0R to prevent choking winners.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -134,7 +133,7 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 20.0 # V17.0: STRICTER Trend requirement (Was 10.0)
+    threshold: 15.0 # V17.1: Loosened from 20.0 to increase trade frequency
   
   cyclical_time: true
   session_awareness: true
@@ -144,7 +143,6 @@ features:
 # --- PHOENIX STRATEGY PARAMETERS ---
 phoenix_strategy:
   # --- ASSET REGIME MAPPING ---
-  # V16.6: DISABLED to allow ML to decide best action (Trend vs Reversion)
   regime_enforcement: "DISABLED" 
   
   asset_regime_map:
@@ -153,7 +151,7 @@ phoenix_strategy:
     GBPUSD: "TREND_BREAKOUT"
     EURUSD: "NEUTRAL"
     AUDUSD: "NEUTRAL"
-    USDCAD: "MEAN_REVERSION" # CAD often mean reverts on Oil
+    USDCAD: "MEAN_REVERSION"
     EURJPY: "TREND_BREAKOUT"
     AUDJPY: "TREND_BREAKOUT"
     CAD: "NEUTRAL"    
@@ -161,25 +159,25 @@ phoenix_strategy:
     USD: "NEUTRAL"
 
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true           
-  require_d1_trend: false                          
+  enable_regime_a_entries: true          
+  require_d1_trend: false                                  
   require_h4_alignment: false                  
   
-  # --- LOGIC MAPPING THRESHOLDS (V17.0 STRICT TUNING) ---
-  hurst_breakout_threshold: 0.48      # STRICT: Was 0.42. Only trade clear trends.
+  # --- LOGIC MAPPING THRESHOLDS ---
+  hurst_breakout_threshold: 0.45      # V17.1: Loosened from 0.48 to capture more trends
   hurst_mean_reversion_threshold: 0.00    
-  ker_trend_threshold: 0.003          # STRICT: Was 0.001. Demand efficiency.
+  ker_trend_threshold: 0.002          # V17.1: Loosened from 0.003
   
-  bb_std_dev: 1.5                     # STRICT: Was 1.0. Demand stronger breakout.
+  bb_std_dev: 1.5                     
   
-  rvol_volatility_trigger: 3.0        # Was 2.5
+  rvol_volatility_trigger: 2.5        # V17.1: Loosened from 3.0
   
   # --- FILTER THRESHOLDS ---
   max_relative_volume: 25.0        
   volume_gate_ratio: 0.8            
   aggressor_threshold: 0.51        
-  ml_confirmation_threshold: 0.60  # STRICT: Was 0.55. Higher confidence required.
-  choppiness_threshold: 60.0       # STRICT: Was 65.0. Reject more chop.
+  ml_confirmation_threshold: 0.55  # V17.1: Loosened from 0.60
+  choppiness_threshold: 65.0       # V17.1: Loosened from 60.0
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -216,11 +214,11 @@ optimization_search_space:
   
   # Triple Barrier Method (Labeling)
   tbm_barrier_width:
-    min: 2.0  # Wider barriers for survival
+    min: 2.0  
     max: 4.0  
   tbm_horizon_minutes:
-    min: 60   # 1 Hour
-    max: 360  # 6 Hours
+    min: 60   
+    max: 360  
     step: 30
   tbm_drift_threshold:
     min: 1.0
@@ -228,88 +226,82 @@ optimization_search_space:
   
   # Strategy Execution
   min_calibrated_probability:
-    min: 0.55 
-    max: 0.65
+    min: 0.52 
+    max: 0.60
 
 # --- RISK MANAGEMENT (FTMO COMPLIANCE) ---
 risk_management:
   account_currency: "USD"
   
-  # --- SIZING METHOD: V17.0 FIXED MICRO ---
-  sizing_method: "fixed_lots" # FORCE SMALL SIZE
-  fixed_lot_size: 0.01        # SMALLEST POSSIBLE SIZE
+  # --- SIZING METHOD: V17.1 DYNAMIC RISK ---
+  sizing_method: "risk_percentage" # V17.1 FIX: Required to hit 10% profit target
+  fixed_lot_size: 0.01        
   
-  # Legacy Risk % (Ignored by fixed_lots but kept for reference)
+  # V17.1: 0.25% risk per trade on 50k = $125 risk per trade.
   base_risk_per_trade_percent: 0.0025
   scaled_risk_percent: 0.005
   
   # REVENGE TRADING GUARD
-  loss_cooldown_minutes: 120  # INCREASED: Lock symbol for 2 hours after a loss
+  loss_cooldown_minutes: 60  # Reduced from 120m to allow faster recovery
   
   # MARGIN LEVEL GATE
-  min_margin_level_percent: 200.0 # Safer margin buffer
+  min_margin_level_percent: 200.0
 
   # PYRAMIDING (COMPOUNDING)
   pyramiding:
     enabled: true
-    max_adds: 1 # Reduced to 1 add
+    max_adds: 1 
     add_on_profit_r: 1.0  
-    risk_per_add_percent: 0.00 # Zero risk adds (Fixed lot handling needed)
+    risk_per_add_percent: 0.001 # 0.1% for adds
   
   # EQUITY RATCHET
   equity_ratchet:
     enabled: true
-    step_percent: 0.05    # Lock floor every 5% gain
+    step_percent: 0.05    
   
   # LIMITS
-  max_daily_loss_pct: 0.045        # 4.5% Daily Limit
+  max_daily_loss_pct: 0.045        
   max_total_loss_pct: 0.095        
   
   # PORTFOLIO HEAT
-  # Relaxed to 8 to allow "1 trade per pair" logic without currency blocking
-  # Since lots are 0.01, high exposure is acceptable.
   max_currency_exposure: 8       
-  
-  # V17.0: CONCURRENCY UPDATE
-  # Allow 8 trades total (1 per pair for the 8 watched pairs)
   max_open_trades: 8              
   max_risk_percent: 5.0           
   
-  # --- LEVERAGE GUARD (V16.11 SWING STANDARDS) ---
+  # --- LEVERAGE GUARD ---
   leverage:
-    default: 30.0        # Forex Majors (Standard)
-    minor: 30.0          # Forex Minors (Standard)
-    gold: 20.0           # XAUUSD
-    indices: 20.0        # US30, SPX500
-    crypto: 2.0          # BTCUSD
+    default: 30.0        
+    minor: 30.0          
+    gold: 20.0           
+    indices: 20.0        
+    crypto: 2.0          
   
   leverage_safety_divisor: 1.5
   
   max_leverage: 30.0
-  max_lot_size: 0.01 # Hard Cap
+  max_lot_size: 50.0 # Restored from hard 0.01 cap
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC
-  stop_loss_atr_mult: 4.0        # WIDENED: Give 0.01 lots room to breathe
-  take_profit_atr_mult: 6.0      # Target big swings
+  stop_loss_atr_mult: 2.5        # V17.1 Tightened from 4.0 to improve R:R mathematics
+  take_profit_atr_mult: 5.0      # V17.1 Target 2R
   
-  # ACTIVE TRAILING STOP
+  # ACTIVE TRAILING STOP (V17.1 Fix)
   trailing_stop:
     enabled: true        
-    activation_r: 1.5       # Wait for 1.5R profit before trailing
-    trail_trigger_r: 1.5       
-    trail_dist_r: 1.0       # Loose trail (1.0R)
+    activation_r: 2.0       # V17.1: Wait until 2R profit before moving to Breakeven (Stop choking trades)
+    trail_trigger_r: 2.0       
+    trail_dist_r: 1.5       # V17.1: Leave 1.5R breathing room
   
   risk_timezone: "Europe/Prague"
   
   # --- SESSION & TIME MANAGEMENT ---
   session_control:
     enabled: true
-    start_hour_server: 10      # Start Trading (London Open)
-    liquidate_hour_server: 21  # Stop & Close All (3h before NY Close)
+    start_hour_server: 10      
+    liquidate_hour_server: 21  
   
-  # Legacy Friday settings (Reinforced by session_control)
-  friday_entry_cutoff_hour: 16 # No entries after 16:00
+  friday_entry_cutoff_hour: 16 
   friday_liquidation_hour_server: 21  
   
   commission_per_lot_rt: 5.0
@@ -320,36 +312,29 @@ risk_management:
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
   
-  # V17.0 REALITY FIX: ABSOLUTE HARD FLOOR FOR STOPS
-  # Enforce 25 pips to survive the noise.
-  min_stop_loss_pips: 25.0
+  # Enforce 15 pips min to survive the noise.
+  min_stop_loss_pips: 15.0
 
-# --- TRADING PORTFOLIO (V16.30 GOLDEN BASKET) ---
+# --- TRADING PORTFOLIO ---
 trading:
-  # THE GOLDEN BASKET: 8 Pairs
   symbols:
-    # --- MAJORS (Low Cost / High Liquidity) ---
-    - "EURUSD"   # The Anchor (Spread ~1.5)
-    - "GBPUSD"   # Trend King (Spread ~2.0)
-    - "USDJPY"   # Carry/Trend (Spread ~1.8)
-    - "AUDUSD"   # Commodity Proxy (Spread ~1.8)
-    - "USDCAD"   # Mean Reversion Proxy (Spread ~2.8)
-    
-    # --- CROSSES (High Volatility / Reasonable Cost) ---
-    - "GBPJPY"   # The Dragon (Vol compensates for ~4.5 spread)
-    - "EURJPY"   # Cross Liquidity (Spread ~2.5)
-    - "AUDJPY"   # Risk-On/Off Proxy (Spread ~3.0)
+    - "EURUSD"  
+    - "GBPUSD"  
+    - "USDJPY"  
+    - "AUDUSD"  
+    - "USDCAD"  
+    - "GBPJPY"  
+    - "EURJPY"  
+    - "AUDJPY"  
   
   auxiliary_symbols:
-    # Pairs needed for PnL conversion but not traded actively
-    - "NZDUSD"  # Keep for safety if we ever add NZD pairs back
-    - "USDCHF"  # Keep for correlation calculations
+    - "NZDUSD"  
+    - "USDCHF"  
     
   timeframe: "M5"
   magic_number: 621001
   slippage: 3 
   
-  # --- EXECUTION OPTIMIZATION ---
   limit_order_offset_pips: 0.1 
   limit_order_ttl_seconds: 60
 
@@ -357,7 +342,6 @@ trading:
 online_learning:
   model_type: "AdaptiveRandomForest"
   
-  # CONFIGURATION (RESTORED)
   n_models: 50        
   grace_period: 200        
   delta: 0.00001        
@@ -368,37 +352,31 @@ online_learning:
   
   burn_in_periods: 30    
   
-  # Volatility Gate
   volatility_gate:
     enabled: true
-    # V16.5: Lowered to 0.9 to catch early expansion
     min_atr_spread_ratio: 0.9  
   
   positive_class_weight: 1.5 
   negative_class_weight: 1.0
   
-  meta_labeling_threshold: 0.60 # STRICTER
+  meta_labeling_threshold: 0.55 # V17.1: Relaxed
   
   tbm:
-    # HORIZON: 4 Hours (Scalper)
     horizon_minutes: 240        
     barrier_width: 2.5        
-    min_profit_pips: 10.0       # Was 5.0 
+    min_profit_pips: 10.0       
     drift_threshold: 1.5 
   
   learning_horizon_sec: 300
-  
-  # AGGRESSOR PROTOCOL
-  # Filter low confidence signals
-  min_calibrated_probability: 0.55 
+  min_calibrated_probability: 0.52 
 
 # --- NEWS FILTER ---
 news_filter:
   enabled: true
   primary_url: "http://nfs.faireconomy.media/ff_calendar_thisweek.xml"
   backup_url: "https://www.forexfactory.com/calendar"
-  buffer_minutes_before: 15   # Increased buffer
-  buffer_minutes_after: 15    # Increased buffer
+  buffer_minutes_before: 15  
+  buffer_minutes_after: 15   
   restricted_events:
     USD: ["FOMC", "NFP", "CPI", "PPI", "GDP"] 
     GBP: ["BOE", "CPI"]
@@ -412,28 +390,24 @@ forensic_audit:
   enforce_spread: true
   max_slippage_pips: 2.0
   commission_per_lot: 5.0
-  # V16.30: Updated assumptions based on GOLDEN BASKET (Standard FTMO Spreads)
-  # Values include small safety buffer.
   spread_pips:
     default: 1.6  
-    GBPJPY: 4.5    # Accepted High Spread (High Vol)
-    USDJPY: 1.8    # Low
-    EURJPY: 2.5    # Medium
-    AUDJPY: 3.0    # Medium
-    GBPUSD: 2.0    # Low
-    EURUSD: 1.6    # Lowest
-    AUDUSD: 1.8    # Low
-    USDCAD: 2.8    # Medium
-    
-    # Legacy/Blacklisted (Kept for historical audit if needed)
-    GBPAUD: 8.0    # AVOID
-    EURAUD: 6.0    # AVOID
-    GBPNZD: 9.0    # AVOID
+    GBPJPY: 4.5    
+    USDJPY: 1.8    
+    EURJPY: 2.5    
+    AUDJPY: 3.0    
+    GBPUSD: 2.0    
+    EURUSD: 1.6    
+    AUDUSD: 1.8    
+    USDCAD: 2.8    
+    GBPAUD: 8.0    
+    EURAUD: 6.0    
+    GBPNZD: 9.0    
 
 # --- WFO OPTIMIZATION ---
 wfo:
   n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 20  # Lowered significantly as we filter heavily
-  risk_per_trade_options: [0.0025]
+  min_trades_optimization: 15  # V17.1: Lowered so Optuna doesn't fail valid iterations
+  risk_per_trade_options: [0.0025, 0.005]

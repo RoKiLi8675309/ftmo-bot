@@ -133,7 +133,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
 
     # 2. AGGREGATION: ADAPTIVE IMBALANCE BARS WITH AUTO-CALIBRATION
     # Fetch params from config (now defaults to 10)
-    config_threshold = CONFIG['data'].get('volume_bar_threshold', 10) 
+    config_threshold = CONFIG['data'].get('volume_bar_threshold', 10.0) 
     alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
     
     # --- AUTO-CALIBRATION LOOP ---
@@ -187,11 +187,15 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
             final_threshold = current_threshold
             break
         else:
-            # Not enough bars, lower threshold
+            # V17.1 Fallback: Progressively aggressively lower threshold to guarantee DF returns
             attempts += 1
-            new_threshold = max(5.0, current_threshold * 0.5) # Lower limit
-            current_threshold = new_threshold
-            final_threshold = current_threshold
+            if attempts == max_attempts:
+                log.warning(f"⚠️ {symbol}: Max calibration attempts reached. Forcing threshold to 2.0.")
+                final_threshold = 2.0
+            else:
+                new_threshold = max(2.0, current_threshold * 0.4) # Aggressive reduction
+                current_threshold = new_threshold
+                final_threshold = current_threshold
 
     # --- PRODUCTION GENERATION ---
     # Now process the FULL dataset using the calibrated threshold as the starting point.
@@ -288,14 +292,13 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
             
-            # DYNAMIC RISK SEARCH (SURVIVAL MODE UPDATE)
-            # Default to low risk if config is missing, to enforce survival during optimization
+            # DYNAMIC RISK SEARCH (PROFIT MAXIMIZATION PROTOCOL)
             risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0025, 0.005])
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             trial.set_user_attr("risk_pct", params['risk_per_trade_percent'] * 100)
             
             pipeline_inst = ResearchPipeline()
-            init_bal = CONFIG['env'].get('initial_balance', 100000.0)
+            init_bal = CONFIG['env'].get('initial_balance', 50000.0)
             
             broker = BacktestBroker(initial_balance=init_bal)
             model = pipeline_inst.get_fresh_model(params)
@@ -327,22 +330,28 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("sqn", metrics['sqn'])
             trial.set_user_attr("calmar", calmar)
 
-            # HARD 8% DRAWDOWN LIMIT
-            if max_dd_pct > 0.08: 
-                trial.set_user_attr("blown", True)
-                return -10000.0 
-            
-            if broker.is_blown:
-                trial.set_user_attr("blown", True)
-                return -10000.0
+            objective_score = total_return + (calmar * 100.0)
 
-            # SIGNIFICANCE FILTER (V17.0: Lowered to 20 for stricter filters)
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 20)
+            # --- OPTUNA TPE GRADIENT FIX ---
+            # Instead of returning flat -10000.0, we return a continuous penalty.
+            # This allows the Tree-structured Parzen Estimator to calculate the gradient of failure
+            # and "walk" away from the parameters that caused it.
+            
+            if broker.is_blown or max_dd_pct > 0.08:
+                trial.set_user_attr("blown", True)
+                # Heavily penalize the exact amount of drawdown over the 8% limit
+                dd_penalty = (max_dd_pct - 0.08) * 200000.0 
+                # Combine negative base, the lost PnL, and the DD penalty
+                return -5000.0 + total_return - dd_penalty
+
+            # SIGNIFICANCE FILTER
+            min_trades = CONFIG['wfo'].get('min_trades_optimization', 15)
             if trades < min_trades:
                 trial.set_user_attr("pruned", True)
-                return 0.0 
-            
-            objective_score = total_return + (calmar * 100.0)
+                # Penalize based on how close we got to the minimum trade count
+                trade_shortfall_penalty = (min_trades - trades) * 100.0
+                return -1000.0 + total_return - trade_shortfall_penalty
+                
             return objective_score
 
         study_name = f"study_{symbol}"
@@ -439,7 +448,8 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
                 
                 pipeline_inst = ResearchPipeline()
-                broker = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
+                init_bal = CONFIG['env'].get('initial_balance', 50000.0)
+                broker = BacktestBroker(initial_balance=init_bal)
                 model = pipeline_inst.get_fresh_model(params)
                 strategy = ResearchStrategy(model, symbol, params)
                 
@@ -456,13 +466,21 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 max_dd_pct = metrics['max_dd_pct']
                 trades = metrics['total_trades']
                 safe_dd = max_dd_pct if max_dd_pct > 0.001 else 0.001
-                calmar = (total_return / 100000.0) / safe_dd
+                calmar = (total_return / init_bal) / safe_dd
                 
-                # HARD 8% DRAWDOWN LIMIT
-                if max_dd_pct > 0.08 or broker.is_blown: return -10000.0
-                if trades < 10: return 0.0 
+                objective_score = total_return + (calmar * 100.0)
                 
-                return total_return + (calmar * 100.0)
+                # --- OPTUNA TPE GRADIENT FIX ---
+                if max_dd_pct > 0.08 or broker.is_blown: 
+                    dd_penalty = (max_dd_pct - 0.08) * 200000.0
+                    return -5000.0 + total_return - dd_penalty
+                    
+                min_trades = CONFIG['wfo'].get('min_trades_optimization', 15)
+                if trades < min_trades: 
+                    trade_shortfall_penalty = (min_trades - trades) * 100.0
+                    return -1000.0 + total_return - trade_shortfall_penalty
+                
+                return objective_score
 
             study.optimize(objective, n_trials=n_trials)
             
@@ -524,7 +542,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
 
         # ROBUST SELECTION LOGIC
         # Filter trials that met the trade count threshold
-        min_trades = CONFIG['wfo'].get('min_trades_optimization', 20)
+        min_trades = CONFIG['wfo'].get('min_trades_optimization', 15)
         
         valid_trials = [
             t for t in study.trials 
@@ -634,7 +652,7 @@ class ResearchPipeline:
             )
         )
 
-    def calculate_performance_metrics(self, trade_log: List[Dict], initial_capital=100000.0) -> Dict[str, float]:
+    def calculate_performance_metrics(self, trade_log: List[Dict], initial_capital=50000.0) -> Dict[str, float]:
         metrics_out = {
             'risk_reward_ratio': 0.0,
             'total_pnl': 0.0,
@@ -689,8 +707,8 @@ class ResearchPipeline:
                 metrics_out['sqn'] = np.sqrt(len(df)) * (df['Net_PnL'].mean() / pnl_std)
 
         if initial_capital <= 1000:
-             log.warning(f"⚠️ SUSPICIOUS INITIAL CAPITAL: {initial_capital}. Defaulting to 100k.")
-             initial_capital = 100000.0
+             log.warning(f"⚠️ SUSPICIOUS INITIAL CAPITAL: {initial_capital}. Defaulting to 50k.")
+             initial_capital = 50000.0
 
         df['Equity'] = initial_capital + df['Net_PnL'].cumsum()
         df['Peak'] = df['Equity'].cummax()
@@ -878,7 +896,7 @@ class ResearchPipeline:
             return
 
         df = pd.DataFrame(trade_log)
-        initial_capital = CONFIG['env'].get('initial_balance', 100000.0)
+        initial_capital = CONFIG['env'].get('initial_balance', 50000.0)
         
         df['Entry_Time'] = pd.to_datetime(df['Entry_Time'])
         df['Exit_Time'] = pd.to_datetime(df['Exit_Time'])

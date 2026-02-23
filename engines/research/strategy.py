@@ -36,7 +36,7 @@ class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
     Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Sniper Survival Protocol (V17.0).
+    Strictly implements the Profit Maximization Protocol (V17.1).
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -51,10 +51,10 @@ class ResearchStrategy:
         
         # --- RISK CONFIGURATION ---
         self.risk_conf = params.get('risk_management', CONFIG.get('risk_management', {}))
-        # Standardize risk multiplier (Increased to 4.0 for V17.0 to survive noise)
-        self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 4.0))
+        # Standardize risk multiplier (V17.1: Tightened to 2.5)
+        self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 2.5))
         self.max_currency_exposure = int(self.risk_conf.get('max_currency_exposure', 8)) 
-        self.cooldown_minutes = int(self.risk_conf.get('loss_cooldown_minutes', 120))
+        self.cooldown_minutes = int(self.risk_conf.get('loss_cooldown_minutes', 60))
         
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
@@ -123,13 +123,13 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # --- STRATEGY CONFIGURATION ---
+        # --- STRATEGY CONFIGURATION (V17.1 Relaxed) ---
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
-        # Logic Thresholds (Strict Tuning V17.0)
-        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.003)) 
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.48)) 
-        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
+        # Logic Thresholds
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.002)) 
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.45)) 
+        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 2.5))
         self.require_d1_trend = phx_conf.get('require_d1_trend', False)
         
         # Regime Enforcement
@@ -138,11 +138,11 @@ class ResearchStrategy:
         
         self.vol_gate_ratio = float(phx_conf.get('volume_gate_ratio', 0.8)) 
         self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 25.0))
-        self.chop_threshold = float(phx_conf.get('choppiness_threshold', 60.0))
+        self.chop_threshold = float(phx_conf.get('choppiness_threshold', 65.0))
         
         adx_cfg = CONFIG.get('features', {}).get('adx', {})
-        # STRICT ADX for V17.0
-        self.adx_threshold = float(params.get('adx_threshold', adx_cfg.get('threshold', 20.0))) 
+        # V17.1: Relaxed ADX
+        self.adx_threshold = float(params.get('adx_threshold', adx_cfg.get('threshold', 15.0))) 
         
         self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.1)
         
@@ -167,8 +167,8 @@ class ResearchStrategy:
         self.ker_drift_detector = drift.ADWIN(delta=0.01)
         self.dynamic_ker_offset = 0.0
 
-        # --- Daily Circuit Breaker State ---
-        self.daily_max_losses = 5 
+        # --- Daily Circuit Breaker State (V17.1) ---
+        self.daily_max_losses = 10 
         self.daily_max_loss_pct = 0.045
 
     def _calculate_golden_trio(self) -> Tuple[float, float, float]:
@@ -536,13 +536,22 @@ class ResearchStrategy:
                 
                 final_weight = base_weight * ret_scalar * ker_weight
                 
-                self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight)
+                # Pre-predict for Calibrator update
+                clean_stored = {k: float(v) for k, v in stored_feats.items()}
+                pre_train_proba = self.model.predict_proba_one(clean_stored)
+                
+                self.model.learn_one(clean_stored, outcome_label, sample_weight=final_weight)
                 
                 if outcome_label != 0:
-                      self.model.learn_one(stored_feats, outcome_label, sample_weight=final_weight * 1.5)
+                      self.model.learn_one(clean_stored, outcome_label, sample_weight=final_weight * 1.5)
                     
                 if outcome_label != 0:
-                    self.meta_labeler.update(stored_feats, primary_action=outcome_label, outcome_pnl=realized_ret)
+                    self.meta_labeler.update(clean_stored, primary_action=outcome_label, outcome_pnl=realized_ret)
+                    
+                    if outcome_label == 1:
+                        self.calibrator_buy.update(pre_train_proba.get(1, 0.0), 1 if realized_ret > 0 else 0)
+                    elif outcome_label == -1:
+                        self.calibrator_sell.update(pre_train_proba.get(-1, 0.0), 1 if realized_ret > 0 else 0)
 
         # C. Add Trade Opportunity
         parkinson = features.get('parkinson_vol', 0.0)
@@ -634,7 +643,6 @@ class ResearchStrategy:
             return 
         
         # G4: TREND STRENGTH (ADX) - HARD BLOCK
-        # V17.0 FIX: If we want to trade trend, we MUST have ADX > 20. No compromises.
         if regime_label == "TREND_BREAKOUT":
             adx_val = features.get('adx', 0.0)
             if adx_val < self.adx_threshold:
@@ -642,26 +650,39 @@ class ResearchStrategy:
                 return
 
         # ============================================================
-        # F. ML CONFIRMATION & EXECUTION
+        # F. ML CONFIRMATION & EXECUTION (V17.1 FIXED)
         # ============================================================
         
         try:
-            pred_proba = self.model.predict_proba_one(features)
+            clean_features = {k: float(v) for k, v in features.items()}
+            pred_proba = self.model.predict_proba_one(clean_features)
+            prob_success = pred_proba.get(proposed_action, 0.0)
             
-            # SURVIVAL: Bypass Calibration
-            confidence = 1.0 
+            # --- V17.1 FIX: Restore Confidence Calibration ---
+            if proposed_action == 1:
+                confidence = self.calibrator_buy.calibrate(prob_success)
+            elif proposed_action == -1:
+                confidence = self.calibrator_sell.calibrate(prob_success)
+            else:
+                confidence = 0.0
+                
+            # --- V17.1 FIX: Enforce Minimum Confidence Gate ---
+            min_conf = float(self.params.get('min_calibrated_probability', 0.52))
+            if confidence < min_conf:
+                self.rejection_stats[f"Low ML Confidence ({confidence:.2f} < {min_conf})"] += 1
+                return
             
             is_profitable = self.meta_labeler.predict(
-                features, 
+                clean_features, 
                 proposed_action, 
-                threshold=float(self.params.get('meta_labeling_threshold', 0.60)) # STRICTER
+                threshold=float(self.params.get('meta_labeling_threshold', 0.55)) # V17.1 Relaxed
             )
             
             if proposed_action != 0:
                 self.meta_label_events += 1
 
             if is_regime_clash:
-               pass 
+                pass 
 
             # --- SNIPER PROTOCOL ---
             # Pass current_hurst to check for Ignition (but restricted)
@@ -689,7 +710,7 @@ class ResearchStrategy:
                         return 
 
                     # 2. Max Adds Check
-                    if len(existing_positions) > pyramid_config.get('max_adds', 1): # Reduced
+                    if len(existing_positions) > pyramid_config.get('max_adds', 1): 
                         return
                         
                     # 3. Profit Threshold Check
@@ -715,7 +736,7 @@ class ResearchStrategy:
     def _execute_entry(self, confidence, price, features, broker, dt_timestamp, action_int, regime, tighten_stops, is_pyramid=False):
         """
         Executes the trade entry logic.
-        V17.0: Passes 'fixed_lots' method implicitly via RiskManager logic.
+        V17.1: Uses Risk Percentage sizing.
         """
         action = "BUY" if action_int == 1 else "SELL"
         
@@ -783,7 +804,7 @@ class ResearchStrategy:
         
         estimated_free_margin = max(0.0, broker.equity - used_margin)
 
-        # CALL RISK MANAGER (V17.0: This will use fixed_lots if config says so)
+        # CALL RISK MANAGER 
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=confidence,
@@ -804,14 +825,15 @@ class ResearchStrategy:
             self.rejection_stats[f"Risk Zero ({trade_intent.comment})"] += 1
             return
 
-        # Explicitly set stops if not returned (fixed lots path might need this)
+        # Explicitly set stops if not returned
         if trade_intent.stop_loss == 0.0:
              # Recalculate geometry
              atr_mult_sl = self.sl_atr_mult
              stop_dist = current_atr * atr_mult_sl
              pip_val_raw, _ = RiskManager.get_pip_info(self.symbol)
-             # Hard floor 25 pips
-             min_stop = 25.0 * pip_val_raw
+             # V17.1: Absolute Hard Floor (15 pips default)
+             config_min_pips = float(self.risk_conf.get('min_stop_loss_pips', 15.0))
+             min_stop = config_min_pips * pip_val_raw
              stop_dist = max(stop_dist, min_stop)
              
              trade_intent.stop_loss = stop_dist
@@ -928,11 +950,11 @@ class ResearchStrategy:
 
     def _manage_trailing_stops(self, broker: BacktestBroker, current_price: float, timestamp: datetime):
         """
-        PATIENCE UPDATE: Wait for 1.5R before moving to Breakeven.
+        V17.1 FIX: Dynamic trailing stop logic aligned with Live Engine.
         """
         trail_conf = self.risk_conf.get('trailing_stop', {})
-        activation_r = float(trail_conf.get('activation_r', 1.5))
-        trail_dist_r = float(trail_conf.get('trail_dist_r', 1.0))
+        activation_r = float(trail_conf.get('activation_r', 2.0))
+        trail_dist_r = float(trail_conf.get('trail_dist_r', 1.5))
 
         for pos in broker.open_positions:
             if pos.symbol != self.symbol: continue
@@ -940,19 +962,15 @@ class ResearchStrategy:
             risk_dist = pos.metadata.get('initial_risk_dist', 0.0)
             if risk_dist <= 0: continue
             
-            if pos.side == 1: 
-                dist_pnl = current_price - pos.entry_price
-            else: 
-                dist_pnl = pos.entry_price - current_price
-                
-            r_multiple = dist_pnl / risk_dist
             new_sl = None
             reason = ""
             
-            if r_multiple >= activation_r:
-                trail_pips = risk_dist * trail_dist_r
+            if pos.side == 1: 
+                dist_pnl = current_price - pos.entry_price
+                r_multiple = dist_pnl / risk_dist
                 
-                if pos.side == 1: 
+                if r_multiple >= activation_r:
+                    trail_pips = risk_dist * trail_dist_r
                     target_sl = current_price - trail_pips
                     min_lock = pos.entry_price + (risk_dist * 0.1)
                     target_sl = max(target_sl, min_lock)
@@ -961,7 +979,12 @@ class ResearchStrategy:
                         new_sl = target_sl
                         reason = f"Trail ({r_multiple:.1f}R)"
                         
-                else: 
+            else: 
+                dist_pnl = pos.entry_price - current_price
+                r_multiple = dist_pnl / risk_dist
+                
+                if r_multiple >= activation_r:
+                    trail_pips = risk_dist * trail_dist_r
                     target_sl = current_price + trail_pips
                     min_lock = pos.entry_price - (risk_dist * 0.1)
                     target_sl = min(target_sl, min_lock)

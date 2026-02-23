@@ -27,6 +27,7 @@ class TradeDispatcher:
     to the Execution Engine (Windows Producer) via Redis Streams.
     
     UPDATED: FORCE MARKET EXECUTION ONLY.
+    V17.1 FIX: INJECTS STATIC INITIAL RISK TO REDIS TO PREVENT R-MULTIPLE HALLUCINATION.
     """
     def __init__(self, stream_mgr: RedisStreamManager, pending_tracker: dict[str, Any], lock: threading.RLock):
         """
@@ -49,6 +50,19 @@ class TradeDispatcher:
             # 1. Generate IDs
             order_id = uuid.uuid4()
             short_id = str(order_id)[:8]
+            
+            # --- V17.1 FIX: PERSIST INITIAL RISK DISTANCE ---
+            # We calculate the absolute price distance between the entry reference 
+            # and the initial stop loss. This is saved to a Redis hash so the 
+            # Trailing Stop and Pyramiding logic don't hallucinate shrinking 
+            # R-multiples as the SL physically moves closer to price.
+            try:
+                initial_risk_dist = abs(trade.entry_price - trade.stop_loss)
+                if initial_risk_dist > 0:
+                    self.stream_mgr.r.hset("bot:initial_risk", short_id, str(initial_risk_dist))
+            except Exception as e:
+                logger.error(f"Failed to persist initial risk to Redis for {short_id}: {e}")
+            # ------------------------------------------------
             
             # 2. Register Pending (Thread-Safe)
             with self.lock:
@@ -188,6 +202,13 @@ class TradeDispatcher:
             
             for oid in to_remove:
                 if oid in self.pending_tracker:
+                    # Clean up the corresponding initial risk from Redis to prevent memory leaks over months
+                    try:
+                        short_id = str(oid)[:8]
+                        self.stream_mgr.r.hdel("bot:initial_risk", short_id)
+                    except Exception:
+                        pass
+                        
                     del self.pending_tracker[oid]
         
         if to_remove:

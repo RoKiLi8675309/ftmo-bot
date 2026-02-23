@@ -29,9 +29,10 @@ from shared import (
     ProbabilityCalibrator,
     VolumeBar,
     RiskManager,
-    load_real_data,             # Required for Warm-up
+    load_real_data,            # Required for Warm-up
     AdaptiveImbalanceBarGenerator, # Required for Warm-up
-    MetaLabeler
+    MetaLabeler,
+    get_redis_connection       # V17.1 Required for Immutable Risk Fetching
 )
 
 logger = logging.getLogger("Predictor")
@@ -50,7 +51,8 @@ class MultiAssetPredictor:
     """
     Manages a dictionary of Online Models (one per symbol).
     Performs 'Inference -> Train' loop on every Volume Bar.
-    Updated for V17.0: Sniper Survival Protocol & Ignition Bypass.
+    Updated for V17.1: AI Bypass Bug Fixed, Calibrated Probabilities Restored, 
+    and Pyramiding Gate immunized against Trailing Stop hallucinations.
     """
     def __init__(self, symbols: List[str], threshold_map: Optional[Dict[str, float]] = None):
         """
@@ -71,7 +73,7 @@ class MultiAssetPredictor:
         risk_conf = CONFIG.get('risk_management', {})
         
         # Standardize risk multiplier
-        risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 4.0))
+        risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 2.5))
         
         # Stricter Portfolio Heat
         self.max_currency_exposure = int(risk_conf.get('max_currency_exposure', 8))
@@ -104,16 +106,16 @@ class MultiAssetPredictor:
         phx_conf = CONFIG.get('phoenix_strategy', {})
         self.regime_enforcement = phx_conf.get('regime_enforcement', 'DISABLED').upper()
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
-        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.003)) 
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.48)) 
-        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 3.0))
+        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.002)) 
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.45)) 
+        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 2.5))
         
         # Initialize default_max_rvol explicitly
         self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 25.0))
         self.default_max_rvol = self.max_rvol_thresh
         
         adx_cfg = CONFIG.get('features', {}).get('adx', {})
-        self.adx_threshold = float(adx_cfg.get('threshold', 20.0)) # Hard floor
+        self.adx_threshold = float(adx_cfg.get('threshold', 15.0)) # Hard floor
 
         for s in symbols:
             # Default from Config
@@ -184,8 +186,8 @@ class MultiAssetPredictor:
         # Daily Performance Tracking (Symbol Circuit Breaker)
         self.daily_performance = {s: {'date': None, 'losses': 0, 'pnl': 0.0} for s in symbols}
         
-        # Scalper Allowance (5 Losses)
-        self.daily_max_losses = 5 
+        # V17.1: Scalper Allowance (10 Losses)
+        self.daily_max_losses = 10 
         
         # 7. Architecture: Auto-Save Timer
         self.last_save_time = time.time()
@@ -211,6 +213,14 @@ class MultiAssetPredictor:
         # --- Dynamic Gate Scaling State ---
         self.ker_drift_detectors = {s: drift.ADWIN(delta=0.01) for s in symbols}
         self.dynamic_ker_offsets = {s: 0.0 for s in symbols}
+        
+        # --- 8. Redis Client (V17.1 Immutable Risk Fix) ---
+        self.redis_client = get_redis_connection(
+            host=CONFIG['redis']['host'],
+            port=CONFIG['redis']['port'],
+            db=0,
+            decode_responses=True
+        )
 
         # Inject Default Data 
         self._inject_auxiliary_data()
@@ -252,7 +262,7 @@ class MultiAssetPredictor:
                 base_clf
             )
             self.meta_labelers[sym] = MetaLabeler()
-            self.calibrators[sym] = ProbabilityCalibrator()
+            self.calibrators[sym] = {'buy': ProbabilityCalibrator(), 'sell': ProbabilityCalibrator()}
 
     def _perform_warmup(self):
         """
@@ -363,9 +373,18 @@ class MultiAssetPredictor:
         
         if resolved_labels:
             for (stored_feats, outcome_label, realized_ret) in resolved_labels:
-                model.learn_one(stored_feats, outcome_label)
+                clean_stored = {k: float(v) for k, v in stored_feats.items()}
+                pre_train_proba = model.predict_proba_one(clean_stored)
+                
+                model.learn_one(clean_stored, outcome_label)
                 if outcome_label != 0:
-                    model.learn_one(stored_feats, outcome_label) # Reinforce non-noise
+                    model.learn_one(clean_stored, outcome_label) # Reinforce non-noise
+                    self.meta_labelers[symbol].update(clean_stored, primary_action=outcome_label, outcome_pnl=realized_ret)
+                    
+                    if outcome_label == 1:
+                        self.calibrators[symbol]['buy'].update(pre_train_proba.get(1, 0.0), 1 if realized_ret > 0 else 0)
+                    elif outcome_label == -1:
+                        self.calibrators[symbol]['sell'].update(pre_train_proba.get(-1, 0.0), 1 if realized_ret > 0 else 0)
         
         # Add Opportunity
         current_atr = features.get('atr', 0.001)
@@ -472,14 +491,6 @@ class MultiAssetPredictor:
             return False
             
         return True
-
-    def _calibrate_confidence(self, raw_conf: float) -> float:
-        """
-        Calibrates raw model probability to a more reliable confidence score.
-        """
-        x = (raw_conf - 0.5) * 10.0 
-        calibrated = 1 / (1 + np.exp(-x))
-        return calibrated
 
     def _get_preferred_regime(self, symbol: str) -> str:
         """
@@ -710,11 +721,19 @@ class MultiAssetPredictor:
                 # Ensure features are strictly floats for River
                 clean_stored = {k: float(v) for k, v in stored_feats.items()}
                 
+                # Predict before learning to get the probability for calibration
+                pre_train_proba = model.predict_proba_one(clean_stored)
+                
                 model.learn_one(clean_stored, outcome_label, sample_weight=final_weight)
                 if outcome_label != 0:
-                      model.learn_one(clean_stored, outcome_label, sample_weight=final_weight * 1.5)
-                if outcome_label != 0:
+                    model.learn_one(clean_stored, outcome_label, sample_weight=final_weight * 1.5)
                     meta_labeler.update(clean_stored, primary_action=outcome_label, outcome_pnl=realized_ret)
+                    
+                    # V17.1 Update Calibrator Online
+                    if outcome_label == 1:
+                        self.calibrators[symbol]['buy'].update(pre_train_proba.get(1, 0.0), 1 if realized_ret > 0 else 0)
+                    elif outcome_label == -1:
+                        self.calibrators[symbol]['sell'].update(pre_train_proba.get(-1, 0.0), 1 if realized_ret > 0 else 0)
 
         # 3. Add Trade Opportunity
         current_atr = features.get('atr', 0.0)
@@ -746,7 +765,26 @@ class MultiAssetPredictor:
                 if pos_type not in ["BUY", "SELL"]: pos_type = "BUY"
 
                 if entry_price > 0 and sl_price > 0:
-                    risk_dist = abs(entry_price - sl_price)
+                    # --- V17.1 FIX: IMMUTABLE RISK DISTANCE FOR PYRAMIDING ---
+                    # Prevents Pyramiding gate from hallucinating massive R-multiples
+                    # when the Trailing Stop moves the SL close to entry.
+                    comment = str(pos.get('comment', ''))
+                    risk_dist = 0.0
+                    try:
+                        parts = comment.split('_')
+                        if len(parts) >= 2 and parts[0] == "Auto":
+                            short_id = parts[1]
+                            stored_risk = self.redis_client.hget("bot:initial_risk", short_id)
+                            if stored_risk:
+                                risk_dist = float(stored_risk)
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch initial risk for pyramiding {symbol}: {e}")
+                    
+                    # Fallback if Redis key missing or failed
+                    if risk_dist <= 1e-5:
+                        risk_dist = abs(entry_price - sl_price)
+                        if risk_dist < 1e-5: return None
+                    # ---------------------------------------------------------
                     
                     current_r = 0.0
                     if pos_type == "BUY":
@@ -771,7 +809,6 @@ class MultiAssetPredictor:
         # 4. AGGRESSOR PROTOCOL WITH NEW GATES
         # ============================================================
         
-        # FIX: Ensure default_max_rvol is available and used
         max_rvol_thresh = self.default_max_rvol
         
         # FRIDAY GUARD
@@ -789,7 +826,6 @@ class MultiAssetPredictor:
                 return Signal(symbol, "HOLD", 0.0, {"reason": f"After Session Close ({server_time.hour} >= {self.liq_hour})"})
 
         # G1: EFFICIENCY (KER) - AGGRESSIVE
-        # Reduced floor to 0.001 to catch early GBP moves
         base_thresh = self.ker_floor 
         effective_ker_thresh = max(0.001, base_thresh + self.dynamic_ker_offsets[symbol])
 
@@ -871,10 +907,9 @@ class MultiAssetPredictor:
             return Signal(symbol, "HOLD", 0.0, {"reason": "Volume Climax"})
             
         # G4: TREND STRENGTH (ADX) - HARD BLOCK
-        # V17.0 FIX: If we want to trade trend, we MUST have ADX > 20. No compromises.
         if regime_label == "TREND_BREAKOUT":
             adx_val = features.get('adx', 0.0)
-            if adx_val < self.adx_threshold: # Threshold is now 20.0 in config
+            if adx_val < self.adx_threshold: 
                 self.rejection_stats[symbol][f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
                 return Signal(symbol, "HOLD", 1.0, {"reason": f"Weak Trend (ADX {adx_val:.1f})"})
 
@@ -883,13 +918,23 @@ class MultiAssetPredictor:
         clean_features = {k: float(v) for k, v in features.items()}
         
         pred_proba = model.predict_proba_one(clean_features)
-        
-        # Extract probability for the proposed action
         prob_success = pred_proba.get(proposed_action, 0.0)
         
-        # SURVIVAL: Bypass Calibration/Confidence Check
-        # We trust the Meta Labeler and Regime Filters entirely.
-        confidence = 1.0 # Force max confidence to bypass filters
+        # --- V17.1 FIX: Restore Confidence Calibration ---
+        if proposed_action == 1:
+            confidence = self.calibrators[symbol]['buy'].calibrate(prob_success)
+        elif proposed_action == -1:
+            confidence = self.calibrators[symbol]['sell'].calibrate(prob_success)
+        else:
+            confidence = 0.0
+
+        # --- V17.1 FIX: Enforce Minimum Confidence Gate ---
+        min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.52)
+        if confidence < min_conf:
+            stats[f"Low ML Confidence ({confidence:.2f} < {min_conf})"] += 1
+            if self.bar_counters[symbol] % 50 == 0:
+                logger.info(f"🔎 SHADOW MODE {symbol}: Rejected {proposed_action} (Conf: {confidence:.2f} < {min_conf})")
+            return Signal(symbol, "HOLD", confidence, {"reason": f"Low ML Confidence ({confidence:.2f})"})
         
         meta_threshold = CONFIG['online_learning'].get('meta_labeling_threshold', 0.55) 
         is_profitable = meta_labeler.predict(clean_features, proposed_action, threshold=meta_threshold)
@@ -1063,6 +1108,7 @@ class MultiAssetPredictor:
             meta_path = self.models_dir / f"meta_model_{sym}.pkl"
             fe_path = self.models_dir / f"feature_engineer_{sym}.pkl"
             buf_path = self.models_dir / f"buffers_{sym}.pkl"
+            cal_path = self.models_dir / f"calibrators_{sym}.pkl"
             
             # Load ML
             if model_path.exists():
@@ -1074,6 +1120,11 @@ class MultiAssetPredictor:
             if meta_path.exists():
                 try:
                     with open(meta_path, "rb") as f: self.meta_labelers[sym] = pickle.load(f)
+                except Exception: pass
+
+            if cal_path.exists():
+                try:
+                    with open(cal_path, "rb") as f: self.calibrators[sym] = pickle.load(f)
                 except Exception: pass
             
             # Load Feature Engineers

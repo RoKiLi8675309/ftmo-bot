@@ -5,9 +5,10 @@
 # DEPENDENCIES: unittest, numpy, redis, shared
 # DESCRIPTION: Pre-Flight Forensic Diagnostics & PIPELINE VERIFICATION.
 # 
-# PHOENIX V16.6 UPDATE (SURVIVAL VALIDATION):
-# 1. NO COST PROBE: Replaced live Limit Order injection with safe Redis Write check.
-# 2. CONFIG ALIGNMENT: Validates V16.6 Survival Mode Risk (0.25% Base, 0.50% Max).
+# PHOENIX V17.1 UPDATE (PROFIT MAXIMIZATION PROTOCOL):
+# 1. SIZING VALIDATION: Ensures sizing_method is 'risk_percentage' to hit FTMO targets.
+# 2. CHOKE GUARD: Verifies trailing stops wait for 2.0R before activating.
+# 3. GATE VALIDATION: Ensures ADX (15) and Hurst (0.45) are relaxed for trade frequency.
 # =============================================================================
 import unittest
 import numpy as np
@@ -40,24 +41,42 @@ logger = logging.getLogger("Diagnose")
 
 class TestConfigurationIntegrity(unittest.TestCase):
     """
-    V16.6 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
-    with the Survival Protocol parameters.
+    V17.1 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
+    with the Profit Maximization parameters (FTMO 10% Target Alignment).
     """
     def test_aggressor_risk_params(self):
-        """Verify Risk Management is set to 0.25% Base / 0.50% Scaled (V16.6 Survival Protocol)."""
+        """Verify Risk Management uses dynamic risk_percentage and correct sizing."""
         risk_conf = CONFIG.get('risk_management', {})
+        sizing_method = risk_conf.get('sizing_method')
         base_risk = risk_conf.get('base_risk_per_trade_percent')
         scaled_risk = risk_conf.get('scaled_risk_percent')
         
-        print(f"    [CONF] Base Risk: {base_risk*100:.2f}% | Scaled Risk: {scaled_risk*100:.2f}%")
+        print(f"    [CONF] Sizing Method: {sizing_method} | Base Risk: {base_risk*100:.2f}% | Scaled Risk: {scaled_risk*100:.2f}%")
         
-        # V16.6 UPDATE: Base Risk must be 0.25% (0.0025) for Survival Mode
-        # This ensures we can take ~20 losses before hitting the 5% daily limit.
-        self.assertEqual(base_risk, 0.0025, "CRITICAL: Base Risk must be 0.25% (0.0025) for Survival Mode")
+        # V17.1 UPDATE: Must use risk_percentage. Fixed 0.01 lots cannot pass FTMO.
+        self.assertEqual(sizing_method, "risk_percentage", "CRITICAL: Must use dynamic risk_percentage to pass FTMO")
         
-        # V16.6 UPDATE: Scaled Risk capped at 0.50% (0.005) for Hot Hand
-        # Even on a winning streak, we cap risk to 0.5% to preserve drawdown.
-        self.assertEqual(scaled_risk, 0.005, "CRITICAL: Scaled Risk must be 0.50% (0.005) for Survival Mode")
+        # Ensure we are risking 0.25% per trade to allow sufficient statistical attempts
+        self.assertEqual(base_risk, 0.0025, "CRITICAL: Base Risk must be 0.25% (0.0025) for FTMO scaling")
+        
+        # Scaled Risk capped at 0.50% (0.005) for Hot Hand
+        self.assertEqual(scaled_risk, 0.005, "CRITICAL: Scaled Risk must be 0.50% (0.005)")
+
+    def test_v17_1_execution_gates(self):
+        """Verify the V17.1 loosened gates are active to prevent trade choking."""
+        phx_conf = CONFIG.get('phoenix_strategy', {})
+        features_conf = CONFIG.get('features', {})
+        risk_conf = CONFIG.get('risk_management', {})
+        
+        adx_thresh = features_conf.get('adx', {}).get('threshold', 99)
+        hurst_thresh = phx_conf.get('hurst_breakout_threshold', 99)
+        trail_act = risk_conf.get('trailing_stop', {}).get('activation_r', 0)
+        
+        print(f"    [CONF] ADX: {adx_thresh} | Hurst: {hurst_thresh} | Trail Act: {trail_act}R")
+        
+        self.assertLessEqual(adx_thresh, 15.0, "CRITICAL: ADX threshold must be <= 15.0 to allow sufficient trade frequency")
+        self.assertLessEqual(hurst_thresh, 0.45, "CRITICAL: Hurst breakout threshold must be <= 0.45 to capture trends early")
+        self.assertGreaterEqual(trail_act, 2.0, "CRITICAL: Trailing stop activation must be >= 2.0R to prevent choking winners")
 
     def test_regime_settings(self):
         """Verify Regime Enforcement is DISABLED for maximum AI adaptability."""
@@ -67,7 +86,7 @@ class TestConfigurationIntegrity(unittest.TestCase):
         self.assertEqual(regime_mode, "DISABLED", "CRITICAL: Regime Enforcement must be DISABLED")
 
     def test_leverage_map_integrity(self):
-        """V14.0: Verify Leverage Map exists for Asset Classes."""
+        """V14.0+: Verify Leverage Map exists for Asset Classes."""
         risk_conf = CONFIG.get('risk_management', {})
         lev_map = risk_conf.get('leverage', {})
         required_keys = ['default', 'minor', 'gold', 'indices', 'crypto']
@@ -75,6 +94,7 @@ class TestConfigurationIntegrity(unittest.TestCase):
         print(f"    [CONF] Leverage Keys: {list(lev_map.keys())}")
         for k in required_keys:
             self.assertIn(k, lev_map, f"CRITICAL: Missing leverage config for '{k}'")
+
 
 class TestInfrastructureAndExecution(unittest.TestCase):
     """
@@ -103,7 +123,7 @@ class TestInfrastructureAndExecution(unittest.TestCase):
         CRITICAL: Is the Windows machine writing to THIS Redis instance?
         Checks 'producer:heartbeat' timestamp.
         """
-        heartbeat_key = CONFIG.get('redis', {}).get('heartbeat_key', 'producer:heartbeat')
+        heartbeat_key = CONFIG.get('producer', {}).get('heartbeat_key', 'producer:heartbeat')
         last_beat = self.r.get(heartbeat_key)
         
         if not last_beat:
@@ -155,6 +175,7 @@ class TestInfrastructureAndExecution(unittest.TestCase):
         else:
             print("    -> Stream is empty.")
 
+
 class TestFeatureEngineering(unittest.TestCase):
     """Validates the 'Golden Six' feature calculations."""
     def setUp(self):
@@ -185,6 +206,7 @@ class TestFeatureEngineering(unittest.TestCase):
         entropy_noise = features_noise.get('entropy', 0.5)
         self.assertGreater(entropy_noise, 0.1, msg="Random noise should have non-zero entropy")
 
+
 class TestRiskCalculations(unittest.TestCase):
     def test_cross_pair_pip_value(self):
         ctx = TradeContext(
@@ -198,7 +220,6 @@ class TestRiskCalculations(unittest.TestCase):
         )
         mock_prices = {"USDCAD": 1.3500}
         
-        # V13.1 Update: Pass free_margin explicitly to test new signature
         trade, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=0.6,
@@ -216,6 +237,7 @@ class TestRiskCalculations(unittest.TestCase):
         digits = PrecisionGuard.get_digits("BTCUSD")
         self.assertEqual(digits, 2, "Crypto heuristic should work")
 
+
 if __name__ == '__main__':
-    print(f"\n🔍 RUNNING PHOENIX V16.6 PIPELINE DIAGNOSTICS...")
+    print(f"\n🔍 RUNNING PHOENIX V17.1 PIPELINE DIAGNOSTICS...")
     unittest.main(verbosity=2)

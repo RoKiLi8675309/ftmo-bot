@@ -287,7 +287,7 @@ class LiveTradingEngine:
         self.stream_mgr.ensure_group()
 
         # 2. Risk & Compliance
-        initial_bal = CONFIG['env'].get('initial_balance', 100000.0)
+        initial_bal = CONFIG['env'].get('initial_balance', 50000.0) # V17.1 default fix
         self.ftmo_guard = FTMORiskMonitor(
             initial_balance=initial_bal,
             max_daily_loss_pct=CONFIG['risk_management']['max_daily_loss_pct'],
@@ -349,8 +349,8 @@ class LiveTradingEngine:
         # Daily Circuit Breaker State (Realized Execution)
         self.daily_execution_stats = defaultdict(lambda: {'losses': 0, 'pnl': 0.0, 'tickets': set()})
         
-        # Increased to 5 to prevent early lockout in Aggressor Mode
-        self.max_daily_losses_per_symbol = 5
+        # V17.1 FIX: Increased to 10. Since we risk 0.25% per trade, 10 losses is only 2.5% drawdown.
+        self.max_daily_losses_per_symbol = 10
         
         # --- TIMEZONE INIT ---
         tz_str = CONFIG['risk_management'].get('risk_timezone', 'Europe/Prague')
@@ -417,7 +417,7 @@ class LiveTradingEngine:
             # --- GOLDEN BASKET CROSSES (Fallbacks) ---
             "GBPJPY": 190.0, "EURJPY": 160.0, "AUDJPY": 95.0,
             # --- LEGACY (Low Priority) ---
-            "GBPAUD": 1.95, "EURAUD": 1.65, "GBPNZD": 2.05
+            "GBPAUD": 1.95, "EURAUD": 1.65, "GBPNZD": 2.10
         }
         for sym, price in defaults.items():
             if sym not in self.latest_prices:
@@ -747,7 +747,7 @@ class LiveTradingEngine:
         # 1. Fetch current positions
         open_positions = self._get_open_positions_from_redis()
         
-        # 2. Check Global Limit (8)
+        # 2. Check Global Limit 
         max_global = CONFIG['risk_management'].get('max_open_trades', 8)
         if len(open_positions) >= max_global:
             logger.warning(f"🚫 Global Trade Limit Reached ({len(open_positions)}/{max_global}).")
@@ -841,12 +841,12 @@ class LiveTradingEngine:
                     logger.warning(f"⚠️ {symbol}: No price data for execution. Skipping.")
                     continue
 
-                # --- V17.0 FIX: Fetch Margin Info for Leverage Guard ---
-                estimated_free_margin = 100000.0 # Default fallback
+                # --- V17.1 FIX: Fetch Margin Info for Leverage Guard ---
+                estimated_free_margin = 50000.0 # Match V17.1 default
                 try:
                     acc_info = self.stream_mgr.r.hgetall(CONFIG['redis']['account_info_key'])
                     if acc_info:
-                        estimated_free_margin = float(acc_info.get('free_margin', 100000.0))
+                        estimated_free_margin = float(acc_info.get('free_margin', 50000.0))
                 except Exception:
                     pass
 
@@ -899,7 +899,6 @@ class LiveTradingEngine:
                 stop_dist = current_atr * atr_mult_sl
                 
                 # ENFORCE HARD FLOOR
-                # Default to 15 pips if config missing or too small
                 min_pips = float(CONFIG['risk_management'].get('min_stop_loss_pips', 15.0))
                 hard_floor_dist = min_pips * pip_val
                 
@@ -949,10 +948,11 @@ class LiveTradingEngine:
         Active Position Management Thread.
         Enforces:
         1. 4h Time Stop (Hard Exit) - Dynamic Config.
-        2. 0.5R Trailing Stop.
+        2. Dynamic Trailing Stop (Configured in yaml).
         3. Daily Session Liquidation (Redundancy Check) - Uses authoritative NY Time.
+        V17.1: Uses immutable initial risk to prevent Trailing Stop hallucination.
         """
-        logger.info(f"{LogSymbols.INFO} Active Position Manager Started (Trail: 0.5R, Time-Stop: Dynamic).")
+        logger.info(f"{LogSymbols.INFO} Active Position Manager Started.")
         
         # Dynamic Horizon Fetch (Default 240m)
         tbm_conf = CONFIG.get('online_learning', {}).get('tbm', {})
@@ -1007,7 +1007,7 @@ class LiveTradingEngine:
                         self.dispatcher.send_order(close_intent, 0.0)
                         continue
 
-                    # --- TRAILING STOP LOGIC (0.5R) ---
+                    # --- V17.1 TRAILING STOP LOGIC (IMMUTABLE RISK DIST FIX) ---
                     current_price = self.latest_prices.get(sym, 0.0)
                     if current_price <= 0: continue
 
@@ -1016,12 +1016,35 @@ class LiveTradingEngine:
                     tp_price = float(pos.get('tp', 0.0))
                     pos_type = pos.get('type') # "BUY" or "SELL"
                     ticket = pos.get('ticket')
+                    comment = str(pos.get('comment', ''))
 
                     if entry_price == 0 or sl_price == 0: continue
 
-                    # Calculate Risk Distance (1R)
-                    risk_dist = abs(entry_price - sl_price)
-                    if risk_dist < 1e-5: continue
+                    # --- V17.1 FIX: IMMUTABLE RISK DISTANCE ---
+                    # Do NOT use current sl_price because it shrinks as the trailing stop moves.
+                    # Fetch the static initial risk saved by the dispatcher.
+                    risk_dist = 0.0
+                    try:
+                        # Extract short_id from comment: "Auto_1234abcd_..." -> "1234abcd"
+                        parts = comment.split('_')
+                        if len(parts) >= 2 and parts[0] == "Auto":
+                            short_id = parts[1]
+                            stored_risk = self.stream_mgr.r.hget("bot:initial_risk", short_id)
+                            if stored_risk:
+                                risk_dist = float(stored_risk)
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch initial risk from Redis for {sym}: {e}")
+
+                    # Fallback to absolute if Redis fails (though it will shrink if already trailed)
+                    if risk_dist <= 1e-5:
+                        risk_dist = abs(entry_price - sl_price)
+                        if risk_dist < 1e-5: continue
+                    # -------------------------------------------
+                    
+                    # FETCH DYNAMIC CONFIG TO PREVENT CHOKING TRADES
+                    trail_conf = CONFIG.get('risk_management', {}).get('trailing_stop', {})
+                    activation_r = float(trail_conf.get('activation_r', 2.0))
+                    trail_dist_r = float(trail_conf.get('trail_dist_r', 1.5))
 
                     new_sl = None
                     
@@ -1029,13 +1052,13 @@ class LiveTradingEngine:
                         dist_pnl = current_price - entry_price
                         r_multiple = dist_pnl / risk_dist
                         
-                        # Activate at 0.5R
-                        if r_multiple >= 0.5:
-                            # Move SL to Entry + 0.1R (Small lock-in)
-                            target_sl = entry_price + (risk_dist * 0.1)
-                            # Or if deep in profit (>1R), trail by 0.3R behind price
-                            if r_multiple >= 1.0:
-                                target_sl = current_price - (risk_dist * 0.3)
+                        if r_multiple >= activation_r:
+                            trail_pips = risk_dist * trail_dist_r
+                            target_sl = current_price - trail_pips
+                            
+                            # Lock in at least 0.1R profit once activated
+                            min_lock = entry_price + (risk_dist * 0.1)
+                            target_sl = max(target_sl, min_lock)
                             
                             # Only move UP
                             if target_sl > sl_price:
@@ -1045,14 +1068,14 @@ class LiveTradingEngine:
                         dist_pnl = entry_price - current_price
                         r_multiple = dist_pnl / risk_dist
                         
-                        # Activate at 0.5R
-                        if r_multiple >= 0.5:
-                            # Move SL to Entry - 0.1R
-                            target_sl = entry_price - (risk_dist * 0.1)
-                            # Trail if deep profit
-                            if r_multiple >= 1.0:
-                                target_sl = current_price + (risk_dist * 0.3)
-                                
+                        if r_multiple >= activation_r:
+                            trail_pips = risk_dist * trail_dist_r
+                            target_sl = current_price + trail_pips
+                            
+                            # Lock in at least 0.1R profit once activated
+                            min_lock = entry_price - (risk_dist * 0.1)
+                            target_sl = min(target_sl, min_lock)
+                            
                             # Only move DOWN
                             if target_sl < sl_price:
                                 new_sl = target_sl
@@ -1067,7 +1090,7 @@ class LiveTradingEngine:
                             stop_loss=new_sl,
                             take_profit=tp_price, # Keep TP
                             ticket=ticket,
-                            comment="Trail 0.5R"
+                            comment=f"Trail {r_multiple:.1f}R"
                         )
                         self.dispatcher.send_order(modify_intent, 0.0)
 
