@@ -24,7 +24,6 @@ dependencies:
   - optuna>=3.0.0
   - redis-py>=4.5.0 # HARDENED: CRITICAL for ExponentialBackoff/Retry support
   - pyarrow
-  - psycopg2
   - sqlalchemy
   - quantstats
   - joblib
@@ -42,6 +41,7 @@ dependencies:
   - lxml # REQUIRED: Fast XML parsing for Forex Factory feed
   - beautifulsoup4 # REQUIRED: HTML parsing fallback
   - pip:
+    - psycopg2-binary # CRITICAL FIX: Pre-compiled wheel bypasses Linux C-Compiler requirements
     - cloudscraper # REQUIRED: Bypass Cloudflare on Forex Factory HTML
     - requests # REQUIRED: HTTP polling
     - hmmlearn # REQUIRED: For GaussianHMM in RegimeDetector
