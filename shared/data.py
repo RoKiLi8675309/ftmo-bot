@@ -375,7 +375,8 @@ def load_real_data(
 ) -> pd.DataFrame:
     """
     Loads historical data from Postgres using SQLAlchemy for stability.
-    Includes V17.1 Telemetry upgrade to identify active Python environment on failure.
+    Includes V17.4 Multiprocessing Fix: Removes explicit psycopg2 import 
+    and relies on SQLAlchemy's native handling combined with the LOKY_PYTHON env var.
     """
     if db_config is None:
         db_config = CONFIG.get('postgres')
@@ -386,7 +387,10 @@ def load_real_data(
     try:
         from sqlalchemy import create_engine, text
         
-        db_url = f"postgresql+psycopg2://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['db']}"
+        # --- V17.4 MULTIPROCESSING SYNC FIX ---
+        # Explicit psycopg2 imports removed to satisfy Pylance and rely purely on
+        # the loky worker executing the correct Conda python instance.
+        db_url = f"postgresql://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['db']}"
         engine = create_engine(db_url)
         
         query_ticks = text("""
@@ -452,7 +456,7 @@ def load_real_data(
     except ImportError as e:
         print(f"❌ ERROR: Missing required database dependencies: {e}")
         print(f"🔎 FORENSIC TELEMETRY: Python Interpreter is currently: {sys.executable}")
-        print(f"💡 FIX: Activate your conda environment and run: pip install sqlalchemy psycopg2-binary")
+        print(f"💡 FIX: Ensure your conda environment has 'sqlalchemy' and 'psycopg2-binary' installed.")
         return pd.DataFrame()
     except Exception as e:
         print(f"ERROR: Database load failed for {symbol}: {e}")

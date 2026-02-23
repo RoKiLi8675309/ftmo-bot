@@ -7,13 +7,21 @@
 # Supports path resolution for both Monolithic and Modular layouts.
 # CRITICAL: Python 3.9 Compatible (No '|' unions).
 #
-# UPDATES (Rec 5 - Timezone & Risk Fix):
-# 1. TIMEZONE: Switched default to 'Europe/Athens' (EET) to align with FTMO Server.
-# 2. RISK CLAMP: Enforced 0.25% Base Risk to allow 20+ losses/day.
+# UPDATES (V17.4 - Loky Conda Sync Fix):
+# 1. ENVIRONMENT LOCK: Enforced LOKY_PYTHON to prevent multiprocessing workers
+#    from dropping the Conda path and failing psycopg2 imports.
+# 2. PYLANCE FIX: Removed manual psycopg2 imports to clear source resolution errors.
 # =============================================================================
 
 import os
 import sys
+
+# --- CRITICAL MULTIPROCESSING FIX ---
+# Forces joblib/loky to use the exact Conda python executable for all worker processes.
+# This prevents the workers from hallucinating that packages like psycopg2 don't exist.
+os.environ["LOKY_PYTHON"] = sys.executable
+os.environ["PYTHONEXECUTABLE"] = sys.executable
+
 import yaml
 import urllib.parse
 from pathlib import Path
@@ -158,8 +166,11 @@ def get_config() -> Optional[Dict[str, Any]]:
     if 'wfo' not in config:
         config['wfo'] = {}
 
+    # --- V17.4 MULTIPROCESSING SYNC FIX ---
+    # Removed dynamic driver loading that caused Pylance errors and worker mismatch.
+    # SQLAlchemy automatically defaults to psycopg2 when using the 'postgresql://' prefix.
     config['wfo']['db_url'] = (
-        f"postgresql+psycopg2://{config['postgres']['user']}:"
+        f"postgresql://{config['postgres']['user']}:"
         f"{safe_pass}@"
         f"{config['postgres']['host']}:{config['postgres']['port']}/"
         f"{config['postgres']['db']}"
