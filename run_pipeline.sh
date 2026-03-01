@@ -78,6 +78,21 @@ fi
 
 echo "Using Python Interpreter: $TARGET_PYTHON"
 
+# --- V17.4 PRE-FLIGHT C-LIBRARY CHECK ---
+echo "Verifying PostgreSQL C-Libraries..."
+if ! "$TARGET_PYTHON" -c "import psycopg2" &> /dev/null; then
+    echo ""
+    echo "❌ CRITICAL: psycopg2 C-extensions failed to load."
+    echo "   Pip installed the wrapper, but WSL2 is missing the underlying C-libraries (libpq)."
+    echo ""
+    echo "💡 THE FIX: Run this exact command to let Conda inject the missing C-libraries:"
+    echo "   conda install -y -c conda-forge psycopg2"
+    echo ""
+    echo "Aborting pipeline to prevent data corruption and worker crashes."
+    exit 1
+fi
+echo "✅ Database Drivers OK."
+
 # --- STAGE 1: PRE-FLIGHT DIAGNOSTICS (THE FORENSIC GATE) ---
 echo ""
 echo "================================================================="

@@ -10,6 +10,7 @@ import queue
 import numpy as np
 import math
 import pytz
+import uuid
 from datetime import datetime, timedelta, date, timezone
 from collections import defaultdict, deque
 from typing import Any, Optional, Dict, List, Set
@@ -43,7 +44,6 @@ from shared import (
 )
 
 # Local Engine Modules
-from engines.live.dispatcher import TradeDispatcher
 from engines.live.predictor import MultiAssetPredictor, Signal
 
 setup_logging("LiveEngine")
@@ -51,6 +51,211 @@ logger = logging.getLogger("LiveEngine")
 
 # CONSTANTS
 MAX_TICK_LATENCY_SEC = 45.0 
+
+# --- MT5 CONSTANTS (HARDCODED FOR LINUX) ---
+# Since we cannot import MetaTrader5 on Linux, we define the standard constants here.
+# These MUST match the Windows Producer's expectation.
+MT5_ORDER_TYPE_BUY = 0
+MT5_ORDER_TYPE_SELL = 1
+MT5_TRADE_ACTION_DEAL = 1
+MT5_TRADE_ACTION_PENDING = 5
+MT5_TRADE_ACTION_SLTP = 6 
+MT5_TRADE_ACTION_MODIFY = 6
+MT5_TRADE_ACTION_REMOVE = 8
+
+class TradeDispatcher:
+    """
+    Handles the reliable transmission of trade orders from the Logic Engine
+    to the Execution Engine (Windows Producer) via Redis Streams.
+    
+    UPDATED: FORCE MARKET EXECUTION ONLY.
+    V17.1 FIX: INJECTS STATIC INITIAL RISK TO REDIS TO PREVENT R-MULTIPLE HALLUCINATION.
+    """
+    def __init__(self, stream_mgr: RedisStreamManager, pending_tracker: dict[str, Any], lock: threading.RLock):
+        """
+        :param stream_mgr: Active RedisStreamManager instance.
+        :param pending_tracker: Reference to the Engine's pending order dictionary.
+        :param lock: Thread lock to ensure thread-safe updates to the tracker.
+        """
+        self.stream_mgr = stream_mgr
+        self.stream_key = CONFIG['redis']['trade_request_stream']
+        self.magic_number = CONFIG['trading'].get('magic_number', 621001)
+        self.pending_tracker = pending_tracker
+        self.lock = lock
+
+    def send_order(self, trade: Trade, estimated_risk_usd: float = 0.0) -> None:
+        """
+        Formats and dispatches a Trade object to Redis.
+        Strictly enforces Market Execution (Deal) protocol.
+        """
+        try:
+            # 1. Generate IDs
+            order_id = uuid.uuid4()
+            short_id = str(order_id)[:8]
+            
+            # --- V17.1 FIX: PERSIST INITIAL RISK DISTANCE ---
+            # We calculate the absolute price distance between the entry reference 
+            # and the initial stop loss. This is saved to a Redis hash so the 
+            # Trailing Stop and Pyramiding logic don't hallucinate shrinking 
+            # R-multiples as the SL physically moves closer to price.
+            try:
+                initial_risk_dist = abs(trade.entry_price - trade.stop_loss)
+                if initial_risk_dist > 0:
+                    self.stream_mgr.r.hset("bot:initial_risk", short_id, str(initial_risk_dist))
+            except Exception as e:
+                logger.error(f"Failed to persist initial risk to Redis for {short_id}: {e}")
+            # ------------------------------------------------
+            
+            # 2. Register Pending (Thread-Safe)
+            with self.lock:
+                self.pending_tracker[str(order_id)] = {
+                    "symbol": trade.symbol,
+                    "action": trade.action,
+                    "volume": trade.volume,
+                    "timestamp": time.time(),
+                    "status": "PENDING",
+                    "risk_usd": estimated_risk_usd
+                }
+
+            # 3. Construct Payload (Strict Protocol Translation)
+            
+            # A. Translate Action (BUY/SELL -> 0/1) to 'type' field
+            # Windows Producer expects 'type' to be the direction.
+            if trade.action == "BUY":
+                mt5_type = MT5_ORDER_TYPE_BUY
+            elif trade.action == "SELL":
+                mt5_type = MT5_ORDER_TYPE_SELL
+            else:
+                # Fallback for "CLOSE_ALL" or "MODIFY" which handle their own logic in Producer
+                # But for standard entry, this is required.
+                mt5_type = MT5_ORDER_TYPE_BUY # Default dummy
+            
+            # B. FORCE MARKET EXECUTION
+            # We ignore trade.entry_type and force TRADE_ACTION_DEAL (1)
+            # Price must be 0.0 for Instant/Market Execution in MT5
+            if trade.action in ["BUY", "SELL"]:
+                mt5_action = MT5_TRADE_ACTION_DEAL
+                final_price = "0.0" 
+            else:
+                # MODIFY / CLOSE_ALL are handled specifically by Producer strings
+                # But strictly speaking, they don't map to standard DEAL/PENDING here
+                # We pass the string action through, Producer handles the switch
+                mt5_action = MT5_TRADE_ACTION_DEAL 
+                final_price = "0.0"
+
+            # Ensure Comment length compliance (MT5 limit)
+            # Shorten UUID for comment: "Auto_1234abcd"
+            comment = f"Auto_{short_id}"
+            if trade.comment:
+                # Truncate carefully to preserve key info within 31 chars
+                comment = f"{comment}_{trade.comment}"[:31]
+
+            # Determine Action String for Producer Logic
+            # If standard trade, send integer. If special command, send string.
+            if trade.action in ["MODIFY", "CLOSE_ALL"]:
+                action_payload = str(trade.action)
+            else:
+                action_payload = str(mt5_action)
+
+            payload = {
+                "id": str(order_id),
+                "uuid": str(order_id),  # CRITICAL for Producer Deduplication
+                "symbol": str(trade.symbol),
+                
+                # --- PROTOCOL TRANSLATION ---
+                "action": action_payload,
+                "type": str(mt5_type),
+                
+                # Explicit formatting to prevent float precision errors
+                "volume": "{:.2f}".format(float(trade.volume)),
+                
+                # FORCE ZERO PRICE for Market Execution
+                "entry_price": final_price,
+                "price": final_price, 
+                
+                # CRITICAL MAPPING: Producer looks for 'sl' and 'tp', NOT 'stop_loss'
+                # Enforce string format to prevent scientific notation (e.g. 1e-5)
+                "sl": "{:.5f}".format(trade.stop_loss),
+                "tp": "{:.5f}".format(trade.take_profit),
+                
+                "magic_number": str(self.magic_number),
+                "magic": str(self.magic_number), 
+                
+                "comment": comment,
+                "timestamp": str(time.time()),  # ZOMBIE CHECK: High precision time
+                
+                # Ticket required for MODIFY
+                "ticket": str(trade.ticket) if trade.ticket else "0"
+            }
+
+            # 4. Transmit to Redis
+            # Enforce maxlen to prevent stream from growing indefinitely
+            self.stream_mgr.r.xadd(self.stream_key, payload, maxlen=50000, approximate=True)
+            
+            logger.info(
+                f"{LogSymbols.UPLOAD} DISPATCH SENT: {trade.action} {trade.symbol} "
+                f"| Vol: {trade.volume:.2f} | Market Order (Price=0.0) | Risk: ${estimated_risk_usd:.2f}"
+            )
+        except Exception as e:
+            logger.error(f"{LogSymbols.ERROR} Dispatch Failed for {trade.symbol}: {e}", exc_info=True)
+            # Rollback tracker if send failed
+            with self.lock:
+                if str(order_id) in self.pending_tracker:
+                    del self.pending_tracker[str(order_id)]
+
+    def cleanup_stale_orders(self, ttl_seconds: int = 600, open_positions: Optional[Dict] = None):
+        """
+        Removes orders that have been stuck in 'PENDING' for too long.
+        Cross-reference with open_positions (Zombie Check) to avoid
+        deleting a key for a trade that actually filled but lost connection.
+        
+        :param ttl_seconds: Max age of a pending order (Default 600s / 10m).
+        :param open_positions: Current live positions to check against.
+        """
+        now = time.time()
+        to_remove = []
+        
+        with self.lock:
+            for oid, data in self.pending_tracker.items():
+                # 1. Time Check
+                if now - data['timestamp'] > ttl_seconds:
+                    
+                    # 2. Zombie Check (If positions provided)
+                    # If we find a position for this symbol that looks like it belongs to us,
+                    # we assume it filled and just clear the pending flag safely.
+                    is_zombie_match = False
+                    if open_positions:
+                        short_id = str(oid)[:8]
+                        symbol = data['symbol']
+                        
+                        for pos in open_positions.values():
+                            # Check Symbol AND Comment match
+                            if pos.get('symbol') == symbol and short_id in pos.get('comment', ''):
+                                is_zombie_match = True
+                                break
+                    
+                    if is_zombie_match:
+                        logger.warning(f"🧟 ZOMBIE MATCH: Clearing stale pending {oid} (Found matching position).")
+                        to_remove.append(oid)
+                    else:
+                        # Genuine Timeout - Order likely rejected or lost
+                        logger.warning(f"🧹 Clearing Stale Pending Order: {oid} ({data['symbol']}) - > {ttl_seconds}s")
+                        to_remove.append(oid)
+            
+            for oid in to_remove:
+                if oid in self.pending_tracker:
+                    # Clean up the corresponding initial risk from Redis to prevent memory leaks over months
+                    try:
+                        short_id = str(oid)[:8]
+                        self.stream_mgr.r.hdel("bot:initial_risk", short_id)
+                    except Exception:
+                        pass
+                        
+                    del self.pending_tracker[oid]
+        
+        if to_remove:
+            logger.info(f"Cleaned up {len(to_remove)} pending orders.")
+
 
 # --- WORKER PROCESS FOR OFF-MAIN-THREAD COMPUTE ---
 class LogicWorker(multiprocessing.Process):
@@ -115,11 +320,12 @@ class LogicWorker(multiprocessing.Process):
                     continue
                 
                 if tick_data == "STOP":
-                    worker_log.info("Logic Worker received STOP signal.")
+                    worker_log.info("Logic Worker received STOP signal. Shutting down gracefully.")
                     break
 
                 symbol = tick_data.get('symbol')
-                if symbol not in self.symbols: continue
+                if symbol not in self.symbols: 
+                    continue
 
                 # 2. Hardened Latency Guard (Rec 2)
                 # We check latency HERE, using the locally maintained Volatility state
@@ -128,11 +334,16 @@ class LogicWorker(multiprocessing.Process):
 
                 # 3. Update Context (if present in payload)
                 if 'ctx_d1' in tick_data:
-                    try: latest_context[symbol]['d1'] = json.loads(tick_data['ctx_d1'])
-                    except: pass
+                    try: 
+                        latest_context[symbol]['d1'] = json.loads(tick_data['ctx_d1'])
+                    except Exception as e: 
+                        worker_log.debug(f"Failed to parse D1 context for {symbol}: {e}")
+                
                 if 'ctx_h4' in tick_data:
-                    try: latest_context[symbol]['h4'] = json.loads(tick_data['ctx_h4'])
-                    except: pass
+                    try: 
+                        latest_context[symbol]['h4'] = json.loads(tick_data['ctx_h4'])
+                    except Exception as e: 
+                        worker_log.debug(f"Failed to parse H4 context for {symbol}: {e}")
 
                 # 4. Process Tick -> Bar
                 # Parse data
@@ -140,11 +351,13 @@ class LogicWorker(multiprocessing.Process):
                     price = float(tick_data.get('price', 0.0))
                     volume = float(tick_data.get('volume', 1.0))
                     ts = float(tick_data.get('time', 0.0))
-                    if ts > 100_000_000_000: ts /= 1000.0 # Normalize ms
+                    if ts > 100_000_000_000: 
+                        ts /= 1000.0 # Normalize milliseconds to seconds
                     
                     bid_vol = float(tick_data.get('bid_vol', 0.0))
                     ask_vol = float(tick_data.get('ask_vol', 0.0))
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as e:
+                    worker_log.debug(f"Malformed tick data received: {e}")
                     continue
 
                 # Aggregate
@@ -171,12 +384,16 @@ class LogicWorker(multiprocessing.Process):
                     if signal:
                         # Push to Execution Queue for Main Thread Dispatcher
                         self.signal_queue.put(signal)
-                        worker_log.info(f"{LogSymbols.SIGNAL} Generated Signal: {signal.action} {symbol} ({signal.confidence:.2f})")
+                        
+                        # Suppress logging HOLD/WARMUP spam in the worker to keep logs clean
+                        if signal.action not in ["HOLD", "WARMUP"]:
+                            worker_log.info(f"{LogSymbols.SIGNAL} Generated Signal: {signal.action} {symbol} ({signal.confidence:.2f})")
 
             except Exception as e:
                 worker_log.error(f"Logic Worker Error: {e}", exc_info=True)
         
         # Cleanup
+        worker_log.info("Saving Predictor State before shutdown...")
         predictor.save_state()
         worker_log.info("Logic Worker Shutdown Complete.")
 
@@ -187,7 +404,8 @@ class LogicWorker(multiprocessing.Process):
         """
         try:
             ts = float(tick_data.get('time', 0.0))
-            if ts > 100_000_000_000: ts /= 1000.0
+            if ts > 100_000_000_000: 
+                ts /= 1000.0
             
             now = time.time()
             latency = abs(now - ts)
@@ -209,7 +427,8 @@ class LogicWorker(multiprocessing.Process):
                 return False
                 
             return True
-        except Exception:
+        except Exception as e:
+            log.debug(f"Latency check failed: {e}")
             return True # Fail open if check fails
 
     def _calibrate_thresholds(self, log: logging.Logger) -> Dict[str, float]:
@@ -228,6 +447,7 @@ class LogicWorker(multiprocessing.Process):
                 df = load_real_data(sym, n_candles=50000, days=30)
                 
                 if df is None or df.empty:
+                    log.warning(f"No historical data for {sym}. Using default threshold: {config_thresh}")
                     threshold_map[sym] = config_thresh
                     continue
                 
@@ -243,7 +463,9 @@ class LogicWorker(multiprocessing.Process):
                         price = getattr(row, 'price', getattr(row, 'close', None))
                         vol = getattr(row, 'volume', 1.0)
                         ts_val = getattr(row, 'Index', None).timestamp()
-                        if price is None: continue
+                        
+                        if price is None: 
+                            continue
                         
                         b_vol = vol / 2
                         s_vol = vol / 2
@@ -287,10 +509,14 @@ class LiveTradingEngine:
         self.stream_mgr.ensure_group()
 
         # 2. Risk & Compliance
-        initial_bal = CONFIG['env'].get('initial_balance', 50000.0) # V17.1 default fix
+        initial_bal = CONFIG['env'].get('initial_balance', 50000.0) 
+        
+        # --- FIX: SAFE CONFIG LOOKUP FOR max_daily_loss_pct ---
+        max_daily_loss = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
+        
         self.ftmo_guard = FTMORiskMonitor(
             initial_balance=initial_bal,
-            max_daily_loss_pct=CONFIG['risk_management']['max_daily_loss_pct'],
+            max_daily_loss_pct=max_daily_loss,
             redis_client=self.stream_mgr.r
         )
         self.portfolio_mgr = PortfolioRiskManager(symbols=self.symbols)
@@ -385,7 +611,8 @@ class LiveTradingEngine:
         self.liquidation_triggered_map = {sym: False for sym in CONFIG['trading']['symbols']}
         
         # --- TICK DEDUPLICATION & HEARTBEAT STATE ---
-        self.processed_ticks = defaultdict(float)
+        # V17.5 FIX: Change from float timestamp to full string hash to allow same-ms ticks
+        self.processed_ticks = defaultdict(str) 
         self.ticks_processed = 0 # Visual Heartbeat Counter
 
         # --- CONTEXT CACHE (D1/H4 from Windows) ---
@@ -434,7 +661,7 @@ class LiveTradingEngine:
             reset_ts = self.stream_mgr.r.get("risk:last_reset_date")
             if reset_ts:
                 return float(reset_ts)
-        except:
+        except Exception:
             pass
         
         # Fallback: Midnight UTC today
@@ -736,33 +963,60 @@ class LiveTradingEngine:
             # Cache for Worker Process injection
             self.latest_positions = pos_map
             return pos_map
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Failed to fetch positions from redis: {e}")
             return {}
 
     def _check_symbol_concurrency(self, symbol: str) -> bool:
         """
-        V17.0 FIX: Enforces 1 Trade Per Pair, up to Global Max.
-        UPDATED: Checks for Pyramiding configuration to allow adding to winners.
-        """
-        # 1. Fetch current positions
-        open_positions = self._get_open_positions_from_redis()
+        V17.5 CRITICAL MARGIN FIX: HARD CAP AT 2 TRADES.
+        The user explicitly demanded a maximum of 1 or 2 trades to prevent margin 
+        exhaustion at the new 0.25% risk level. We enforce a hard ceiling of 2 here,
+        ignoring higher settings in config.yaml.
         
-        # 2. Check Global Limit 
-        max_global = CONFIG['risk_management'].get('max_open_trades', 8)
-        if len(open_positions) >= max_global:
-            logger.warning(f"🚫 Global Trade Limit Reached ({len(open_positions)}/{max_global}).")
+        RACE CONDITION FIX: Inject local pending_orders to prevent multiple burst
+        signals from bypassing the check before Redis updates.
+        """
+        magic = CONFIG['trading']['magic_number']
+        key = f"{CONFIG['redis']['position_state_key_prefix']}:{magic}"
+        
+        total_open_tickets = 0
+        symbol_open_tickets = 0
+        
+        try:
+            data = self.stream_mgr.r.get(key)
+            if data:
+                pos_list = json.loads(data)
+                # Count actual number of raw tickets, not just unique symbols
+                total_open_tickets = len(pos_list)
+                symbol_open_tickets = sum(1 for p in pos_list if p.get('symbol') == symbol)
+        except Exception as e:
+            logger.debug(f"Concurrency check redis fetch failed: {e}")
+
+        # --- MULTI-PROCESS RACE CONDITION FIX ---
+        # Add locally pending orders that haven't hit MT5/Redis yet
+        with self.lock:
+            local_pending_total = len(self.pending_orders)
+            local_pending_symbol = sum(1 for o in self.pending_orders.values() if o.get('symbol') == symbol)
+            
+        total_open_tickets += local_pending_total
+        symbol_open_tickets += local_pending_symbol
+
+        # --- HARD MARGIN CEILING ---
+        # NEVER allow more than 2 trades globally. Period.
+        config_max = CONFIG['risk_management'].get('max_open_trades', 2)
+        max_global = min(config_max, 2) 
+
+        if total_open_tickets >= max_global:
+            logger.warning(f"🚫 Global Trade Limit Reached ({total_open_tickets}/{max_global}). Margin Protected.")
             return False
 
-        # 3. Check if THIS symbol is already active
-        if symbol in open_positions:
-            # CHECK PYRAMIDING CONFIG
+        if symbol_open_tickets > 0:
             is_pyramid_on = CONFIG['risk_management'].get('pyramiding', {}).get('enabled', False)
-            if is_pyramid_on:
-                # If Pyramiding is enabled, we DO NOT block here.
-                # We allow the signal to proceed to RiskManager, which validates the specific "Add" criteria (Profitability, R-Multiple).
+            if is_pyramid_on and symbol_open_tickets < 2:
                 return True
             else:
-                logger.warning(f"🚫 {symbol} already active. Concurrency Limit (1 per pair).")
+                logger.warning(f"🚫 {symbol} already active. Concurrency Limit reached.")
                 return False
             
         return True
@@ -783,12 +1037,15 @@ class LiveTradingEngine:
                 except queue.Empty:
                     continue
                 
-                # --- FIX: IGNORE WARMUP SIGNALS ---
-                # "WARMUP" signals are for model training only, not execution.
-                # If we dispatch them, they default to "BUY" and cause invalid stops.
-                if signal.action == "WARMUP":
+                # --- ABSOLUTE ZERO TOLERANCE GATEWAY ---
+                # Completely annihilates HOLD and WARMUP signals before 
+                # they can ever reach the SL/TP calculator.
+                if signal.action in ["HOLD", "WARMUP"]:
                     continue
-                # ----------------------------------
+                    
+                if signal.action not in ["BUY", "SELL"]:
+                    continue
+                # ---------------------------------------
                 
                 symbol = signal.symbol
                 
@@ -801,7 +1058,7 @@ class LiveTradingEngine:
                 if time.time() - self.last_dispatch_time.get(symbol, 0) < ttl_sec:
                     continue
                 
-                # 4. CONCURRENCY CHECK (V17.0)
+                # 4. CONCURRENCY CHECK (V17.5 HARD CAP + RACE FIX)
                 if not self._check_symbol_concurrency(symbol):
                     continue
 
@@ -826,7 +1083,8 @@ class LiveTradingEngine:
                         daily_pnl_pct = (self.ftmo_guard.equity - start_eq) / start_eq
                     else:
                         daily_pnl_pct = 0.0
-                except:
+                except Exception as e:
+                    logger.debug(f"Failed to calculate daily PnL pct: {e}")
                     daily_pnl_pct = 0.0
                 
                 # Portfolio Heat
@@ -847,7 +1105,8 @@ class LiveTradingEngine:
                     acc_info = self.stream_mgr.r.hgetall(CONFIG['redis']['account_info_key'])
                     if acc_info:
                         estimated_free_margin = float(acc_info.get('free_margin', 50000.0))
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Failed to fetch free margin: {e}")
                     pass
 
                 # Calculate Trade Size
@@ -872,7 +1131,8 @@ class LiveTradingEngine:
                     free_margin=estimated_free_margin # Pass explicit free margin
                 )
                 
-                if trade_intent.volume <= 0: continue
+                if trade_intent.volume <= 0: 
+                    continue
                 
                 # Apply Signal Actions
                 trade_intent.action = signal.action
@@ -901,9 +1161,6 @@ class LiveTradingEngine:
                 # ENFORCE HARD FLOOR
                 min_pips = float(CONFIG['risk_management'].get('min_stop_loss_pips', 15.0))
                 hard_floor_dist = min_pips * pip_val
-                
-                # Log Geometry for Debugging
-                logger.info(f"📉 SL GEOMETRY: ATR={current_atr:.5f} | Floor={hard_floor_dist:.5f} ({min_pips} pips) | Calc={stop_dist:.5f}")
                 
                 # Apply Floor
                 stop_dist = max(stop_dist, hard_floor_dist)
@@ -1095,7 +1352,7 @@ class LiveTradingEngine:
                         self.dispatcher.send_order(modify_intent, 0.0)
 
             except Exception as e:
-                logger.error(f"Position Manager Error: {e}")
+                logger.error(f"Position Manager Error: {e}", exc_info=True)
             
             time.sleep(1) 
 
@@ -1104,13 +1361,19 @@ class LiveTradingEngine:
         Clears 'Pending' status if any position exists for the symbol.
         Robust against broken comment/UUID chains.
         """
-        self.dispatcher.cleanup_stale_orders(ttl_seconds=600, open_positions=open_positions)
+        try:
+            self.dispatcher.cleanup_stale_orders(ttl_seconds=600, open_positions=open_positions)
+        except Exception as e:
+            logger.debug(f"Pending order reconciliation failed: {e}")
 
     def process_tick(self, tick_data: dict):
         """
         Main Thread Tick Handler.
         Simply unpacks and pushes to LogicWorker Queue.
         Minimal latency. Rec 1.
+        
+        V17.5 FIX: Replaced strict `<` time deduplication with a tick hash
+        to safely allow multi-tick millisecond bursts from MT5.
         """
         try:
             symbol = tick_data.get('symbol')
@@ -1131,10 +1394,18 @@ class LiveTradingEngine:
 
             if symbol not in self.symbols: return
             
-            # Deduplication check
+            # --- V17.5 TICK DEDUPLICATION FIX ---
+            # MT5 frequently sends multiple ticks in the exact same millisecond.
+            # We construct a hash to only drop *exact* identical duplicate payloads.
             ts = float(tick_data.get('time', 0.0))
-            if ts <= self.processed_ticks[symbol]: return
-            self.processed_ticks[symbol] = ts
+            vol = float(tick_data.get('volume', 0.0))
+            tick_hash = f"{ts}_{price}_{vol}"
+            
+            if tick_hash == self.processed_ticks[symbol]:
+                return # Exact identical duplicate, ignore
+                
+            self.processed_ticks[symbol] = tick_hash
+            # ------------------------------------
             
             # Visual Heartbeat
             self.ticks_processed += 1
@@ -1152,55 +1423,55 @@ class LiveTradingEngine:
                 logger.warning("⚠️ Tick Queue Full! Dropping tick to maintain real-time edge.")
                 
         except Exception as e:
-            logger.error(f"Main Process Tick Error: {e}")
+            logger.error(f"Main Process Tick Error: {e}", exc_info=True)
 
     def _check_risk_gates(self, symbol: str) -> bool:
         """
         Runs the gauntlet of safety checks.
         Includes Margin Level Guard & Session Window Guard.
         """
-        # 1. Midnight Freeze Check
-        if self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['midnight_freeze']):
-            logger.warning(f"{LogSymbols.FROZEN} Midnight Freeze Active. Holding for Daily Anchor.")
-            return False
-
-        # 2. Daily Anchor Existence Check
-        if not self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['daily_starting_equity']):
-            logger.warning(f"{LogSymbols.LOCK} Daily Anchor Missing. Waiting for Producer Sync.")
-            return False
-
-        # 3. FTMO Drawdown Guard
-        if not self.ftmo_guard.can_trade():
-            # Generate detailed audit log for the failure
-            log_msg = self.ftmo_guard.check_circuit_breakers() if hasattr(self.ftmo_guard, 'check_circuit_breakers') else "Circuit Breaker Tripped"
-            logger.warning(f"{LogSymbols.LOCK} FTMO Guard Halted: {log_msg}")
-            return False
-
-        # 4. General Market Hours & SESSION WINDOW
-        # V17.5: Using internal time check which handles TZ correct
-        if not self.session_guard.is_trading_allowed():
-            # DIAGNOSTIC LOGGING FOR TIMEZONE ISSUES
-            srv_time = datetime.now(self.session_guard.market_tz)
-            logger.warning(f"{LogSymbols.LOCK} Session Guard Block: Server Time {srv_time.strftime('%H:%M')} (TZ: {self.session_guard.market_tz}) < Start Hour {self.session_guard.start_hour} or > End {self.session_guard.liq_hour}")
-            return False
-            
-        # 5. Friday Entry Guard (No new trades after Noon NY Time)
-        if self.session_guard.is_friday_afternoon():
-            logger.warning(f"{LogSymbols.LOCK} Friday Guard Block: No new trades allowed late Friday (NY Noon).")
-            return False
-
-        # 6. Penalty Box (Correlation/Volatility penalty OR Revenge Guard)
-        if self.portfolio_mgr.check_penalty_box(symbol):
-            logger.warning(f"{LogSymbols.LOCK} {symbol} is in Penalty Box (Cool-down Active).")
-            return False
-
-        # 7. News Check
-        if not self.compliance_guard.check_trade_permission(symbol):
-             return False
-
-        # --- 8. MARGIN LEVEL GUARD ---
-        # Fetch current margin health from Redis
         try:
+            # 1. Midnight Freeze Check
+            if self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['midnight_freeze']):
+                logger.warning(f"{LogSymbols.FROZEN} Midnight Freeze Active. Holding for Daily Anchor.")
+                return False
+
+            # 2. Daily Anchor Existence Check
+            if not self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['daily_starting_equity']):
+                logger.warning(f"{LogSymbols.LOCK} Daily Anchor Missing. Waiting for Producer Sync.")
+                return False
+
+            # 3. FTMO Drawdown Guard
+            if not self.ftmo_guard.can_trade():
+                # Generate detailed audit log for the failure
+                log_msg = self.ftmo_guard.check_circuit_breakers() if hasattr(self.ftmo_guard, 'check_circuit_breakers') else "Circuit Breaker Tripped"
+                logger.warning(f"{LogSymbols.LOCK} FTMO Guard Halted: {log_msg}")
+                return False
+
+            # 4. General Market Hours & SESSION WINDOW
+            # V17.5: Using internal time check which handles TZ correct
+            if not self.session_guard.is_trading_allowed():
+                # DIAGNOSTIC LOGGING FOR TIMEZONE ISSUES
+                srv_time = datetime.now(self.session_guard.market_tz)
+                logger.warning(f"{LogSymbols.LOCK} Session Guard Block: Server Time {srv_time.strftime('%H:%M')} (TZ: {self.session_guard.market_tz}) < Start Hour {self.session_guard.start_hour} or > End {self.session_guard.liq_hour}")
+                return False
+                
+            # 5. Friday Entry Guard (No new trades after Noon NY Time)
+            if self.session_guard.is_friday_afternoon():
+                logger.warning(f"{LogSymbols.LOCK} Friday Guard Block: No new trades allowed late Friday (NY Noon).")
+                return False
+
+            # 6. Penalty Box (Correlation/Volatility penalty OR Revenge Guard)
+            if self.portfolio_mgr.check_penalty_box(symbol):
+                logger.warning(f"{LogSymbols.LOCK} {symbol} is in Penalty Box (Cool-down Active).")
+                return False
+
+            # 7. News Check
+            if not self.compliance_guard.check_trade_permission(symbol):
+                 return False
+
+            # --- 8. MARGIN LEVEL GUARD ---
+            # Fetch current margin health from Redis
             acc_info = self.stream_mgr.r.hgetall(CONFIG['redis']['account_info_key'])
             if acc_info:
                 equity = float(acc_info.get('equity', 0))
@@ -1214,10 +1485,10 @@ class LiveTradingEngine:
                     if margin_level < min_margin_level:
                         logger.critical(f"🛑 MARGIN LEVEL CRITICAL: {margin_level:.2f}% < {min_margin_level}%. BLOCKING TRADES.")
                         return False
+            return True
         except Exception as e:
-            logger.warning(f"Margin Check Failed: {e}")
-
-        return True
+            logger.warning(f"Risk Gate Check Failed: {e}", exc_info=True)
+            return False
 
     def run(self):
         """
@@ -1289,7 +1560,7 @@ class LiveTradingEngine:
                     pass
                 
             except Exception as e:
-                logger.error(f"{LogSymbols.ERROR} Stream Read Error: {e}")
+                logger.error(f"{LogSymbols.ERROR} Stream Read Error: {e}", exc_info=True)
                 time.sleep(1)
 
     def shutdown(self) -> None:

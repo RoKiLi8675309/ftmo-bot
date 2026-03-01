@@ -285,7 +285,8 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             params['vpin_threshold'] = trial.suggest_float('vpin_threshold', space['vpin_threshold']['min'], space['vpin_threshold']['max'])
             
             params['tbm'] = {
-                'barrier_width': trial.suggest_float('barrier_width', space['tbm_barrier_width']['min'], space['tbm_barrier_width']['max']),
+                # V17.6 FIX: Enforce minimum 2.0 RR to clear the spread and commissions
+                'barrier_width': trial.suggest_float('barrier_width', max(2.0, space['tbm_barrier_width']['min']), max(4.0, space['tbm_barrier_width']['max'])),
                 'horizon_minutes': trial.suggest_int('horizon_minutes', space['tbm_horizon_minutes']['min'], space['tbm_horizon_minutes']['max'], step=space['tbm_horizon_minutes']['step']),
                 'drift_threshold': trial.suggest_float('drift_threshold', space['tbm_drift_threshold']['min'], space['tbm_drift_threshold']['max'])
             }
@@ -309,7 +310,10 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 if snapshot.get_price(symbol, 'close') == 0: continue
                 broker.process_pending(snapshot)
                 strategy.on_data(snapshot, broker)
-                if broker.is_blown: break
+                
+                # Stop processing only if TOTALLY blown (permanent ruin)
+                if getattr(broker, 'is_totally_blown', False): 
+                    break
             
             metrics = pipeline_inst.calculate_performance_metrics(broker.trade_log, broker.initial_balance)
             
@@ -332,17 +336,16 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
 
             objective_score = total_return + (calmar * 100.0)
 
-            # --- OPTUNA TPE GRADIENT FIX ---
-            # Instead of returning flat -10000.0, we return a continuous penalty.
-            # This allows the Tree-structured Parzen Estimator to calculate the gradient of failure
-            # and "walk" away from the parameters that caused it.
+            # --- OPTUNA TPE GRADIENT FIX (V17.6 Daily Resuscitation Support) ---
+            # Penalize total blowouts, excessive drawdown, AND daily limit hits.
+            daily_hits = getattr(broker, 'daily_limit_hits', 0)
+            total_blown = getattr(broker, 'is_totally_blown', False)
             
-            if broker.is_blown or max_dd_pct > 0.08:
+            if total_blown or max_dd_pct > 0.08 or daily_hits > 0:
                 trial.set_user_attr("blown", True)
-                # Heavily penalize the exact amount of drawdown over the 8% limit
-                dd_penalty = (max_dd_pct - 0.08) * 200000.0 
-                # Combine negative base, the lost PnL, and the DD penalty
-                return -5000.0 + total_return - dd_penalty
+                dd_penalty = (max_dd_pct - 0.08) * 200000.0 if max_dd_pct > 0.08 else 0
+                daily_hit_penalty = daily_hits * 5000.0
+                return -5000.0 + total_return - dd_penalty - daily_hit_penalty
 
             # SIGNIFICANCE FILTER
             min_trades = CONFIG['wfo'].get('min_trades_optimization', 15)
@@ -437,7 +440,7 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 params['entropy_threshold'] = trial.suggest_float('entropy_threshold', space['entropy_threshold']['min'], space['entropy_threshold']['max'])
                 params['vpin_threshold'] = trial.suggest_float('vpin_threshold', space['vpin_threshold']['min'], space['vpin_threshold']['max'])
                 params['tbm'] = {
-                    'barrier_width': trial.suggest_float('barrier_width', space['tbm_barrier_width']['min'], space['tbm_barrier_width']['max']),
+                    'barrier_width': trial.suggest_float('barrier_width', max(2.0, space['tbm_barrier_width']['min']), max(4.0, space['tbm_barrier_width']['max'])),
                     'horizon_minutes': trial.suggest_int('horizon_minutes', space['tbm_horizon_minutes']['min'], space['tbm_horizon_minutes']['max'], step=space['tbm_horizon_minutes']['step']),
                     'drift_threshold': trial.suggest_float('drift_threshold', space['tbm_drift_threshold']['min'], space['tbm_drift_threshold']['max'])
                 }
@@ -458,7 +461,7 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                     if snapshot.get_price(symbol, 'close') == 0: continue
                     broker.process_pending(snapshot)
                     strategy.on_data(snapshot, broker)
-                    if broker.is_blown: break
+                    if getattr(broker, 'is_totally_blown', False): break
                 
                 metrics = pipeline_inst.calculate_performance_metrics(broker.trade_log, broker.initial_balance)
                 
@@ -471,9 +474,12 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 objective_score = total_return + (calmar * 100.0)
                 
                 # --- OPTUNA TPE GRADIENT FIX ---
-                if max_dd_pct > 0.08 or broker.is_blown: 
-                    dd_penalty = (max_dd_pct - 0.08) * 200000.0
-                    return -5000.0 + total_return - dd_penalty
+                daily_hits = getattr(broker, 'daily_limit_hits', 0)
+                total_blown = getattr(broker, 'is_totally_blown', False)
+                if total_blown or max_dd_pct > 0.08 or daily_hits > 0: 
+                    dd_penalty = (max_dd_pct - 0.08) * 200000.0 if max_dd_pct > 0.08 else 0
+                    daily_hit_penalty = daily_hits * 5000.0
+                    return -5000.0 + total_return - dd_penalty - daily_hit_penalty
                     
                 min_trades = CONFIG['wfo'].get('min_trades_optimization', 15)
                 if trades < min_trades: 

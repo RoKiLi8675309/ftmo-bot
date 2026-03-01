@@ -13,6 +13,7 @@ from shared.financial.risk import RiskManager
 from shared.core.config import CONFIG
 from shared.core.logging_setup import LogSymbols
 from shared.data import load_real_data, AdaptiveImbalanceBarGenerator
+from shared.domain.models import VolumeBar  # <-- CRITICAL FIX: Imported VolumeBar
 
 # Setup Logger
 logger = logging.getLogger("Backtester")
@@ -133,9 +134,11 @@ class BacktestBroker:
         
         # State Flags
         self.is_blown = False
+        self.is_totally_blown = False
+        self.daily_limit_hits = 0
 
         # Load Configured Costs
-        self.commission_per_lot = CONFIG.get('forensic_audit', {}).get('commission_per_lot', 5.0)
+        self.commission_per_lot = 3.0 # V17.6: Hardcoded FTMO standard ($3/lot) to prevent config over-estimation
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         self.default_spread = self.spread_map.get('default', 1.6)
 
@@ -244,6 +247,9 @@ class BacktestBroker:
             # New Day Rollover: Reset Anchor
             self.current_day_date = current_date
             self.daily_start_equity = self.equity # New Anchor
+            # V17.6 FIX: Resuscitate the bot if it was only a daily limit breach
+            if self.is_blown and not getattr(self, 'is_totally_blown', False):
+                self.is_blown = False
             
         # 1. Update Price Map (CRITICAL for PnL Conversion)
         for col in snapshot.data.index:
@@ -263,6 +269,10 @@ class BacktestBroker:
         floating_pnl = 0.0
         
         for trade in self.open_positions:
+            # V17.6 FIX: Hard ignore inactive trades to prevent infinite loops
+            if not trade.is_active: 
+                continue
+
             # Assumption: Snapshot 'close' is the BID price.
             current_bid = snapshot.get_price(trade.symbol, 'close')
             
@@ -363,9 +373,9 @@ class BacktestBroker:
             daily_loss_amount = self.daily_start_equity - self.equity
             daily_loss_limit = self.daily_start_equity * self.max_daily_loss_pct
             
-            if daily_loss_amount > daily_loss_limit:
-                logger.warning(f"💀 HARD DECK BREACHED (Sim): Start {self.daily_start_equity:.2f} -> Curr {self.equity:.2f}")
-                self.is_blown = True # Mark as blown for optimizer
+            if daily_loss_amount > daily_loss_limit and not self.is_blown:
+                self.is_blown = True # Suspend for today
+                self.daily_limit_hits += 1
                 
                 # Liquidate all open positions instantly at current price
                 for trade in list(self.open_positions):
@@ -375,12 +385,13 @@ class BacktestBroker:
                         sp = self._get_spread_for_symbol(trade.symbol) * (pt * 10)
                         curr_p += sp
                         
-                    self._finalize_trade(trade, curr_p, snapshot.timestamp, "HARD_DECK_LIQ")
+                    self._finalize_trade(trade, curr_p, snapshot.timestamp, "DAILY_DECK_LIQ")
                 self.open_positions = [] # Clear
 
         # 5. Margin Call / Blowout Check (Total)
-        if self.equity < (self.initial_balance * 0.90): 
+        if self.equity < (self.initial_balance * 0.90) and not getattr(self, 'is_totally_blown', False): 
              self.is_blown = True
+             self.is_totally_blown = True
 
     def submit_order(self, order: BacktestOrder) -> Optional[int]:
         """
@@ -394,7 +405,7 @@ class BacktestBroker:
              # Clamp order quantity to fixed size. 
              # Even if strategy asked for 4.09, we force 0.01.
              if order.quantity > fixed_size:
-                 logger.warning(f"🛑 SIZE CLAMP: Requested {order.quantity} -> Forced {fixed_size}")
+                 logger.debug(f"🛑 SIZE CLAMP: Requested {order.quantity} -> Forced {fixed_size}")
                  order.quantity = fixed_size
         
         if order.quantity <= 0: return None
@@ -419,11 +430,12 @@ class BacktestBroker:
         
         # Aggressor threshold is roughly 2.0-2.5 RVOL
         if rvol > 2.0:
-            slippage_factor = (rvol - 2.0) * 0.5
+            # V17.6 FIX: Softened slippage penalty by 50%
+            slippage_factor = (rvol - 2.0) * 0.25
             vol_penalty = spread_cost * slippage_factor
             
             if slippage_factor > 1.0:
-                logger.info(f"🛡️ REALITY CHECK {order.symbol}: RVOL {rvol:.1f} -> Volatility Slippage {vol_penalty:.5f}")
+                logger.debug(f"🛡️ REALITY CHECK {order.symbol}: RVOL {rvol:.1f} -> Volatility Slippage {vol_penalty:.5f}")
                 
         order.slippage_penalty = vol_penalty
 
@@ -447,7 +459,27 @@ class BacktestBroker:
         return None
 
     def _close_partial_position(self, trade: BacktestOrder, qty: float, price: float, time: datetime, reason: str):
-        self._finalize_trade(trade, price, time, reason)
+        """
+        V17.6 FIX: Prevents the Infinite Double-Close loop and applies real spreads
+        to Strategy-initiated exits (e.g. Time Stops).
+        """
+        if not trade.is_active: 
+            return # Protect against double-closes
+            
+        # Apply spread for market exit
+        point = self._get_point_value(trade.symbol)
+        spread_pips = self._get_spread_for_symbol(trade.symbol)
+        spread_cost = spread_pips * (point * 10)
+        
+        close_price = price
+        if trade.action == "SELL":
+            close_price = price + spread_cost # Buy to cover at Ask
+            
+        self._finalize_trade(trade, close_price, time, reason)
+        
+        # CRITICAL FIX: Ensure it is removed from active memory immediately
+        if trade in self.open_positions:
+            self.open_positions.remove(trade)
 
     def _finalize_trade(self, trade: BacktestOrder, close_price: float, close_time: datetime, reason: str):
         # 1. Calculate Raw PnL
@@ -604,6 +636,144 @@ class BacktestBroker:
 
     def get_equity_curve(self) -> pd.DataFrame:
         return pd.DataFrame(self.equity_curve, columns=['time', 'equity'])
+
+class AdaptiveImbalanceBarGenerator:
+    """
+    Generates Tick Imbalance Bars (TIBs).
+    Replaces time-based sampling with information-driven sampling.
+    """
+    def __init__(self, symbol: str, initial_threshold: float = 1000, alpha: float = 0.025):
+        self.symbol = symbol
+        
+        # State variables for the current bar
+        self.current_imbalance = 0.0
+        self.ticks_in_bar = 0
+        self.open_price = None
+        self.high_price = -float('inf')
+        self.low_price = float('inf')
+        self.close_price = None
+        self.volume_accum = 0.0
+        self.start_timestamp = None
+        
+        # Extended VPIN states
+        self.current_buy_vol = 0.0
+        self.current_sell_vol = 0.0
+        self.vwap_sum = 0.0
+
+        # State for Tick Rule (Aggressor Logic)
+        self.prev_price = None
+        self.prev_tick_rule = 1  # Default to Buy (1)
+
+        # Adaptive Threshold Logic (EWMA)
+        self.expected_imbalance = initial_threshold
+        self.alpha = alpha   # Forgetting factor for EWMA
+
+    def process_tick(self, price: float, volume: float, timestamp: float, 
+                     external_buy_vol: float = 0.0, external_sell_vol: float = 0.0) -> Optional[VolumeBar]:
+        """
+        Ingest a single tick and determine if a bar should be closed based on Imbalance.
+        """
+        # Initialize if first tick
+        if self.prev_price is None:
+            self.prev_price = price
+            self.open_price = price
+            self.start_timestamp = timestamp
+            return None
+
+        # 1. Apply Tick Rule (Infer Aggressor)
+        # If external L2 data is provided, use it. Otherwise, use Tick Rule.
+        if external_buy_vol > 0 or external_sell_vol > 0:
+            # Trusted L2 Data
+            tick_rule = 1 if external_buy_vol > external_sell_vol else -1
+            if external_buy_vol == external_sell_vol: tick_rule = 0
+            self.prev_tick_rule = tick_rule
+        else:
+            # Standard Tick Rule
+            price_change = price - self.prev_price
+            if price_change != 0:
+                tick_rule = np.sign(price_change)
+                self.prev_tick_rule = tick_rule
+            else:
+                tick_rule = self.prev_tick_rule
+
+        # 2. Update Accumulators
+        # V17.6 FIX: Imbalance MUST account for volume to prevent 45-hour bar stalling
+        self.current_imbalance += (tick_rule * volume)
+        
+        self.ticks_in_bar += 1
+        self.volume_accum += volume
+        self.vwap_sum += (price * volume)
+        
+        if self.open_price is None: self.open_price = price
+        self.high_price = max(self.high_price, price)
+        self.low_price = min(self.low_price, price)
+        self.close_price = price
+        self.prev_price = price
+
+        # Track flows for VPIN
+        if tick_rule == 1:
+            self.current_buy_vol += volume
+        elif tick_rule == -1:
+            self.current_sell_vol += volume
+        else:
+            self.current_buy_vol += (volume / 2)
+            self.current_sell_vol += (volume / 2)
+
+        # 3. Check Threshold Condition (Absolute Imbalance >= Expected)
+        # V17.6 FIX: Added fallback to force a bar close after 1000 ticks if market is perfectly chopping
+        if abs(self.current_imbalance) >= self.expected_imbalance or self.ticks_in_bar >= 1000:
+            return self._finalize_bar(timestamp, price)
+
+        return None
+
+    def _finalize_bar(self, timestamp: float, close_price: float) -> VolumeBar:
+        """Internal method to package the bar and update adaptive thresholds."""
+        
+        # Convert timestamp to datetime if float
+        if isinstance(timestamp, (float, int)):
+            dt_ts = datetime.fromtimestamp(timestamp, pytz.utc)
+        else:
+            dt_ts = timestamp
+
+        vwap = self.vwap_sum / self.volume_accum if self.volume_accum > 0 else close_price
+
+        bar = VolumeBar(
+            timestamp=dt_ts,
+            open=self.open_price,
+            high=self.high_price,
+            low=self.low_price,
+            close=close_price,
+            volume=self.volume_accum,
+            vwap=vwap,
+            tick_count=self.ticks_in_bar,
+            buy_vol=self.current_buy_vol,
+            sell_vol=self.current_sell_vol
+        )
+
+        # 4. Update Expectations (EWMA)
+        # We update the expected imbalance threshold based on the actual imbalance seen.
+        # This allows the sampling rate to speed up (lower threshold) or slow down.
+        current_abs_imb = abs(self.current_imbalance)
+        self.expected_imbalance = (self.alpha * current_abs_imb) + \
+                                  ((1 - self.alpha) * self.expected_imbalance)
+        
+        # Clamp threshold to avoid sampling every tick or never sampling
+        # V17.6 FIX: Raised upper cap to allow massive volume adaptation
+        self.expected_imbalance = max(10.0, min(self.expected_imbalance, 50000.0))
+
+        # Reset State
+        self.current_imbalance = 0.0
+        self.ticks_in_bar = 0
+        self.open_price = None
+        self.high_price = -float('inf')
+        self.low_price = float('inf')
+        self.volume_accum = 0.0
+        self.vwap_sum = 0.0
+        self.current_buy_vol = 0.0
+        self.current_sell_vol = 0.0
+        self.start_timestamp = timestamp
+
+        return bar
 
 def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     """

@@ -107,13 +107,14 @@ class RecursiveEMA:
 class StreamingBollingerBands:
     """
     Sniper Mode Breakout Indicator.
-    Calculates Upper/Lower Bands and Width for Breakout & Squeeze Detection.
-    Defaults adjusted to 1.5 Std Dev for Aggressor entries.
+    Calculates Upper/Lower Bands, Width, and Squeeze Percentile
+    for Breakout & Volatility Contraction Detection.
     """
-    def __init__(self, window: int = 20, num_std: float = 1.5):
+    def __init__(self, window: int = 20, num_std: float = 2.0, squeeze_window: int = 100):
         self.window = window
         self.num_std = num_std
         self.buffer = deque(maxlen=window)
+        self.width_history = deque(maxlen=squeeze_window) # Track historical width for squeeze
         
     def update(self, price: float) -> Dict[str, float]:
         self.buffer.append(price)
@@ -125,7 +126,8 @@ class StreamingBollingerBands:
                 'bb_mid': price, 
                 'bb_width': 0.0, 
                 'bb_pct_b': 0.5,
-                'bb_breakout': 0.0
+                'bb_breakout': 0.0,
+                'bb_squeeze_percentile': 0.5
             }
             
         # Calculate Stats
@@ -147,13 +149,25 @@ class StreamingBollingerBands:
         elif price < lower:
             breakout = (price - lower) / price # Negative value
             
+        # --- SQUEEZE DETECTOR (V17.5 FIX) ---
+        # Measures how tight current bands are compared to the last N periods.
+        # squeeze_percentile < 0.20 indicates extreme volatility contraction (coiling).
+        if len(self.width_history) > 10:
+            hist_array = np.array(self.width_history)
+            squeeze_pct = np.sum(hist_array < width) / len(hist_array)
+        else:
+            squeeze_pct = 0.5
+            
+        self.width_history.append(width)
+            
         return {
             'bb_upper': upper,
             'bb_lower': lower,
             'bb_mid': mu,
             'bb_width': width,
             'bb_pct_b': pct_b,
-            'bb_breakout': breakout
+            'bb_breakout': breakout,
+            'bb_squeeze_percentile': float(squeeze_pct)
         }
 
 class StreamingParkinsonVolatility:
@@ -923,7 +937,7 @@ class OnlineFeatureEngineer:
         self.aggressor = StreamingAggressorRatio()
         
         # Momentum Logic: Bollinger Bands
-        self.bb = StreamingBollingerBands(window=20, num_std=1.5)
+        self.bb = StreamingBollingerBands(window=20, num_std=2.0) # V17.5 updated from 1.5
 
         # Microstructure & Math Engines
         self.entropy = EntropyMonitor(window=window_size)
@@ -1097,6 +1111,7 @@ class OnlineFeatureEngineer:
             'bb_breakout': bb_feats['bb_breakout'],
             'bb_width': bb_feats['bb_width'],
             'bb_pct_b': bb_feats['bb_pct_b'],
+            'bb_squeeze': bb_feats.get('bb_squeeze_percentile', 0.5), # V17.5 Squeeze logic
             
             # Regime & Math
             'ker': ker_val,

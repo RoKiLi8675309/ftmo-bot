@@ -51,8 +51,7 @@ class MultiAssetPredictor:
     """
     Manages a dictionary of Online Models (one per symbol).
     Performs 'Inference -> Train' loop on every Volume Bar.
-    Updated for V17.1: AI Bypass Bug Fixed, Calibrated Probabilities Restored, 
-    and Pyramiding Gate immunized against Trailing Stop hallucinations.
+    Updated for V17.6: Re-engineered Regime Gates (Unchoked).
     """
     def __init__(self, symbols: List[str], threshold_map: Optional[Dict[str, float]] = None):
         """
@@ -78,6 +77,13 @@ class MultiAssetPredictor:
         # Stricter Portfolio Heat
         self.max_currency_exposure = int(risk_conf.get('max_currency_exposure', 8))
         
+        # --- SESSION CONTROL (CRITICAL FIX) ---
+        session_conf = risk_conf.get('session_control', {})
+        self.session_enabled = session_conf.get('enabled', False)
+        self.start_hour = session_conf.get('start_hour_server', 10)
+        self.liq_hour = session_conf.get('liquidate_hour_server', 21)
+        self.friday_entry_cutoff = risk_conf.get('friday_entry_cutoff_hour', 16)
+        
         self.labelers = {}
         self.optimized_params = {} # Cache for gates
         
@@ -89,7 +95,7 @@ class MultiAssetPredictor:
         self.volume_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         
         self.bb_window = 20
-        self.bb_std = CONFIG['phoenix_strategy'].get('bb_std_dev', 1.5) 
+        self.bb_std = 1.0 # V17.6 OVERRIDE: Loosened from 2.0 to restore triggers
         self.bb_buffers = {s: deque(maxlen=self.bb_window) for s in symbols}
         
         # --- SNIPER PROTOCOL BUFFERS ---
@@ -102,20 +108,25 @@ class MultiAssetPredictor:
         # Volatility Gate Buffer (Returns)
         self.returns_window = {s: deque(maxlen=20) for s in symbols}
 
-        # --- STRATEGY THRESHOLDS (CACHED) ---
+        # ============================================================
+        # STRATEGY CONFIGURATION (V17.6 UNCHOKE OVERRIDES)
+        # We explicitly OVERRIDE config.yaml here because V17.5 strict settings 
+        # caused trade starvation (No Trigger) and mathematical ruin.
+        # ============================================================
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        self.regime_enforcement = phx_conf.get('regime_enforcement', 'DISABLED').upper()
+        
+        self.regime_enforcement = "DISABLED" # V17.6 OVERRIDE
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
-        self.ker_floor = float(phx_conf.get('ker_trend_threshold', 0.002)) 
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.45)) 
-        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 2.5))
         
-        # Initialize default_max_rvol explicitly
-        self.max_rvol_thresh = float(phx_conf.get('max_relative_volume', 25.0))
-        self.default_max_rvol = self.max_rvol_thresh
+        self.ker_floor = 0.001 # V17.6 OVERRIDE
+        self.hurst_breakout = 0.51 # V17.6 OVERRIDE
+        self.hurst_reversion = 0.49 # V17.6 OVERRIDE
+        self.rvol_trigger = 2.0 # V17.6 OVERRIDE
         
-        adx_cfg = CONFIG.get('features', {}).get('adx', {})
-        self.adx_threshold = float(adx_cfg.get('threshold', 15.0)) # Hard floor
+        self.default_max_rvol = 50.0 # V17.6 OVERRIDE
+        
+        self.adx_threshold = 10.0 # V17.6 OVERRIDE
+        # ============================================================
 
         for s in symbols:
             # Default from Config
@@ -476,6 +487,7 @@ class MultiAssetPredictor:
     def _check_volatility_condition(self, symbol: str, current_price: float) -> bool:
         """
         Ensures distinct market movement exists before entering.
+        V17.6 FIX: Reduced threshold to prevent starving valid setups.
         """
         buffer = self.returns_window[symbol]
         if len(buffer) < 10:
@@ -484,8 +496,8 @@ class MultiAssetPredictor:
         # Calculate Volatility (Std Dev of Returns)
         vol = np.std(list(buffer))
         
-        # Minimum Volatility Threshold (approx 1.5 pips movement per bar)
-        MIN_VOLATILITY = 0.00015 
+        # V17.6 FIX: Reduced to 0.00005 to prevent choking out valid setups
+        MIN_VOLATILITY = 0.00005 
         
         if vol < MIN_VOLATILITY:
             return False
@@ -514,7 +526,7 @@ class MultiAssetPredictor:
         if "MEAN_REVERSION" in regimes_found:
             return "MEAN_REVERSION"
             
-        # Priority 3: Neutral (Default for EURUSD if defined as such)
+        # Priority 3: Neutral
         return "NEUTRAL"
 
     def _check_currency_exposure(self, symbol: str, open_positions: Dict[str, Any]) -> bool:
@@ -833,8 +845,7 @@ class MultiAssetPredictor:
             stats[f"Low Efficiency"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": f"Low Efficiency (KER {ker_val:.3f} < {effective_ker_thresh:.3f})"})
 
-        # G2: REGIME IDENTIFICATION (UNSHACKLED)
-        # If Regime Enforcement is DISABLED, we treat this purely as a technical filter (BB)
+        # G2: REGIME IDENTIFICATION (V17.6 UNCHOKED)
         preferred_regime = self._get_preferred_regime(symbol)
         regime_label = "Neutral"
         proposed_action = 0 # 0=Hold, 1=Buy, -1=Sell
@@ -851,8 +862,9 @@ class MultiAssetPredictor:
         upper_bb = bb_mu + (bb_mult * bb_std)
         lower_bb = bb_mu - (bb_mult * bb_std)
         
-        # --- LOGIC MAPPING: TREND ONLY ---
+        # --- REGIME LOGIC MAPPING (V17.6: UNCHOKED) ---
         is_trending = hurst > self.hurst_breakout
+        is_reverting = hurst < self.hurst_reversion
         
         if is_trending:
             if preferred_regime == "MEAN_REVERSION":
@@ -865,19 +877,21 @@ class MultiAssetPredictor:
             elif bar.close < lower_bb:
                 proposed_action = -1 # Breakout Sell
                 
+        elif is_reverting:
+            if preferred_regime == "TREND_BREAKOUT":
+                is_regime_clash = True
+                
+            # Mean Reversion Logic
+            regime_label = "MEAN_REVERSION"
+            if bar.close > upper_bb:
+                proposed_action = -1 # Fade the top (Sell)
+            elif bar.close < lower_bb:
+                proposed_action = 1  # Fade the bottom (Buy)
+                
         else:
-            # NEUTRAL ZONE / MEAN REVERSION POTENTIAL
-            # If we disable regime enforcement, allow Mean Reversion on Low Hurst
-            if self.regime_enforcement == "DISABLED":
-                 # Low Hurst = Reversion. If hitting bands, fade it.
-                 regime_label = "MEAN_REVERSION"
-                 if bar.close > upper_bb:
-                     proposed_action = -1 # Reversion Sell
-                 elif bar.close < lower_bb:
-                     proposed_action = 1  # Reversion Buy
-            else:
-                stats[f"Random Walk Regime (H={hurst:.2f})"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": f"Random Walk (Hurst {hurst:.2f})"})
+            # DEAD ZONE: Random Walk / Choppy Market
+            stats[f"Dead Zone / Random Walk (H={hurst:.2f})"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": f"Dead Zone (Hurst {hurst:.2f})"})
 
         if proposed_action == 0:
             stats["No Trigger"] += 1
@@ -893,7 +907,7 @@ class MultiAssetPredictor:
         if is_regime_clash:
             if self.regime_enforcement == "HARD":
                 stats["Personality Clash (Hard Block)"] += 1
-                return Signal(symbol, "HOLD", 0.0, {"reason": "Asset Personality Clash"})
+                return Signal(symbol, "HOLD", 0.0, {"reason": f"Asset Personality Clash ({regime_label} vs {preferred_regime})"})
             elif self.regime_enforcement == "DISABLED":
                  # Bypass clash flag to allow full adaptability
                  is_regime_clash = False 
@@ -929,7 +943,7 @@ class MultiAssetPredictor:
             confidence = 0.0
 
         # --- V17.1 FIX: Enforce Minimum Confidence Gate ---
-        min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.52)
+        min_conf = CONFIG['online_learning'].get('min_calibrated_probability', 0.55)
         if confidence < min_conf:
             stats[f"Low ML Confidence ({confidence:.2f} < {min_conf})"] += 1
             if self.bar_counters[symbol] % 50 == 0:

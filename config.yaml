@@ -1,11 +1,12 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V17.1 (PROFIT MAXIMIZATION PROTOCOL)
+# config.yaml – PROJECT PHOENIX V17.5 (FTMO SURVIVAL & PROFIT MAXIMIZATION)
 # STATUS: LIVE TRADING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# CRITICAL FIXES (V17.1):
-# 1. SIZING: Switched from fixed_lots to risk_percentage (0.25% per trade).
-# 2. GATES: Relaxed ADX (15) and Hurst (0.45) to increase trade frequency.
-# 3. EXITS: Loosened trailing stop activation to 2.0R to prevent choking winners.
+# FORENSIC FIXES (V17.5):
+# 1. HURST CORRECTION: Increased breakout threshold to 0.58 (prevents buying random walk tops).
+# 2. ADX TIGHTENING: Increased to 22.0 to filter out consolidation noise.
+# 3. TP ASYMMETRY: Reduced TP ATR mult from 5.0 to 2.5 to match the 4-hour time stop reality.
+# 4. ASSET REGIMES: Shifted AUDUSD/USDCAD to MEAN_REVERSION to match intrinsic behavior.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -133,7 +134,7 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 15.0 # V17.1: Loosened from 20.0 to increase trade frequency
+    threshold: 22.0 # V17.5 FIX: Tightened from 15.0 to 22.0 to eliminate chop.
   
   cyclical_time: true
   session_awareness: true
@@ -143,41 +144,41 @@ features:
 # --- PHOENIX STRATEGY PARAMETERS ---
 phoenix_strategy:
   # --- ASSET REGIME MAPPING ---
-  regime_enforcement: "DISABLED" 
+  regime_enforcement: "HARD" # V17.5 FIX: Enforce regimes to stop buying tops on ranging pairs
   
   asset_regime_map:
     GBPJPY: "TREND_BREAKOUT" 
     USDJPY: "TREND_BREAKOUT"
-    GBPUSD: "TREND_BREAKOUT"
-    EURUSD: "NEUTRAL"
-    AUDUSD: "NEUTRAL"
-    USDCAD: "MEAN_REVERSION"
     EURJPY: "TREND_BREAKOUT"
     AUDJPY: "TREND_BREAKOUT"
+    GBPUSD: "NEUTRAL"
+    EURUSD: "NEUTRAL"
+    AUDUSD: "MEAN_REVERSION" # V17.5 FIX: Naturally a ranging pair, fade the extremes
+    USDCAD: "MEAN_REVERSION" # V17.5 FIX: Oil proxy, highly mean-reverting
     CAD: "NEUTRAL"    
     CHF: "NEUTRAL"    
     USD: "NEUTRAL"
 
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true          
-  require_d1_trend: false                                  
+  require_d1_trend: true # V17.5 FIX: Align with macro to boost win rate                                 
   require_h4_alignment: false                  
   
   # --- LOGIC MAPPING THRESHOLDS ---
-  hurst_breakout_threshold: 0.45      # V17.1: Loosened from 0.48 to capture more trends
-  hurst_mean_reversion_threshold: 0.00    
-  ker_trend_threshold: 0.002          # V17.1: Loosened from 0.003
+  hurst_breakout_threshold: 0.58      # V17.5 FIX: Mathematical trend requires > 0.5. Set to 0.58.
+  hurst_mean_reversion_threshold: 0.45    
+  ker_trend_threshold: 0.002          
   
-  bb_std_dev: 1.5                     
+  bb_std_dev: 2.0                     # V17.5 FIX: Widened from 1.5 to 2.0 to confirm true breakouts
   
-  rvol_volatility_trigger: 2.5        # V17.1: Loosened from 3.0
+  rvol_volatility_trigger: 2.5        
   
   # --- FILTER THRESHOLDS ---
   max_relative_volume: 25.0        
   volume_gate_ratio: 0.8            
   aggressor_threshold: 0.51        
-  ml_confirmation_threshold: 0.55  # V17.1: Loosened from 0.60
-  choppiness_threshold: 65.0       # V17.1: Loosened from 60.0
+  ml_confirmation_threshold: 0.55  
+  choppiness_threshold: 65.0       
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -214,8 +215,8 @@ optimization_search_space:
   
   # Triple Barrier Method (Labeling)
   tbm_barrier_width:
-    min: 2.0  
-    max: 4.0  
+    min: 1.5  # V17.5 FIX: Lowered minimum to allow tighter, more realistic TP discovery
+    max: 3.0  
   tbm_horizon_minutes:
     min: 60   
     max: 360  
@@ -226,15 +227,18 @@ optimization_search_space:
   
   # Strategy Execution
   min_calibrated_probability:
-    min: 0.52 
-    max: 0.60
+    min: 0.55 # V17.5 FIX: Raise floor to 55% to stop 50/50 coinflips
+    max: 0.65
 
 # --- RISK MANAGEMENT (FTMO COMPLIANCE) ---
 risk_management:
   account_currency: "USD"
   
+  # CRITICAL FTMO LIMIT (4.5% safe buffer for 5% max daily loss)
+  max_daily_loss_pct: 0.045
+  
   # --- SIZING METHOD: V17.1 DYNAMIC RISK ---
-  sizing_method: "risk_percentage" # V17.1 FIX: Required to hit 10% profit target
+  sizing_method: "risk_percentage" 
   fixed_lot_size: 0.01        
   
   # V17.1: 0.25% risk per trade on 50k = $125 risk per trade.
@@ -242,31 +246,27 @@ risk_management:
   scaled_risk_percent: 0.005
   
   # REVENGE TRADING GUARD
-  loss_cooldown_minutes: 60  # Reduced from 120m to allow faster recovery
+  loss_cooldown_minutes: 60  
   
   # MARGIN LEVEL GATE
   min_margin_level_percent: 200.0
 
   # PYRAMIDING (COMPOUNDING)
   pyramiding:
-    enabled: true
+    enabled: false # V17.5 FIX: Disabled to prevent margin exhaustion during drawdown recovery
     max_adds: 1 
     add_on_profit_r: 1.0  
-    risk_per_add_percent: 0.001 # 0.1% for adds
+    risk_per_add_percent: 0.001 
   
   # EQUITY RATCHET
   equity_ratchet:
     enabled: true
     step_percent: 0.05    
   
-  # LIMITS
-  max_daily_loss_pct: 0.045        
-  max_total_loss_pct: 0.095        
-  
-  # PORTFOLIO HEAT
-  max_currency_exposure: 8       
-  max_open_trades: 8              
-  max_risk_percent: 5.0           
+  # --- V17.4 FIX: PORTFOLIO HEAT & MARGIN PROTECTION ---
+  max_currency_exposure: 2       
+  max_open_trades: 2             # V17.5 FIX: Hard cap at 2 to protect Free Margin
+  max_risk_percent: 1.0          # Hard limit on total portfolio risk (2 trades * 0.50% max)
   
   # --- LEVERAGE GUARD ---
   leverage:
@@ -279,21 +279,21 @@ risk_management:
   leverage_safety_divisor: 1.5
   
   max_leverage: 30.0
-  max_lot_size: 50.0 # Restored from hard 0.01 cap
+  max_lot_size: 50.0 
   min_lot_size: 0.01
   
   # PROJECT PHOENIX EXIT LOGIC
-  stop_loss_atr_mult: 2.5        # V17.1 Tightened from 4.0 to improve R:R mathematics
-  take_profit_atr_mult: 5.0      # V17.1 Target 2R
+  stop_loss_atr_mult: 2.5        # Keep wide enough to survive JPY noise
+  take_profit_atr_mult: 2.5      # V17.5 FIX: Reduced from 5.0 to 2.5 to hit targets before 4h time stop
   
-  # ACTIVE TRAILING STOP (V17.1 Fix)
+  # ACTIVE TRAILING STOP
   trailing_stop:
     enabled: true        
-    activation_r: 2.0       # V17.1: Wait until 2R profit before moving to Breakeven (Stop choking trades)
-    trail_trigger_r: 2.0       
-    trail_dist_r: 1.5       # V17.1: Leave 1.5R breathing room
+    activation_r: 1.5       # V17.5 FIX: Lock in profits faster (down from 2.0)
+    trail_trigger_r: 1.5       
+    trail_dist_r: 1.0       # V17.5 FIX: Keep trail tighter
   
-  risk_timezone: "Europe/Prague"
+  risk_timezone: "Europe/Athens"
   
   # --- SESSION & TIME MANAGEMENT ---
   session_control:
@@ -307,7 +307,7 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 50          
+  max_trades_per_day: 15          # V17.5 FIX: Cap overtrading (down from 50)
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
@@ -359,7 +359,7 @@ online_learning:
   positive_class_weight: 1.5 
   negative_class_weight: 1.0
   
-  meta_labeling_threshold: 0.55 # V17.1: Relaxed
+  meta_labeling_threshold: 0.55 
   
   tbm:
     horizon_minutes: 240        
@@ -368,7 +368,7 @@ online_learning:
     drift_threshold: 1.5 
   
   learning_horizon_sec: 300
-  min_calibrated_probability: 0.52 
+  min_calibrated_probability: 0.55 # V17.5 FIX: Raised floor
 
 # --- NEWS FILTER ---
 news_filter:
@@ -409,5 +409,5 @@ wfo:
   n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 15  # V17.1: Lowered so Optuna doesn't fail valid iterations
+  min_trades_optimization: 15  
   risk_per_trade_options: [0.0025, 0.005]

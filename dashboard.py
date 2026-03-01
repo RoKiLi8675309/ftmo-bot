@@ -243,7 +243,9 @@ st.title("Phoenix Algo Dashboard")
 
 start_eq, curr_eq, daily_pnl, daily_dd_pct = get_risk_metrics()
 free_margin, margin, margin_level = get_account_margin_info()
-daily_limit_pct = CONFIG['risk_management']['max_daily_loss_pct']
+
+# SAFE LOOKUP: Replaced strict dictionary lookup with robust get() fallback
+daily_limit_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
 
 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
 

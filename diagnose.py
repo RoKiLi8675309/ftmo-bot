@@ -5,10 +5,11 @@
 # DEPENDENCIES: unittest, numpy, redis, shared
 # DESCRIPTION: Pre-Flight Forensic Diagnostics & PIPELINE VERIFICATION.
 # 
-# PHOENIX V17.1 UPDATE (PROFIT MAXIMIZATION PROTOCOL):
+# PHOENIX V17.5 UPDATE (FTMO SURVIVAL PROTOCOL):
 # 1. SIZING VALIDATION: Ensures sizing_method is 'risk_percentage' to hit FTMO targets.
-# 2. CHOKE GUARD: Verifies trailing stops wait for 2.0R before activating.
-# 3. GATE VALIDATION: Ensures ADX (15) and Hurst (0.45) are relaxed for trade frequency.
+# 2. CHOKE GUARD: Verifies trailing stops activate quickly at 1.5R.
+# 3. GATE VALIDATION: Ensures ADX (22) and Hurst (0.58) are tightened to avoid chop.
+# 4. REGIME VALIDATION: Ensures Regime Enforcement is set to HARD.
 # =============================================================================
 import unittest
 import numpy as np
@@ -41,8 +42,8 @@ logger = logging.getLogger("Diagnose")
 
 class TestConfigurationIntegrity(unittest.TestCase):
     """
-    V17.1 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
-    with the Profit Maximization parameters (FTMO 10% Target Alignment).
+    V17.5 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
+    with the FTMO Survival Protocol parameters.
     """
     def test_aggressor_risk_params(self):
         """Verify Risk Management uses dynamic risk_percentage and correct sizing."""
@@ -53,7 +54,7 @@ class TestConfigurationIntegrity(unittest.TestCase):
         
         print(f"    [CONF] Sizing Method: {sizing_method} | Base Risk: {base_risk*100:.2f}% | Scaled Risk: {scaled_risk*100:.2f}%")
         
-        # V17.1 UPDATE: Must use risk_percentage. Fixed 0.01 lots cannot pass FTMO.
+        # V17.1/17.5 UPDATE: Must use risk_percentage. Fixed 0.01 lots cannot pass FTMO.
         self.assertEqual(sizing_method, "risk_percentage", "CRITICAL: Must use dynamic risk_percentage to pass FTMO")
         
         # Ensure we are risking 0.25% per trade to allow sufficient statistical attempts
@@ -62,28 +63,28 @@ class TestConfigurationIntegrity(unittest.TestCase):
         # Scaled Risk capped at 0.50% (0.005) for Hot Hand
         self.assertEqual(scaled_risk, 0.005, "CRITICAL: Scaled Risk must be 0.50% (0.005)")
 
-    def test_v17_1_execution_gates(self):
-        """Verify the V17.1 loosened gates are active to prevent trade choking."""
+    def test_v17_5_execution_gates(self):
+        """Verify the V17.5 tightened gates are active to prevent chop trading."""
         phx_conf = CONFIG.get('phoenix_strategy', {})
         features_conf = CONFIG.get('features', {})
         risk_conf = CONFIG.get('risk_management', {})
         
-        adx_thresh = features_conf.get('adx', {}).get('threshold', 99)
-        hurst_thresh = phx_conf.get('hurst_breakout_threshold', 99)
+        adx_thresh = features_conf.get('adx', {}).get('threshold', 0)
+        hurst_thresh = phx_conf.get('hurst_breakout_threshold', 0)
         trail_act = risk_conf.get('trailing_stop', {}).get('activation_r', 0)
         
         print(f"    [CONF] ADX: {adx_thresh} | Hurst: {hurst_thresh} | Trail Act: {trail_act}R")
         
-        self.assertLessEqual(adx_thresh, 15.0, "CRITICAL: ADX threshold must be <= 15.0 to allow sufficient trade frequency")
-        self.assertLessEqual(hurst_thresh, 0.45, "CRITICAL: Hurst breakout threshold must be <= 0.45 to capture trends early")
-        self.assertGreaterEqual(trail_act, 2.0, "CRITICAL: Trailing stop activation must be >= 2.0R to prevent choking winners")
+        self.assertGreaterEqual(adx_thresh, 22.0, "CRITICAL: ADX threshold must be >= 22.0 to filter out chop")
+        self.assertGreaterEqual(hurst_thresh, 0.58, "CRITICAL: Hurst breakout threshold must be >= 0.58 to capture strict trends")
+        self.assertLessEqual(trail_act, 1.5, "CRITICAL: Trailing stop activation must be <= 1.5R to lock in profits quickly")
 
     def test_regime_settings(self):
-        """Verify Regime Enforcement is DISABLED for maximum AI adaptability."""
+        """Verify Regime Enforcement is HARD for maximum protection."""
         phx_conf = CONFIG.get('phoenix_strategy', {})
         regime_mode = phx_conf.get('regime_enforcement')
         print(f"    [CONF] Regime Mode: {regime_mode}")
-        self.assertEqual(regime_mode, "DISABLED", "CRITICAL: Regime Enforcement must be DISABLED")
+        self.assertEqual(regime_mode, "HARD", "CRITICAL: Regime Enforcement must be HARD")
 
     def test_leverage_map_integrity(self):
         """V14.0+: Verify Leverage Map exists for Asset Classes."""
@@ -239,5 +240,5 @@ class TestRiskCalculations(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    print(f"\n🔍 RUNNING PHOENIX V17.1 PIPELINE DIAGNOSTICS...")
+    print(f"\n🔍 RUNNING PHOENIX V17.5 PIPELINE DIAGNOSTICS...")
     unittest.main(verbosity=2)
