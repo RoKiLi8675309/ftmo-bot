@@ -13,7 +13,7 @@ from shared.financial.risk import RiskManager
 from shared.core.config import CONFIG
 from shared.core.logging_setup import LogSymbols
 from shared.data import load_real_data, AdaptiveImbalanceBarGenerator
-from shared.domain.models import VolumeBar  # <-- CRITICAL FIX: Imported VolumeBar
+from shared.domain.models import VolumeBar  
 
 # Setup Logger
 logger = logging.getLogger("Backtester")
@@ -424,28 +424,39 @@ class BacktestBroker:
         spread_pips = self._get_spread_for_symbol(order.symbol)
         spread_cost = spread_pips * (point * 10)
         
-        # --- VOLATILITY PENALTY (REALITY INJECTION) ---
+        # --- REALITY INJECTION ---
         rvol = order.metadata.get('rvol', 0.0)
         vol_penalty = 0.0
         
-        # Aggressor threshold is roughly 2.0-2.5 RVOL
-        if rvol > 2.0:
-            # V17.6 FIX: Softened slippage penalty by 50%
-            slippage_factor = (rvol - 2.0) * 0.25
+        if rvol > 5.0:
+            slippage_factor = (rvol - 5.0) * 0.50 # Steeper penalty, but only on rare anomalies
             vol_penalty = spread_cost * slippage_factor
             
             if slippage_factor > 1.0:
-                logger.debug(f"🛡️ REALITY CHECK {order.symbol}: RVOL {rvol:.1f} -> Volatility Slippage {vol_penalty:.5f}")
+                logger.debug(f"🛡️ REALITY CHECK {order.symbol}: Anomaly RVOL {rvol:.1f} -> Slippage {vol_penalty:.5f}")
                 
         order.slippage_penalty = vol_penalty
 
-        # EXECUTION REALITY:
+        # V20.2 FIX: GEOMETRIC PARITY SHIFT (Double Spread Penalty Cure)
+        # We must shift the SL and TP by the exact amount of the spread/slippage
+        # so that the geometric risk (distance in pips) remains perfectly identical
+        # to the Strategy intent and the Labeler bounds.
         if order.action == "BUY":
             # Buy Limit/Market fills at Ask
-            order.entry_price = order.entry_price + spread_cost + vol_penalty
+            execution_price = order.entry_price + spread_cost + vol_penalty
+            offset = execution_price - order.entry_price
+            
+            order.entry_price = execution_price
+            if order.stop_loss > 0: order.stop_loss += offset
+            if order.take_profit > 0: order.take_profit += offset
         else:
             # Sell Limit/Market fills at Bid - Penalty
-            order.entry_price = order.entry_price - vol_penalty
+            execution_price = order.entry_price - vol_penalty
+            offset = execution_price - order.entry_price
+            
+            order.entry_price = execution_price
+            if order.stop_loss > 0: order.stop_loss += offset
+            if order.take_profit > 0: order.take_profit += offset
             
         order.commission = order.quantity * self.commission_per_lot
         

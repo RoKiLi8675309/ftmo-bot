@@ -53,12 +53,17 @@ class RiskManager:
 
     @staticmethod
     def get_pip_info(symbol: str) -> Tuple[float, int]:
-        """Returns (pip_size, digits)."""
+        """
+        Returns (pip_size, digits).
+        V20.2 FIX: Strict MT5 standard alignment for non-forex pairs.
+        """
         s = symbol.upper()
         if "JPY" in s: return 0.01, 3
         if "XAU" in s or "XAG" in s: return 0.1, 2
-        if any(x in s for x in ["US30", "GER30", "NAS100", "SPX500", "DJI", "DAX"]): return 1.0, 1
-        if "BTC" in s or "ETH" in s: return 1.0, 2
+        if any(x in s for x in ["US30", "GER30", "GER40", "NAS100", "SPX500", "US500", "DJI", "DAX", "UK100", "JP225"]): 
+            return 1.0, 1
+        if "BTC" in s or "ETH" in s: 
+            return 1.0, 2
         return 0.0001, 5
 
     @staticmethod
@@ -132,7 +137,7 @@ class RiskManager:
             leverage = float(lev_map.get('minor', 30.0))
         if "XAU" in s or "XAG" in s:
             leverage = float(lev_map.get('gold', 20.0))
-        if any(x in s for x in ["US30", "GER30", "NAS100", "SPX500"]):
+        if any(x in s for x in ["US30", "GER30", "GER40", "NAS100", "SPX500", "US500", "DJI", "DAX", "UK100", "JP225"]):
             leverage = float(lev_map.get('indices', 20.0))
         if "BTC" in s or "ETH" in s:
             leverage = float(lev_map.get('crypto', 2.0))
@@ -147,8 +152,10 @@ class RiskManager:
     def _calculate_max_margin_volume(symbol: str, free_margin: float, contract_size: float, price: float, conversion_rate: float) -> float:
         """
         Calculates maximum volume allowed by free margin (Leverage Guard).
+        V20.2 FIX: Guard against Infinity or NaN on zero division.
         """
-        if free_margin <= 0: return 0.0
+        if free_margin <= 0 or contract_size <= 0 or price <= 0 or conversion_rate <= 0: 
+            return 0.0
 
         risk_conf = CONFIG.get('risk_management', {})
         lev_map = risk_conf.get('leverage', {})
@@ -162,7 +169,7 @@ class RiskManager:
             lev = float(lev_map.get('gold', 20.0))
         elif "BTC" in s or "ETH" in s:
             lev = float(lev_map.get('crypto', 2.0))
-        elif any(x in s for x in ["US30", "GER30", "NAS100", "SPX500"]):
+        elif any(x in s for x in ["US30", "GER30", "GER40", "NAS100", "SPX500", "US500", "DJI", "DAX", "UK100", "JP225"]):
             lev = float(lev_map.get('indices', 20.0))
 
         if lev <= 0: return 0.0
@@ -172,6 +179,8 @@ class RiskManager:
 
         # 95% Safety Factor
         max_vol = (free_margin * 0.95) / one_lot_margin
+        if not math.isfinite(max_vol): return 0.0
+        
         return max_vol
 
     @staticmethod
@@ -189,11 +198,13 @@ class RiskManager:
         performance_score: float = 0.0,
         daily_pnl_pct: float = 0.0,
         current_open_risk_pct: float = 0.0,
-        free_margin: float = 999999.0 
+        free_margin: float = 999999.0,
+        parkinson_vol: float = 0.0  
     ) -> Tuple[Trade, float]:
         """
-        V17.0 UPDATE: Supports 'fixed_lots' to force micro-sizing (Survival Protocol).
-        Prevents 4.0 lot blowups by bypassing equity-based calculations.
+        V20.2 UPDATE: Strict Geometric Synchronization.
+        Ensures the TradeIntent TP/SL distances perfectly match the AdaptiveTripleBarrier's
+        internal realities (including dynamic reward multipliers, volatility boosts, and minimum pip floors).
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -209,33 +220,54 @@ class RiskManager:
         else:
             c_size = RiskManager.get_contract_size(symbol)
         
-        # 2. Stop Loss Geometry (Geometry First, Sizing Second)
-        atr_mult_sl = float(risk_conf.get('stop_loss_atr_mult', 1.5)) 
-        atr_mult_tp = float(risk_conf.get('take_profit_atr_mult', 3.0))
+        # 2. Stop Loss Geometry (Parity with AdaptiveTripleBarrier)
+        atr_mult_sl = float(risk_conf.get('stop_loss_atr_mult', 2.0)) 
         
-        if atr and atr > 0:
-            stop_dist = atr * atr_mult_sl
+        # Pull dynamic reward multiplier directly from context if strategy modified it
+        if hasattr(context, 'risk_reward_ratio') and context.risk_reward_ratio and context.risk_reward_ratio > 0:
+            current_reward_mult = context.risk_reward_ratio
         else:
-            stop_dist = price * 0.002 * atr_mult_sl
+            current_reward_mult = float(risk_conf.get('take_profit_atr_mult', 2.5))
+            
+        # Mirrors the exact expansion math in AdaptiveTripleBarrier to prevent TP/SL hallucination.
+        adaptive_scalar = 1.0 + (volatility * 100.0)
+        vol_boost = 0.5 if parkinson_vol > 0.002 else 0.0
+        
+        effective_risk_mult = (atr_mult_sl + vol_boost) * adaptive_scalar
+        effective_reward_mult = (current_reward_mult + vol_boost) * adaptive_scalar
+
+        if atr and atr > 0:
+            raw_stop_dist = atr * effective_risk_mult
+        else:
+            raw_stop_dist = price * 0.002 * effective_risk_mult
             
         # Hard Floor Enforcement
         pip_val_raw, _ = RiskManager.get_pip_info(symbol)
         if pip_val_raw <= 0: pip_val_raw = 0.0001
         
-        # V17.0: Absolute Hard Floor (25 pips default)
-        config_min_pips = float(risk_conf.get('min_stop_loss_pips', 25.0))
+        # Absolute Hard Floor (8.0 pips default)
+        config_min_pips = float(risk_conf.get('min_stop_loss_pips', 8.0))
         min_stop_hard_floor = config_min_pips * pip_val_raw
         
-        # Apply Floor
-        stop_dist = max(stop_dist, min_stop_hard_floor)
+        # V20.2 FIX: Asset-specific floor safety nets to prevent instant spread blowout
+        if "BTC" in symbol or "ETH" in symbol:
+            min_stop_hard_floor = max(min_stop_hard_floor, 50.0 * pip_val_raw) # 50.0 distance floor
+        elif any(idx in symbol for idx in ["US30", "GER30", "NAS100", "SPX500"]):
+            min_stop_hard_floor = max(min_stop_hard_floor, 5.0 * pip_val_raw) # 5.0 distance floor
+        
+        # Apply Floor (This matches the new Labeler logic perfectly)
+        stop_dist = max(raw_stop_dist, min_stop_hard_floor)
         sl_pips = stop_dist / pip_val_raw
+
+        # Calculate TP based on the exact dynamically requested ratio *after* floor modification
+        tp_dist = stop_dist * (effective_reward_mult / effective_risk_mult)
 
         # 3. Conversion Rate
         conversion_rate = RiskManager.get_conversion_rate(symbol, price, market_prices)
         if conversion_rate <= 0:
             return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, "No Conversion Rate"), 0.0
 
-        # Calculate Risk Per Lot (Required for both Fixed and Dynamic logic)
+        # Calculate Risk Per Lot
         usd_per_pip_per_lot = c_size * pip_val_raw * conversion_rate
         loss_per_lot_usd = sl_pips * usd_per_pip_per_lot
         
@@ -243,8 +275,7 @@ class RiskManager:
             return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, "Zero Risk Error"), 0.0
 
         # =========================================================
-        # V17.0 FIX: FIXED LOT BYPASS
-        # If method is 'fixed_lots', we ignore all equity math.
+        # FIXED LOT BYPASS
         # =========================================================
         sizing_method = risk_conf.get('sizing_method', 'risk_percentage')
         
@@ -255,33 +286,31 @@ class RiskManager:
             max_margin_lots = RiskManager._calculate_max_margin_volume(symbol, free_margin, c_size, price, conversion_rate)
             
             if fixed_qty > max_margin_lots:
-                # If we can't afford 0.01, we hold.
                 return Trade(symbol, "HOLD", 0.0, 0.0, 0.0, 0.0, f"Insufficient Margin for {fixed_qty}"), 0.0
             
-            # Calculate implied risk for stats
             implied_risk_usd = fixed_qty * loss_per_lot_usd
             
             trade = Trade(
                 symbol=symbol,
-                action="HOLD", # Action set by caller
+                action="HOLD", 
                 volume=fixed_qty,
                 entry_price=price,
                 stop_loss=stop_dist,
-                take_profit=stop_dist * (atr_mult_tp / atr_mult_sl),
+                take_profit=tp_dist,
                 comment=f"Fixed:{fixed_qty}|SL:{sl_pips:.0f}|R:${implied_risk_usd:.2f}"
             )
             return trade, implied_risk_usd
 
         # =========================================================
-        # LEGACY PERCENTAGE LOGIC (Fallback)
+        # DYNAMIC PERCENTAGE LOGIC
         # =========================================================
         
         lots = 0.0
         calculated_risk_usd = 0.0
         
-        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.0025)
+        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.0050)
         buffer_threshold = risk_conf.get('profit_buffer_threshold', 0.02)
-        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.005)
+        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.0075)
         
         scaling_comment = ""
         
@@ -340,7 +369,7 @@ class RiskManager:
             volume=lots,
             entry_price=price,
             stop_loss=stop_dist,
-            take_profit=stop_dist * (atr_mult_tp / atr_mult_sl),
+            take_profit=tp_dist,
             comment=f"Risk:{risk_pct:.2f}%{scaling_comment}|SQN:{performance_score:.1f}|R:${final_risk_usd:.0f}"
         )
         
@@ -514,12 +543,14 @@ class HierarchicalRiskParity:
             return {c: 1.0/len(cols) for c in cols}
         
         try:
-            corr = returns_df.corr().fillna(0)
+            # V20.2 FIX: Guard against flatline zero-variance which causes NaN in correlation
+            df_safe = returns_df.fillna(0.0)
+            corr = df_safe.corr().fillna(0.0)
             dist = ssd.pdist(corr, metric='euclidean')
             link = sch.linkage(dist, method='single')
             sort_ix = HierarchicalRiskParity._get_quasi_diag(link)
             sort_ix = [cols[i] for i in sort_ix]
-            cov = returns_df.cov()
+            cov = df_safe.cov()
             variances = np.diag(cov)
             variances[variances < EPS] = EPS
             inv_var = 1.0 / variances
@@ -539,7 +570,7 @@ class HierarchicalRiskParity:
             df0 = sort_ix[sort_ix >= num_items]
             i = df0.index
             j = df0.values - num_items
-            sort_ix[i] = link[j, 0]
+            sort_ix.loc[i] = link[j, 0]
             df0 = pd.Series(link[j, 1], index=i + 1)
             sort_ix = pd.concat([sort_ix, df0])
             sort_ix = sort_ix.sort_index()
@@ -565,7 +596,11 @@ class PortfolioRiskManager:
         if min_len < 20: return
         data = {s: self.returns_buffer[s][-min_len:] for s in self.symbols}
         df = pd.DataFrame(data)
-        self.correlation_matrix = df.corr()
+        
+        # V20.2 FIX: Guard against NaN correlations from flat price action arrays
+        df = df.fillna(0.0)
+        corr = df.corr()
+        self.correlation_matrix = corr.fillna(0.0)
 
     def get_correlation_count(self, symbol: str, threshold: float = 0.7) -> int:
         if self.correlation_matrix.empty or symbol not in self.correlation_matrix.columns: return 0

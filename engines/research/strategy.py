@@ -2,41 +2,285 @@ from __future__ import annotations
 import logging
 import sys
 import numpy as np
-import random
 import math
 import pytz
-import json
 from collections import deque, defaultdict, Counter
 from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime, timedelta
 
 # Third-Party Imports
-from river import drift
+try:
+    from river import drift, linear_model, optim, forest, metrics
+except ImportError:
+    pass
 
 # Shared Imports
 from shared import (
     CONFIG,
     OnlineFeatureEngineer,
-    AdaptiveTripleBarrier,
-    ProbabilityCalibrator,
     RiskManager,
     TradeContext,
     LogSymbols,
     Trade
 )
-# New Feature Import
-from shared.financial.features import MetaLabeler
 
 # Local Imports
 from engines.research.backtester import MarketSnapshot, BacktestBroker, BacktestOrder
 
 logger = logging.getLogger("ResearchStrategy")
 
+# =============================================================================
+# V20.2 MATHEMATICAL PARITY CLASSES (THE IMPULSE SCALPER)
+# Embedded locally to guarantee the WFO Backtester uses the exact same 
+# Probability Calibration and TP/SL Geometry as the Live Predictor.
+# =============================================================================
+
+class ProbabilityCalibrator:
+    """
+    V20.2 BOOTSTRAP PROTOCOL:
+    Platt Scaling Calibrator adapted for swing trading confidence.
+    Guarantees smooth, continuous probability outputs (0.01 to 0.99).
+    """
+    def __init__(self):
+        self.calibrator = linear_model.LogisticRegression(
+            optimizer=optim.SGD(0.05),
+            loss=optim.losses.Log(),
+            l2=0.1
+        )
+        self.samples_seen = 0
+
+    def update(self, prob: float, label: int):
+        if math.isfinite(prob):
+            self.calibrator.learn_one({'raw_prob': prob}, label)
+            self.samples_seen += 1
+
+    def calibrate(self, raw_prob: float) -> float:
+        # V20.2 FIX: Gently floor early probabilities so WFO trials don't stall out
+        # before the calibrator has enough data to build a baseline curve.
+        if self.samples_seen < 100:
+            return max(0.50, raw_prob) 
+            
+        try:
+            calibrated_dict = self.calibrator.predict_proba_one({'raw_prob': raw_prob})
+            calibrated = calibrated_dict.get(1, raw_prob)
+            return max(0.01, min(calibrated, 0.99))
+        except Exception:
+            return max(0.50, raw_prob)
+
+class MetaLabeler:
+    """
+    Secondary model that learns when the primary model is likely to be right or wrong.
+    """
+    def __init__(self):
+        self.model = forest.ARFClassifier(
+            n_models=10, 
+            seed=42, 
+            metric=metrics.F1()
+        )
+        self.buffer = deque(maxlen=1000)
+
+    def update(self, features: Dict[str, float], primary_action: int, outcome_pnl: float):
+        if primary_action == 0: return
+        y_meta = 1 if outcome_pnl > 0 else 0
+        try:
+            meta_feats = self._enrich(features, primary_action)
+            clean_features = self._sanitize(meta_feats)
+            self.model.learn_one(clean_features, y_meta)
+            self.buffer.append((clean_features, y_meta))
+        except Exception: pass
+
+    def predict(self, features: Dict[str, float], primary_action: int, threshold: float = 0.50) -> bool:
+        if primary_action == 0: return False
+        
+        # Allow 100 free trades before enforcing Meta-Labeler
+        if len(self.buffer) < 100: return True 
+        
+        try:
+            meta_feats = self._enrich(features, primary_action)
+            clean_features = self._sanitize(meta_feats)
+            probs = self.model.predict_proba_one(clean_features)
+            # V20.2 FIX: Relaxed to 50/50 statistical edge
+            return probs.get(1, 0.0) >= threshold
+        except Exception:
+            return False
+
+    def _enrich(self, features: Dict[str, float], action: int) -> Dict[str, float]:
+        clean = features.copy()
+        clean['primary_action'] = float(action)
+        clean['vol_x_action'] = clean.get('volatility', 0.0) * action
+        clean['hurst_x_action'] = (clean.get('hurst', 0.5) - 0.5) * action
+        clean['vpin_x_action'] = clean.get('vpin', 0.5) * action
+        clean['ker_x_action'] = clean.get('ker', 0.5) * action
+        clean['aggressor_x_action'] = (clean.get('aggressor_ratio', 0.5) - 0.5) * action
+        return clean
+
+    def _sanitize(self, features: Dict[str, float]) -> Dict[str, float]:
+        return {k: float(v) for k, v in features.items() if v is not None and math.isfinite(v)}
+
+class AdaptiveTripleBarrier:
+    """
+    V20.2 SPREAD TRAP CURE & CHOP LABELING.
+    Simulates actual broker execution constraints perfectly aligned with RiskManager.
+    """
+    def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.0, reward_mult: float = 2.0, 
+                 drift_threshold: float = 0.75, horizon_type: str = 'TIME', horizon_value: float = 0.0):
+        self.buffer = deque()
+        self.time_limit = horizon_ticks
+        self.risk_mult = risk_mult
+        self.reward_mult = reward_mult
+        self.drift_threshold = drift_threshold
+        self.horizon_type = horizon_type.upper()
+        self.horizon_threshold = horizon_value
+        if self.horizon_type == 'TIME' and self.horizon_threshold == 0:
+            self.horizon_threshold = horizon_ticks
+
+    def add_trade_opportunity(self, features: Dict[str, float], entry_price: float, current_atr: float, 
+                              timestamp: float, parkinson_vol: float = 0.0, 
+                              min_stop_dist: float = 0.0, spread_in_price: float = 0.0, 
+                              comm_in_price: float = 0.0, min_profit_dist: float = 0.0,
+                              proposed_action: int = 0, pred_proba: float = 0.5,
+                              override_reward_mult: float = None):
+        
+        if current_atr <= 0: current_atr = entry_price * 0.0001
+        
+        volatility = features.get('volatility', 0.0)
+        adaptive_scalar = 1.0 + (volatility * 100.0)
+        
+        p_vol = parkinson_vol if parkinson_vol > 0 else features.get('parkinson_vol', 0.0)
+        vol_boost = 0.5 if p_vol > 0.002 else 0.0
+        
+        # Apply Regime-Specific TP Override
+        actual_reward_mult = override_reward_mult if override_reward_mult else self.reward_mult
+        
+        effective_risk_mult = (self.risk_mult + vol_boost) * adaptive_scalar
+        effective_reward_mult = (actual_reward_mult + vol_boost) * adaptive_scalar
+        
+        raw_risk_dist = effective_risk_mult * current_atr
+        actual_risk_dist = max(raw_risk_dist, min_stop_dist) 
+        
+        actual_reward_dist = actual_risk_dist * (effective_reward_mult / effective_risk_mult)
+        
+        buy_tp = entry_price + actual_reward_dist
+        buy_sl = entry_price - actual_risk_dist
+        
+        sell_tp = entry_price - actual_reward_dist - spread_in_price
+        sell_sl = entry_price + actual_risk_dist - spread_in_price
+
+        self.buffer.append({
+            'features': features.copy(),
+            'entry': entry_price,
+            'buy_tp': buy_tp,
+            'buy_sl': buy_sl,
+            'sell_tp': sell_tp,
+            'sell_sl': sell_sl,
+            'atr': current_atr,
+            'start_time': timestamp, 
+            'age': 0,
+            'cum_vol': 0.0,
+            'cum_volatility': 0.0,
+            'spread_pct': spread_in_price / entry_price if entry_price > 0 else 0.0,
+            'comm_pct': comm_in_price / entry_price if entry_price > 0 else 0.0,
+            'proposed_action': proposed_action,
+            'pred_proba': pred_proba
+        })
+
+    def resolve_labels(self, current_high: float, current_low: float, current_close: float = None, 
+                       current_volume: float = 0.0, current_log_ret: float = 0.0,
+                       current_timestamp: float = 0.0) -> List[Tuple[Dict[str, float], int, float, int, float, float]]:
+        resolved = []
+        active = deque()
+        if current_close is None: current_close = (current_high + current_low) / 2.0
+
+        while self.buffer:
+            trade = self.buffer.popleft()
+            trade['age'] += 1
+            trade['cum_vol'] += current_volume
+            trade['cum_volatility'] += (current_log_ret ** 2)
+
+            is_expired = False
+            if self.horizon_type == 'TIME':
+                duration_sec = current_timestamp - trade['start_time']
+                if duration_sec >= (self.time_limit * 60): 
+                    is_expired = True
+            elif self.horizon_type == 'VOLUME':
+                thresh = self.horizon_threshold if self.horizon_threshold > 0 else current_volume * 100
+                if trade['cum_vol'] >= thresh: is_expired = True
+            elif self.horizon_type == 'VOLATILITY':
+                thresh = self.horizon_threshold if self.horizon_threshold > 0 else 0.0005
+                if trade['cum_volatility'] >= thresh: is_expired = True
+
+            buy_status = 0
+            sell_status = 0
+
+            if current_low <= trade['buy_sl']: buy_status = -1
+            elif current_high >= trade['buy_tp']: buy_status = 1
+            
+            if current_high >= trade['sell_sl']: sell_status = -1
+            elif current_low <= trade['sell_tp']: sell_status = 1
+
+            if buy_status != 0 or sell_status != 0 or is_expired:
+                buy_ret = 0.0
+                sell_ret = 0.0
+                spread_pct = trade['spread_pct']
+                comm_pct = trade['comm_pct']
+
+                if buy_status == 1: 
+                    buy_ret = (trade['buy_tp'] - trade['entry']) / trade['entry'] - spread_pct - comm_pct
+                elif buy_status == -1: 
+                    buy_ret = (trade['buy_sl'] - trade['entry']) / trade['entry'] - spread_pct - comm_pct
+                elif is_expired: 
+                    buy_ret = (current_close - trade['entry']) / trade['entry'] - spread_pct - comm_pct
+
+                if sell_status == 1: 
+                    sell_ret = (trade['entry'] - trade['sell_tp']) / trade['entry'] - spread_pct - comm_pct
+                elif sell_status == -1: 
+                    sell_ret = (trade['entry'] - trade['sell_sl']) / trade['entry'] - spread_pct - comm_pct
+                elif is_expired: 
+                    sell_ret = (trade['entry'] - current_close) / trade['entry'] - spread_pct - comm_pct
+
+                # V20.2 FIX: Teach the Base Model what Noise/Chop is.
+                # Do NOT force a 1 or -1 label if BOTH directions resulted in a loss.
+                if buy_ret > 0 and buy_ret > sell_ret:
+                    optimal_label = 1
+                    optimal_ret = buy_ret
+                elif sell_ret > 0 and sell_ret > buy_ret:
+                    optimal_label = -1
+                    optimal_ret = sell_ret
+                else:
+                    optimal_label = 0
+                    optimal_ret = max(buy_ret, sell_ret)
+                    
+                proposed_action = trade.get('proposed_action', 0)
+                pred_proba = trade.get('pred_proba', 0.5)
+                proposed_ret = 0.0
+                
+                if proposed_action == 1:
+                    proposed_ret = buy_ret
+                elif proposed_action == -1:
+                    proposed_ret = sell_ret
+
+                resolved.append((
+                    trade['features'], 
+                    optimal_label, 
+                    optimal_ret,
+                    proposed_action,
+                    pred_proba,
+                    proposed_ret
+                ))
+            else:
+                active.append(trade)
+
+        self.buffer = active
+        return resolved
+
+# =============================================================================
+# STRATEGY ENGINE
+# =============================================================================
+
 class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
-    Manages its own Feature Engineering, Adaptive Labeler, and River Model.
-    Strictly implements the Profit Maximization Protocol (V17.6).
+    Strictly implements the Profit Maximization Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
         self.model = model
@@ -51,34 +295,29 @@ class ResearchStrategy:
         
         # --- RISK CONFIGURATION ---
         self.risk_conf = params.get('risk_management', CONFIG.get('risk_management', {}))
-        # Standardize risk multiplier 
-        self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 2.5))
+        self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 1.5))
         self.max_currency_exposure = int(self.risk_conf.get('max_currency_exposure', 2))
-        self.cooldown_minutes = int(self.risk_conf.get('loss_cooldown_minutes', 60))
+        self.cooldown_minutes = int(self.risk_conf.get('loss_cooldown_minutes', 30)) # V20.2
         
         # 2. Adaptive Triple Barrier Labeler (The Teacher)
         tbm_conf = params.get('tbm', {})
-        risk_mult_conf = self.sl_atr_mult
-        self.optimized_reward_mult = float(tbm_conf.get('barrier_width', 2.5)) 
+        self.optimized_reward_mult = float(tbm_conf.get('barrier_width', 1.5)) 
         
-        # Default Horizon Reduced to 240m (4h) for Scalping
         self.labeler = AdaptiveTripleBarrier(
-            horizon_ticks=int(tbm_conf.get('horizon_minutes', 240)), 
-            risk_mult=risk_mult_conf, 
+            horizon_ticks=int(tbm_conf.get('horizon_minutes', 360)), 
+            risk_mult=self.sl_atr_mult, 
             reward_mult=self.optimized_reward_mult,
             drift_threshold=float(tbm_conf.get('drift_threshold', 1.5))
         )
         
-        # 3. Meta Labeler (The Gatekeeper)
+        # 3. Meta Labeler & Calibrators
         self.meta_labeler = MetaLabeler()
+        self.calibrator_buy = ProbabilityCalibrator()
+        self.calibrator_sell = ProbabilityCalibrator()
         self.meta_label_events = 0 
         
-        # 4. Probability Calibrators
-        self.calibrator_buy = ProbabilityCalibrator(window=2000)
-        self.calibrator_sell = ProbabilityCalibrator(window=2000)
-        
-        # 5. Warm-up State
-        self.burn_in_limit = params.get('burn_in_periods', 30) 
+        # 4. Warm-up State
+        self.burn_in_limit = params.get('burn_in_periods', 30)
         self.burn_in_counter = 0
         self.burn_in_complete = False
         
@@ -88,6 +327,13 @@ class ResearchStrategy:
         self.last_price_map = {}
         self.bars_processed = 0
         self.consecutive_losses = 0 
+        
+        self.active_signals = deque()
+        self.daily_performance = {'pnl': 0.0, 'losses': 0}
+        
+        # V18.1: DIRECTIONAL COOLDOWN (Anti-Machine Gun)
+        self.last_trade_bar = 0
+        self.last_trade_direction = 0
         
         # --- GOLDEN TRIO BUFFERS ---
         self.window_size_trio = 100
@@ -116,34 +362,25 @@ class ResearchStrategy:
         self.feature_importance_counter = Counter() 
         
         # ============================================================
-        # STRATEGY CONFIGURATION (V17.6 UNCHOKE OVERRIDES)
-        # We explicitly OVERRIDE config.yaml here because V17.5 strict settings 
-        # caused trade starvation (No Trigger) and mathematical ruin.
+        # STRATEGY CONFIGURATION (V20.2 UNCHOKED PROTOCOL)
         # ============================================================
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
         self.bb_window = 20
-        self.bb_std = 1.5 # V17.6 OVERRIDE: Loosened from 2.0 to restore triggers
+        self.bb_std = float(phx_conf.get('bb_std_dev', 1.0)) # V20.2
         self.bb_buffer = deque(maxlen=self.bb_window)
         
-        self.ker_floor = 0.002
-        self.hurst_breakout = 0.55 # V17.6 OVERRIDE: Loosened from 0.58
-        self.hurst_reversion = 0.48 # V17.6 OVERRIDE: Loosened from 0.45
-        self.rvol_trigger = 2.5
-        self.require_d1_trend = phx_conf.get('require_d1_trend', True)
+        # V20.2 FIX: Lowered barriers to prevent trade starvation
+        self.ker_floor = 0.0003 
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.52))
+        self.hurst_veto = 0.65 
         
-        # V17.6 OVERRIDE: Force regime logic to open up all asset classes
+        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 0.8)) 
+        
         self.regime_enforcement = "DISABLED" 
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
-        
-        self.vol_gate_ratio = 0.8
-        self.max_rvol_thresh = 25.0
-        self.chop_threshold = 65.0
-        
-        self.adx_threshold = 15.0 # V17.6 OVERRIDE: Loosened from 22.0
-        # ============================================================
-        
-        self.limit_order_offset_pips = CONFIG.get('trading', {}).get('limit_order_offset_pips', 0.1)
+        self.max_rvol_thresh = 35.0 
+        self.adx_threshold = 0.0 
         
         # --- SESSION CONTROL ---
         session_conf = self.risk_conf.get('session_control', {})
@@ -151,32 +388,26 @@ class ResearchStrategy:
         self.start_hour = session_conf.get('start_hour_server', 10)
         self.liq_hour = session_conf.get('liquidate_hour_server', 21)
         
-        # Legacy Friday Liquidation (Reinforced)
         self.friday_entry_cutoff = self.risk_conf.get('friday_entry_cutoff_hour', 16)
         self.friday_close_hour = self.risk_conf.get('friday_liquidation_hour_server', 21)
         
-        # Timezone Handling
         tz_str = self.risk_conf.get('risk_timezone', 'Europe/Prague')
         try:
             self.server_tz = pytz.timezone(tz_str)
         except Exception:
             self.server_tz = pytz.timezone('Europe/Prague')
         
-        # --- Dynamic Gate Scaling State ---
+        # Drift Detection
         self.ker_drift_detector = drift.ADWIN(delta=0.01)
         self.dynamic_ker_offset = 0.0
 
-        # --- Daily Circuit Breaker State ---
-        self.daily_max_losses = 10 
+        # Daily Circuit Breaker
+        self.daily_max_losses = 20 
         self.daily_max_loss_pct = 0.045
 
     def _calculate_golden_trio(self) -> Tuple[float, float, float]:
-        """
-        Calculates the "Golden Trio" of features locally using accurate buffers.
-        """
         closes = self.closes_buffer
         vols = self.volume_buffer
-        
         hurst = 0.5
         ker = 0.5
         rvol = 1.0
@@ -186,9 +417,7 @@ class ResearchStrategy:
 
         prices = np.array(closes)
         
-        # 1. Simple Hurst
         try:
-            # Math Guard: Variance check
             if np.var(prices) < 1e-9:
                 hurst = 0.5
             else:
@@ -199,109 +428,49 @@ class ResearchStrategy:
                     std = np.std(diff)
                     tau.append(std if std > 1e-9 else 1e-9)
                 
-                # Polyfit on log-log
                 poly = np.polyfit(np.log(lags), np.log(tau), 1)
-                hurst = poly[0] 
-                hurst = max(0.0, min(1.0, hurst))
+                hurst = max(0.0, min(1.0, poly[0]))
         except:
             hurst = 0.5
 
-        # 2. KER
         try:
             diffs = np.diff(prices)
             net_change = abs(prices[-1] - prices[0])
             sum_changes = np.sum(np.abs(diffs))
-            if sum_changes > 1e-9:
-                ker = net_change / sum_changes
-            else:
-                ker = 0.0
+            ker = net_change / sum_changes if sum_changes > 1e-9 else 0.0
         except:
             ker = 0.0
 
-        # 3. RVOL
         if len(vols) > 10:
             curr_vol = vols[-1]
             avg_vol = np.mean(list(vols)[:-1]) 
-            if avg_vol > 1e-9:
-                rvol = curr_vol / avg_vol
-            else:
-                rvol = 1.0
+            rvol = curr_vol / avg_vol if avg_vol > 1e-9 else 1.0
         
         return hurst, ker, rvol
 
-    def _calculate_trend_bias(self, current_price: float) -> int:
-        """
-        Returns 1 (Bullish), -1 (Bearish), or 0 (Neutral).
-        """
-        if len(self.sma_window) < 200:
-            return 0 
-            
-        sma_200 = sum(self.sma_window) / 200
-        threshold = sma_200 * 0.0005
-        
-        if current_price > (sma_200 + threshold):
-            return 1
-        elif current_price < (sma_200 - threshold):
-            return -1
-        else:
-            return 0
-
     def _check_volatility_condition(self, current_price: float) -> bool:
-        """
-        V17.5 PARITY FIX: Buffer updating logic moved to main on_data loop.
-        This solely checks the standard deviation to ensure sufficient volatility.
-        """
-        if len(self.returns_window) < 10:
-            return True 
-            
+        if len(self.returns_window) < 10: return True 
         vol = np.std(list(self.returns_window))
-        MIN_VOLATILITY = 0.00015 
-        
-        if vol < MIN_VOLATILITY:
-            return False
-            
-        return True
-
-    def _calibrate_confidence(self, raw_conf: float) -> float:
-        x = (raw_conf - 0.5) * 10.0 
-        calibrated = 1 / (1 + np.exp(-x))
-        return calibrated
+        return vol >= 0.00005
 
     def _get_preferred_regime(self, symbol: str) -> str:
-        """
-        ROBUST ASSET PERSONALITY DETECTION.
-        """
-        if symbol in self.asset_regime_map:
-            return self.asset_regime_map[symbol]
-        
-        regimes_found = []
-        for key, regime in self.asset_regime_map.items():
-            if key in symbol:
-                regimes_found.append(regime)
-        
-        if "TREND_BREAKOUT" in regimes_found:
-            return "TREND_BREAKOUT"
-            
-        if "MEAN_REVERSION" in regimes_found:
-            return "MEAN_REVERSION"
-            
+        if symbol in self.asset_regime_map: return self.asset_regime_map[symbol]
+        regimes_found = [regime for key, regime in self.asset_regime_map.items() if key in symbol]
+        if "TREND_BREAKOUT" in regimes_found: return "TREND_BREAKOUT"
+        if "MEAN_REVERSION" in regimes_found: return "MEAN_REVERSION"
         return "NEUTRAL"
 
     def _check_currency_exposure(self, broker: BacktestBroker, symbol: str) -> bool:
         base_ccy = symbol[:3]
         quote_ccy = symbol[3:]
-        
         base_count = 0
         quote_count = 0
         
         for pos in broker.open_positions:
             pos_base = pos.symbol[:3]
             pos_quote = pos.symbol[3:]
-            
-            if base_ccy == pos_base or base_ccy == pos_quote:
-                base_count += 1
-            if quote_ccy == pos_base or quote_ccy == pos_quote:
-                quote_count += 1
+            if base_ccy == pos_base or base_ccy == pos_quote: base_count += 1
+            if quote_ccy == pos_base or quote_ccy == pos_quote: quote_count += 1
         
         if base_count >= self.max_currency_exposure:
             self.rejection_stats[f"Max Exposure ({base_ccy})"] += 1
@@ -315,12 +484,9 @@ class ResearchStrategy:
 
     def _check_revenge_guard(self, broker: BacktestBroker, current_time: datetime) -> bool:
         my_closed_trades = [t for t in broker.closed_positions if t.symbol == self.symbol and t.close_time is not None]
-        
-        if not my_closed_trades:
-            return False
+        if not my_closed_trades: return False
             
         last_trade = my_closed_trades[-1]
-        
         close_time = last_trade.close_time
         if close_time.tzinfo is None:
             close_time = close_time.replace(tzinfo=current_time.tzinfo)
@@ -328,15 +494,11 @@ class ResearchStrategy:
             close_time = close_time.astimezone(current_time.tzinfo)
             
         cooldown_expiry = close_time + timedelta(minutes=self.cooldown_minutes)
-        
-        if current_time < cooldown_expiry:
-            return True 
-            
-        return False
+        return current_time < cooldown_expiry
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
         """
-        Main Event Loop for the Strategy (Scalper Mode).
+        Main Event Loop for the Strategy (Backtest Mode).
         """
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
@@ -355,20 +517,16 @@ class ResearchStrategy:
         self.volume_buffer.append(volume)
         self.sma_window.append(price)
         
-        # --- V17.5 PARITY FIX: Global Returns Window Update ---
         if len(self.sma_window) >= 2:
             prev_p = self.sma_window[-2]
             if prev_p > 0:
-                ret = math.log(price / prev_p)
-                self.returns_window.append(ret)
+                self.returns_window.append(math.log(price / prev_p))
         
         self.sniper_closes.append(price)
         if len(self.sniper_closes) > 1:
-            delta = self.sniper_closes[-1] - self.sniper_closes[-2]
-            self.sniper_rsi.append(delta)
+            self.sniper_rsi.append(self.sniper_closes[-1] - self.sniper_closes[-2])
         self.bb_buffer.append(price)
 
-        # Inject Aux Data
         self._inject_auxiliary_data()
 
         # Timestamp Handling
@@ -387,20 +545,15 @@ class ResearchStrategy:
             dt_ts = dt_ts.replace(tzinfo=pytz.utc)
         server_time = dt_ts.astimezone(self.server_tz)
 
-        # --- UPDATE MTF CONTEXT ---
+        # Context
         context_data = self._simulate_mtf_context(price, server_time)
         self.current_d1_ema = context_data.get('d1', {}).get('ema200', 0.0)
 
-        # V17.6 FIX: Removed _check_daily_loss_limit invocation entirely. 
-        # The BacktestBroker handles hard-deck violations and sets broker.is_blown correctly.
-        # This stops the infinite loop of "Account Daily Limit Hit" rejections!
-
-        # --- SYMBOL CIRCUIT BREAKER ---
+        # Essential Risk Gates
         if self._check_symbol_circuit_breaker(broker, server_time):
             self.rejection_stats["Symbol Circuit Breaker (Loss Limit)"] += 1
             return
             
-        # --- REVENGE TRADING GUARD (MANDATORY COOLDOWN) ---
         if self._check_revenge_guard(broker, server_time):
             self.rejection_stats["Mandatory Cooldown (Revenge Guard)"] += 1
             return
@@ -409,39 +562,23 @@ class ResearchStrategy:
         self._manage_trailing_stops(broker, price, dt_ts)
         self._manage_time_stops(broker, dt_ts)
 
-        # --- GAP-PROOF LIQUIDATION (SESSION & WEEKEND) ---
+        # --- GAP-PROOF LIQUIDATION ---
         is_weekend_hold = (server_time.weekday() > 4) 
         is_friday_close = (server_time.weekday() == 4 and server_time.hour >= self.friday_close_hour)
-        
         is_daily_session_close = False
-        if self.session_enabled:
-            if server_time.hour >= self.liq_hour:
-                is_daily_session_close = True
+        if self.session_enabled and server_time.hour >= self.liq_hour:
+            is_daily_session_close = True
 
         if is_weekend_hold or is_friday_close or is_daily_session_close:
             for pos in list(broker.open_positions):
                 if pos.symbol == self.symbol:
                      broker._close_partial_position(
-                        pos, 
-                        pos.quantity, 
-                        price, 
-                        dt_ts, 
-                        "Session/Friday Liquidation"
+                        pos, pos.quantity, price, dt_ts, "Session/Friday Liquidation"
                     )
             return 
-        
-        # --- SESSION START GUARD ---
-        if self.session_enabled and server_time.hour < self.start_hour:
-            return 
 
-        # Friday Entry Guard
-        if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff:
-            return 
-
-        # Flow Volumes (Tick Rule Fallback)
         buy_vol = snapshot.get_price(self.symbol, 'buy_vol')
         sell_vol = snapshot.get_price(self.symbol, 'sell_vol')
-        
         if buy_vol == 0 and sell_vol == 0:
             if self.last_price > 0:
                 if price > self.last_price:
@@ -450,64 +587,52 @@ class ResearchStrategy:
                     buy_vol = 0.0; sell_vol = volume
                 else:
                     buy_vol = volume / 2.0; sell_vol = volume / 2.0
-        
+                    
+        # Grab previous price for accurate candle body representation
+        prev_price = self.sma_window[-2] if len(self.sma_window) >= 2 else price
         self.last_price = price
 
-        # A. Feature Engineering
+        # ============================================================
+        # A. FEATURE ENGINEERING
+        # ============================================================
         features = self.fe.update(
-            price=price,
-            timestamp=timestamp,
-            volume=volume,
-            high=high,
-            low=low,
-            buy_vol=buy_vol,
-            sell_vol=sell_vol,
-            time_feats={},
-            context_data=context_data
+            price=price, timestamp=timestamp, volume=volume,
+            high=high, low=low, buy_vol=buy_vol, sell_vol=sell_vol,
+            time_feats={}, context_data=context_data
         )
-        
         if features is None: return
 
-        # --- GOLDEN TRIO INJECTION ---
         hurst, ker_val, rvol_val = self._calculate_golden_trio()
-        
         features['hurst'] = hurst
         features['ker'] = ker_val
         features['rvol'] = rvol_val
         
         self.last_features = features
-        
-        if self.burn_in_counter < self.burn_in_limit:
-            self.burn_in_counter += 1
-            if self.burn_in_counter == self.burn_in_limit:
-                self.burn_in_complete = True
-            return
 
-        self.bars_processed += 1
-
-        # Drift Detection
         self.ker_drift_detector.update(ker_val)
         if self.ker_drift_detector.drift_detected:
             self.dynamic_ker_offset = max(-0.10, self.dynamic_ker_offset - 0.05)
         else:
             self.dynamic_ker_offset = min(0.0, self.dynamic_ker_offset + 0.001)
 
-        # B. Delayed Training (V17.5 PARITY FIX: Pass Log Ret & Volume)
+        # ============================================================
+        # B. DELAYED TRAINING
+        # ============================================================
         log_ret = features.get('log_ret', 0.0)
+        
         resolved_labels = self.labeler.resolve_labels(
-            high, low, 
-            current_close=price, 
-            current_volume=volume, 
-            current_log_ret=log_ret
+            high, low, current_close=price, current_volume=volume, current_log_ret=log_ret,
+            current_timestamp=timestamp
         )
         
         if resolved_labels:
-            for (stored_feats, outcome_label, realized_ret) in resolved_labels:
-                w_pos = float(self.params.get('positive_class_weight', 1.5))
-                w_neg = float(self.params.get('negative_class_weight', 1.0))
-                base_weight = w_pos if outcome_label != 0 else w_neg
+            for (stored_feats, optimal_label, optimal_ret, past_action, past_prob, past_ret) in resolved_labels:
                 
-                ret_scalar = math.log1p(abs(realized_ret) * 100.0)
+                w_pos = float(self.params.get('positive_class_weight', 1.0))
+                w_neg = float(self.params.get('negative_class_weight', 1.0))
+                base_weight = w_pos if optimal_label != 0 else w_neg
+                
+                ret_scalar = math.log1p(abs(optimal_ret) * 100.0)
                 ret_scalar = max(0.5, min(ret_scalar, 5.0))
                 
                 hist_ker = stored_feats.get('ker', 0.5)
@@ -515,199 +640,187 @@ class ResearchStrategy:
                 
                 final_weight = base_weight * ret_scalar * ker_weight
                 
-                clean_stored = {k: float(v) for k, v in stored_feats.items()}
-                pre_train_proba = self.model.predict_proba_one(clean_stored)
+                if optimal_label == 0:
+                    final_weight *= 0.05 
                 
-                self.model.learn_one(clean_stored, outcome_label, sample_weight=final_weight)
+                clean_stored = {k: float(v) for k, v in stored_feats.items() if math.isfinite(v)}
                 
-                if outcome_label != 0:
-                      self.model.learn_one(clean_stored, outcome_label, sample_weight=final_weight * 1.5)
-                    
-                if outcome_label != 0:
-                    self.meta_labeler.update(clean_stored, primary_action=outcome_label, outcome_pnl=realized_ret)
-                    
-                    if outcome_label == 1:
-                        self.calibrator_buy.update(pre_train_proba.get(1, 0.0), 1 if realized_ret > 0 else 0)
-                    elif outcome_label == -1:
-                        self.calibrator_sell.update(pre_train_proba.get(-1, 0.0), 1 if realized_ret > 0 else 0)
+                if optimal_label != 0:
+                    self.model.learn_one(clean_stored, optimal_label, sample_weight=final_weight)
+                
+                if past_action != 0:
+                    self.meta_labeler.update(clean_stored, primary_action=past_action, outcome_pnl=past_ret)
+                    if past_action == 1:
+                        self.calibrator_buy.update(past_prob, 1 if past_ret > 0 else 0)
+                    elif past_action == -1:
+                        self.calibrator_sell.update(past_prob, 1 if past_ret > 0 else 0)
 
-        # C. Add Trade Opportunity
-        parkinson = features.get('parkinson_vol', 0.0)
+        # ============================================================
+        # C. SMART SIGNAL MATRIX (V20.2 IMPULSE SCALPER)
+        # ============================================================
+        regime_label = "Neutral"
+        proposed_action = 0 
+        
+        rsi_val = features.get('rsi_norm', 0.5) * 100.0
+        is_trending = hurst >= self.hurst_breakout
         current_atr = features.get('atr', 0.001)
-        self.labeler.add_trade_opportunity(features, price, current_atr, timestamp, parkinson_vol=parkinson)
+        
+        candle_move = abs(price - prev_price)
+        
+        # 1. VOLATILITY IMPULSE LOGIC (RVol + Absolute Move)
+        is_impulse = (rvol_val >= self.rvol_trigger) and (candle_move >= (current_atr * 0.5))
+        
+        if len(self.bb_buffer) >= self.bb_window:
+            bb_mu = np.mean(self.bb_buffer)
+            bb_std = np.std(self.bb_buffer)
+            if bb_std < 1e-9: bb_std = 1e-9 # Prevent Div/0 Flatline Collapse
+            
+            upper_bb = bb_mu + (self.bb_std * bb_std)
+            lower_bb = bb_mu - (self.bb_std * bb_std)
+            
+            if is_trending:
+                regime_label = "TREND_BREAKOUT"
+                
+                # V20.2: Structural Breakout (Impulse Continuation)
+                if is_impulse:
+                    if price > prev_price: 
+                        proposed_action = 1 
+                    elif price < prev_price: 
+                        proposed_action = -1 
+                    
+            else:
+                regime_label = "MEAN_REVERSION"
+                
+                # V20.2: True Extreme Exhaustion (Rubber Band)
+                if price <= lower_bb and rsi_val <= 25: 
+                    proposed_action = 1 
+                elif price >= upper_bb and rsi_val >= 75: 
+                    proposed_action = -1  
 
-        # D. ACTIVE TRADE MANAGEMENT (PYRAMIDING)
+        # Soft Veto: Only block MR if Hurst is incredibly high (hyper-trend)
+        if hurst >= self.hurst_veto and regime_label == "MEAN_REVERSION" and proposed_action != 0:
+            proposed_action = 0
+            self.rejection_stats["Veto: Hyper Trend (Hurst)"] += 1
+
+        clean_features = {k: float(v) for k, v in features.items() if math.isfinite(v)}
+        try:
+            pred_proba = self.model.predict_proba_one(clean_features)
+            prob_success = pred_proba.get(proposed_action, 0.0)
+        except:
+            prob_success = 0.0
+
+        # ============================================================
+        # D. ADD TRADE OPPORTUNITY
+        # ============================================================
+        parkinson = features.get('parkinson_vol', 0.0)
+        
+        pip_val, _ = RiskManager.get_pip_info(self.symbol)
+        if pip_val <= 0: pip_val = 0.0001
+        
+        spread_pips = float(CONFIG.get('forensic_audit', {}).get('spread_pips', {}).get(self.symbol, 1.6))
+        spread_in_price = spread_pips * pip_val
+        comm_in_price = 0.5 * pip_val 
+        
+        min_stop_pips = float(self.risk_conf.get('min_stop_loss_pips', 8.0))
+        min_stop_dist = min_stop_pips * pip_val
+        min_profit_dist = float(self.params.get('tbm', {}).get('min_profit_pips', 12.0)) * pip_val 
+
+        if regime_label == "MEAN_REVERSION":
+            current_reward_target = 1.0 
+        else:
+            current_reward_target = max(self.optimized_reward_mult, 1.5)
+
+        self.labeler.add_trade_opportunity(
+            features=features, entry_price=price, current_atr=current_atr, 
+            timestamp=timestamp, parkinson_vol=parkinson,
+            min_stop_dist=min_stop_dist, spread_in_price=spread_in_price,
+            comm_in_price=comm_in_price, min_profit_dist=min_profit_dist,
+            proposed_action=proposed_action, pred_proba=prob_success,
+            override_reward_mult=current_reward_target
+        )
+
+        # ============================================================
+        # E. SURVIVAL GATES (V20.2 UNCHOKED PROTOCOL)
+        # ============================================================
+        if self.burn_in_counter < self.burn_in_limit:
+            self.burn_in_counter += 1
+            if self.burn_in_counter == self.burn_in_limit: self.burn_in_complete = True
+            return
+
+        self.bars_processed += 1
         existing_positions = [p for p in broker.open_positions if p.symbol == self.symbol]
         
-        # ============================================================
-        # E. SURVIVAL GATES & ASSET PERSONALITY (V17.6 UNCHOKE)
-        # ============================================================
-        
-        # G1: EFFICIENCY (KER)
-        base_thresh = self.ker_floor 
-        effective_ker_thresh = max(0.001, base_thresh + self.dynamic_ker_offset)
-            
-        if ker_val < effective_ker_thresh:
-            self.rejection_stats[f"Low Efficiency (KER {ker_val:.3f} < {effective_ker_thresh:.3f})"] += 1
-            return
-
-        # G2: REGIME IDENTIFICATION (THE DEAD ZONE)
-        preferred_regime = self._get_preferred_regime(self.symbol)
-        regime_label = "Neutral"
-        proposed_action = 0 # 0=Hold, 1=Buy, -1=Sell
-        is_regime_clash = False
-        
-        # Check Bollinger Bands state
-        if len(self.bb_buffer) < self.bb_window:
-            self.rejection_stats["Warming Up BB"] += 1
-            return
-            
-        bb_mu = np.mean(self.bb_buffer)
-        bb_std = np.std(self.bb_buffer)
-        bb_mult = self.bb_std 
-        
-        upper_bb = bb_mu + (bb_mult * bb_std)
-        lower_bb = bb_mu - (bb_mult * bb_std)
-        
-        # --- LOGIC MAPPING: DEAD ZONE IMPLEMENTED ---
-        is_trending = hurst > self.hurst_breakout
-        is_reverting = hurst < self.hurst_reversion
-        
-        if is_trending:
-            if preferred_regime == "MEAN_REVERSION":
-                is_regime_clash = True
-            
-            # Trend Logic
-            regime_label = "TREND_BREAKOUT"
-            if price > upper_bb:
-                proposed_action = 1 # Breakout Buy
-            elif price < lower_bb:
-                proposed_action = -1 # Breakout Sell
-                
-        elif is_reverting:
-            if preferred_regime == "TREND_BREAKOUT":
-                is_regime_clash = True
-                
-            # Mean Reversion Logic
-            regime_label = "MEAN_REVERSION"
-            if price > upper_bb:
-                proposed_action = -1 # Fade the top (Sell)
-            elif price < lower_bb:
-                proposed_action = 1  # Fade the bottom (Buy)
-                
-        else:
-            # DEAD ZONE: Random Walk / Choppy Market
-            self.rejection_stats[f"Dead Zone / Random Walk (H={hurst:.2f})"] += 1
-            return
+        if self.session_enabled and server_time.hour < self.start_hour: return 
+        if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff: return 
 
         if proposed_action == 0:
             self.rejection_stats["No Trigger"] += 1
             return
             
-        # --- GATE: VOLATILITY EXPANSION ---
-        if not self._check_volatility_condition(price):
-            self.rejection_stats["Low Volatility (Dead Zone)"] += 1
+        # V20.2: Loosened Statistical Gates
+        effective_ker_thresh = max(0.0001, self.ker_floor + self.dynamic_ker_offset)
+        if ker_val < effective_ker_thresh:
+            self.rejection_stats[f"Low Efficiency (KER)"] += 1
             return
 
-        # --- REGIME ENFORCEMENT ---
-        if is_regime_clash:
-            if self.regime_enforcement == "HARD":
-                self.rejection_stats[f"Personality Clash ({regime_label} vs {preferred_regime})"] += 1
-                return
-            elif self.regime_enforcement == "DISABLED":
-                 is_regime_clash = False 
-            else:
-                pass 
-
-        # G3: EXHAUSTION
-        if rvol_val > self.max_rvol_thresh:
-            self.rejection_stats[f"Volume Climax"] += 1
-            return 
-        
-        # G4: TREND STRENGTH (ADX) - HARD BLOCK
-        if regime_label == "TREND_BREAKOUT":
-            adx_val = features.get('adx', 0.0)
-            if adx_val < self.adx_threshold:
-                self.rejection_stats[f"Weak Trend (ADX {adx_val:.1f} < {self.adx_threshold})"] += 1
-                return
+        if rvol_val < 0.8:
+            self.rejection_stats["Low RVol"] += 1
+            return
 
         # ============================================================
-        # F. ML CONFIRMATION & EXECUTION (V17.5 FIXED)
+        # F. ML CONFIRMATION & EXECUTION
         # ============================================================
-        
         try:
-            clean_features = {k: float(v) for k, v in features.items()}
-            pred_proba = self.model.predict_proba_one(clean_features)
-            prob_success = pred_proba.get(proposed_action, 0.0)
-            
-            # --- V17.1 FIX: Restore Confidence Calibration ---
-            if proposed_action == 1:
-                confidence = self.calibrator_buy.calibrate(prob_success)
-            elif proposed_action == -1:
-                confidence = self.calibrator_sell.calibrate(prob_success)
-            else:
-                confidence = 0.0
+            if proposed_action == 1: confidence = self.calibrator_buy.calibrate(prob_success)
+            elif proposed_action == -1: confidence = self.calibrator_sell.calibrate(prob_success)
+            else: confidence = 0.0
                 
-            # --- V17.5 FIX: Enforce Minimum Confidence Gate ---
-            min_conf = float(self.params.get('min_calibrated_probability', 0.55))
+            # V20.2 FIX: Realistic Probability Gate
+            min_conf = float(self.params.get('min_calibrated_probability', 0.50)) 
             if confidence < min_conf:
-                self.rejection_stats[f"Low ML Confidence ({confidence:.2f} < {min_conf})"] += 1
+                self.rejection_stats[f"Low ML Confidence"] += 1
                 return
             
-            is_profitable = self.meta_labeler.predict(
-                clean_features, 
-                proposed_action, 
-                threshold=float(self.params.get('meta_labeling_threshold', 0.55))
-            )
-            
-            if proposed_action != 0:
-                self.meta_label_events += 1
+            meta_thresh = float(self.params.get('meta_labeling_threshold', 0.50))
+            is_profitable = self.meta_labeler.predict(clean_features, proposed_action, threshold=meta_thresh)
+            if proposed_action != 0: self.meta_label_events += 1
 
-            if is_regime_clash:
-                pass 
-
-            # --- SNIPER PROTOCOL ---
-            # Pass current_hurst to check for Ignition
-            if not self._check_sniper_filters(proposed_action, price, hurst):
-                self.rejection_stats["Sniper Reject (RSI Extreme)"] += 1
-                return
+            is_pyramid = False
             
-            # --- PORTFOLIO HEAT ---
-            if not self._check_currency_exposure(broker, self.symbol):
-                return
+            if existing_positions:
+                pyramid_config = self.risk_conf.get('pyramiding', {})
+                if not pyramid_config.get('enabled', False): return 
+                
+                last_pos = existing_positions[-1]
+                if (last_pos.side == 1 and proposed_action != 1) or (last_pos.side == -1 and proposed_action != -1):
+                    return 
+
+                if len(existing_positions) > pyramid_config.get('max_adds', 1): return
+                    
+                risk_dist = last_pos.metadata.get('initial_risk_dist', 1.0)
+                dist = (price - last_pos.entry_price) if last_pos.side == 1 else (last_pos.entry_price - price)
+                current_r = dist / risk_dist if risk_dist > 0 else 0
+                
+                if current_r < pyramid_config.get('add_on_profit_r', 1.0): return 
+                is_pyramid = True
 
             if is_profitable:
-                # PYRAMIDING CHECK
-                is_pyramid = False
+                action_str = "BUY" if proposed_action == 1 else "SELL"
                 
-                if existing_positions:
-                    pyramid_config = self.risk_conf.get('pyramiding', {})
-                    if not pyramid_config.get('enabled', False):
-                        return # Standard Block
-                    
-                    # 1. Direction Check
-                    last_pos = existing_positions[-1]
-                    if (last_pos.side == 1 and proposed_action != 1) or \
-                       (last_pos.side == -1 and proposed_action != -1):
-                        return 
-
-                    # 2. Max Adds Check
-                    if len(existing_positions) > pyramid_config.get('max_adds', 1): 
-                        return
-                        
-                    # 3. Profit Threshold Check
-                    risk_dist = last_pos.metadata.get('initial_risk_dist', 1.0)
-                    dist = (price - last_pos.entry_price) if last_pos.side == 1 else (last_pos.entry_price - price)
-                    current_r = dist / risk_dist if risk_dist > 0 else 0
-                    
-                    if current_r < pyramid_config.get('add_on_profit_r', 1.0):
-                        return 
-                    
-                    is_pyramid = True
-
-                # Tighten Stops Logic (RVOL Trigger)
+                imp_feats = [regime_label]
+                if rvol_val > 2.0: imp_feats.append('High_Fuel')
+                if hurst > 0.6: imp_feats.append('High_Hurst')
+                for f in imp_feats: self.feature_importance_counter[f] += 1
+                
                 tighten_stops = (rvol_val > self.rvol_trigger)
-                self._execute_entry(confidence, price, features, broker, dt_ts, proposed_action, regime_label, tighten_stops, is_pyramid)
+
+                # Execute
+                self._execute_entry(confidence, price, features, broker, dt_ts, proposed_action, regime_label, tighten_stops, is_pyramid, current_reward_target)
+                
+                # Update Cooldown State
+                self.last_trade_bar = self.bars_processed
+                self.last_trade_direction = proposed_action
+                
             else:
                 self.rejection_stats['Meta-Labeler Reject'] += 1
 
@@ -715,26 +828,13 @@ class ResearchStrategy:
             if self.debug_mode: logger.error(f"Strategy Error: {e}")
             pass
 
-    def _execute_entry(self, confidence, price, features, broker, dt_timestamp, action_int, regime, tighten_stops, is_pyramid=False):
-        """
-        Executes the trade entry logic.
-        V17.5: Enforces parity with Live Engine sizing and margin checks.
-        """
+    def _execute_entry(self, confidence, price, features, broker, dt_timestamp, action_int, regime, tighten_stops, is_pyramid, current_reward_target):
         action = "BUY" if action_int == 1 else "SELL"
-        
         exposure_count = 0
         quote_currency = self.symbol[-3:] 
         for pos in broker.open_positions:
-            if quote_currency in pos.symbol: 
-                exposure_count += 1
+            if quote_currency in pos.symbol: exposure_count += 1
         
-        # Check High Fuel (RVOL) for Reward Boost
-        rvol = features.get('rvol', 0.0)
-        current_reward = self.optimized_reward_mult
-        
-        if rvol > 3.0:
-            current_reward = max(current_reward, 4.0)
-
         ctx = TradeContext(
             symbol=self.symbol,
             price=price,
@@ -742,31 +842,21 @@ class ResearchStrategy:
             account_equity=broker.equity,
             account_currency="USD",
             win_rate=0.45, 
-            risk_reward_ratio=current_reward 
+            risk_reward_ratio=current_reward_target 
         )
 
         current_atr = features.get('atr', 0.001)
         current_ker = features.get('ker', 1.0)
         volatility = features.get('volatility', 0.001)
+        parkinson = features.get('parkinson_vol', 0.0)
         
-        # Risk Override 
-        if is_pyramid:
-             risk_override = self.risk_conf.get('pyramiding', {}).get('risk_per_add_percent', 0.00)
-        else:
-             risk_override = self.params.get('risk_per_trade_percent')
-        
+        risk_override = self.risk_conf.get('pyramiding', {}).get('risk_per_add_percent', 0.00) if is_pyramid else self.params.get('risk_per_trade_percent')
         sqn_score = self._calculate_symbol_sqn(broker)
-        
-        if -3.0 < sqn_score < -1.0:
-            effective_sqn = -0.99
-        else:
-            effective_sqn = sqn_score
+        effective_sqn = -0.99 if -3.0 < sqn_score < -1.0 else sqn_score
 
-        # CALCULATE DAILY PNL PCT
         daily_pnl_val = broker.equity - broker.daily_start_equity
         daily_pnl_pct = daily_pnl_val / broker.daily_start_equity if broker.daily_start_equity > 0 else 0.0
 
-        # --- CALCULATE TOTAL OPEN RISK % ---
         current_open_risk_usd = 0.0
         used_margin = 0.0
         contract_size = 100000 
@@ -774,19 +864,12 @@ class ResearchStrategy:
         for pos in broker.open_positions:
             price_dist = abs(pos.entry_price - pos.stop_loss)
             rate = RiskManager.get_conversion_rate(pos.symbol, pos.entry_price, self.last_price_map)
-            risk_val = price_dist * pos.quantity * contract_size * rate
-            current_open_risk_usd += risk_val
-            
-            trade_margin = RiskManager.calculate_required_margin(
-                pos.symbol, pos.quantity, pos.entry_price, contract_size, rate
-            )
-            used_margin += trade_margin
+            current_open_risk_usd += price_dist * pos.quantity * contract_size * rate
+            used_margin += RiskManager.calculate_required_margin(pos.symbol, pos.quantity, pos.entry_price, contract_size, rate)
             
         current_open_risk_pct = (current_open_risk_usd / broker.equity) * 100.0
-        
         estimated_free_margin = max(0.0, broker.equity - used_margin)
 
-        # CALL RISK MANAGER 
         trade_intent, risk_usd = RiskManager.calculate_rck_size(
             context=ctx,
             conf=confidence,
@@ -800,46 +883,31 @@ class ResearchStrategy:
             performance_score=effective_sqn,
             daily_pnl_pct=daily_pnl_pct,
             current_open_risk_pct=current_open_risk_pct,
-            free_margin=estimated_free_margin 
+            free_margin=estimated_free_margin,
+            parkinson_vol=parkinson 
         )
 
         if trade_intent.volume <= 0:
-            self.rejection_stats[f"Risk Zero ({trade_intent.comment})"] += 1
+            self.rejection_stats[f"Risk Zero"] += 1
             return
-
-        # Explicitly set stops if not returned
-        if trade_intent.stop_loss == 0.0:
-             # Recalculate geometry
-             atr_mult_sl = self.sl_atr_mult
-             stop_dist = current_atr * atr_mult_sl
-             pip_val_raw, _ = RiskManager.get_pip_info(self.symbol)
-             # V17.1: Absolute Hard Floor (15 pips default)
-             config_min_pips = float(self.risk_conf.get('min_stop_loss_pips', 15.0))
-             min_stop = config_min_pips * pip_val_raw
-             stop_dist = max(stop_dist, min_stop)
-             
-             trade_intent.stop_loss = stop_dist
-             trade_intent.take_profit = stop_dist * (current_reward)
 
         trade_intent.action = action
         qty = trade_intent.volume
+        
+        # RiskManager returns absolute distances in trade_intent.stop_loss and trade_intent.take_profit
         stop_dist = trade_intent.stop_loss
         tp_dist = trade_intent.take_profit
 
-        if action == "BUY":
-            sl_price = price - stop_dist
-            tp_price = price + tp_dist
-            side = 1
-        else:
-            sl_price = price + stop_dist
-            tp_price = price - tp_dist
-            side = -1
+        # V20.2 PARITY: Apply the calculated distances to the execution price
+        sl_price = price - stop_dist if action == "BUY" else price + stop_dist
+        tp_price = price + tp_dist if action == "BUY" else price - tp_dist
+        side = 1 if action == "BUY" else -1
 
         order = BacktestOrder(
             symbol=self.symbol,
             side=side,
             quantity=qty,
-            entry_price=price, # Backtest engine handles its own slippage modeling
+            entry_price=price, 
             timestamp_created=dt_timestamp, 
             stop_loss=sl_price,
             take_profit=tp_price,
@@ -848,26 +916,18 @@ class ResearchStrategy:
                 'regime': regime,
                 'confidence': float(confidence),
                 'rvol': features.get('rvol', 0),
-                'parkinson': features.get('parkinson_vol', 0),
+                'parkinson': parkinson,
                 'ker': current_ker,
                 'atr': current_atr,
-                'optimized_rr': current_reward,
+                'optimized_rr': current_reward_target,
                 'initial_risk_dist': stop_dist, 
                 'entry_price_snap': price,
                 'tighten_stops': tighten_stops,
                 'is_pyramid': is_pyramid
             }
         )
-        
         broker.submit_order(order)
         
-        imp_feats = []
-        imp_feats.append(regime)
-        if features.get('rvol', 0) > 2.0: imp_feats.append('High_Fuel')
-        
-        for f in imp_feats:
-            self.feature_importance_counter[f] += 1
-
         self.trade_events.append({
             'time': dt_timestamp.timestamp(), 
             'action': action,
@@ -877,27 +937,19 @@ class ResearchStrategy:
             'ker': current_ker,
             'atr': current_atr,
             'regime': regime,
-            'top_feats': imp_feats,
             'pyramid': is_pyramid
         })
 
     def _calculate_symbol_sqn(self, broker: BacktestBroker) -> float:
         trades = [t.net_pnl for t in broker.closed_positions if t.symbol == self.symbol]
-        if len(trades) < 5: 
-            return 0.0
+        if len(trades) < 5: return 0.0
         window = trades[-50:]
         avg_pnl = np.mean(window)
         std_pnl = np.std(window)
-        if std_pnl < 1e-9:
-            return 0.0
-        sqn = math.sqrt(len(window)) * (avg_pnl / std_pnl)
-        return sqn
+        if std_pnl < 1e-9: return 0.0
+        return math.sqrt(len(window)) * (avg_pnl / std_pnl)
 
     def _manage_time_stops(self, broker: BacktestBroker, current_time: datetime):
-        """
-        Managed Time Exits.
-        """
-        # Fetch dynamic horizon from config (default 240m / 4h)
         tbm_conf = self.params.get('tbm', {})
         horizon_minutes = int(tbm_conf.get('horizon_minutes', 240))
         hard_stop_seconds = horizon_minutes * 60
@@ -906,42 +958,22 @@ class ResearchStrategy:
         for pos in broker.open_positions:
             if pos.symbol != self.symbol: continue
             
-            if pos.timestamp_created.tzinfo is None:
-                pos_time = pos.timestamp_created.replace(tzinfo=pytz.utc)
-            else:
-                pos_time = pos.timestamp_created
-                
-            if current_time.tzinfo is None:
-                curr_time_aware = current_time.replace(tzinfo=pytz.utc)
-            else:
-                curr_time_aware = current_time
+            pos_time = pos.timestamp_created.replace(tzinfo=pytz.utc) if pos.timestamp_created.tzinfo is None else pos.timestamp_created
+            curr_time_aware = current_time.replace(tzinfo=pytz.utc) if current_time.tzinfo is None else current_time
             
-            duration = (curr_time_aware - pos_time).total_seconds()
-            
-            if duration > hard_stop_seconds:
-                hours = int(horizon_minutes / 60)
-                to_close.append((pos, f"Time Stop ({hours}h)"))
+            if (curr_time_aware - pos_time).total_seconds() > hard_stop_seconds:
+                to_close.append((pos, f"Time Stop ({int(horizon_minutes/60)}h)"))
             
         for pos, reason in to_close:
-            broker._close_partial_position(
-                pos, 
-                pos.quantity, 
-                self.last_price, 
-                current_time, 
-                reason
-            )
+            broker._close_partial_position(pos, pos.quantity, self.last_price, current_time, reason)
 
     def _manage_trailing_stops(self, broker: BacktestBroker, current_price: float, timestamp: datetime):
-        """
-        V17.5 FIX: Dynamic trailing stop logic aligned with Live Engine.
-        """
         trail_conf = self.risk_conf.get('trailing_stop', {})
-        activation_r = float(trail_conf.get('activation_r', 1.5)) # V17.5 adjusted to 1.5
-        trail_dist_r = float(trail_conf.get('trail_dist_r', 1.0))
+        activation_r = float(trail_conf.get('activation_r', 1.0))
+        trail_dist_r = float(trail_conf.get('trail_dist_r', 0.5))
 
         for pos in broker.open_positions:
             if pos.symbol != self.symbol: continue
-            
             risk_dist = pos.metadata.get('initial_risk_dist', 0.0)
             if risk_dist <= 0: continue
             
@@ -949,78 +981,53 @@ class ResearchStrategy:
             reason = ""
             
             if pos.side == 1: 
-                dist_pnl = current_price - pos.entry_price
-                r_multiple = dist_pnl / risk_dist
-                
+                r_multiple = (current_price - pos.entry_price) / risk_dist
                 if r_multiple >= activation_r:
-                    trail_pips = risk_dist * trail_dist_r
-                    target_sl = current_price - trail_pips
-                    min_lock = pos.entry_price + (risk_dist * 0.1)
-                    target_sl = max(target_sl, min_lock)
-                    
+                    target_sl = max(current_price - (risk_dist * trail_dist_r), pos.entry_price + (risk_dist * 0.1))
                     if target_sl > pos.stop_loss:
-                        new_sl = target_sl
-                        reason = f"Trail ({r_multiple:.1f}R)"
+                        new_sl, reason = target_sl, f"Trail ({r_multiple:.1f}R)"
                         
             else: 
-                dist_pnl = pos.entry_price - current_price
-                r_multiple = dist_pnl / risk_dist
-                
+                r_multiple = (pos.entry_price - current_price) / risk_dist
                 if r_multiple >= activation_r:
-                    trail_pips = risk_dist * trail_dist_r
-                    target_sl = current_price + trail_pips
-                    min_lock = pos.entry_price - (risk_dist * 0.1)
-                    target_sl = min(target_sl, min_lock)
-                    
+                    target_sl = min(current_price + (risk_dist * trail_dist_r), pos.entry_price - (risk_dist * 0.1))
                     if target_sl < pos.stop_loss:
-                        new_sl = target_sl
-                        reason = f"Trail ({r_multiple:.1f}R)"
+                        new_sl, reason = target_sl, f"Trail ({r_multiple:.1f}R)"
             
             if new_sl is not None:
                 pos.stop_loss = new_sl
-                if "Trail" in reason:
-                      if reason not in pos.comment:
-                          pos.comment += f"|{reason}"
-                      if self.debug_mode:
-                          logger.info(f"🛡️ {self.symbol} SL Moved to {new_sl:.5f} ({reason})")
+                if "Trail" not in pos.comment: pos.comment += f"|{reason}"
 
     def _check_symbol_circuit_breaker(self, broker: BacktestBroker, server_time: datetime) -> bool:
         today_losses = 0
         today_pnl = 0.0
-        
         current_day_start = server_time.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         
         for trade in broker.closed_positions:
-            if trade.symbol != self.symbol:
-                continue
+            if trade.symbol != self.symbol: continue
             
-            exit_ts = trade.exit_time if hasattr(trade, 'exit_time') else 0.0
+            if trade.close_time:
+                close_time_aware = trade.close_time if trade.close_time.tzinfo else trade.close_time.replace(tzinfo=pytz.utc)
+                exit_ts = close_time_aware.timestamp()
+            else:
+                exit_ts = 0.0
             
             if exit_ts >= current_day_start:
                 today_pnl += trade.net_pnl
-                if trade.net_pnl < 0:
-                    today_losses += 1
+                if trade.net_pnl < 0: today_losses += 1
         
-        if today_losses >= self.daily_max_losses:
-            return True
-            
-        loss_limit_usd = broker.initial_balance * self.daily_max_loss_pct
-        if today_pnl < -loss_limit_usd:
-            return True
-            
+        if today_losses >= self.daily_max_losses: return True
+        if today_pnl < -(broker.initial_balance * self.daily_max_loss_pct): return True
         return False
 
     def _update_streak_status(self, broker: BacktestBroker):
         if not broker.closed_positions:
             self.consecutive_losses = 0
             return
-            
         streak = 0
         for trade in reversed(broker.closed_positions):
-            if trade.net_pnl < 0:
-                streak += 1
-            else:
-                break
+            if trade.net_pnl < 0: streak += 1
+            else: break
         self.consecutive_losses = streak
 
     def _simulate_mtf_context(self, price: float, dt: datetime) -> Dict[str, Any]:
@@ -1035,79 +1042,43 @@ class ResearchStrategy:
             self.last_d1_idx = d1_idx
             
         ctx = {'d1': {}, 'h4': {}}
-        
         if len(self.d1_buffer) > 0:
             arr = np.array(self.d1_buffer)
-            if len(arr) < 200:
-                ema = np.mean(arr)
+            if len(arr) < 200: ema = np.mean(arr)
             else:
-                span = 200
-                alpha = 2 / (span + 1)
+                alpha = 2 / 201
                 ema = arr[0]
-                for x in arr[1:]:
-                    ema = (alpha * x) + ((1 - alpha) * ema)
+                for x in arr[1:]: ema = (alpha * x) + ((1 - alpha) * ema)
             ctx['d1']['ema200'] = ema
-        else:
-            ctx['d1']['ema200'] = 0.0
+        else: ctx['d1']['ema200'] = 0.0
             
         if len(self.h4_buffer) > 14:
             arr = np.array(self.h4_buffer)
             changes = np.diff(arr)
-            gains = changes[changes > 0]
-            losses = -changes[changes < 0]
+            gains, losses = changes[changes > 0], -changes[changes < 0]
             avg_gain = np.mean(gains[-14:]) if len(gains) > 0 else 0
             avg_loss = np.mean(losses[-14:]) if len(losses) > 0 else 0
-            
-            if avg_loss == 0:
-                rsi = 100.0
-            else:
-                rs = avg_gain / avg_loss
-                rsi = 100 - (100 / (1 + rs))
-            ctx['h4']['rsi'] = rsi
-        else:
-            ctx['h4']['rsi'] = 50.0
-            
+            ctx['h4']['rsi'] = 100.0 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss)))
+        else: ctx['h4']['rsi'] = 50.0
         return ctx
 
     def _check_sniper_filters(self, signal: int, price: float, current_hurst: float) -> bool:
-        """
-        SNIPER PROTOCOL (AGGRESSOR UPDATE):
-        1. RSI Guard: Rejects EXTREME exhaustion, but allows high momentum "Ignition".
-        2. Ignition Bypass: If Hurst > 0.6, we assume trend is strong enough to ignore RSI.
-        """
-        # 1. RSI CALCULATION (M5 Extension)
-        if len(self.sniper_rsi) < 14:
-            rsi = 50.0 
+        if len(self.sniper_rsi) < 14: rsi = 50.0 
         else:
-            gains = [x for x in self.sniper_rsi if x > 0]
-            losses = [abs(x) for x in self.sniper_rsi if x < 0]
-            avg_gain = sum(gains) / 14 if gains else 0
-            avg_loss = sum(losses) / 14 if losses else 1e-9
-            rs = avg_gain / avg_loss
-            rsi = 100 - (100 / (1 + rs))
+            gains, losses = [x for x in self.sniper_rsi if x > 0], [abs(x) for x in self.sniper_rsi if x < 0]
+            avg_gain, avg_loss = sum(gains)/14 if gains else 0, sum(losses)/14 if losses else 1e-9
+            rsi = 100 - (100 / (1 + (avg_gain / avg_loss)))
 
-        # 2. IGNITION BYPASS
-        if current_hurst > 0.6:
-            return True
-
-        # 3. EXHAUSTION GUARD (Relaxed)
-        upper = 85
-        lower = 15
+        if current_hurst > 0.55: return True
         
-        if "JPY" in self.symbol:
-             upper = 90
-             lower = 10
+        upper, lower = (85, 15) if "JPY" in self.symbol else (80, 20)
 
-        if signal == 1: # BUY
-            if rsi > upper: 
-                self.rejection_stats['Overbought_RSI'] += 1
-                return False 
-            
-        elif signal == -1: # SELL
-            if rsi < lower: 
-                self.rejection_stats['Oversold_RSI'] += 1
-                return False 
-        
+        if signal == 1 and rsi > upper:
+            self.rejection_stats['Overbought_RSI'] += 1
+            return False 
+        elif signal == -1 and rsi < lower:
+            self.rejection_stats['Oversold_RSI'] += 1
+            return False 
         return True
 
     def _inject_auxiliary_data(self):
@@ -1118,32 +1089,24 @@ class ResearchStrategy:
             "GBPAUD": 1.95, "EURAUD": 1.65, "GBPNZD": 2.05
         }
         for sym, price in defaults.items():
-            if sym not in self.last_price_map:
-                self.last_price_map[sym] = price
+            if sym not in self.last_price_map: self.last_price_map[sym] = price
 
     def generate_autopsy(self) -> str:
         if not self.trade_events:
-            sorted_rejects = sorted(self.rejection_stats.items(), key=lambda item: item[1], reverse=True)
-            reject_str = ", ".join([f"{k}: {v}" for k, v in sorted_rejects[:5]])
-            
+            reject_str = ", ".join([f"{k}: {v}" for k, v in sorted(self.rejection_stats.items(), key=lambda item: item[1], reverse=True)[:5]])
             status = "Waiting for Warm-Up" if not self.burn_in_complete else "No Trigger Conditions Met"
             return f"AUTOPSY: No trades. Status: {status}. Top Rejections: {{{reject_str}}}. Bars processed: {self.bars_processed}"
         
         avg_conf = np.mean([t['conf'] for t in self.trade_events])
         avg_rvol = np.mean([t['rvol'] for t in self.trade_events]) 
-        
-        sorted_rejects = sorted(self.rejection_stats.items(), key=lambda item: item[1], reverse=True)
-        reject_str = ", ".join([f"{k}: {v}" for k, v in sorted_rejects[:5]])
-        
-        top_features = self.feature_importance_counter.most_common(5)
-        feat_str = str(top_features)
+        reject_str = ", ".join([f"{k}: {v}" for k, v in sorted(self.rejection_stats.items(), key=lambda item: item[1], reverse=True)[:5]])
         
         report = (
             f"\n --- 💀 PHOENIX AUTOPSY ({self.symbol}) ---\n"
             f" Trades: {len(self.trade_events)}\n"
             f" Avg Conf: {avg_conf:.2f}\n"
             f" Avg RVol: {avg_rvol:.2f}\n"
-            f" Top Drivers: {feat_str}\n"
+            f" Top Drivers: {str(self.feature_importance_counter.most_common(5))}\n"
             f" Rejections: {{{reject_str}}}\n"
             f" ----------------------------------------\n"
         )

@@ -3,6 +3,7 @@ import json
 import uuid
 import threading
 import time
+import math
 from typing import Any, Dict, Optional
 
 # Shared Imports
@@ -27,7 +28,7 @@ class TradeDispatcher:
     to the Execution Engine (Windows Producer) via Redis Streams.
     
     UPDATED: FORCE MARKET EXECUTION ONLY.
-    V17.1 FIX: INJECTS STATIC INITIAL RISK TO REDIS TO PREVENT R-MULTIPLE HALLUCINATION.
+    V20.2 FIX: INJECTS STATIC INITIAL RISK TO REDIS & SANITIZES SL/TP FLOATS.
     """
     def __init__(self, stream_mgr: RedisStreamManager, pending_tracker: dict[str, Any], lock: threading.RLock):
         """
@@ -44,21 +45,22 @@ class TradeDispatcher:
     def send_order(self, trade: Trade, estimated_risk_usd: float = 0.0) -> None:
         """
         Formats and dispatches a Trade object to Redis.
-        Strictly enforces Market Execution (Deal) protocol.
+        Strictly enforces Market Execution (Deal) protocol and guards against
+        float parsing errors in the Windows MT5 SDK.
         """
         try:
             # 1. Generate IDs
             order_id = uuid.uuid4()
             short_id = str(order_id)[:8]
             
-            # --- V17.1 FIX: PERSIST INITIAL RISK DISTANCE ---
+            # --- V20.2 FIX: PERSIST INITIAL RISK DISTANCE ---
             # We calculate the absolute price distance between the entry reference 
             # and the initial stop loss. This is saved to a Redis hash so the 
             # Trailing Stop and Pyramiding logic don't hallucinate shrinking 
             # R-multiples as the SL physically moves closer to price.
             try:
                 initial_risk_dist = abs(trade.entry_price - trade.stop_loss)
-                if initial_risk_dist > 0:
+                if initial_risk_dist > 0 and math.isfinite(initial_risk_dist):
                     self.stream_mgr.r.hset("bot:initial_risk", short_id, str(initial_risk_dist))
             except Exception as e:
                 logger.error(f"Failed to persist initial risk to Redis for {short_id}: {e}")
@@ -85,8 +87,7 @@ class TradeDispatcher:
                 mt5_type = MT5_ORDER_TYPE_SELL
             else:
                 # Fallback for "CLOSE_ALL" or "MODIFY" which handle their own logic in Producer
-                # But for standard entry, this is required.
-                mt5_type = MT5_ORDER_TYPE_BUY # Default dummy
+                mt5_type = MT5_ORDER_TYPE_BUY 
             
             # B. FORCE MARKET EXECUTION
             # We ignore trade.entry_type and force TRADE_ACTION_DEAL (1)
@@ -96,8 +97,6 @@ class TradeDispatcher:
                 final_price = "0.0" 
             else:
                 # MODIFY / CLOSE_ALL are handled specifically by Producer strings
-                # But strictly speaking, they don't map to standard DEAL/PENDING here
-                # We pass the string action through, Producer handles the switch
                 mt5_action = MT5_TRADE_ACTION_DEAL 
                 final_price = "0.0"
 
@@ -115,6 +114,12 @@ class TradeDispatcher:
             else:
                 action_payload = str(mt5_action)
 
+            # --- V20.2 MATH GUARD: Sanitize Floats ---
+            # Prevents NaN or Infinity from crashing the MT5 SDK string parser
+            safe_sl = float(trade.stop_loss) if math.isfinite(trade.stop_loss) else 0.0
+            safe_tp = float(trade.take_profit) if math.isfinite(trade.take_profit) else 0.0
+            safe_vol = float(trade.volume) if math.isfinite(trade.volume) else 0.01
+
             payload = {
                 "id": str(order_id),
                 "uuid": str(order_id),  # CRITICAL for Producer Deduplication
@@ -125,7 +130,7 @@ class TradeDispatcher:
                 "type": str(mt5_type),
                 
                 # Explicit formatting to prevent float precision errors
-                "volume": "{:.2f}".format(float(trade.volume)),
+                "volume": "{:.2f}".format(safe_vol),
                 
                 # FORCE ZERO PRICE for Market Execution
                 "entry_price": final_price,
@@ -133,8 +138,8 @@ class TradeDispatcher:
                 
                 # CRITICAL MAPPING: Producer looks for 'sl' and 'tp', NOT 'stop_loss'
                 # Enforce string format to prevent scientific notation (e.g. 1e-5)
-                "sl": "{:.5f}".format(trade.stop_loss),
-                "tp": "{:.5f}".format(trade.take_profit),
+                "sl": "{:.5f}".format(safe_sl),
+                "tp": "{:.5f}".format(safe_tp),
                 
                 "magic_number": str(self.magic_number),
                 "magic": str(self.magic_number), 
@@ -155,7 +160,7 @@ class TradeDispatcher:
                 f"| Vol: {trade.volume:.2f} | Market Order (Price=0.0) | Risk: ${estimated_risk_usd:.2f}"
             )
         except Exception as e:
-            logger.error(f"{LogSymbols.ERROR} Dispatch Failed for {trade.symbol}: {e}")
+            logger.error(f"{LogSymbols.ERROR} Dispatch Failed for {trade.symbol}: {e}", exc_info=True)
             # Rollback tracker if send failed
             with self.lock:
                 if str(order_id) in self.pending_tracker:

@@ -48,233 +48,149 @@ except ImportError as e:
 setup_logging("Research")
 log = logging.getLogger("Research")
 
-# --- 1. TELEMETRY & REPORTING UTILS ---
+# =============================================================================
+# PHOENIX RESEARCH ENGINE V20.2 – ORDER-FLOW SWING PROTOCOL (PROFITABILITY PATCH)
+# =============================================================================
 
 class EmojiCallback:
     """
     Injects FTMO-style Emojis and RICH TELEMETRY into Optuna Trial reporting.
     """
     def __call__(self, study, trial):
+        if trial.value is None: return
         val = trial.value
         attrs = trial.user_attrs
         
-        # Extract Symbol from Study Name (Convention: "study_SYMBOL")
         symbol = study.study_name.replace("study_", "")
         
-        # 1. Determine Status Icon & Rank
-        risk_pct = attrs.get('risk_pct', 0.0) # Retrieved from attributes
+        risk_pct = attrs.get('risk_pct', 0.0)
         trades = attrs.get('trades', 0)
         pnl = attrs.get('pnl', 0.0)
         dd = attrs.get('max_dd_pct', 0.0) * 100
+        pf = attrs.get('profit_factor', 0.0)
+        sqn = attrs.get('sqn', 0.0)
         calmar = attrs.get('calmar', 0.0)
         
         status = "FAIL"
         icon = "🔻"
         
         if attrs.get('blown', False):
-            icon = "💀" # Blown Account (>8% DD or Ruin)
+            icon = "💀" # Blown Account or Daily Breach
             status = "BLOWN"
-        elif dd > 8.0: # HARD LIMIT: 8.0%
-            icon = "⚠️" # High Risk
+        elif dd > 5.0: # FTMO Buffer: 5.0%
+            icon = "⚠️" 
             status = "RISKY"
         elif attrs.get('pruned', False):
-            icon = "✂️" # Pruned (Low Trades)
+            icon = "✂️" # Pruned (Low Trades / Sterile)
             status = "PRUNE"
-        elif pnl > 1000 and calmar > 2.0:
-            icon = "🚀" # High Quality & High Profit
+        elif pnl > 2000 and sqn > 1.0:
+            icon = "🚀" # High Alpha / Smooth Curve
             status = "ALPHA"
         elif pnl > 0:
             icon = "✅" # Profitable
             status = "PASS"
 
-        # 2. Extract Metrics
         wr = attrs.get('win_rate', 0.0) * 100
-        pf = attrs.get('profit_factor', 0.0)
         
-        # 3. Format Output (Column Aligned)
-        # Structure: [ICON] STATUS | SYMBOL | ID | RISK | SCORE | PnL | DD | WR | TRADES
         msg = (
             f"{icon} {status:<6} | {symbol:<6} | Trial {trial.number:<3} | "
             f"R: {risk_pct:>4.3f}% | "
             f"🏆 {val:>8.1f} | "
-            f"💰 ${pnl:>9,.0f} | " # Compacted PnL for space
+            f"💰 ${pnl:>9,.0f} | "
             f"📉 {dd:>5.2f}% | "
             f"🎯 {wr:>5.1f}% | "
-            f"⚡ {pf:>4.2f} | "
+            f"⚡ PF:{pf:>4.2f} SQN:{sqn:>4.2f} | "
             f"#️⃣ {trades:<4}"
         )
-        
-        # 4. Log to File & Console
         log.info(msg.strip())
         
-        # 5. Detailed Analysis (Victory Lap OR Autopsy)
         if 'autopsy' in attrs:
-            # Victory Lap for significant profit
             if pnl > 1000.0 and not attrs.get('blown', False):
-                report_type = "🏁 VICTORY LAP"
-                report_msg = f"\n{report_type} (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
-                log.info(report_msg)
-            
-            # Failure Autopsy for ANY loss or zero trades
+                log.info(f"\n🏁 VICTORY LAP (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80))
             elif pnl < 0 or trades == 0 or attrs.get('blown', False):
-                report_type = "🔎 FAILURE AUTOPSY"
-                report_msg = f"\n{report_type} (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80)
-                log.info(report_msg)
+                log.info(f"\n🔎 FAILURE AUTOPSY (Trial {trial.number}): {attrs['autopsy'].strip()}\n" + ("-" * 80))
 
 def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
-    """
-    Helper to Load Ticks -> Aggregate to Tick Imbalance Bars (TIBs) -> Return Clean DataFrame.
-    """
-    # 1. Load Massive Amount of Ticks (To get sufficient Bars)
     raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2)
-    
-    if raw_ticks.empty:
-        return pd.DataFrame()
+    if raw_ticks.empty: return pd.DataFrame()
 
-    # 2. AGGREGATION: ADAPTIVE IMBALANCE BARS WITH AUTO-CALIBRATION
-    # Fetch params from config (now defaults to 10)
     config_threshold = CONFIG['data'].get('volume_bar_threshold', 10.0) 
     alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
     
-    # --- AUTO-CALIBRATION LOOP ---
-    # We restrict the calibration data to the first 30 days to avoid lookahead bias.
-    first_timestamp = raw_ticks.index.min()
-    calibration_cutoff = first_timestamp + timedelta(days=30)
-    
-    calibration_df = raw_ticks[raw_ticks.index < calibration_cutoff]
-    
-    if calibration_df.empty:
-        # Fallback if data is less than 30 days
-        calibration_df = raw_ticks
+    first_ts = raw_ticks.index.min()
+    cal_cutoff = first_ts + timedelta(days=30)
+    cal_df = raw_ticks[raw_ticks.index < cal_cutoff]
+    if cal_df.empty: cal_df = raw_ticks
         
-    current_threshold = config_threshold
-    min_bars_needed = 500
-    attempts = 0
-    max_attempts = 4
+    current_thresh = config_threshold
+    min_bars = 500
+    final_thresh = config_threshold 
     
-    final_threshold = config_threshold # Default
-    
-    while attempts < max_attempts:
-        gen = AdaptiveImbalanceBarGenerator(
-            symbol=symbol,
-            initial_threshold=current_threshold,
-            alpha=alpha
-        )
+    for attempt in range(4):
+        gen = AdaptiveImbalanceBarGenerator(symbol=symbol, initial_threshold=current_thresh, alpha=alpha)
+        count = 0
+        for row in cal_df.itertuples():
+            p = getattr(row, 'price', getattr(row, 'close', None))
+            v = getattr(row, 'volume', 1.0)
+            t = getattr(row, 'Index', getattr(row, 'time', None))
+            ts_val = t.timestamp() if isinstance(t, (datetime, pd.Timestamp)) else float(t)
+            if p is None: continue
+            if gen.process_tick(p, v, ts_val, 0.0, 0.0): count += 1
         
-        bar_count = 0
-        # Iterate through calibration subset efficiently
-        for row in calibration_df.itertuples():
-            price = getattr(row, 'price', getattr(row, 'close', None))
-            vol = getattr(row, 'volume', 1.0)
-            
-            ts = getattr(row, 'Index', getattr(row, 'time', None))
-            if isinstance(ts, (datetime, pd.Timestamp)):
-                ts_val = ts.timestamp()
-            else:
-                ts_val = float(ts)
-                
-            if price is None: continue
-
-            # Synthetic Flow for Calibration (Same as production logic)
-            b_vol = 0.0
-            s_vol = 0.0
-            
-            bar = gen.process_tick(price, vol, ts_val, b_vol, s_vol)
-            if bar:
-                bar_count += 1
-        
-        if bar_count >= min_bars_needed:
-            final_threshold = current_threshold
+        if count >= min_bars:
+            final_thresh = current_thresh
             break
         else:
-            # V17.1 Fallback: Progressively aggressively lower threshold to guarantee DF returns
-            attempts += 1
-            if attempts == max_attempts:
-                log.warning(f"⚠️ {symbol}: Max calibration attempts reached. Forcing threshold to 2.0.")
-                final_threshold = 2.0
-            else:
-                new_threshold = max(2.0, current_threshold * 0.4) # Aggressive reduction
-                current_threshold = new_threshold
-                final_threshold = current_threshold
+            current_thresh = max(2.0, current_thresh * 0.4)
+            final_thresh = current_thresh
 
-    # --- PRODUCTION GENERATION ---
-    # Now process the FULL dataset using the calibrated threshold as the starting point.
-    gen = AdaptiveImbalanceBarGenerator(
-        symbol=symbol,
-        initial_threshold=final_threshold,
-        alpha=alpha
-    )
-    
-    bars_list = []
-    
+    log.info(f"📊 {symbol}: Calibrated Imbalance Threshold to {final_thresh:.2f}")
+
+    gen = AdaptiveImbalanceBarGenerator(symbol=symbol, initial_threshold=final_thresh, alpha=alpha)
+    bars = []
     for row in raw_ticks.itertuples():
-        price = getattr(row, 'price', getattr(row, 'close', None))
-        vol = getattr(row, 'volume', 1.0)
-        
-        ts = getattr(row, 'Index', getattr(row, 'time', None))
-        if isinstance(ts, (datetime, pd.Timestamp)):
-            ts_val = ts.timestamp()
-        else:
-            ts_val = float(ts)
-            
-        b_vol = 0.0
-        s_vol = 0.0
-        
-        if price is None: continue
-
-        bar = gen.process_tick(price, vol, ts_val, b_vol, s_vol)
-        
+        p = getattr(row, 'price', getattr(row, 'close', None))
+        v = getattr(row, 'volume', 1.0)
+        t = getattr(row, 'Index', getattr(row, 'time', None))
+        ts_val = t.timestamp() if isinstance(t, (datetime, pd.Timestamp)) else float(t)
+        if p is None: continue
+        bar = gen.process_tick(p, v, ts_val, 0.0, 0.0)
         if bar:
-            bars_list.append({
-                'timestamp': bar.timestamp,
-                'open': bar.open,
-                'high': bar.high,
-                'low': bar.low,
-                'close': bar.close,
-                'volume': bar.volume,
-                'vwap': bar.vwap,
-                'tick_count': bar.tick_count,
-                'buy_vol': bar.buy_vol,
-                'sell_vol': bar.sell_vol
+            bars.append({
+                'timestamp': bar.timestamp, 'open': bar.open, 'high': bar.high, 
+                'low': bar.low, 'close': bar.close, 'volume': bar.volume,
+                'vwap': bar.vwap, 'tick_count': bar.tick_count, 
+                'buy_vol': bar.buy_vol, 'sell_vol': bar.sell_vol
             })
 
-    if not bars_list:
-        log.warning(f"❌ {symbol}: Failed to generate bars from full dataset.")
-        return pd.DataFrame()
-
-    # 3. Convert to DataFrame
-    df_bars = pd.DataFrame(bars_list)
-    
-    # 4. Set Index to Datetime for Snapshot compatibility
+    if not bars: return pd.DataFrame()
+    df_bars = pd.DataFrame(bars)
     df_bars['time'] = pd.to_datetime(df_bars['timestamp'], unit='s', utc=True)
     df_bars.set_index('time', inplace=True, drop=False)
-    
     return df_bars
 
-# --- 2. WORKER FUNCTIONS (ISOLATED PROCESSES) ---
+# --- 2. WORKER FUNCTIONS ---
 
 def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url: str) -> None:
-    """
-    ISOLATED WORKER FUNCTION: Runs in a separate process.
-    Executes Global Optimization using "PROFIT IS KING" Logic.
-    """
-    # Double ensure single threading inside worker
     os.environ["OMP_NUM_THREADS"] = "1"
     setup_logging(f"Worker_{symbol}")
-    log = logging.getLogger(f"Worker_{symbol}")
     optuna.logging.set_verbosity(optuna.logging.WARN)
     
     try:
-        # Use dynamic train_candles passed from pipeline
         df = process_data_into_bars(symbol, n_ticks=train_candles)
         if df.empty: return
-        log.info(f"📥 {symbol}: Generated {len(df)} Imbalance Bars for training.")
 
         def objective(trial):
             space = CONFIG['optimization_search_space']
             params = CONFIG['online_learning'].copy()
             
-            # --- HYPERPARAMETER MAPPING ---
+            # --- V20.2 CRITICAL FIX: FORCE RISK SCALING FOR WFO ---
+            # Even if Live mode uses fixed 0.01 lots, the Optimizer MUST see 
+            # actual compounded dollars to calculate PF/SQN accurately.
+            params['risk_management'] = CONFIG.get('risk_management', {}).copy()
+            params['risk_management']['sizing_method'] = 'risk_percentage'
+            
+            # 1. Hyperparameter Suggestions
             params['n_models'] = trial.suggest_int('n_models', space['n_models']['min'], space['n_models']['max'], step=space['n_models']['step'])
             params['grace_period'] = trial.suggest_int('grace_period', space['grace_period']['min'], space['grace_period']['max'], step=space['grace_period']['step'])
             params['delta'] = trial.suggest_float('delta', float(space['delta']['min']), float(space['delta']['max']), log=space['delta'].get('log', True))
@@ -285,16 +201,15 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             params['vpin_threshold'] = trial.suggest_float('vpin_threshold', space['vpin_threshold']['min'], space['vpin_threshold']['max'])
             
             params['tbm'] = {
-                # V17.6 FIX: Enforce minimum 2.0 RR to clear the spread and commissions
-                'barrier_width': trial.suggest_float('barrier_width', max(2.0, space['tbm_barrier_width']['min']), max(4.0, space['tbm_barrier_width']['max'])),
+                'barrier_width': trial.suggest_float('barrier_width', space['tbm_barrier_width']['min'], space['tbm_barrier_width']['max']),
                 'horizon_minutes': trial.suggest_int('horizon_minutes', space['tbm_horizon_minutes']['min'], space['tbm_horizon_minutes']['max'], step=space['tbm_horizon_minutes']['step']),
-                'drift_threshold': trial.suggest_float('drift_threshold', space['tbm_drift_threshold']['min'], space['tbm_drift_threshold']['max'])
+                'drift_threshold': trial.suggest_float('drift_threshold', space['tbm_drift_threshold']['min'], space['tbm_drift_threshold']['max']),
+                'min_profit_pips': 12.0 
             }
             
             params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
             
-            # DYNAMIC RISK SEARCH (PROFIT MAXIMIZATION PROTOCOL)
-            risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0025, 0.005])
+            risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0025, 0.0050])
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             trial.set_user_attr("risk_pct", params['risk_per_trade_percent'] * 100)
             
@@ -306,299 +221,206 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             strategy = ResearchStrategy(model, symbol, params)
             
             for index, row in df.iterrows():
-                snapshot = MarketSnapshot(timestamp=index, data=row)
-                if snapshot.get_price(symbol, 'close') == 0: continue
-                broker.process_pending(snapshot)
-                strategy.on_data(snapshot, broker)
-                
-                # Stop processing only if TOTALLY blown (permanent ruin)
-                if getattr(broker, 'is_totally_blown', False): 
-                    break
+                snap = MarketSnapshot(timestamp=index, data=row)
+                if snap.get_price(symbol, 'close') == 0: continue
+                broker.process_pending(snap)
+                strategy.on_data(snap, broker)
+                if getattr(broker, 'is_totally_blown', False): break
             
-            metrics = pipeline_inst.calculate_performance_metrics(broker.trade_log, broker.initial_balance)
+            pm = pipeline_inst.calculate_performance_metrics(broker.trade_log, broker.initial_balance)
             
-            # --- PROFIT IS KING OBJECTIVE ---
-            total_return = metrics['total_pnl']
-            max_dd_pct = metrics['max_dd_pct']
-            trades = metrics['total_trades']
-            safe_dd = max_dd_pct if max_dd_pct > 0.001 else 0.001
-            calmar = (total_return / init_bal) / safe_dd
+            total_ret = pm['total_pnl']
+            max_dd = pm['max_dd_pct']
+            trades = pm['total_trades']
+            sqn = pm['sqn']
+            pf = pm['profit_factor']
+            safe_dd = max_dd if max_dd > 0.001 else 0.001
+            calmar = (total_ret / init_bal) / safe_dd
 
             trial.set_user_attr("autopsy", strategy.generate_autopsy())
-            trial.set_user_attr("pnl", total_return)
-            trial.set_user_attr("max_dd_pct", max_dd_pct)
-            trial.set_user_attr("win_rate", metrics['win_rate'])
+            trial.set_user_attr("pnl", total_ret)
+            trial.set_user_attr("max_dd_pct", max_dd)
+            trial.set_user_attr("win_rate", pm['win_rate'])
             trial.set_user_attr("trades", trades)
-            trial.set_user_attr("profit_factor", metrics['profit_factor'])
-            trial.set_user_attr("risk_reward_ratio", metrics['risk_reward_ratio'])
-            trial.set_user_attr("sqn", metrics['sqn'])
+            trial.set_user_attr("profit_factor", pf)
+            trial.set_user_attr("risk_reward_ratio", pm['risk_reward_ratio'])
+            trial.set_user_attr("sqn", sqn)
             trial.set_user_attr("calmar", calmar)
 
-            objective_score = total_return + (calmar * 100.0)
+            score = total_ret + (sqn * 1000.0) + (pf * 500.0) + (calmar * 10.0)
 
-            # --- OPTUNA TPE GRADIENT FIX (V17.6 Daily Resuscitation Support) ---
-            # Penalize total blowouts, excessive drawdown, AND daily limit hits.
             daily_hits = getattr(broker, 'daily_limit_hits', 0)
             total_blown = getattr(broker, 'is_totally_blown', False)
             
-            if total_blown or max_dd_pct > 0.08 or daily_hits > 0:
+            if total_blown or max_dd > 0.08 or daily_hits > 0:
                 trial.set_user_attr("blown", True)
-                dd_penalty = (max_dd_pct - 0.08) * 200000.0 if max_dd_pct > 0.08 else 0
-                daily_hit_penalty = daily_hits * 5000.0
-                return -5000.0 + total_return - dd_penalty - daily_hit_penalty
+                dd_penalty = (max_dd - 0.08) * 500000.0 if max_dd > 0.08 else 0
+                daily_penalty = daily_hits * 10000.0
+                return -10000.0 + total_ret - dd_penalty - daily_penalty
 
-            # SIGNIFICANCE FILTER
-            min_trades = CONFIG['wfo'].get('min_trades_optimization', 15)
+            # V20.2 SOFTER SIGNIFICANCE FILTER: Lowered penalty to allow AI to explore
+            min_trades = 30 # Lowered from 50 to allow medium-frequency trials
             if trades < min_trades:
                 trial.set_user_attr("pruned", True)
-                # Penalize based on how close we got to the minimum trade count
-                trade_shortfall_penalty = (min_trades - trades) * 100.0
-                return -1000.0 + total_return - trade_shortfall_penalty
+                trade_shortfall = (min_trades - trades) * 10.0 # Softened penalty so it doesn't crush scores
+                return -100.0 + total_ret - trade_shortfall 
                 
-            return objective_score
+            return score
 
         study_name = f"study_{symbol}"
-        for _ in range(3):
+        for _ in range(5):
             try:
                 study = optuna.load_study(study_name=study_name, storage=db_url)
                 break
-            except Exception:
-                time.sleep(1)
+            except: time.sleep(1)
         
         study.optimize(objective, n_trials=n_trials, callbacks=[EmojiCallback()])
-        del df
-        gc.collect()
+        del df; gc.collect()
         
     except Exception as e:
-        log.error(f"CRITICAL WORKER ERROR ({symbol}): {e}")
+        log.error(f"CRITICAL WORKER ERROR ({symbol}): {e}", exc_info=True)
 
 def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
-    """
-    ISOLATED WORKER FUNCTION: Runs Walk-Forward Optimization.
-    """
     os.environ["OMP_NUM_THREADS"] = "1"
     setup_logging(f"WFO_{symbol}")
-    log = logging.getLogger(f"WFO_{symbol}")
     optuna.logging.set_verbosity(optuna.logging.WARN)
     
     try:
-        # 1. Load All Data - Dynamic config load
         train_ticks = CONFIG['data'].get('num_candles_train', 10000000)
         df = process_data_into_bars(symbol, n_ticks=train_ticks)
         if df.empty: return
         
-        # 2. Define Window Params
         train_months = CONFIG['wfo'].get('train_years', 2) * 12
         test_months = CONFIG['wfo'].get('test_months', 6)
         
-        # Create Sliding Windows
-        start_date = df.index.min()
-        end_date = df.index.max()
-        
-        current_train_start = start_date
-        wfo_results = []
-        
-        log.info(f"🔄 Starting WFO Loop for {symbol}. Range: {start_date} -> {end_date}")
+        start_date, end_date = df.index.min(), df.index.max()
+        curr_train_start = start_date
+        results = []
         
         while True:
-            train_end = current_train_start + pd.DateOffset(months=train_months)
+            train_end = curr_train_start + pd.DateOffset(months=train_months)
             test_end = train_end + pd.DateOffset(months=test_months)
-            
-            if test_end > end_date:
-                break
+            if test_end > end_date: break
                 
-            # Slice Data
-            df_train = df[(df.index >= current_train_start) & (df.index < train_end)]
+            df_train = df[(df.index >= curr_train_start) & (df.index < train_end)]
             df_test = df[(df.index >= train_end) & (df.index < test_end)]
-            
             if df_train.empty or df_test.empty:
-                current_train_start += pd.DateOffset(months=test_months)
-                continue
+                curr_train_start += pd.DateOffset(months=test_months); continue
                 
-            window_id = f"{train_end.strftime('%Y-%m')}"
-            log.info(f"🪟 Processing Window {window_id} (Train: {len(df_train)} bars, Test: {len(df_test)} bars)")
-            
-            # --- OPTIMIZATION STEP (IN-SAMPLE) ---
-            study_name = f"wfo_{symbol}_{window_id}"
-            storage_url = f"sqlite:///wfo_{symbol}.db" 
-            
-            try:
-                optuna.delete_study(study_name=study_name, storage=storage_url)
+            win_id = f"{train_end.strftime('%Y-%m')}"
+            study_name = f"wfo_{symbol}_{win_id}"
+            try: optuna.delete_study(study_name=study_name, storage=f"sqlite:///wfo_{symbol}.db")
             except: pass
             
-            study = optuna.create_study(study_name=study_name, storage=storage_url, direction="maximize")
+            study = optuna.create_study(study_name=study_name, storage=f"sqlite:///wfo_{symbol}.db", direction="maximize")
             
-            def objective(trial):
+            def wfo_objective(trial):
                 space = CONFIG['optimization_search_space']
                 params = CONFIG['online_learning'].copy()
                 
-                params['n_models'] = trial.suggest_int('n_models', space['n_models']['min'], space['n_models']['max'], step=space['n_models']['step'])
-                params['grace_period'] = trial.suggest_int('grace_period', space['grace_period']['min'], space['grace_period']['max'], step=space['grace_period']['step'])
-                params['delta'] = trial.suggest_float('delta', float(space['delta']['min']), float(space['delta']['max']), log=space['delta'].get('log', True))
-                params['lambda_value'] = trial.suggest_int('lambda_value', space['lambda_value']['min'], space['lambda_value']['max'], step=space['lambda_value']['step'])
-                params['max_features'] = trial.suggest_categorical('max_features', ['log2', 'sqrt'])
-                params['entropy_threshold'] = trial.suggest_float('entropy_threshold', space['entropy_threshold']['min'], space['entropy_threshold']['max'])
-                params['vpin_threshold'] = trial.suggest_float('vpin_threshold', space['vpin_threshold']['min'], space['vpin_threshold']['max'])
-                params['tbm'] = {
-                    'barrier_width': trial.suggest_float('barrier_width', max(2.0, space['tbm_barrier_width']['min']), max(4.0, space['tbm_barrier_width']['max'])),
-                    'horizon_minutes': trial.suggest_int('horizon_minutes', space['tbm_horizon_minutes']['min'], space['tbm_horizon_minutes']['max'], step=space['tbm_horizon_minutes']['step']),
-                    'drift_threshold': trial.suggest_float('drift_threshold', space['tbm_drift_threshold']['min'], space['tbm_drift_threshold']['max'])
-                }
+                # FORCE RISK PERCENTAGE FOR WFO
+                params['risk_management'] = CONFIG.get('risk_management', {}).copy()
+                params['risk_management']['sizing_method'] = 'risk_percentage'
+                
+                params['n_models'] = trial.suggest_int('n_models', 30, 60)
+                params['barrier_width'] = trial.suggest_float('barrier_width', space['tbm_barrier_width']['min'], space['tbm_barrier_width']['max'])
                 params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
+                params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', [0.0025, 0.0050])
                 
-                # DYNAMIC RISK SEARCH
-                risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0025, 0.005])
-                params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
+                pipeline = ResearchPipeline()
+                broker = BacktestBroker(initial_balance=50000.0)
+                model = pipeline.get_fresh_model(params)
+                strat = ResearchStrategy(model, symbol, params)
                 
-                pipeline_inst = ResearchPipeline()
-                init_bal = CONFIG['env'].get('initial_balance', 50000.0)
-                broker = BacktestBroker(initial_balance=init_bal)
-                model = pipeline_inst.get_fresh_model(params)
-                strategy = ResearchStrategy(model, symbol, params)
-                
-                for index, row in df_train.iterrows():
-                    snapshot = MarketSnapshot(timestamp=index, data=row)
-                    if snapshot.get_price(symbol, 'close') == 0: continue
-                    broker.process_pending(snapshot)
-                    strategy.on_data(snapshot, broker)
+                for idx, row in df_train.iterrows():
+                    snap = MarketSnapshot(timestamp=idx, data=row)
+                    broker.process_pending(snap)
+                    strat.on_data(snap, broker)
                     if getattr(broker, 'is_totally_blown', False): break
                 
-                metrics = pipeline_inst.calculate_performance_metrics(broker.trade_log, broker.initial_balance)
+                pm = pipeline.calculate_performance_metrics(broker.trade_log)
                 
-                total_return = metrics['total_pnl']
-                max_dd_pct = metrics['max_dd_pct']
-                trades = metrics['total_trades']
-                safe_dd = max_dd_pct if max_dd_pct > 0.001 else 0.001
-                calmar = (total_return / init_bal) / safe_dd
-                
-                objective_score = total_return + (calmar * 100.0)
-                
-                # --- OPTUNA TPE GRADIENT FIX ---
-                daily_hits = getattr(broker, 'daily_limit_hits', 0)
-                total_blown = getattr(broker, 'is_totally_blown', False)
-                if total_blown or max_dd_pct > 0.08 or daily_hits > 0: 
-                    dd_penalty = (max_dd_pct - 0.08) * 200000.0 if max_dd_pct > 0.08 else 0
-                    daily_hit_penalty = daily_hits * 5000.0
-                    return -5000.0 + total_return - dd_penalty - daily_hit_penalty
-                    
-                min_trades = CONFIG['wfo'].get('min_trades_optimization', 15)
-                if trades < min_trades: 
-                    trade_shortfall_penalty = (min_trades - trades) * 100.0
-                    return -1000.0 + total_return - trade_shortfall_penalty
-                
-                return objective_score
+                if pm['total_trades'] < 5: return -100.0
+                return pm['total_pnl']
 
-            study.optimize(objective, n_trials=n_trials)
+            study.optimize(wfo_objective, n_trials=n_trials)
             
-            # --- VALIDATION STEP (OUT-OF-SAMPLE) ---
-            best_params = study.best_params
-            final_params = CONFIG['online_learning'].copy()
-            final_params.update(best_params)
+            final_p = CONFIG['online_learning'].copy()
+            final_p.update(study.best_params)
             
-            pipeline_inst = ResearchPipeline()
-            broker_test = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
-            model_test = pipeline_inst.get_fresh_model(final_params)
-            strategy_test = ResearchStrategy(model_test, symbol, final_params)
+            pipe = ResearchPipeline()
+            broker_oos = BacktestBroker(initial_balance=50000.0)
+            model_oos = pipe.get_fresh_model(final_p)
+            strat_oos = ResearchStrategy(model_oos, symbol, final_p)
             
-            for index, row in df_test.iterrows():
-                snapshot = MarketSnapshot(timestamp=index, data=row)
-                if snapshot.get_price(symbol, 'close') == 0: continue
-                broker_test.process_pending(snapshot)
-                strategy_test.on_data(snapshot, broker_test)
-                
-            test_metrics = pipeline_inst.calculate_performance_metrics(broker_test.trade_log, broker_test.initial_balance)
+            for idx, row in df_test.iterrows():
+                snap = MarketSnapshot(timestamp=idx, data=row)
+                broker_oos.process_pending(snap)
+                strat_oos.on_data(snap, broker_oos)
             
-            log.info(f"✅ Window {window_id} OOS Result: PnL ${test_metrics['total_pnl']:.0f} | DD {test_metrics['max_dd_pct']*100:.2f}% | Trades {test_metrics['total_trades']}")
+            oos_m = pipe.calculate_performance_metrics(broker_oos.trade_log)
+            results.append({'window': win_id, 'pnl': oos_m['total_pnl']})
+            curr_train_start += pd.DateOffset(months=test_months)
             
-            wfo_results.append({
-                'window': window_id,
-                'pnl': test_metrics['total_pnl'],
-                'dd': test_metrics['max_dd_pct'],
-                'trades': test_metrics['total_trades']
-            })
-            
-            current_train_start += pd.DateOffset(months=test_months)
-            
-        total_wfo_pnl = sum([r['pnl'] for r in wfo_results])
-        log.info(f"🏆 WFO COMPLETE {symbol}: Total OOS PnL ${total_wfo_pnl:.2f}")
+        log.info(f"🏆 WFO COMPLETE {symbol}: Total OOS PnL ${sum([r['pnl'] for r in results]):.2f}")
         
     except Exception as e:
         log.error(f"WFO Worker Error {symbol}: {e}")
 
 def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_dir: Path) -> None:
-    """
-    Trains the Final Production Model using the Best Params found.
-    Filters for Statistical Significance (min_trades).
-    """
     os.environ["OMP_NUM_THREADS"] = "1"
     setup_logging(f"Worker_Final_{symbol}")
     log = logging.getLogger(f"Worker_Final_{symbol}")
     
     try:
-        # Use dynamic train_candles passed from pipeline
         df = process_data_into_bars(symbol, n_ticks=train_candles)
         if df.empty: return
 
         study_name = f"study_{symbol}"
         study = optuna.load_study(study_name=study_name, storage=db_url)
         
-        if len(study.trials) == 0:
-            log.warning(f"No trials found for {symbol}. Skipping finalization.")
-            return
+        if not study.trials: return
 
-        # ROBUST SELECTION LOGIC
-        # Filter trials that met the trade count threshold
-        min_trades = CONFIG['wfo'].get('min_trades_optimization', 15)
+        min_trades = 30 # V20.2 Matching
+        valid = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE 
+                 and t.value is not None and t.user_attrs.get('trades', 0) >= min_trades
+                 and not t.user_attrs.get('blown', False)]
         
-        valid_trials = [
-            t for t in study.trials 
-            if t.state == optuna.trial.TrialState.COMPLETE 
-            and t.value is not None 
-            and t.user_attrs.get('trades', 0) >= min_trades
-            and not t.user_attrs.get('blown', False)
-        ]
-        
-        if valid_trials:
-            # Select the one with the highest objective value
-            best_trial = max(valid_trials, key=lambda t: t.value)
-            log.info(f"✅ Selected Robust Trial {best_trial.number} (Trades: {best_trial.user_attrs.get('trades')} >= {min_trades}, Score: {best_trial.value:.2f})")
+        if valid:
+            best_trial = max(valid, key=lambda t: t.value)
+            log.info(f"✅ Selected Robust Trial {best_trial.number} (Trades: {best_trial.user_attrs.get('trades')}, Score: {best_trial.value:.2f})")
         else:
-            # Fallback (Warning)
-            log.warning(f"⚠️ No trials met min_trades={min_trades}. Falling back to absolute best (Risk of Overfitting).")
+            log.warning(f"⚠️ No trials met min_trades={min_trades}. Selecting best available outlier.")
             best_trial = study.best_trial
             
         best_params = best_trial.params
-        
-        params_path = models_dir / f"best_params_{symbol}.json"
-        with open(params_path, "w") as f:
+        with open(models_dir / f"best_params_{symbol}.json", "w") as f:
             json.dump(best_params, f, indent=4)
 
-        final_params = CONFIG['online_learning'].copy()
-        final_params.update(best_params)
+        final_p = CONFIG['online_learning'].copy()
+        final_p.update(best_params)
         
-        pipeline_inst = ResearchPipeline()
-        model = pipeline_inst.get_fresh_model(final_params)
+        # FORCE RISK PERCENTAGE FOR FINAL VERIFICATION BACKTEST TOO
+        final_p['risk_management'] = CONFIG.get('risk_management', {}).copy()
+        final_p['risk_management']['sizing_method'] = 'risk_percentage'
+        
+        pipe = ResearchPipeline()
+        model = pipe.get_fresh_model(final_p)
         broker = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
-        strategy = ResearchStrategy(model, symbol, final_params)
+        strat = ResearchStrategy(model, symbol, final_p)
 
-        for index, row in df.iterrows():
-            snapshot = MarketSnapshot(timestamp=index, data=row)
-            if snapshot.get_price(symbol, 'close') == 0: continue
-            
-            broker.process_pending(snapshot)
-            strategy.on_data(snapshot, broker)
+        for idx, row in df.iterrows():
+            snap = MarketSnapshot(timestamp=idx, data=row)
+            broker.process_pending(snap)
+            strat.on_data(snap, broker)
 
-        with open(models_dir / f"river_pipeline_{symbol}.pkl", "wb") as f:
-            pickle.dump(strategy.model, f)
-        
-        with open(models_dir / f"meta_model_{symbol}.pkl", "wb") as f:
-            pickle.dump(strategy.meta_labeler, f)
+        # Persistence
+        for name, obj in [("river_pipeline", strat.model), ("meta_model", strat.meta_labeler), 
+                          ("calibrators", {'buy': strat.calibrator_buy, 'sell': strat.calibrator_sell})]:
+            with open(models_dir / f"{name}_{symbol}.pkl", "wb") as f:
+                pickle.dump(obj, f)
             
-        cal_state = {'buy': strategy.calibrator_buy, 'sell': strategy.calibrator_sell}
-        with open(models_dir / f"calibrators_{symbol}.pkl", "wb") as f:
-            pickle.dump(cal_state, f)
-            
-        log.info(f"✅ FINALIZED {symbol} | Best Score: {best_trial.value:.4f}")
+        log.info(f"✅ FINALIZED {symbol} | Metrics: {pipe.calculate_performance_metrics(broker.trade_log)}")
         gc.collect()
         
     except Exception as e:
@@ -608,440 +430,125 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
 
 class ResearchPipeline:
     def __init__(self):
-        # Safe Get for Symbols (Pruned list)
         self.symbols = CONFIG['trading'].get('symbols', [])
-        self.models_dir = Path("models")
-        self.models_dir.mkdir(exist_ok=True)
-        self.reports_dir = Path("reports")
-        self.reports_dir.mkdir(exist_ok=True)
-        
-        # DYNAMIC CONFIG LOADING FOR MASSIVE DATASETS
+        self.models_dir = Path("models"); self.models_dir.mkdir(exist_ok=True)
+        self.reports_dir = Path("reports"); self.reports_dir.mkdir(exist_ok=True)
         self.train_candles = CONFIG['data'].get('num_candles_train', 10000000)
-        self.backtest_candles = CONFIG['data'].get('num_candles_backtest', 1000000)
-        
         self.db_url = CONFIG['wfo'].get('db_url', 'sqlite:///optuna.db') 
-        
         log_cores = psutil.cpu_count(logical=True)
-        self.total_cores = max(1, log_cores - 4) if log_cores else 10
+        self.total_cores = max(1, log_cores - 2) if log_cores else 10
 
     def get_fresh_model(self, params: Dict[str, Any] = None) -> Any:
-        if params is None:
-            params = CONFIG['online_learning']
-        
-        metric_map = {
-            "LogLoss": metrics.LogLoss(),
-            "F1": metrics.F1(),
-            "Accuracy": metrics.Accuracy()
-        }
-        selected_metric = metric_map.get(params.get('metric', 'LogLoss'), metrics.LogLoss())
-
+        if params is None: params = CONFIG['online_learning']
         base_clf = forest.ARFClassifier(
-            n_models=params.get('n_models', 30),
-            seed=42,
-            grace_period=params.get('grace_period', 250),
+            n_models=params.get('n_models', 50), seed=42,
+            grace_period=params.get('grace_period', 200),
             delta=params.get('delta', 1e-5),
-            split_criterion='gini',
-            leaf_prediction='mc',
-            max_features=params.get('max_features', 'log2'),
             lambda_value=params.get('lambda_value', 10),
-            metric=selected_metric,
-            warning_detector=drift.ADWIN(delta=params.get('warning_delta', 0.001)),
-            drift_detector=drift.ADWIN(delta=params.get('delta', 1e-5))
+            metric=metrics.LogLoss(),
+            warning_detector=drift.ADWIN(delta=0.001),
+            drift_detector=drift.ADWIN(delta=1e-5)
         )
-
-        return compose.Pipeline(
-            preprocessing.StandardScaler(),
-            ensemble.ADWINBaggingClassifier(
-                model=base_clf,
-                n_models=5,
-                seed=42
-            )
-        )
+        return compose.Pipeline(preprocessing.StandardScaler(), base_clf)
 
     def calculate_performance_metrics(self, trade_log: List[Dict], initial_capital=50000.0) -> Dict[str, float]:
-        metrics_out = {
-            'risk_reward_ratio': 0.0,
-            'total_pnl': 0.0,
-            'max_dd_pct': 0.0,
-            'win_rate': 0.0,
-            'total_trades': 0,
-            'profit_factor': 0.0,
-            'sharpe': 0.0,
-            'sortino': 0.0,
-            'sqn': 0.0,
-            'avg_win': 0.0,
-            'avg_loss': 0.0,
-            'dd_events_gt_5': 0
-        }
-        
-        if not trade_log:
-            return metrics_out
-            
+        m = {k: 0.0 for k in ['risk_reward_ratio', 'total_pnl', 'max_dd_pct', 'win_rate', 'total_trades', 'profit_factor', 'sharpe', 'sortino', 'sqn']}
+        if not trade_log: return m
         df = pd.DataFrame(trade_log)
-        df['Entry_Time'] = pd.to_datetime(df['Entry_Time'])
-        df['Exit_Time'] = pd.to_datetime(df['Exit_Time'])
-        df = df.sort_values('Exit_Time') 
-        df['Net_PnL'] = pd.to_numeric(df['Net_PnL'], errors='coerce').fillna(0.0)
-        
-        total_pnl = df['Net_PnL'].sum()
-        metrics_out['total_pnl'] = total_pnl
-        metrics_out['total_trades'] = len(df)
-        
-        winners = df[df['Net_PnL'] > 0]
-        losers = df[df['Net_PnL'] <= 0]
-        metrics_out['win_rate'] = len(winners) / len(df) if len(df) > 0 else 0.0
-        
-        metrics_out['avg_win'] = winners['Net_PnL'].mean() if not winners.empty else 0.0
-        metrics_out['avg_loss'] = losers['Net_PnL'].mean() if not losers.empty else 0.0
-        
-        avg_loss_abs = abs(metrics_out['avg_loss'])
-        if avg_loss_abs > 0:
-            metrics_out['risk_reward_ratio'] = metrics_out['avg_win'] / avg_loss_abs
-        else:
-            if metrics_out['avg_win'] > 0:
-                metrics_out['risk_reward_ratio'] = 10.0
-            else:
-                metrics_out['risk_reward_ratio'] = 0.0
-
-        gross_profit = winners['Net_PnL'].sum()
-        gross_loss = abs(losers['Net_PnL'].sum())
-        metrics_out['profit_factor'] = gross_profit / gross_loss if gross_loss > 0 else 0.0
-
-        if len(df) > 1:
-            pnl_std = df['Net_PnL'].std()
-            if pnl_std > 1e-9:
-                metrics_out['sqn'] = np.sqrt(len(df)) * (df['Net_PnL'].mean() / pnl_std)
-
-        if initial_capital <= 1000:
-             log.warning(f"⚠️ SUSPICIOUS INITIAL CAPITAL: {initial_capital}. Defaulting to 50k.")
-             initial_capital = 50000.0
-
-        df['Equity'] = initial_capital + df['Net_PnL'].cumsum()
-        df['Peak'] = df['Equity'].cummax()
-        df['Peak'] = df['Peak'].clip(lower=initial_capital)
-        df['Drawdown_USD'] = df['Equity'] - df['Peak']
-        df['Drawdown_Pct'] = (df['Drawdown_USD'] / df['Peak']).abs()
-        
-        max_dd_pct = df['Drawdown_Pct'].max()
-        metrics_out['max_dd_pct'] = max_dd_pct if not pd.isna(max_dd_pct) else 0.0
-        
-        dd_events = len(df[df['Drawdown_Pct'] > 0.05])
-        metrics_out['dd_events_gt_5'] = dd_events
-
-        equity_df = pd.DataFrame({'time': df['Exit_Time'], 'pnl': df['Net_PnL']})
-        equity_df.set_index('time', inplace=True)
-        hourly_pnl = equity_df['pnl'].resample('1H').sum().fillna(0)
-        hourly_equity = initial_capital + hourly_pnl.cumsum()
-        hourly_returns = hourly_equity.pct_change().dropna()
-        
-        if len(hourly_returns) > 1:
-            avg_ret = hourly_returns.mean()
-            std_ret = hourly_returns.std()
-            annual_factor = np.sqrt(252 * 24)
-            if std_ret > 1e-9:
-                metrics_out['sharpe'] = (avg_ret / std_ret) * annual_factor
-            
-            downside_returns = hourly_returns[hourly_returns < 0]
-            if len(downside_returns) > 0:
-                downside_std = downside_returns.std()
-                if downside_std > 1e-9:
-                    metrics_out['sortino'] = (avg_ret / downside_std) * annual_factor
-
-        return metrics_out
-
-    def _get_sqn_rating(self, sqn: float) -> str:
-        if sqn < 1.6: return "POOR 🛑"
-        if sqn < 2.0: return "AVERAGE ⚠️"
-        if sqn < 2.5: return "GOOD ✅"
-        if sqn < 3.0: return "EXCELLENT 🚀"
-        if sqn < 5.0: return "SUPERB 💎"
-        if sqn < 7.0: return "HOLY GRAIL? 🦄"
-        return "GOD MODE ⚡"
-
-    def _purge_models(self):
-        """
-        Deletes all existing model files to ensure a clean slate for retraining.
-        """
-        log.warning(f"{LogSymbols.TRASH} PURGING OLD MODELS...")
-        for p in self.models_dir.glob("*.pkl"):
-            try:
-                p.unlink()
-                log.info(f"Deleted: {p.name}")
-            except Exception as e:
-                log.error(f"Failed to delete {p.name}: {e}")
-
-    def run_training(self, fresh_start: bool = False):
-        log.info(f"{LogSymbols.TRAINING} STARTING SWARM OPTIMIZATION on {len(self.symbols)} symbols...")
-        log.info(f"OBJECTIVE: PROFIT IS KING (Total PnL + Efficiency Tie-Breaker)")
-        log.info(f"HARDWARE DETECTED: {psutil.cpu_count(logical=True)} Cores. Using {self.total_cores} workers (Configured).")
-        
-        if fresh_start:
-            self._purge_models()
-
-        for symbol in self.symbols:
-            study_name = f"study_{symbol}"
-            if fresh_start:
-                print(f"🗑️ ATTEMPTING PURGE: {study_name}...")
-                try:
-                    optuna.delete_study(study_name=study_name, storage=self.db_url)
-                    print(f"✅ PURGED: {study_name}")
-                except Exception:
-                    pass
-            
-            try:
-                optuna.create_study(study_name=study_name, storage=self.db_url, direction="maximize", load_if_exists=True)
-            except Exception as e:
-                log.warning(f"Study init warning {symbol}: {e}")
-
-        total_trials_per_symbol = CONFIG['wfo'].get('n_trials', 200)
-        tasks = []
-        workers_per_symbol = max(1, self.total_cores // len(self.symbols))
-        trials_per_worker = math.ceil(total_trials_per_symbol / workers_per_symbol)
-        
-        log.info(f"DISTRIBUTION: {workers_per_symbol} workers/symbol | {trials_per_worker} trials/worker")
-        
-        for symbol in self.symbols:
-            for _ in range(workers_per_symbol):
-                tasks.append((symbol, trials_per_worker, self.train_candles, self.db_url))
-        
-        start_time = time.time()
-        
-        Parallel(n_jobs=self.total_cores, backend="loky")(
-            delayed(_worker_optimize_task)(*t) for t in tasks
-        )
-        
-        duration = time.time() - start_time
-        log.info(f"{LogSymbols.SUCCESS} Swarm Optimization Complete in {duration:.2f}s")
-        log.info(f"{LogSymbols.SAVE} Finalizing Models & Artifacts...")
-        
-        Parallel(n_jobs=len(self.symbols), backend="loky")(
-            delayed(_worker_finalize_task)(
-                sym,
-                self.train_candles,
-                self.db_url,
-                self.models_dir
-            ) for sym in self.symbols
-        )
-        log.info(f"{LogSymbols.SUCCESS} Training Pipeline Completed.")
-
-    def run_wfo(self):
-        log.info(f"{LogSymbols.TIME} STARTING WALK-FORWARD OPTIMIZATION (WFO)...")
-        log.info(f"OBJECTIVE: PROFIT IS KING (Rolling Window Validation)")
-        
-        n_trials = CONFIG['wfo'].get('n_trials', 50)
-        
-        Parallel(n_jobs=len(self.symbols), backend="loky")(
-            delayed(_worker_wfo_task)(
-                sym,
-                n_trials,
-                self.db_url
-            ) for sym in self.symbols
-        )
-        log.info(f"{LogSymbols.SUCCESS} WFO Pipeline Completed.")
-
-    def run_backtest(self):
-        log.info(f"{LogSymbols.BACKTEST} Starting BACKTEST verification...")
-        
-        results = Parallel(n_jobs=len(self.symbols), backend="loky")(
-            delayed(self._run_backtest_symbol)(sym) for sym in self.symbols
-        )
-        
-        all_trades = []
-        for trades in results:
-            all_trades.extend(trades)
-            
-        self._generate_report(all_trades)
-
-    def _run_backtest_symbol(self, symbol: str) -> List[Dict]:
-        try:
-            df = process_data_into_bars(symbol, n_ticks=self.train_candles)
-            if df.empty: return []
-
-            model_path = self.models_dir / f"river_pipeline_{symbol}.pkl"
-            params_path = self.models_dir / f"best_params_{symbol}.json"
-            meta_path = self.models_dir / f"meta_model_{symbol}.pkl"
-            cal_path = self.models_dir / f"calibrators_{symbol}.pkl"
-
-            if not model_path.exists():
-                log.error(f"Model missing for {symbol}")
-                return []
-                
-            with open(model_path, "rb") as f: model = pickle.load(f)
-            
-            params = CONFIG['online_learning'].copy()
-            if params_path.exists():
-                with open(params_path, "r") as f: params.update(json.load(f))
-            
-            strategy = ResearchStrategy(model, symbol, params)
-            strategy.debug_mode = True
-            
-            if meta_path.exists():
-                with open(meta_path, "rb") as f: strategy.meta_labeler = pickle.load(f)
-            if cal_path.exists():
-                with open(cal_path, "rb") as f:
-                    cals = pickle.load(f)
-                    strategy.calibrator_buy = cals['buy']
-                    strategy.calibrator_sell = cals['sell']
-            
-            broker = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
-            
-            for index, row in df.iterrows():
-                snapshot = MarketSnapshot(timestamp=index, data=row)
-                if snapshot.get_price(symbol, 'close') > 0:
-                    broker.process_pending(snapshot)
-                    strategy.on_data(snapshot, broker)
-            
-            return broker.trade_log
-        except Exception as e:
-            print(f"Backtest error {symbol}: {e}")
-            return []
-
-    def _generate_report(self, trade_log: List[Dict]):
-        if not trade_log:
-            log.info("No trades executed during backtest.")
-            return
-
-        df = pd.DataFrame(trade_log)
-        initial_capital = CONFIG['env'].get('initial_balance', 50000.0)
-        
-        df['Entry_Time'] = pd.to_datetime(df['Entry_Time'])
         df['Exit_Time'] = pd.to_datetime(df['Exit_Time'])
         df = df.sort_values('Exit_Time')
+        df['Net_PnL'] = pd.to_numeric(df['Net_PnL'], errors='coerce').fillna(0.0)
+        
+        m['total_pnl'] = df['Net_PnL'].sum()
+        m['total_trades'] = len(df)
+        wins, loss = df[df['Net_PnL'] > 0], df[df['Net_PnL'] <= 0]
+        m['win_rate'] = len(wins) / len(df)
+        m['profit_factor'] = wins['Net_PnL'].sum() / abs(loss['Net_PnL'].sum()) if not loss.empty else 0.0
         
         df['Equity'] = initial_capital + df['Net_PnL'].cumsum()
-        df['Peak'] = df['Equity'].cummax()
-        df['Peak'] = df['Peak'].clip(lower=initial_capital)
-        df['Drawdown_USD'] = df['Equity'] - df['Peak']
-        df['Drawdown_Pct'] = (df['Drawdown_USD'] / df['Peak']).abs() * 100.0
+        df['Drawdown'] = (df['Equity'] - df['Equity'].cummax()) / df['Equity'].cummax()
+        m['max_dd_pct'] = abs(df['Drawdown'].min())
         
-        total_trades = len(df)
-        net_pnl = df['Net_PnL'].sum()
-        win_count = len(df[df['Net_PnL'] > 0])
-        loss_count = len(df[df['Net_PnL'] <= 0])
-        win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0.0
-        
-        gross_profit = df[df['Net_PnL'] > 0]['Net_PnL'].sum()
-        gross_loss = abs(df[df['Net_PnL'] < 0]['Net_PnL'].sum())
-        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
-        
-        avg_win = df[df['Net_PnL'] > 0]['Net_PnL'].mean() if win_count > 0 else 0.0
-        avg_loss = df[df['Net_PnL'] <= 0]['Net_PnL'].mean() if loss_count > 0 else 0.0
-        rr_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else 0.0
-        
-        expectancy = (win_rate/100 * avg_win) + ((1 - win_rate/100) * avg_loss)
-        max_dd_pct = df['Drawdown_Pct'].max()
-        max_dd_usd = df['Drawdown_USD'].min()
-        
-        equity_series = pd.Series(df['Net_PnL'].values, index=pd.to_datetime(df['Exit_Time'])).resample('1H').sum().fillna(0)
-        hourly_equity = initial_capital + equity_series.cumsum()
-        hourly_returns = hourly_equity.pct_change().dropna()
-        
-        sharpe = 0.0
-        if hourly_returns.std() > 1e-9:
-            sharpe = (hourly_returns.mean() / hourly_returns.std()) * np.sqrt(252 * 24)
+        if len(df) > 5:
+            m['sqn'] = np.sqrt(len(df)) * (df['Net_PnL'].mean() / df['Net_PnL'].std())
+        return m
 
-        returns_std = df['Net_PnL'].std()
-        sqn = (math.sqrt(total_trades) * (df['Net_PnL'].mean() / returns_std)) if returns_std > 0 else 0.0
-        sqn_rating = self._get_sqn_rating(sqn)
-        
-        if 'Duration_Min' not in df.columns:
-             df['Duration_Min'] = (df['Exit_Time'] - df['Entry_Time']).dt.total_seconds() / 60.0
-        
-        avg_duration = df['Duration_Min'].mean()
-        
-        log.info("="*60)
-        log.info(f"PHOENIX RESEARCH ENGINE - BACKTEST REPORT")
-        log.info("="*60)
-        log.info(f"{'Metric':<30} | {'Value':<15}")
-        log.info("-"*50)
-        log.info(f"{'Net Profit':<30} | ${net_pnl:,.2f}")
-        log.info(f"{'Initial Capital':<30} | ${initial_capital:,.2f}")
-        log.info(f"{'Return %':<30} | {(net_pnl/initial_capital)*100:.2f}%")
-        log.info(f"{'Profit Factor':<30} | {profit_factor:.2f}")
-        log.info(f"{'Win Rate':<30} | {win_rate:.2f}% ({win_count}/{total_trades})")
-        log.info(f"{'Total Trades':<30} | {total_trades}")
-        log.info("-"*50)
-        log.info(f"{'Max Drawdown':<30} | {max_dd_pct:.2f}% (${abs(max_dd_usd):,.2f})")
-        log.info(f"{'Expectancy':<30} | ${expectancy:.2f}")
-        log.info(f"{'SQN Score':<30} | {sqn:.2f} ({sqn_rating})")
-        log.info(f"{'Sharpe (Hourly)':<30} | {sharpe:.4f}")
-        log.info("-"*50)
-        log.info(f"{'Avg Win':<30} | ${avg_win:,.2f}")
-        log.info(f"{'Avg Loss':<30} | ${avg_loss:,.2f}")
-        log.info(f"{'Risk:Reward':<30} | 1:{rr_ratio:.2f}")
-        log.info(f"{'Avg Duration':<30} | {avg_duration:.1f} min")
-        log.info("="*60)
+    def run_training(self, fresh_start: bool = False):
+        log.info(f"{LogSymbols.TRAINING} STARTING V20.2 SWARM OPTIMIZATION...")
+        if fresh_start:
+            for p in self.models_dir.glob("*.pkl"): p.unlink()
+            for s in self.symbols:
+                try: optuna.delete_study(study_name=f"study_{s}", storage=self.db_url)
+                except: pass
 
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_path = self.reports_dir / f"backtest_trades_{timestamp_str}.csv"
-        df.to_csv(csv_path)
-        log.info(f"{LogSymbols.DATABASE} Saved Trades to {csv_path}")
+        tasks = []
+        workers_per_symbol = max(1, self.total_cores // len(self.symbols))
+        trials_per_worker = math.ceil(CONFIG['wfo'].get('n_trials', 100) / workers_per_symbol)
         
+        for s in self.symbols:
+            optuna.create_study(study_name=f"study_{s}", storage=self.db_url, direction="maximize", load_if_exists=True)
+            for _ in range(workers_per_symbol):
+                tasks.append((s, trials_per_worker, self.train_candles, self.db_url))
+        
+        start = time.time()
+        Parallel(n_jobs=self.total_cores, backend="loky")(delayed(_worker_optimize_task)(*t) for t in tasks)
+        log.info(f"{LogSymbols.SUCCESS} Swarm Complete in {time.time()-start:.2f}s. Finalizing...")
+        
+        Parallel(n_jobs=len(self.symbols), backend="loky")(delayed(_worker_finalize_task)(s, self.train_candles, self.db_url, self.models_dir) for s in self.symbols)
+
+    def run_backtest(self):
+        log.info(f"{LogSymbols.BACKTEST} Running Verification Backtest...")
+        results = Parallel(n_jobs=len(self.symbols), backend="loky")(delayed(self._run_backtest_symbol)(s) for s in self.symbols)
+        all_trades = [t for sub in results for t in sub]
+        self._generate_report(all_trades)
+
+    def _run_backtest_symbol(self, s: str) -> List[Dict]:
         try:
-            self._plot_equity_curve(df, timestamp_str)
-        except Exception as e:
-            log.warning(f"Could not generate plot: {e}")
-
-    def _plot_equity_curve(self, df_equity: pd.DataFrame, timestamp_str: str):
-        try:
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                                vertical_spacing=0.05, row_heights=[0.7, 0.3],
-                                subplot_titles=("Equity Curve", "Drawdown"))
-
-            fig.add_trace(
-                go.Scatter(x=df_equity['Entry_Time'], y=df_equity['Equity'], mode='lines', name='Equity', line=dict(color='#00ff00')),
-                row=1, col=1
-            )
+            df = process_data_into_bars(s, n_ticks=self.train_candles)
+            if df.empty: return []
+            with open(self.models_dir / f"river_pipeline_{s}.pkl", "rb") as f: model = pickle.load(f)
+            params = CONFIG['online_learning'].copy()
+            with open(self.models_dir / f"best_params_{s}.json", "r") as f: params.update(json.load(f))
             
-            fig.add_trace(
-                go.Scatter(x=df_equity['Entry_Time'], y=df_equity['Drawdown_Pct'], mode='lines', name='Drawdown %', fill='tozeroy', line=dict(color='#ff0000')),
-                row=2, col=1
-            )
+            # FORCE RISK PERCENTAGE FOR FINAL VERIFICATION BACKTEST
+            params['risk_management'] = CONFIG.get('risk_management', {}).copy()
+            params['risk_management']['sizing_method'] = 'risk_percentage'
 
-            fig.update_layout(
-                title="Backtest Performance (Aggregate)",
-                xaxis_title="Time",
-                template="plotly_dark",
-                height=800
-            )
-            
-            output_file = self.reports_dir / f"backtest_report_{timestamp_str}.html"
-            fig.write_html(output_file)
-            log.info(f"✅ HTML Report saved to: {output_file}")
-        except ImportError:
-            log.warning("Plotly not installed or import error. Skipping plot.")
+            strat = ResearchStrategy(model, s, params)
+            broker = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
+            for idx, row in df.iterrows():
+                snap = MarketSnapshot(timestamp=idx, data=row)
+                broker.process_pending(snap); strat.on_data(snap, broker)
+            return broker.trade_log
+        except: return []
+
+    def _generate_report(self, trade_log: List[Dict]):
+        if not trade_log: return
+        df = pd.DataFrame(trade_log)
+        df['Exit_Time'] = pd.to_datetime(df['Exit_Time'])
+        df = df.sort_values('Exit_Time')
+        df['Equity'] = 50000.0 + df['Net_PnL'].cumsum()
+        log.info("="*60 + "\nPHOENIX V20.2 FINAL REPORT\n" + "="*60)
+        log.info(f"Total Trades: {len(df)} | Net Profit: ${df['Net_PnL'].sum():,.2f}")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        df.to_csv(self.reports_dir / f"backtest_trades_{timestamp}.csv")
 
 def main():
-    optuna.logging.set_verbosity(optuna.logging.WARN)
-    
     parser = argparse.ArgumentParser()
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--backtest', action='store_true')
     parser.add_argument('--fresh-start', action='store_true')
     parser.add_argument('--wfo', action='store_true')
-    
     args = parser.parse_args()
-    
     pipeline = ResearchPipeline()
-    
-    if args.wfo:
-        pipeline.run_wfo()
-    elif args.train:
-        pipeline.run_training(fresh_start=args.fresh_start)
-    elif args.backtest:
-        pipeline.run_backtest()
+    if args.wfo: pipeline.run_wfo()
+    elif args.train: pipeline.run_training(fresh_start=args.fresh_start)
+    elif args.backtest: pipeline.run_backtest()
     else:
-        # Default behavior if no flags: Train then Backtest
-        log.info("No flags provided. Defaulting to FRESH TRAIN + BACKTEST.")
-        pipeline.run_training(fresh_start=True)
-        pipeline.run_backtest()
+        pipeline.run_training(fresh_start=True); pipeline.run_backtest()
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        log.info("Research process interrupted.")
-        sys.exit(0)
+    try: main()
     except Exception as e:
         log.critical(f"Research Pipeline Failed: {e}", exc_info=True)
         sys.exit(1)

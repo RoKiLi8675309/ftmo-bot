@@ -37,7 +37,8 @@ except ImportError:
 
 # River / Sklearn imports (Guarded for Windows Producer compatibility)
 try:
-    from river import linear_model, forest, metrics
+    # ✅ FIX: Added 'optim' to the river imports
+    from river import linear_model, forest, metrics, optim
     from sklearn.isotonic import IsotonicRegression
     from sklearn.exceptions import ConvergenceWarning
     ML_AVAILABLE = True
@@ -133,6 +134,7 @@ class StreamingBollingerBands:
         # Calculate Stats
         mu = np.mean(self.buffer)
         std = np.std(self.buffer)
+        if std < 1e-9: std = 1e-9 # Prevent Div/0 Flatline Collapse
         
         upper = mu + (self.num_std * std)
         lower = mu - (self.num_std * std)
@@ -149,9 +151,8 @@ class StreamingBollingerBands:
         elif price < lower:
             breakout = (price - lower) / price # Negative value
             
-        # --- SQUEEZE DETECTOR (V17.5 FIX) ---
+        # --- SQUEEZE DETECTOR ---
         # Measures how tight current bands are compared to the last N periods.
-        # squeeze_percentile < 0.20 indicates extreme volatility contraction (coiling).
         if len(self.width_history) > 10:
             hist_array = np.array(self.width_history)
             squeeze_pct = np.sum(hist_array < width) / len(hist_array)
@@ -700,157 +701,226 @@ class StreamingIndicators:
         self.prev_close = price
         return features
 
-# --- 5. ADAPTIVE TRIPLE BARRIER ---
+# --- 5. ADAPTIVE TRIPLE BARRIER (V20.2 RE-ENGINEERED) ---
 
 class AdaptiveTripleBarrier:
     """
-    Labeling engine.
-    Updated for Rec 3: Volatility-Based Horizon Transition.
-    Replaces static time expiry with dynamic Volume or Volatility limits.
+    V20.2 Reality-Injected Labeling Engine.
+    Simulates actual broker execution constraints during ML training.
     """
     def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.0, reward_mult: float = 2.0, 
                  drift_threshold: float = 0.75, horizon_type: str = 'TIME', horizon_value: float = 0.0):
-        """
-        :param horizon_type: 'TIME' (ticks), 'VOLUME' (cum_vol), 'VOLATILITY' (cum_sq_ret)
-        :param horizon_value: The threshold for VOLUME or VOLATILITY horizons. If 0, uses config defaults.
-        """
         self.buffer = deque()
         self.time_limit = horizon_ticks
         self.risk_mult = risk_mult
         self.reward_mult = reward_mult
         self.drift_threshold = drift_threshold
-        
-        # Strategic Rec 3: Dynamic Horizon Support
         self.horizon_type = horizon_type.upper()
         self.horizon_threshold = horizon_value
-        
         if self.horizon_type == 'TIME' and self.horizon_threshold == 0:
             self.horizon_threshold = horizon_ticks
 
-    def add_trade_opportunity(self, features: Dict[str, float], entry_price: float, current_atr: float, timestamp: float, parkinson_vol: float = 0.0):
+    def add_trade_opportunity(self, features: Dict[str, float], entry_price: float, current_atr: float, 
+                              timestamp: float, parkinson_vol: float = 0.0, 
+                              min_stop_dist: float = 0.0, cost_in_price: float = 0.0, 
+                              min_profit_dist: float = 0.0,
+                              proposed_action: int = 0, pred_proba: float = 0.5):
+        """
+        Calculates exact broker geometry.
+        Now explicitly tracks the proposed action to train the calibrator on actual failures.
+        """
         if current_atr <= 0: current_atr = entry_price * 0.0001
         
-        # Base Volatility Scaling
         volatility = features.get('volatility', 0.0)
         adaptive_scalar = 1.0 + (volatility * 100.0)
         
-        # Parkinson Volatility Boost (Expansion Logic)
         p_vol = parkinson_vol if parkinson_vol > 0 else features.get('parkinson_vol', 0.0)
-        
-        vol_boost = 0.0
-        if p_vol > 0.002:
-            vol_boost = 0.5 # Add 0.5x ATR room during expansion
+        vol_boost = 0.5 if p_vol > 0.002 else 0.0
         
         effective_risk_mult = (self.risk_mult + vol_boost) * adaptive_scalar
         effective_reward_mult = (self.reward_mult + vol_boost) * adaptive_scalar
         
-        upper_barrier = entry_price + (effective_reward_mult * current_atr)
-        lower_barrier = entry_price - (effective_risk_mult * current_atr)
+        # 1. Base Geometry
+        raw_risk_dist = effective_risk_mult * current_atr
+        actual_risk_dist = max(raw_risk_dist, min_stop_dist) 
         
+        actual_reward_dist = actual_risk_dist * (effective_reward_mult / effective_risk_mult)
+        
+        # 2. Broker Reality Injection
+        # A BUY trade pays the spread twice (Ask entry, Bid exit). 
+        # So TP is pushed further away by cost. SL is pulled closer by cost.
+        buy_tp = entry_price + actual_reward_dist + cost_in_price
+        buy_sl = entry_price - actual_risk_dist + cost_in_price
+        
+        # A SELL trade sells at Bid, buys back at Ask. 
+        # TP is pushed lower by cost. SL is pushed higher (sooner) by cost.
+        sell_tp = entry_price - actual_reward_dist - cost_in_price
+        sell_sl = entry_price + actual_risk_dist - cost_in_price
+
+        # Minimum required profit after costs
+        min_profit_pct = (min_profit_dist + cost_in_price) / entry_price if entry_price > 0 else 0.0
+        
+        # Inject minimum profit requirement into features so Strategy loop can retrieve it
+        feats_copy = features.copy()
+        feats_copy['min_profit_pct'] = min_profit_pct
+
         self.buffer.append({
-            'features': features,
+            'features': feats_copy,
             'entry': entry_price,
-            'tp': upper_barrier,
-            'sl': lower_barrier,
+            'buy_tp': buy_tp,
+            'buy_sl': buy_sl,
+            'sell_tp': sell_tp,
+            'sell_sl': sell_sl,
             'atr': current_atr,
             'start_time': timestamp,
             'age': 0,
-            'cum_vol': 0.0,         # For Volume Horizon
-            'cum_volatility': 0.0   # For Volatility Horizon (sum of squared returns)
+            'cum_vol': 0.0,
+            'cum_volatility': 0.0,
+            'cost_pct': cost_in_price / entry_price if entry_price > 0 else 0.0,
+            'min_profit_pct': min_profit_pct,
+            'proposed_action': proposed_action,
+            'pred_proba': pred_proba
         })
 
     def resolve_labels(self, current_high: float, current_low: float, current_close: float = None, 
-                       current_volume: float = 0.0, current_log_ret: float = 0.0) -> List[Tuple[Dict[str, float], int, float]]:
+                       current_volume: float = 0.0, current_log_ret: float = 0.0) -> List[Tuple[Dict[str, float], int, float, int, float, float]]:
         """
-        Checks active labels for barrier hits or expiry.
-        Now supports Volume and Volatility based expiry.
+        Evaluates independent virtual BUY and SELL trades to solve Asymmetry.
+        Returns: (features, optimal_label, optimal_ret, proposed_action, pred_proba, proposed_ret)
         """
         resolved = []
         active = deque()
-        
-        if current_close is None:
-            current_close = (current_high + current_low) / 2.0
+        if current_close is None: current_close = (current_high + current_low) / 2.0
 
         while self.buffer:
             trade = self.buffer.popleft()
-            
-            # Update cumulative metrics
             trade['age'] += 1
             trade['cum_vol'] += current_volume
             trade['cum_volatility'] += (current_log_ret ** 2)
-            
-            label = None
-            realized_ret = 0.0
-            
-            # 1. Vertical Barrier Check (Expiry)
+
             is_expired = False
             if self.horizon_type == 'TIME':
                 if trade['age'] >= self.time_limit: is_expired = True
             elif self.horizon_type == 'VOLUME':
-                # Threshold default to 100x current bar vol if not set (simple heuristic fallback)
                 thresh = self.horizon_threshold if self.horizon_threshold > 0 else current_volume * 100
                 if trade['cum_vol'] >= thresh: is_expired = True
             elif self.horizon_type == 'VOLATILITY':
-                # Threshold default to 5x daily var if not set
                 thresh = self.horizon_threshold if self.horizon_threshold > 0 else 0.0005
                 if trade['cum_volatility'] >= thresh: is_expired = True
-            
-            # 2. Horizontal Barrier Checks (TP/SL)
-            if current_high >= trade['tp']:
-                label = 1  # BUY
-                realized_ret = (trade['tp'] - trade['entry']) / trade['entry']
-            elif current_low <= trade['sl']:
-                label = -1 # SELL
-                realized_ret = (trade['entry'] - trade['sl']) / trade['entry']
-            
-            # 3. Expiry Resolution
-            elif is_expired:
-                drift = current_close - trade['entry']
-                drift_req = trade['atr'] * self.drift_threshold
-                
-                if drift > drift_req:
-                    label = 1 # Soft BUY
-                    realized_ret = (current_close - trade['entry']) / trade['entry']
-                elif drift < -drift_req:
-                    label = -1 # Soft SELL
-                    realized_ret = (trade['entry'] - current_close) / trade['entry']
-                else:
-                    label = 0 # Noise
-                    realized_ret = 0.0
 
-            if label is not None:
-                resolved.append((trade['features'], label, realized_ret))
+            buy_status = 0
+            sell_status = 0
+
+            # Evaluate VIRTUAL BUY
+            if current_low <= trade['buy_sl']: buy_status = -1
+            elif current_high >= trade['buy_tp']: buy_status = 1
+            
+            # Evaluate VIRTUAL SELL
+            if current_high >= trade['sell_sl']: sell_status = -1
+            elif current_low <= trade['sell_tp']: sell_status = 1
+
+            # Resolve if triggered or expired
+            if buy_status != 0 or sell_status != 0 or is_expired:
+                buy_ret = 0.0
+                sell_ret = 0.0
+                cost_pct = trade['cost_pct']
+
+                # Calculate Net Return (BUY)
+                if buy_status == 1: 
+                    buy_ret = (trade['buy_tp'] - trade['entry']) / trade['entry'] - cost_pct
+                elif buy_status == -1: 
+                    buy_ret = (trade['buy_sl'] - trade['entry']) / trade['entry'] - cost_pct
+                elif is_expired: 
+                    buy_ret = (current_close - trade['entry']) / trade['entry'] - cost_pct
+
+                # Calculate Net Return (SELL)
+                if sell_status == 1: 
+                    sell_ret = (trade['entry'] - trade['sell_tp']) / trade['entry'] - cost_pct
+                elif sell_status == -1: 
+                    sell_ret = (trade['entry'] - trade['sell_sl']) / trade['entry'] - cost_pct
+                elif is_expired: 
+                    sell_ret = (trade['entry'] - current_close) / trade['entry'] - cost_pct
+
+                # V20.2 FIX: Optimal Label Selection
+                # We MUST explicitely label Chop (0) when both sides fail.
+                # Previously this was falling back to the "least bad" option,
+                # teaching the model to trade even when there was no Alpha.
+                if buy_ret > 0 and buy_ret > sell_ret:
+                    optimal_label = 1
+                    optimal_ret = buy_ret
+                elif sell_ret > 0 and sell_ret > buy_ret:
+                    optimal_label = -1
+                    optimal_ret = sell_ret
+                else:
+                    # Both lost money, or absolute 0 return. This is pure Noise/Chop.
+                    optimal_label = 0
+                    optimal_ret = max(buy_ret, sell_ret)
+                    
+                # Proposed Action Outcome (crucial to defeat survivorship bias)
+                proposed_action = trade.get('proposed_action', 0)
+                pred_proba = trade.get('pred_proba', 0.5)
+                proposed_ret = 0.0
+                
+                if proposed_action == 1:
+                    proposed_ret = buy_ret
+                elif proposed_action == -1:
+                    proposed_ret = sell_ret
+
+                resolved.append((
+                    trade['features'], 
+                    optimal_label, 
+                    optimal_ret,
+                    proposed_action,
+                    pred_proba,
+                    proposed_ret
+                ))
             else:
                 active.append(trade)
-        
+
         self.buffer = active
         return resolved
 
 # --- 6. PROBABILITY CALIBRATOR & META LABELER ---
 
 class ProbabilityCalibrator:
+    """
+    V20.2 Bootstrap Protocol:
+    Calibrates raw output probabilities to true empirical probabilities.
+    Insulated against NaN crashes during probability collapse.
+    """
     def __init__(self, window: int = 1000):
-        self.window = window
-        self.y_true = deque(maxlen=window)
-        self.y_prob = deque(maxlen=window)
         self.calibrator = None
         if ML_AVAILABLE:
-            self.calibrator = IsotonicRegression(out_of_bounds='clip')
+            self.calibrator = linear_model.LogisticRegression(
+                optimizer=optim.SGD(0.05),
+                loss=optim.losses.Log(),
+                l2=0.1
+            )
+        self.samples_seen = 0
 
     def update(self, prob: float, label: int):
-        self.y_prob.append(prob)
-        self.y_true.append(label)
+        if ML_AVAILABLE and math.isfinite(prob):
+            self.calibrator.learn_one({'raw_prob': prob}, label)
+            self.samples_seen += 1
 
     def calibrate(self, raw_prob: float) -> float:
-        if not ML_AVAILABLE or len(self.y_true) < 100:
-            return raw_prob
+        if not ML_AVAILABLE: return raw_prob
+        
+        # V20.2 FIX: Gently floor early probabilities so WFO trials don't stall out
+        if self.samples_seen < 100:
+            return max(0.50, raw_prob)
+            
         try:
-            self.calibrator.fit(list(self.y_prob), list(self.y_true))
-            return float(self.calibrator.predict([raw_prob])[0])
+            calibrated_dict = self.calibrator.predict_proba_one({'raw_prob': raw_prob})
+            calibrated = calibrated_dict.get(1, raw_prob)
+            return max(0.01, min(calibrated, 0.99))
         except Exception:
-            return raw_prob
+            return max(0.50, raw_prob)
 
 class MetaLabeler:
+    """
+    Secondary model that learns when the primary model is likely to be right or wrong.
+    """
     def __init__(self):
         self.model = None
         self.buffer = deque(maxlen=1000)
@@ -873,19 +943,23 @@ class MetaLabeler:
             self.model.learn_one(clean_features, y_meta)
             self.buffer.append((clean_features, y_meta))
         except Exception as e:
-            logger.error(f"MetaLabeler Update Error: {e}")
+            logger.debug(f"MetaLabeler Update Error: {e}")
 
-    def predict(self, features: Dict[str, float], primary_action: int, threshold: float = 0.55) -> bool:
+    def predict(self, features: Dict[str, float], primary_action: int, threshold: float = 0.50) -> bool:
         if not ML_AVAILABLE or primary_action == 0:
             return False
+            
+        # V20.2 FIX: Allow 100 free trades before enforcing Meta-Labeler
+        if len(self.buffer) < 100: return True 
+            
         try:
             meta_feats = self._enrich(features, primary_action)
             clean_features = self._sanitize(meta_feats)
             probs = self.model.predict_proba_one(clean_features)
             prob_profit = probs.get(1, 0.0)
-            return prob_profit > threshold
+            return prob_profit >= threshold
         except Exception as e:
-            logger.error(f"MetaLabeler Predict Error: {e}")
+            logger.debug(f"MetaLabeler Predict Error: {e}")
             return False
 
     def _enrich(self, features: Dict[str, float], action: int) -> Dict[str, float]:
@@ -900,7 +974,7 @@ class MetaLabeler:
     def _sanitize(self, features: Dict[str, float]) -> Dict[str, float]:
         clean = {}
         for k, v in features.items():
-            if math.isfinite(v):
+            if v is not None and math.isfinite(v):
                 clean[k] = float(v)
             else:
                 clean[k] = 0.0
@@ -937,7 +1011,7 @@ class OnlineFeatureEngineer:
         self.aggressor = StreamingAggressorRatio()
         
         # Momentum Logic: Bollinger Bands
-        self.bb = StreamingBollingerBands(window=20, num_std=2.0) # V17.5 updated from 1.5
+        self.bb = StreamingBollingerBands(window=20, num_std=1.0)
 
         # Microstructure & Math Engines
         self.entropy = EntropyMonitor(window=window_size)
@@ -1022,7 +1096,6 @@ class OnlineFeatureEngineer:
         # Hurst
         hurst_val = 0.5
         if len(self.returns) >= 20:
-            # Explicit float64 for JIT stability
             ret_arr = np.array(list(self.returns), dtype=np.float64)
             hurst_val = calculate_hurst(ret_arr)
 
@@ -1107,11 +1180,11 @@ class OnlineFeatureEngineer:
             'flow_imbalance': flow_imbalance, 
             'flow_ratio': flow_ratio,            
             
-            # V9 Momentum Features
+            # Momentum Features
             'bb_breakout': bb_feats['bb_breakout'],
             'bb_width': bb_feats['bb_width'],
             'bb_pct_b': bb_feats['bb_pct_b'],
-            'bb_squeeze': bb_feats.get('bb_squeeze_percentile', 0.5), # V17.5 Squeeze logic
+            'bb_squeeze': bb_feats.get('bb_squeeze_percentile', 0.5),
             
             # Regime & Math
             'ker': ker_val,
@@ -1121,8 +1194,8 @@ class OnlineFeatureEngineer:
             'hurst': hurst_val,
             'frac_diff': fd_price,
             'vpin': vpin_val,
-            'choppiness': chop_index,    # 0-100 (50+ = Chop)
-            'vortex_spread': vi_plus - vi_minus, # >0 Bullish, <0 Bearish
+            'choppiness': chop_index,    
+            'vortex_spread': vi_plus - vi_minus, 
             
             # Technicals
             'rsi_norm': rsi_norm,
@@ -1160,7 +1233,7 @@ class OnlineFeatureEngineer:
     def _sanitize_features(self, features: Dict[str, float]) -> Dict[str, float]:
         clean = {}
         for k, v in features.items():
-            if math.isfinite(v):
+            if v is not None and math.isfinite(v):
                 clean[k] = float(v)
             else:
                 clean[k] = 0.0
@@ -1218,7 +1291,11 @@ class EntropyMonitor:
         try:
             prices = list(self.buffer)
             returns = np.diff(prices)
+            
+            # V20.2 FIX: If standard deviation is effectively zero, there is 
+            # no information entropy. Return 0.0 instead of default 0.5.
             if np.std(returns) < 1e-9: return 0.0
+                
             hist, _ = np.histogram(returns, bins=10, density=True)
             ent = entropy(hist)
             if math.isnan(ent): return 0.5
@@ -1307,6 +1384,9 @@ def calculate_hurst(ts):
     Calculates the Hurst Exponent using Numba-optimized standard deviation analysis.
     Uses explicit manual linear regression (O(N)) to replace np.linalg.lstsq, 
     ensuring stability across Numpy versions in Numba.
+    
+    V20.2 FIX: Cast internal np.zeros arrays to float64 to ensure Numba JIT stability 
+    regardless of the type of the incoming `ts` array.
     """
     n = len(ts)
     if n < 20: return 0.5
