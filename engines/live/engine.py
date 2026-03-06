@@ -72,7 +72,7 @@ class TradeDispatcher:
     to the Execution Engine (Windows Producer) via Redis Streams.
     
     UPDATED: FORCE MARKET EXECUTION ONLY.
-    V20.2 FIX: STRICT IMMUTABLE RISK PERSISTENCE FOR SWING TRADING.
+    V20.4 FIX: STRICT IMMUTABLE RISK PERSISTENCE FOR SWING TRADING.
     """
     def __init__(self, stream_mgr: RedisStreamManager, pending_tracker: dict[str, Any], lock: threading.RLock):
         self.stream_mgr = stream_mgr
@@ -87,7 +87,7 @@ class TradeDispatcher:
             order_id = uuid.uuid4()
             short_id = str(order_id)[:8]
             
-            # --- V20.0 FIX: PERSIST INITIAL RISK DISTANCE ---
+            # --- V20.4 FIX: PERSIST INITIAL RISK DISTANCE ---
             try:
                 initial_risk_dist = abs(trade.entry_price - trade.stop_loss)
                 if initial_risk_dist > 0:
@@ -232,7 +232,7 @@ class LogicWorker(multiprocessing.Process):
     def run(self):
         setup_logging("LogicWorker")
         worker_log = logging.getLogger("LogicWorker")
-        worker_log.info(f"{LogSymbols.ONLINE} Logic Worker Started (PID: {os.getpid()}) | V20.2 True Order Flow Protocol Active")
+        worker_log.info(f"{LogSymbols.ONLINE} Logic Worker Started (PID: {os.getpid()}) | V20.5 Unchoked Protocol Active")
         
         threshold_map = self._calibrate_thresholds(worker_log)
         
@@ -240,7 +240,6 @@ class LogicWorker(multiprocessing.Process):
         alpha = self.config['data'].get('imbalance_alpha', 0.05)
         
         for sym in self.symbols:
-            # V20.2 FIX: Align volume_bar_threshold fallback to 10.0
             thresh = threshold_map.get(sym, self.config['data'].get('volume_bar_threshold', 10.0)) 
             aggregators[sym] = AdaptiveImbalanceBarGenerator(
                 symbol=sym,
@@ -331,9 +330,6 @@ class LogicWorker(multiprocessing.Process):
                 ts /= 1000.0
             
             now = time.time()
-            
-            # V20.2 FIX: If Linux clock drifts behind Windows clock, it produces negative latency.
-            # Using max(0.0, ...) ensures we don't drop valid ticks due to minor cross-OS NTP disparities.
             latency = max(0.0, now - ts)
             symbol = tick_data.get('symbol')
             
@@ -357,7 +353,7 @@ class LogicWorker(multiprocessing.Process):
         log.info(f"{LogSymbols.TRAINING} Logic Worker: Auto-Calibrating Thresholds...")
         threshold_map = {}
         alpha = self.config['data'].get('imbalance_alpha', 0.05)
-        config_thresh = self.config['data'].get('volume_bar_threshold', 10.0) # V20.2 Default
+        config_thresh = self.config['data'].get('volume_bar_threshold', 10.0) 
         
         for sym in self.symbols:
             try:
@@ -492,7 +488,6 @@ class LiveTradingEngine:
         self.last_corr_update = time.time()
         self.latest_prices = {}
         
-        # V20.2 FIX: Structure initialized to manage symbol->list mapping
         self.latest_positions = defaultdict(list)
         
         self._inject_fallback_prices()
@@ -511,6 +506,10 @@ class LiveTradingEngine:
 
         self.mgmt_thread = threading.Thread(target=self._manage_active_positions_loop, daemon=True)
         self.mgmt_thread.start()
+
+        # V20.5: Start MT5 Execution Logger Thread (PubSub from Windows)
+        self.execution_log_thread = threading.Thread(target=self._execution_logger_loop, daemon=True)
+        self.execution_log_thread.start()
 
     def _inject_fallback_prices(self):
         defaults = {
@@ -753,10 +752,6 @@ class LiveTradingEngine:
         return False
 
     def _get_open_positions_from_redis(self) -> Dict[str, List[Dict]]:
-        """
-        V20.2 MULTI-TIER FIX: Maps symbols to a LIST of positions to ensure 
-        pyramiding orders aren't overwritten and forgotten.
-        """
         magic = CONFIG['trading']['magic_number']
         key = f"{CONFIG['redis']['position_state_key_prefix']}:{magic}"
         
@@ -772,7 +767,6 @@ class LiveTradingEngine:
                 if sym:
                     pos_map[sym].append(p)
             
-            # Persist locally for processing
             self.latest_positions = dict(pos_map)
             return dict(pos_map)
         except Exception as e:
@@ -802,22 +796,19 @@ class LiveTradingEngine:
         total_open_tickets += local_pending_total
         symbol_open_tickets += local_pending_symbol
 
-        config_max = CONFIG.get('risk_management', {}).get('max_open_trades', 4)
+        # V20.5 FIX: Remove arbitrary global limits that choke scale. Fallback to 100.
+        config_max = CONFIG.get('risk_management', {}).get('max_open_trades', 100)
         max_global = config_max
 
         if total_open_tickets >= max_global:
             logger.warning(f"🚫 Global Trade Limit Reached ({total_open_tickets}/{max_global}). Margin Protected.")
             return False
 
-        if symbol_open_tickets > 0:
-            is_pyramid_on = CONFIG.get('risk_management', {}).get('pyramiding', {}).get('enabled', False)
-            max_adds = CONFIG.get('risk_management', {}).get('pyramiding', {}).get('max_adds', 1)
-            
-            if is_pyramid_on and symbol_open_tickets <= max_adds:
-                return True
-            else:
-                logger.warning(f"🚫 {symbol} already active. Concurrency Limit reached.")
-                return False
+        # V20.5 FIX: STRICT 1 TRADE PER PAIR
+        # We completely bypass the buggy pyramiding loop. If 1 trade exists, block new ones.
+        if symbol_open_tickets >= 1:
+            # Silently drop to avoid console spam during high-frequency signals on an open pair
+            return False
             
         return True
 
@@ -910,7 +901,6 @@ class LiveTradingEngine:
                 if trade_intent.volume <= 0: 
                     continue
                 
-                # RiskManager returns CORRECT distances; we just convert to absolute
                 trade_intent.action = signal.action
                 entry_ref = current_price
                 trade_intent.entry_price = entry_ref
@@ -951,7 +941,6 @@ class LiveTradingEngine:
                 now_utc = datetime.now(pytz.utc)
                 session_liquidation = self.session_guard.should_liquidate(timestamp=now_utc)
 
-                # V20.2 FIX: Iterate through lists of positions per symbol to respect pyramids
                 for sym, pos_list in positions_map.items():
                     for pos in pos_list:
                         exit_reason = None
@@ -1066,7 +1055,6 @@ class LiveTradingEngine:
 
     def _reconcile_pending_orders(self, open_positions_map: Dict[str, List[Dict]]):
         try:
-            # Flatten map for Trade Dispatcher Zombie scanning
             flat_positions = {}
             if open_positions_map:
                 for sym, pos_list in open_positions_map.items():
@@ -1130,13 +1118,9 @@ class LiveTradingEngine:
             if self.ticks_processed % 1000 == 0:
                 logger.info(f"⚡ HEARTBEAT: Processed {self.ticks_processed} ticks... (Last: {symbol})")
 
-            # Override the estimated volumes with our exact flag-based volumes
             tick_data['bid_vol'] = bid_vol
             tick_data['ask_vol'] = ask_vol
             
-            # --- V20.2 PREDICTOR COMPATIBILITY FIX ---
-            # Pass a flattened structure of the LAST position per symbol
-            # until the Predictor is updated to seamlessly ingest multi-tier lists.
             legacy_positions = {}
             for s, p_list in self.latest_positions.items():
                 if p_list: legacy_positions[s] = p_list[-1]
@@ -1239,7 +1223,6 @@ class LiveTradingEngine:
                             self.process_tick(data)
                             self.stream_mgr.r.xack(stream_key, group, message_id)
                 
-                # --- V20.2 MULTI-TIER RECONCILIATION ---
                 open_positions_map = self._get_open_positions_from_redis()
                 self._reconcile_pending_orders(open_positions_map)
                 
@@ -1280,6 +1263,42 @@ class LiveTradingEngine:
             logger.error(f"Error terminating logic worker: {e}")
             
         logger.info("Logic Worker Terminated.")
+
+    def _execution_logger_loop(self):
+        """
+        V20.5: Listens to Redis PubSub for real-time trade execution updates from Windows Producer.
+        Brings MT5 terminal visibility directly into the Linux VS Code console.
+        """
+        logger.info(f"{LogSymbols.ONLINE} MT5 Execution Logger Thread Started.")
+        try:
+            pubsub = self.stream_mgr.r.pubsub()
+            pubsub.subscribe(['order_filled_channel', 'order_failed_channel'])
+            
+            for message in pubsub.listen():
+                if self.shutdown_flag:
+                    break
+                    
+                if message['type'] == 'message':
+                    try:
+                        if isinstance(message['data'], bytes):
+                            data_str = message['data'].decode('utf-8')
+                        else:
+                            data_str = message['data']
+                            
+                        data = json.loads(data_str)
+                        channel = message['channel']
+                        
+                        if isinstance(channel, bytes):
+                            channel = channel.decode('utf-8')
+                        
+                        if channel == 'order_filled_channel':
+                            logger.info(f"{LogSymbols.SUCCESS} [MT5 TERMINAL] ORDER FILLED: {data.get('symbol')} | Ticket: {data.get('ticket')}")
+                        elif channel == 'order_failed_channel':
+                            logger.error(f"{LogSymbols.ERROR} [MT5 TERMINAL] ORDER FAILED: {data.get('symbol')} | Reason: {data.get('reason')}")
+                    except Exception as e:
+                        logger.debug(f"Failed to parse MT5 execution message: {e}")
+        except Exception as e:
+            logger.error(f"Execution Logger Loop Error: {e}")
 
 if __name__ == "__main__":
     engine = LiveTradingEngine()

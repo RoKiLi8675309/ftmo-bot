@@ -28,7 +28,7 @@ class TradeDispatcher:
     to the Execution Engine (Windows Producer) via Redis Streams.
     
     UPDATED: FORCE MARKET EXECUTION ONLY.
-    V20.2 FIX: INJECTS STATIC INITIAL RISK TO REDIS & SANITIZES SL/TP FLOATS.
+    V20.5 FIX: INJECTS STRICT 1:2 R:R METAL LAYER GUARD & SANITIZES SL/TP FLOATS.
     """
     def __init__(self, stream_mgr: RedisStreamManager, pending_tracker: dict[str, Any], lock: threading.RLock):
         """
@@ -53,6 +53,19 @@ class TradeDispatcher:
             order_id = uuid.uuid4()
             short_id = str(order_id)[:8]
             
+            # --- V20.5 FIX: STRICT R:R ENFORCEMENT AT THE DISPATCH LAYER ---
+            # Even if the logic layer requests a trade, we mathematically verify it here 
+            # before it ever touches Redis or MT5.
+            if trade.action in ["BUY", "SELL"] and trade.stop_loss > 0 and trade.take_profit > 0:
+                risk_dist = abs(trade.entry_price - trade.stop_loss)
+                reward_dist = abs(trade.take_profit - trade.entry_price)
+                if risk_dist > 0:
+                    rr_ratio = reward_dist / risk_dist
+                    # 1.90 allows for minor float rounding from the 2.0x target
+                    if rr_ratio < 1.90:
+                        logger.error(f"🛑 REJECTED BY DISPATCHER: {trade.symbol} R:R Ratio is {rr_ratio:.2f} (Target >= 2.0). Blocked to prevent spread bleed.")
+                        return  # Abort dispatch immediately
+
             # --- V20.2 FIX: PERSIST INITIAL RISK DISTANCE ---
             # We calculate the absolute price distance between the entry reference 
             # and the initial stop loss. This is saved to a Redis hash so the 

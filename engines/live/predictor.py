@@ -46,7 +46,7 @@ class Signal:
 
 class ProbabilityCalibrator:
     """
-    V20.2 BOOTSTRAP PROTOCOL:
+    V20.5 BOOTSTRAP PROTOCOL:
     Platt Scaling Calibrator adapted for swing trading confidence.
     """
     def __init__(self):
@@ -56,24 +56,29 @@ class ProbabilityCalibrator:
             l2=0.1 
         )
         self.samples_seen = 0
+        self.pos_count = 0
+        self.neg_count = 0
 
     def update(self, prob: float, label: int):
         if math.isfinite(prob):
             self.calibrator.learn_one({'raw_prob': prob}, label)
             self.samples_seen += 1
+            if label == 1:
+                self.pos_count += 1
+            else:
+                self.neg_count += 1
 
     def calibrate(self, raw_prob: float) -> float:
-        # V20.2 FIX: Gently floor early probabilities so WFO trials don't stall out
-        # before the calibrator has enough data to build a baseline curve.
-        if self.samples_seen < 100:
-            return max(0.50, raw_prob) 
+        # V20.5 FIX: Ensure enough data before choking trades
+        if self.pos_count < 50 or self.neg_count < 50:
+            return max(0.60, raw_prob) 
             
         try:
             calibrated_dict = self.calibrator.predict_proba_one({'raw_prob': raw_prob})
             calibrated = calibrated_dict.get(1, raw_prob)
-            return max(0.01, min(calibrated, 0.99))
+            return max(raw_prob - 0.05, min(calibrated, 0.99))
         except Exception:
-            return max(0.50, raw_prob)
+            return max(0.60, raw_prob)
 
 class MetaLabeler:
     """
@@ -86,12 +91,21 @@ class MetaLabeler:
             metric=metrics.F1()
         )
         self.buffer = deque(maxlen=1000)
+        self.pos_count = 0
+        self.neg_count = 0
 
     def update(self, features: Dict[str, float], primary_action: int, outcome_pnl: float):
         if primary_action == 0:
             return
         
+        # 1 = Profit, 0 = Loss.
         y_meta = 1 if outcome_pnl > 0 else 0
+        
+        if y_meta == 1:
+            self.pos_count += 1
+        else:
+            self.neg_count += 1
+            
         try:
             meta_feats = self._enrich(features, primary_action)
             clean_features = self._sanitize(meta_feats)
@@ -104,17 +118,17 @@ class MetaLabeler:
         if primary_action == 0:
             return False
             
-        if len(self.buffer) < 100: 
+        if self.pos_count < 50 or self.neg_count < 50: 
             return True 
             
         try:
             meta_feats = self._enrich(features, primary_action)
             clean_features = self._sanitize(meta_feats)
             probs = self.model.predict_proba_one(clean_features)
-            return probs.get(1, 0.0) >= threshold
+            return probs.get(1, 0.0) >= 0.40
         except Exception as e:
             logger.debug(f"MetaLabeler Predict Error: {e}")
-            return False
+            return True
 
     def _enrich(self, features: Dict[str, float], action: int) -> Dict[str, float]:
         clean = features.copy()
@@ -137,10 +151,10 @@ class MetaLabeler:
 
 class AdaptiveTripleBarrier:
     """
-    V20.2 SPREAD TRAP CURE & CHOP LABELING.
-    Enforces wide barriers to escape broker slippage and explicit Noise labeling.
+    V20.5 SPREAD TRAP CURE & CHOP LABELING.
+    Enforces wide barriers to escape broker slippage.
     """
-    def __init__(self, horizon_ticks: int = 720, risk_mult: float = 2.0, reward_mult: float = 3.0, 
+    def __init__(self, horizon_ticks: int = 720, risk_mult: float = 1.5, reward_mult: float = 3.0, 
                  drift_threshold: float = 1.5, horizon_type: str = 'TIME', horizon_value: float = 0.0):
         self.buffer = deque()
         self.time_limit = horizon_ticks
@@ -257,17 +271,15 @@ class AdaptiveTripleBarrier:
                 elif is_expired: 
                     sell_ret = (trade['entry'] - current_close) / trade['entry'] - spread_pct - comm_pct
 
-                # V20.2 FIX: Teach the Base Model what Noise/Chop is.
-                # Do NOT force a 1 or -1 label if BOTH directions resulted in a loss.
-                if buy_ret > 0 and buy_ret > sell_ret:
+                if buy_ret > sell_ret:
                     optimal_label = 1
                     optimal_ret = buy_ret
-                elif sell_ret > 0 and sell_ret > buy_ret:
+                elif sell_ret > buy_ret:
                     optimal_label = -1
                     optimal_ret = sell_ret
                 else:
-                    optimal_label = 0
-                    optimal_ret = max(buy_ret, sell_ret)
+                    optimal_label = 1 if current_close >= trade['entry'] else -1
+                    optimal_ret = buy_ret
                     
                 proposed_action = trade.get('proposed_action', 0)
                 pred_proba = trade.get('pred_proba', 0.5)
@@ -307,9 +319,9 @@ class MultiAssetPredictor:
         
         tbm_conf = CONFIG['online_learning']['tbm']
         risk_conf = CONFIG.get('risk_management', {})
-        risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 2.0)) 
+        risk_mult_conf = float(risk_conf.get('stop_loss_atr_mult', 1.5)) # V20.5 tighter baseline 
         
-        self.max_currency_exposure = int(risk_conf.get('max_currency_exposure', 2))
+        self.max_currency_exposure = int(risk_conf.get('max_currency_exposure', 4))
         
         session_conf = risk_conf.get('session_control', {})
         self.session_enabled = session_conf.get('enabled', False)
@@ -325,7 +337,7 @@ class MultiAssetPredictor:
         self.volume_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         
         self.bb_window = 20
-        self.bb_std = 2.0 
+        self.bb_std = 1.5 # V20.5 Wider bands to prevent chop entries
         self.bb_buffers = {s: deque(maxlen=self.bb_window) for s in symbols}
         
         self.sniper_closes = {s: deque(maxlen=200) for s in symbols} 
@@ -344,16 +356,16 @@ class MultiAssetPredictor:
         self.regime_enforcement = "DISABLED" 
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
         
-        # V20.2: Lowered thresholds to unchoke bot
         self.ker_floor = 0.0003 
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.52)) 
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.55)) # V20.5 Stricter Trends
         self.hurst_veto = 0.65 
         self.rvol_trigger = 0.8 
         self.max_rvol_thresh = 35.0 
+        self.adx_threshold = float(CONFIG.get('features', {}).get('adx', {}).get('threshold', 25.0)) # V20.5 Momentum Reinstated
 
         for s in symbols:
             s_risk = risk_mult_conf
-            s_reward = tbm_conf.get('barrier_width', 2.5)
+            s_reward = tbm_conf.get('barrier_width', 3.0) # V20.5 forces 1:3 baseline to beat spread
             s_horizon = tbm_conf.get('horizon_minutes', 720) 
             s_horizon_type = tbm_conf.get('horizon_type', 'TIME')
             s_horizon_val = float(tbm_conf.get('horizon_threshold', 0.0))
@@ -365,7 +377,7 @@ class MultiAssetPredictor:
                         bp = json.load(f)
                         self.optimized_params[s] = bp 
                         
-                        if 'barrier_width' in bp: s_reward = float(bp['barrier_width'])
+                        if 'barrier_width' in bp: s_reward = max(float(bp['barrier_width']), 2.0) # Absolute minimum 1:2
                         if 'horizon_minutes' in bp: s_horizon = int(bp['horizon_minutes'])
                         
                         if 'risk_per_trade_percent' in bp:
@@ -572,37 +584,40 @@ class MultiAssetPredictor:
         
         min_stop_pips = float(CONFIG.get('risk_management', {}).get('min_stop_loss_pips', 15.0))
         min_stop_dist = min_stop_pips * pip_val
-        min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 25.0))
+        min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 30.0))
         min_profit_dist = min_profit_pips * pip_val
 
-        # --- V20.2 ORDER FLOW SWING SIMULATION ---
-        aggressor_ratio = features.get('aggressor_ratio', 0.5)
+        # ============================================================
+        # V20.5 SMART SIGNAL MATRIX (WARMUP) - INJECTING HEURISTICS
+        # ============================================================
         is_trending = hurst >= self.hurst_breakout
         proposed_action = 0
+        
+        adx_val = features.get('adx', 0.0)
+        rsi_norm = features.get('rsi_norm', 0.5)
+        rsi_val = rsi_norm * 100.0
         
         if len(self.bb_buffers[symbol]) >= self.bb_window:
             bb_mu = np.mean(self.bb_buffers[symbol])
             bb_std = np.std(self.bb_buffers[symbol])
-            if bb_std < 1e-9: bb_std = 1e-9 # Prevent Div/0 Flatline Collapse
+            if bb_std < 1e-9: bb_std = 1e-9 
             
             upper_bb = bb_mu + (self.bb_std * bb_std)
             lower_bb = bb_mu - (self.bb_std * bb_std)
             
-            buy_pressure = aggressor_ratio >= 0.65
-            sell_pressure = aggressor_ratio <= 0.35
-            vol_expansion = rvol_val >= self.rvol_trigger
-            
             if is_trending:
                 regime_label = "TREND_BREAKOUT"
-                if bar.close >= upper_bb and buy_pressure and vol_expansion: 
-                    proposed_action = 1 
-                elif bar.close <= lower_bb and sell_pressure and vol_expansion: 
-                    proposed_action = -1 
+                if adx_val >= self.adx_threshold: # V20.5: Enforce Momentum
+                    if bar.close >= upper_bb: 
+                        proposed_action = 1 
+                    elif bar.close <= lower_bb: 
+                        proposed_action = -1 
             else:
                 regime_label = "MEAN_REVERSION"
-                if bar.close <= lower_bb and buy_pressure: 
+                # V20.5: Enforce Overbought/Oversold Exhaustion
+                if bar.close <= lower_bb and rsi_val < 30.0: 
                     proposed_action = 1 
-                elif bar.close >= upper_bb and sell_pressure: 
+                elif bar.close >= upper_bb and rsi_val > 70.0: 
                     proposed_action = -1  
 
         if hurst >= self.hurst_veto and regime_label == "MEAN_REVERSION" and proposed_action != 0:
@@ -615,7 +630,9 @@ class MultiAssetPredictor:
         except:
             prob_success = 0.0
 
-        current_reward_target = max(self.labelers[symbol].reward_mult, 1.5)
+        current_reward_target = max(self.labelers[symbol].reward_mult, 2.0)
+        if regime_label == "TREND_BREAKOUT":
+            current_reward_target = max(current_reward_target, 3.0)
 
         self.labelers[symbol].add_trade_opportunity(
             features=features, entry_price=bar.close, current_atr=current_atr, 
@@ -662,35 +679,6 @@ class MultiAssetPredictor:
         
         return hurst, ker, rvol
 
-    def _check_volatility_condition(self, symbol: str) -> bool:
-        buffer = self.returns_window[symbol]
-        if len(buffer) < 10: return True 
-        vol = np.std(list(buffer))
-        return vol >= 0.00005 
-
-    def _get_preferred_regime(self, symbol: str) -> str:
-        if symbol in self.asset_regime_map: return self.asset_regime_map[symbol]
-        regimes_found = [regime for key, regime in self.asset_regime_map.items() if key in symbol]
-        if "TREND_BREAKOUT" in regimes_found: return "TREND_BREAKOUT"
-        if "MEAN_REVERSION" in regimes_found: return "MEAN_REVERSION"
-        return "NEUTRAL"
-
-    def _check_currency_exposure(self, symbol: str, open_positions: Dict[str, Any]) -> bool:
-        base_ccy = symbol[:3]
-        quote_ccy = symbol[3:]
-        base_count = 0
-        quote_count = 0
-        
-        for sym in open_positions:
-            pos_base = sym[:3]
-            pos_quote = sym[3:]
-            if base_ccy == pos_base or base_ccy == pos_quote: base_count += 1
-            if quote_ccy == pos_base or quote_ccy == pos_quote: quote_count += 1
-        
-        if base_count >= self.max_currency_exposure: return False
-        if quote_count >= self.max_currency_exposure: return False
-        return True
-
     def process_bar(self, symbol: str, bar: VolumeBar, context_data: Dict[str, Any] = None) -> Optional[Signal]:
         if symbol not in self.symbols: return None
         price = bar.close
@@ -704,7 +692,6 @@ class MultiAssetPredictor:
         model = self.models[symbol]
         meta_labeler = self.meta_labelers[symbol]
         stats = self.rejection_stats[symbol]
-        feat_stats = self.feature_stats[symbol]
         
         self.bar_counters[symbol] += 1
         
@@ -727,9 +714,6 @@ class MultiAssetPredictor:
             if prev_p > 0:
                 self.returns_window[symbol].append(math.log(price / prev_p))
 
-        self.sniper_closes[symbol].append(price)
-        if len(self.sniper_closes[symbol]) > 1:
-            self.sniper_rsi[symbol].append(self.sniper_closes[symbol][-1] - self.sniper_closes[symbol][-2])
         self.bb_buffers[symbol].append(price)
 
         buy_vol = getattr(bar, 'buy_vol', 0.0)
@@ -772,9 +756,6 @@ class MultiAssetPredictor:
             self.dynamic_ker_offsets[symbol] = max(-0.10, self.dynamic_ker_offsets[symbol] - 0.05)
         else:
             self.dynamic_ker_offsets[symbol] = min(0.0, self.dynamic_ker_offsets[symbol] + 0.001)
-
-        feat_stats['avg_ker'] = (0.99) * feat_stats.get('avg_ker', 0.5) + 0.01 * ker_val
-        feat_stats['avg_rvol'] = (0.99) * feat_stats.get('avg_rvol', 1.0) + 0.01 * rvol_val
 
         # ============================================================
         # B. DELAYED TRAINING
@@ -820,60 +801,7 @@ class MultiAssetPredictor:
         except Exception as e:
             logger.error(f"Training Loop Crash: {e}", exc_info=True)
 
-        # ============================================================
-        # C. SMART SIGNAL MATRIX (V20.2 ORDER FLOW SWING)
-        # ============================================================
-        regime_label = "Neutral"
-        proposed_action = 0 
-        
-        aggressor_ratio = features.get('aggressor_ratio', 0.5)
-        is_trending = hurst >= self.hurst_breakout
-        
-        if len(self.bb_buffers[symbol]) >= self.bb_window:
-            bb_mu = np.mean(self.bb_buffers[symbol])
-            bb_std = np.std(self.bb_buffers[symbol])
-            if bb_std < 1e-9: bb_std = 1e-9 # Prevent Div/0 Flatline Collapse
-            
-            upper_bb = bb_mu + (self.bb_std * bb_std)
-            lower_bb = bb_mu - (self.bb_std * bb_std)
-            
-            buy_pressure = aggressor_ratio >= 0.65
-            sell_pressure = aggressor_ratio <= 0.35
-            vol_expansion = rvol_val >= self.rvol_trigger
-            
-            if is_trending:
-                regime_label = "TREND_BREAKOUT"
-                
-                # Volatility Breakout with Institutional Backing
-                if price >= upper_bb and buy_pressure and vol_expansion: 
-                    proposed_action = 1 
-                elif price <= lower_bb and sell_pressure and vol_expansion: 
-                    proposed_action = -1 
-                    
-            else:
-                regime_label = "MEAN_REVERSION"
-                
-                # Order Flow Absorption (Price hits exhaustion bounds but flow is opposite)
-                if price <= lower_bb and buy_pressure: 
-                    proposed_action = 1 
-                elif price >= upper_bb and sell_pressure: 
-                    proposed_action = -1  
-
-        if hurst >= self.hurst_veto and regime_label == "MEAN_REVERSION" and proposed_action != 0:
-            proposed_action = 0
-
-        clean_features = {k: float(v) for k, v in features.items() if math.isfinite(v)}
-        try:
-            pred_proba = model.predict_proba_one(clean_features)
-            prob_success = pred_proba.get(proposed_action, 0.0)
-        except Exception:
-            prob_success = 0.0
-
-        # ============================================================
-        # D. ADD TRADE OPPORTUNITY (WITH BROKER REALITY)
-        # ============================================================
         current_atr = features.get('atr', 0.001)
-        
         pip_val, _ = RiskManager.get_pip_info(symbol)
         if pip_val <= 0: pip_val = 0.0001
         
@@ -883,12 +811,64 @@ class MultiAssetPredictor:
         
         min_stop_pips = float(CONFIG.get('risk_management', {}).get('min_stop_loss_pips', 15.0))
         min_stop_dist = min_stop_pips * pip_val
-        min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 25.0))
+        min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 30.0))
         min_profit_dist = min_profit_pips * pip_val
 
-        current_reward_target = max(self.labelers[symbol].reward_mult, 1.5)
+        # ============================================================
+        # C. SMART SIGNAL MATRIX (V20.5: EXPERT HEURISTICS)
+        # ============================================================
+        regime_label = "Neutral"
+        proposed_action = 0 
+        
+        is_trending = hurst >= self.hurst_breakout
+        
+        adx_val = features.get('adx', 0.0)
+        rsi_norm = features.get('rsi_norm', 0.5)
+        rsi_val = rsi_norm * 100.0
+        
+        if len(self.bb_buffers[symbol]) >= self.bb_window:
+            bb_mu = np.mean(self.bb_buffers[symbol])
+            bb_std = np.std(self.bb_buffers[symbol])
+            if bb_std < 1e-9: bb_std = 1e-9 
+            
+            upper_bb = bb_mu + (self.bb_std * bb_std)
+            lower_bb = bb_mu - (self.bb_std * bb_std)
+            
+            if is_trending:
+                regime_label = "TREND_BREAKOUT"
+                # V20.5: Require Momentum Confirmation to escape consolidation chop
+                if adx_val >= self.adx_threshold:
+                    if price >= upper_bb: 
+                        proposed_action = 1 
+                    elif price <= lower_bb: 
+                        proposed_action = -1 
+            else:
+                regime_label = "MEAN_REVERSION"
+                # V20.5: Require Exhaustion to prevent stepping in front of trains
+                if price <= lower_bb and rsi_val < 30.0: 
+                    proposed_action = 1 
+                elif price >= upper_bb and rsi_val > 70.0: 
+                    proposed_action = -1  
 
-        labeler.add_trade_opportunity(
+        if hurst >= self.hurst_veto and regime_label == "MEAN_REVERSION" and proposed_action != 0:
+            proposed_action = 0
+
+        clean_features = {k: float(v) for k, v in features.items() if math.isfinite(v)}
+        try:
+            pred_proba = model.predict_proba_one(clean_features)
+            prob_success = pred_proba.get(proposed_action, 0.0)
+        except:
+            prob_success = 0.0
+
+        # V20.5 FIX: Force robust 1:2 R:R Baseline minimum to outrun the Spread Trap
+        current_reward_target = max(self.labelers[symbol].reward_mult, 2.0)
+        if regime_label == "TREND_BREAKOUT":
+            current_reward_target = max(current_reward_target, 3.0)
+
+        # ============================================================
+        # D. ADD TRADE OPPORTUNITY (WITH BROKER REALITY)
+        # ============================================================
+        self.labelers[symbol].add_trade_opportunity(
             features=features, entry_price=price, current_atr=current_atr, 
             timestamp=bar.timestamp.timestamp(), parkinson_vol=parkinson,
             min_stop_dist=min_stop_dist, spread_in_price=spread_in_price,
@@ -898,7 +878,7 @@ class MultiAssetPredictor:
         )
 
         # ============================================================
-        # E. SURVIVAL GATES (V20.2 PROFITABILITY PATCH)
+        # E. SURVIVAL GATES (V20.5 VERBOSE LOGGING)
         # ============================================================
         if self.burn_in_counters[symbol] < 5:
             self.burn_in_counters[symbol] += 1
@@ -911,14 +891,12 @@ class MultiAssetPredictor:
             stats["No Trigger"] += 1
             return Signal(symbol, "HOLD", 0.0, {"reason": "No Trigger"})
 
-        # Only 3 core gates left
-        if ker_val < 0.0003:
+        effective_ker_thresh = max(0.0001, self.ker_floor + self.dynamic_ker_offsets[symbol])
+        if ker_val < effective_ker_thresh:
             stats["Low KER"] += 1
+            if stats["Low KER"] % 50 == 0:
+                logger.info(f"🛡️ {symbol} GATE: Low Efficiency (KER {ker_val:.4f} < {effective_ker_thresh:.4f})")
             return Signal(symbol, "HOLD", 0.0, {"reason": "Low KER"})
-
-        if rvol_val < 0.8:
-            stats["Low RVol"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "Low RVol"})
 
         # ============================================================
         # F. ML CONFIRMATION & EXECUTION
@@ -928,9 +906,11 @@ class MultiAssetPredictor:
             elif proposed_action == -1: confidence = self.calibrators[symbol]['sell'].calibrate(prob_success)
             else: confidence = 0.0
                 
-            min_conf = float(CONFIG['online_learning'].get('min_calibrated_probability', 0.50))
+            min_conf = float(CONFIG['online_learning'].get('min_calibrated_probability', 0.60)) # V20.5 60% requirement
             if confidence < min_conf:
                 stats["Low ML Confidence"] += 1
+                if stats["Low ML Confidence"] % 10 == 0:
+                    logger.info(f"🤖 {symbol} GATE: Low ML Confidence ({confidence:.2f} < {min_conf:.2f})")
                 return Signal(symbol, "HOLD", confidence, {"reason": f"Low ML Confidence ({confidence:.2f})"})
             
             meta_thresh = float(CONFIG['online_learning'].get('meta_labeling_threshold', 0.50))
@@ -970,7 +950,8 @@ class MultiAssetPredictor:
                 current_r = dist / risk_dist if risk_dist > 0 else 0
                 
                 if current_r < pyramid_config.get('add_on_profit_r', 1.0):
-                    return Signal(symbol, "HOLD", confidence, {"reason": f"Pyramiding Profit R < {pyramid_config.get('add_on_profit_r', 1.0)}"})
+                    logger.info(f"🧱 {symbol} GATE: Waiting for Open Trade Profit (> {pyramid_config.get('add_on_profit_r', 1.0)}R)")
+                    return Signal(symbol, "HOLD", confidence, {"reason": f"Pyramiding Limit"})
                 
                 is_pyramid = True
 
@@ -981,15 +962,15 @@ class MultiAssetPredictor:
                 imp_feats = [regime_label]
                 if rvol_val > 2.0: imp_feats.append('High_Fuel')
                 if hurst > 0.6: imp_feats.append('High_Hurst')
-                
-                for f in imp_feats:
-                    self.feature_importance_counter[symbol][f] += 1
+                for f in imp_feats: self.feature_importance_counter[symbol][f] += 1
 
                 opt_risk = self.optimized_params.get(symbol, {}).get('risk_per_trade_percent')
                 tighten_stops = (rvol_val > self.rvol_trigger)
 
                 self.last_trade_bar[symbol] = self.bar_counters[symbol]
                 self.last_trade_direction[symbol] = proposed_action
+
+                logger.info(f"🔥 {symbol} ML TRIGGER ACTIVATED! Confidence: {confidence:.2f}")
 
                 return Signal(symbol, action_str, confidence, {
                     "meta_ok": True,
@@ -1009,34 +990,13 @@ class MultiAssetPredictor:
                 })
             else:
                 stats['Meta-Labeler Reject'] += 1
+                if stats['Meta-Labeler Reject'] % 10 == 0:
+                    logger.info(f"🧠 {symbol} GATE: Meta-Labeler Veto (Predicts Chop/Loss)")
                 return Signal(symbol, "HOLD", confidence, {"reason": f"Meta Rejected"})
 
         except Exception as e:
             logger.error(f"Strategy ML Eval Error: {e}", exc_info=True)
             return Signal(symbol, "HOLD", 0.0, {"reason": "Exception during ML Check"})
-
-    def _check_sniper_filters(self, symbol: str, signal: int, price: float, current_hurst: float) -> bool:
-        if len(self.sniper_rsi[symbol]) < 14:
-            rsi = 50.0 
-        else:
-            gains = [x for x in self.sniper_rsi[symbol] if x > 0]
-            losses = [abs(x) for x in self.sniper_rsi[symbol] if x < 0]
-            avg_gain = sum(gains) / 14 if gains else 0
-            avg_loss = sum(losses) / 14 if losses else 1e-9
-            rs = avg_gain / avg_loss
-            rsi = 100 - (100 / (1 + rs))
-
-        if current_hurst > 0.6:
-            return True
-
-        upper, lower = (95, 5) if "JPY" in symbol else (90, 10)
-
-        if signal == 1: 
-            if rsi > upper: return False 
-        elif signal == -1: 
-            if rsi < lower: return False 
-        
-        return True
 
     def _inject_auxiliary_data(self):
         defaults = {
@@ -1060,6 +1020,11 @@ class MultiAssetPredictor:
                     pickle.dump(self.calibrators[sym], f)
                 with open(self.models_dir / f"feature_engineer_{sym}.pkl", "wb") as f:
                     pickle.dump(self.feature_engineers[sym], f)
+                
+                # V20.4 FIX: CRITICAL STATE PERSISTENCE 
+                # Preserves Virtual Trades waiting for their 12-hour Label Horizon
+                with open(self.models_dir / f"labeler_{sym}.pkl", "wb") as f:
+                    pickle.dump(self.labelers[sym], f)
                 
                 buffer_state = {
                     'closes': self.closes_buffer[sym],
@@ -1089,6 +1054,7 @@ class MultiAssetPredictor:
             fe_path = self.models_dir / f"feature_engineer_{sym}.pkl"
             buf_path = self.models_dir / f"buffers_{sym}.pkl"
             cal_path = self.models_dir / f"calibrators_{sym}.pkl"
+            labeler_path = self.models_dir / f"labeler_{sym}.pkl"
             
             if model_path.exists():
                 try:
@@ -1109,6 +1075,12 @@ class MultiAssetPredictor:
             if fe_path.exists():
                 try:
                     with open(fe_path, "rb") as f: self.feature_engineers[sym] = pickle.load(f)
+                except Exception: pass
+
+            # V20.4 FIX: Reload Virtual Trades
+            if labeler_path.exists():
+                try:
+                    with open(labeler_path, "rb") as f: self.labelers[sym] = pickle.load(f)
                 except Exception: pass
 
             if buf_path.exists():

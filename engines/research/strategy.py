@@ -11,8 +11,9 @@ from datetime import datetime, timedelta
 # Third-Party Imports
 try:
     from river import drift, linear_model, optim, forest, metrics
+    ML_AVAILABLE = True
 except ImportError:
-    pass
+    ML_AVAILABLE = False
 
 # Shared Imports
 from shared import (
@@ -30,58 +31,83 @@ from engines.research.backtester import MarketSnapshot, BacktestBroker, Backtest
 logger = logging.getLogger("ResearchStrategy")
 
 # =============================================================================
-# V20.2 MATHEMATICAL PARITY CLASSES (THE IMPULSE SCALPER)
+# V20.5 MATHEMATICAL PARITY CLASSES (THE ML UNCHOKING)
 # Embedded locally to guarantee the WFO Backtester uses the exact same 
 # Probability Calibration and TP/SL Geometry as the Live Predictor.
 # =============================================================================
 
 class ProbabilityCalibrator:
     """
-    V20.2 BOOTSTRAP PROTOCOL:
+    V20.5 BOOTSTRAP PROTOCOL:
     Platt Scaling Calibrator adapted for swing trading confidence.
     Guarantees smooth, continuous probability outputs (0.01 to 0.99).
+    Now requires Statistical Maturity (50 wins & 50 losses) before choking trades.
     """
-    def __init__(self):
-        self.calibrator = linear_model.LogisticRegression(
-            optimizer=optim.SGD(0.05),
-            loss=optim.losses.Log(),
-            l2=0.1
-        )
+    def __init__(self, window: int = 1000):
+        self.calibrator = None
+        if ML_AVAILABLE:
+            self.calibrator = linear_model.LogisticRegression(
+                optimizer=optim.SGD(0.05),
+                loss=optim.losses.Log(),
+                l2=0.1
+            )
         self.samples_seen = 0
+        self.pos_count = 0
+        self.neg_count = 0
 
     def update(self, prob: float, label: int):
-        if math.isfinite(prob):
+        if ML_AVAILABLE and math.isfinite(prob):
             self.calibrator.learn_one({'raw_prob': prob}, label)
             self.samples_seen += 1
+            if label == 1:
+                self.pos_count += 1
+            else:
+                self.neg_count += 1
 
     def calibrate(self, raw_prob: float) -> float:
-        # V20.2 FIX: Gently floor early probabilities so WFO trials don't stall out
-        # before the calibrator has enough data to build a baseline curve.
-        if self.samples_seen < 100:
-            return max(0.50, raw_prob) 
+        if not ML_AVAILABLE: return raw_prob
+        
+        # V20.5 FIX: Guarantee WFO threshold bypass during data gathering
+        # Prevents the "Probability Collapse" where the model blocks all trades
+        if self.pos_count < 50 or self.neg_count < 50:
+            return max(0.60, raw_prob) 
             
         try:
             calibrated_dict = self.calibrator.predict_proba_one({'raw_prob': raw_prob})
             calibrated = calibrated_dict.get(1, raw_prob)
-            return max(0.01, min(calibrated, 0.99))
+            # V20.5 FIX: Never penalize base model by more than 5% to prevent collapse
+            return max(raw_prob - 0.05, min(calibrated, 0.99))
         except Exception:
-            return max(0.50, raw_prob)
+            return max(0.60, raw_prob)
 
 class MetaLabeler:
     """
     Secondary model that learns when the primary model is likely to be right or wrong.
     """
     def __init__(self):
-        self.model = forest.ARFClassifier(
-            n_models=10, 
-            seed=42, 
-            metric=metrics.F1()
-        )
+        self.model = None
         self.buffer = deque(maxlen=1000)
+        self.pos_count = 0
+        self.neg_count = 0
+        
+        if ML_AVAILABLE:
+            self.model = forest.ARFClassifier(
+                n_models=10, 
+                seed=42, 
+                metric=metrics.F1()
+            )
 
     def update(self, features: Dict[str, float], primary_action: int, outcome_pnl: float):
-        if primary_action == 0: return
+        if not ML_AVAILABLE or primary_action == 0:
+            return
+        
         y_meta = 1 if outcome_pnl > 0 else 0
+        
+        if y_meta == 1:
+            self.pos_count += 1
+        else:
+            self.neg_count += 1
+            
         try:
             meta_feats = self._enrich(features, primary_action)
             clean_features = self._sanitize(meta_feats)
@@ -90,19 +116,20 @@ class MetaLabeler:
         except Exception: pass
 
     def predict(self, features: Dict[str, float], primary_action: int, threshold: float = 0.50) -> bool:
-        if primary_action == 0: return False
+        if not ML_AVAILABLE or primary_action == 0:
+            return False
         
-        # Allow 100 free trades before enforcing Meta-Labeler
-        if len(self.buffer) < 100: return True 
+        # V20.5 FIX: Ensure Statistical Maturity.
+        if self.pos_count < 50 or self.neg_count < 50: 
+            return True 
         
         try:
             meta_feats = self._enrich(features, primary_action)
             clean_features = self._sanitize(meta_feats)
             probs = self.model.predict_proba_one(clean_features)
-            # V20.2 FIX: Relaxed to 50/50 statistical edge
-            return probs.get(1, 0.0) >= threshold
+            return probs.get(1, 0.0) >= 0.40
         except Exception:
-            return False
+            return True
 
     def _enrich(self, features: Dict[str, float], action: int) -> Dict[str, float]:
         clean = features.copy()
@@ -119,10 +146,10 @@ class MetaLabeler:
 
 class AdaptiveTripleBarrier:
     """
-    V20.2 SPREAD TRAP CURE & CHOP LABELING.
+    SPREAD TRAP CURE & CHOP LABELING.
     Simulates actual broker execution constraints perfectly aligned with RiskManager.
     """
-    def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.0, reward_mult: float = 2.0, 
+    def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.5, reward_mult: float = 3.0, 
                  drift_threshold: float = 0.75, horizon_type: str = 'TIME', horizon_value: float = 0.0):
         self.buffer = deque()
         self.time_limit = horizon_ticks
@@ -149,7 +176,6 @@ class AdaptiveTripleBarrier:
         p_vol = parkinson_vol if parkinson_vol > 0 else features.get('parkinson_vol', 0.0)
         vol_boost = 0.5 if p_vol > 0.002 else 0.0
         
-        # Apply Regime-Specific TP Override
         actual_reward_mult = override_reward_mult if override_reward_mult else self.reward_mult
         
         effective_risk_mult = (self.risk_mult + vol_boost) * adaptive_scalar
@@ -185,8 +211,7 @@ class AdaptiveTripleBarrier:
         })
 
     def resolve_labels(self, current_high: float, current_low: float, current_close: float = None, 
-                       current_volume: float = 0.0, current_log_ret: float = 0.0,
-                       current_timestamp: float = 0.0) -> List[Tuple[Dict[str, float], int, float, int, float, float]]:
+                       current_volume: float = 0.0, current_log_ret: float = 0.0) -> List[Tuple[Dict[str, float], int, float, int, float, float]]:
         resolved = []
         active = deque()
         if current_close is None: current_close = (current_high + current_low) / 2.0
@@ -199,9 +224,7 @@ class AdaptiveTripleBarrier:
 
             is_expired = False
             if self.horizon_type == 'TIME':
-                duration_sec = current_timestamp - trade['start_time']
-                if duration_sec >= (self.time_limit * 60): 
-                    is_expired = True
+                if trade['age'] >= self.time_limit: is_expired = True
             elif self.horizon_type == 'VOLUME':
                 thresh = self.horizon_threshold if self.horizon_threshold > 0 else current_volume * 100
                 if trade['cum_vol'] >= thresh: is_expired = True
@@ -238,17 +261,16 @@ class AdaptiveTripleBarrier:
                 elif is_expired: 
                     sell_ret = (trade['entry'] - current_close) / trade['entry'] - spread_pct - comm_pct
 
-                # V20.2 FIX: Teach the Base Model what Noise/Chop is.
-                # Do NOT force a 1 or -1 label if BOTH directions resulted in a loss.
-                if buy_ret > 0 and buy_ret > sell_ret:
+                # V20.5 FIX: REVERT BASE MODEL TO BINARY
+                if buy_ret > sell_ret:
                     optimal_label = 1
                     optimal_ret = buy_ret
-                elif sell_ret > 0 and sell_ret > buy_ret:
+                elif sell_ret > buy_ret:
                     optimal_label = -1
                     optimal_ret = sell_ret
                 else:
-                    optimal_label = 0
-                    optimal_ret = max(buy_ret, sell_ret)
+                    optimal_label = 1 if current_close >= trade['entry'] else -1
+                    optimal_ret = buy_ret
                     
                 proposed_action = trade.get('proposed_action', 0)
                 pred_proba = trade.get('pred_proba', 0.5)
@@ -286,9 +308,9 @@ class ResearchStrategy:
         self.model = model
         self.symbol = symbol
         self.params = params
-        self.debug_mode = False
+        self.debug_mode = False 
         
-        # 1. Feature Engineer (The Eyes)
+        # 1. Feature Engineer
         self.fe = OnlineFeatureEngineer(
             window_size=params.get('window_size', 50)
         )
@@ -296,15 +318,15 @@ class ResearchStrategy:
         # --- RISK CONFIGURATION ---
         self.risk_conf = params.get('risk_management', CONFIG.get('risk_management', {}))
         self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 1.5))
-        self.max_currency_exposure = int(self.risk_conf.get('max_currency_exposure', 2))
-        self.cooldown_minutes = int(self.risk_conf.get('loss_cooldown_minutes', 30)) # V20.2
+        self.max_currency_exposure = int(self.risk_conf.get('max_currency_exposure', 4))
+        self.cooldown_minutes = int(self.risk_conf.get('loss_cooldown_minutes', 15)) 
         
-        # 2. Adaptive Triple Barrier Labeler (The Teacher)
+        # 2. Adaptive Triple Barrier Labeler
         tbm_conf = params.get('tbm', {})
-        self.optimized_reward_mult = float(tbm_conf.get('barrier_width', 1.5)) 
+        self.optimized_reward_mult = float(tbm_conf.get('barrier_width', 3.0)) 
         
         self.labeler = AdaptiveTripleBarrier(
-            horizon_ticks=int(tbm_conf.get('horizon_minutes', 360)), 
+            horizon_ticks=int(tbm_conf.get('horizon_minutes', 720)), 
             risk_mult=self.sl_atr_mult, 
             reward_mult=self.optimized_reward_mult,
             drift_threshold=float(tbm_conf.get('drift_threshold', 1.5))
@@ -331,7 +353,6 @@ class ResearchStrategy:
         self.active_signals = deque()
         self.daily_performance = {'pnl': 0.0, 'losses': 0}
         
-        # V18.1: DIRECTIONAL COOLDOWN (Anti-Machine Gun)
         self.last_trade_bar = 0
         self.last_trade_direction = 0
         
@@ -340,18 +361,12 @@ class ResearchStrategy:
         self.closes_buffer = deque(maxlen=self.window_size_trio)
         self.volume_buffer = deque(maxlen=self.window_size_trio)
         
-        # MTF Simulation State
         self.h4_buffer = deque(maxlen=200) 
         self.d1_buffer = deque(maxlen=200) 
         self.last_h4_idx = -1
         self.last_d1_idx = -1
         self.current_d1_ema = 0.0 
         
-        # --- SNIPER PROTOCOL INDICATORS ---
-        self.sniper_closes = deque(maxlen=200)        
-        self.sniper_rsi = deque(maxlen=15)    
-        
-        # --- NEW FILTERS ---
         self.sma_window = deque(maxlen=200)
         self.returns_window = deque(maxlen=20)
         
@@ -362,17 +377,16 @@ class ResearchStrategy:
         self.feature_importance_counter = Counter() 
         
         # ============================================================
-        # STRATEGY CONFIGURATION (V20.2 UNCHOKED PROTOCOL)
+        # STRATEGY CONFIGURATION (V20.5 UNCHOKED PROTOCOL)
         # ============================================================
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
         self.bb_window = 20
-        self.bb_std = float(phx_conf.get('bb_std_dev', 1.0)) # V20.2
+        self.bb_std = float(phx_conf.get('bb_std_dev', 1.5)) 
         self.bb_buffer = deque(maxlen=self.bb_window)
         
-        # V20.2 FIX: Lowered barriers to prevent trade starvation
         self.ker_floor = 0.0003 
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.52))
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.55))
         self.hurst_veto = 0.65 
         
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 0.8)) 
@@ -380,7 +394,7 @@ class ResearchStrategy:
         self.regime_enforcement = "DISABLED" 
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
         self.max_rvol_thresh = 35.0 
-        self.adx_threshold = 0.0 
+        self.adx_threshold = float(CONFIG.get('features', {}).get('adx', {}).get('threshold', 25.0))
         
         # --- SESSION CONTROL ---
         session_conf = self.risk_conf.get('session_control', {})
@@ -397,11 +411,10 @@ class ResearchStrategy:
         except Exception:
             self.server_tz = pytz.timezone('Europe/Prague')
         
-        # Drift Detection
-        self.ker_drift_detector = drift.ADWIN(delta=0.01)
+        if ML_AVAILABLE:
+            self.ker_drift_detector = drift.ADWIN(delta=0.01)
         self.dynamic_ker_offset = 0.0
 
-        # Daily Circuit Breaker
         self.daily_max_losses = 20 
         self.daily_max_loss_pct = 0.045
 
@@ -507,12 +520,10 @@ class ResearchStrategy:
         
         if price <= 0: return
 
-        # Update Price Map
         self.last_price_map = snapshot.to_price_dict()
         if self.symbol not in self.last_price_map:
             self.last_price_map[self.symbol] = price
 
-        # Update Buffers
         self.closes_buffer.append(price)
         self.volume_buffer.append(volume)
         self.sma_window.append(price)
@@ -522,14 +533,10 @@ class ResearchStrategy:
             if prev_p > 0:
                 self.returns_window.append(math.log(price / prev_p))
         
-        self.sniper_closes.append(price)
-        if len(self.sniper_closes) > 1:
-            self.sniper_rsi.append(self.sniper_closes[-1] - self.sniper_closes[-2])
         self.bb_buffer.append(price)
 
         self._inject_auxiliary_data()
 
-        # Timestamp Handling
         dt_ts = datetime.now()
         try:
             if hasattr(snapshot.timestamp, 'timestamp'):
@@ -545,11 +552,9 @@ class ResearchStrategy:
             dt_ts = dt_ts.replace(tzinfo=pytz.utc)
         server_time = dt_ts.astimezone(self.server_tz)
 
-        # Context
         context_data = self._simulate_mtf_context(price, server_time)
         self.current_d1_ema = context_data.get('d1', {}).get('ema200', 0.0)
 
-        # Essential Risk Gates
         if self._check_symbol_circuit_breaker(broker, server_time):
             self.rejection_stats["Symbol Circuit Breaker (Loss Limit)"] += 1
             return
@@ -562,7 +567,6 @@ class ResearchStrategy:
         self._manage_trailing_stops(broker, price, dt_ts)
         self._manage_time_stops(broker, dt_ts)
 
-        # --- GAP-PROOF LIQUIDATION ---
         is_weekend_hold = (server_time.weekday() > 4) 
         is_friday_close = (server_time.weekday() == 4 and server_time.hour >= self.friday_close_hour)
         is_daily_session_close = False
@@ -588,7 +592,6 @@ class ResearchStrategy:
                 else:
                     buy_vol = volume / 2.0; sell_vol = volume / 2.0
                     
-        # Grab previous price for accurate candle body representation
         prev_price = self.sma_window[-2] if len(self.sma_window) >= 2 else price
         self.last_price = price
 
@@ -609,11 +612,12 @@ class ResearchStrategy:
         
         self.last_features = features
 
-        self.ker_drift_detector.update(ker_val)
-        if self.ker_drift_detector.drift_detected:
-            self.dynamic_ker_offset = max(-0.10, self.dynamic_ker_offset - 0.05)
-        else:
-            self.dynamic_ker_offset = min(0.0, self.dynamic_ker_offset + 0.001)
+        if ML_AVAILABLE:
+            self.ker_drift_detector.update(ker_val)
+            if self.ker_drift_detector.drift_detected:
+                self.dynamic_ker_offset = max(-0.10, self.dynamic_ker_offset - 0.05)
+            else:
+                self.dynamic_ker_offset = min(0.0, self.dynamic_ker_offset + 0.001)
 
         # ============================================================
         # B. DELAYED TRAINING
@@ -621,8 +625,7 @@ class ResearchStrategy:
         log_ret = features.get('log_ret', 0.0)
         
         resolved_labels = self.labeler.resolve_labels(
-            high, low, current_close=price, current_volume=volume, current_log_ret=log_ret,
-            current_timestamp=timestamp
+            high, low, current_close=price, current_volume=volume, current_log_ret=log_ret
         )
         
         if resolved_labels:
@@ -645,7 +648,7 @@ class ResearchStrategy:
                 
                 clean_stored = {k: float(v) for k, v in stored_feats.items() if math.isfinite(v)}
                 
-                if optimal_label != 0:
+                if optimal_label != 0 and ML_AVAILABLE:
                     self.model.learn_one(clean_stored, optimal_label, sample_weight=final_weight)
                 
                 if past_action != 0:
@@ -656,62 +659,58 @@ class ResearchStrategy:
                         self.calibrator_sell.update(past_prob, 1 if past_ret > 0 else 0)
 
         # ============================================================
-        # C. SMART SIGNAL MATRIX (V20.2 IMPULSE SCALPER)
+        # C. SMART SIGNAL MATRIX (V20.5 EXPERT HEURISTICS)
         # ============================================================
         regime_label = "Neutral"
         proposed_action = 0 
         
-        rsi_val = features.get('rsi_norm', 0.5) * 100.0
         is_trending = hurst >= self.hurst_breakout
-        current_atr = features.get('atr', 0.001)
         
-        candle_move = abs(price - prev_price)
-        
-        # 1. VOLATILITY IMPULSE LOGIC (RVol + Absolute Move)
-        is_impulse = (rvol_val >= self.rvol_trigger) and (candle_move >= (current_atr * 0.5))
-        
+        adx_val = features.get('adx', 0.0)
+        rsi_norm = features.get('rsi_norm', 0.5)
+        rsi_val = rsi_norm * 100.0
+
         if len(self.bb_buffer) >= self.bb_window:
             bb_mu = np.mean(self.bb_buffer)
             bb_std = np.std(self.bb_buffer)
-            if bb_std < 1e-9: bb_std = 1e-9 # Prevent Div/0 Flatline Collapse
+            if bb_std < 1e-9: bb_std = 1e-9 
             
             upper_bb = bb_mu + (self.bb_std * bb_std)
             lower_bb = bb_mu - (self.bb_std * bb_std)
             
             if is_trending:
                 regime_label = "TREND_BREAKOUT"
-                
-                # V20.2: Structural Breakout (Impulse Continuation)
-                if is_impulse:
-                    if price > prev_price: 
+                if adx_val >= self.adx_threshold: # V20.5 Momentum
+                    if price >= upper_bb: 
                         proposed_action = 1 
-                    elif price < prev_price: 
+                    elif price <= lower_bb: 
                         proposed_action = -1 
-                    
             else:
                 regime_label = "MEAN_REVERSION"
-                
-                # V20.2: True Extreme Exhaustion (Rubber Band)
-                if price <= lower_bb and rsi_val <= 25: 
+                # V20.5 Exhaustion
+                if price <= lower_bb and rsi_val < 30.0: 
                     proposed_action = 1 
-                elif price >= upper_bb and rsi_val >= 75: 
+                elif price >= upper_bb and rsi_val > 70.0: 
                     proposed_action = -1  
 
-        # Soft Veto: Only block MR if Hurst is incredibly high (hyper-trend)
         if hurst >= self.hurst_veto and regime_label == "MEAN_REVERSION" and proposed_action != 0:
             proposed_action = 0
             self.rejection_stats["Veto: Hyper Trend (Hurst)"] += 1
 
         clean_features = {k: float(v) for k, v in features.items() if math.isfinite(v)}
         try:
-            pred_proba = self.model.predict_proba_one(clean_features)
-            prob_success = pred_proba.get(proposed_action, 0.0)
+            if ML_AVAILABLE:
+                pred_proba = self.model.predict_proba_one(clean_features)
+                prob_success = pred_proba.get(proposed_action, 0.0)
+            else:
+                prob_success = 0.5
         except:
             prob_success = 0.0
 
         # ============================================================
         # D. ADD TRADE OPPORTUNITY
         # ============================================================
+        current_atr = features.get('atr', 0.001)
         parkinson = features.get('parkinson_vol', 0.0)
         
         pip_val, _ = RiskManager.get_pip_info(self.symbol)
@@ -721,14 +720,14 @@ class ResearchStrategy:
         spread_in_price = spread_pips * pip_val
         comm_in_price = 0.5 * pip_val 
         
-        min_stop_pips = float(self.risk_conf.get('min_stop_loss_pips', 8.0))
+        min_stop_pips = float(self.risk_conf.get('min_stop_loss_pips', 15.0))
         min_stop_dist = min_stop_pips * pip_val
-        min_profit_dist = float(self.params.get('tbm', {}).get('min_profit_pips', 12.0)) * pip_val 
+        min_profit_dist = float(self.params.get('tbm', {}).get('min_profit_pips', 30.0)) * pip_val 
 
-        if regime_label == "MEAN_REVERSION":
-            current_reward_target = 1.0 
-        else:
-            current_reward_target = max(self.optimized_reward_mult, 1.5)
+        # V20.5: Forced 1:2 Minimum Risk Reward
+        current_reward_target = max(self.optimized_reward_mult, 2.0)
+        if regime_label == "TREND_BREAKOUT":
+            current_reward_target = max(current_reward_target, 3.0)
 
         self.labeler.add_trade_opportunity(
             features=features, entry_price=price, current_atr=current_atr, 
@@ -740,7 +739,7 @@ class ResearchStrategy:
         )
 
         # ============================================================
-        # E. SURVIVAL GATES (V20.2 UNCHOKED PROTOCOL)
+        # E. SURVIVAL GATES
         # ============================================================
         if self.burn_in_counter < self.burn_in_limit:
             self.burn_in_counter += 1
@@ -757,14 +756,11 @@ class ResearchStrategy:
             self.rejection_stats["No Trigger"] += 1
             return
             
-        # V20.2: Loosened Statistical Gates
         effective_ker_thresh = max(0.0001, self.ker_floor + self.dynamic_ker_offset)
         if ker_val < effective_ker_thresh:
             self.rejection_stats[f"Low Efficiency (KER)"] += 1
-            return
-
-        if rvol_val < 0.8:
-            self.rejection_stats["Low RVol"] += 1
+            if self.rejection_stats[f"Low Efficiency (KER)"] % 50 == 0:
+                if self.debug_mode: logger.info(f"🛡️ {self.symbol} GATE: Low Efficiency (KER {ker_val:.4f} < {effective_ker_thresh:.4f})")
             return
 
         # ============================================================
@@ -775,10 +771,11 @@ class ResearchStrategy:
             elif proposed_action == -1: confidence = self.calibrator_sell.calibrate(prob_success)
             else: confidence = 0.0
                 
-            # V20.2 FIX: Realistic Probability Gate
-            min_conf = float(self.params.get('min_calibrated_probability', 0.50)) 
+            min_conf = float(self.params.get('min_calibrated_probability', 0.60)) 
             if confidence < min_conf:
                 self.rejection_stats[f"Low ML Confidence"] += 1
+                if self.rejection_stats[f"Low ML Confidence"] % 10 == 0:
+                    if self.debug_mode: logger.info(f"🤖 {self.symbol} GATE: Low ML Confidence ({confidence:.2f} < {min_conf:.2f})")
                 return
             
             meta_thresh = float(self.params.get('meta_labeling_threshold', 0.50))
@@ -801,7 +798,9 @@ class ResearchStrategy:
                 dist = (price - last_pos.entry_price) if last_pos.side == 1 else (last_pos.entry_price - price)
                 current_r = dist / risk_dist if risk_dist > 0 else 0
                 
-                if current_r < pyramid_config.get('add_on_profit_r', 1.0): return 
+                if current_r < pyramid_config.get('add_on_profit_r', 1.0): 
+                    if self.debug_mode: logger.info(f"🧱 {self.symbol} GATE: Waiting for Open Trade Profit (> {pyramid_config.get('add_on_profit_r', 1.0)}R)")
+                    return 
                 is_pyramid = True
 
             if is_profitable:
@@ -814,15 +813,17 @@ class ResearchStrategy:
                 
                 tighten_stops = (rvol_val > self.rvol_trigger)
 
-                # Execute
                 self._execute_entry(confidence, price, features, broker, dt_ts, proposed_action, regime_label, tighten_stops, is_pyramid, current_reward_target)
                 
-                # Update Cooldown State
                 self.last_trade_bar = self.bars_processed
                 self.last_trade_direction = proposed_action
                 
+                if self.debug_mode: logger.info(f"🔥 {self.symbol} ML TRIGGER ACTIVATED! Confidence: {confidence:.2f}")
+                
             else:
                 self.rejection_stats['Meta-Labeler Reject'] += 1
+                if self.rejection_stats['Meta-Labeler Reject'] % 10 == 0:
+                    if self.debug_mode: logger.info(f"🧠 {self.symbol} GATE: Meta-Labeler Veto (Predicts Chop/Loss)")
 
         except Exception as e:
             if self.debug_mode: logger.error(f"Strategy Error: {e}")
@@ -894,11 +895,9 @@ class ResearchStrategy:
         trade_intent.action = action
         qty = trade_intent.volume
         
-        # RiskManager returns absolute distances in trade_intent.stop_loss and trade_intent.take_profit
         stop_dist = trade_intent.stop_loss
         tp_dist = trade_intent.take_profit
 
-        # V20.2 PARITY: Apply the calculated distances to the execution price
         sl_price = price - stop_dist if action == "BUY" else price + stop_dist
         tp_price = price + tp_dist if action == "BUY" else price - tp_dist
         side = 1 if action == "BUY" else -1
@@ -951,7 +950,7 @@ class ResearchStrategy:
 
     def _manage_time_stops(self, broker: BacktestBroker, current_time: datetime):
         tbm_conf = self.params.get('tbm', {})
-        horizon_minutes = int(tbm_conf.get('horizon_minutes', 240))
+        horizon_minutes = int(tbm_conf.get('horizon_minutes', 720)) 
         hard_stop_seconds = horizon_minutes * 60
         
         to_close = []
@@ -1061,25 +1060,6 @@ class ResearchStrategy:
             ctx['h4']['rsi'] = 100.0 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss)))
         else: ctx['h4']['rsi'] = 50.0
         return ctx
-
-    def _check_sniper_filters(self, signal: int, price: float, current_hurst: float) -> bool:
-        if len(self.sniper_rsi) < 14: rsi = 50.0 
-        else:
-            gains, losses = [x for x in self.sniper_rsi if x > 0], [abs(x) for x in self.sniper_rsi if x < 0]
-            avg_gain, avg_loss = sum(gains)/14 if gains else 0, sum(losses)/14 if losses else 1e-9
-            rsi = 100 - (100 / (1 + (avg_gain / avg_loss)))
-
-        if current_hurst > 0.55: return True
-        
-        upper, lower = (85, 15) if "JPY" in self.symbol else (80, 20)
-
-        if signal == 1 and rsi > upper:
-            self.rejection_stats['Overbought_RSI'] += 1
-            return False 
-        elif signal == -1 and rsi < lower:
-            self.rejection_stats['Oversold_RSI'] += 1
-            return False 
-        return True
 
     def _inject_auxiliary_data(self):
         defaults = {

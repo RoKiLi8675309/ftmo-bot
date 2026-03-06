@@ -37,7 +37,6 @@ except ImportError:
 
 # River / Sklearn imports (Guarded for Windows Producer compatibility)
 try:
-    # ✅ FIX: Added 'optim' to the river imports
     from river import linear_model, forest, metrics, optim
     from sklearn.isotonic import IsotonicRegression
     from sklearn.exceptions import ConvergenceWarning
@@ -701,11 +700,11 @@ class StreamingIndicators:
         self.prev_close = price
         return features
 
-# --- 5. ADAPTIVE TRIPLE BARRIER (V20.2 RE-ENGINEERED) ---
+# --- 5. ADAPTIVE TRIPLE BARRIER (V20.3 RE-ENGINEERED) ---
 
 class AdaptiveTripleBarrier:
     """
-    V20.2 Reality-Injected Labeling Engine.
+    V20.3 Reality-Injected Labeling Engine.
     Simulates actual broker execution constraints during ML training.
     """
     def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.0, reward_mult: float = 2.0, 
@@ -724,7 +723,8 @@ class AdaptiveTripleBarrier:
                               timestamp: float, parkinson_vol: float = 0.0, 
                               min_stop_dist: float = 0.0, cost_in_price: float = 0.0, 
                               min_profit_dist: float = 0.0,
-                              proposed_action: int = 0, pred_proba: float = 0.5):
+                              proposed_action: int = 0, pred_proba: float = 0.5,
+                              override_reward_mult: float = None):
         """
         Calculates exact broker geometry.
         Now explicitly tracks the proposed action to train the calibrator on actual failures.
@@ -737,8 +737,10 @@ class AdaptiveTripleBarrier:
         p_vol = parkinson_vol if parkinson_vol > 0 else features.get('parkinson_vol', 0.0)
         vol_boost = 0.5 if p_vol > 0.002 else 0.0
         
+        actual_reward_mult = override_reward_mult if override_reward_mult else self.reward_mult
+        
         effective_risk_mult = (self.risk_mult + vol_boost) * adaptive_scalar
-        effective_reward_mult = (self.reward_mult + vol_boost) * adaptive_scalar
+        effective_reward_mult = (actual_reward_mult + vol_boost) * adaptive_scalar
         
         # 1. Base Geometry
         raw_risk_dist = effective_risk_mult * current_atr
@@ -841,20 +843,19 @@ class AdaptiveTripleBarrier:
                 elif is_expired: 
                     sell_ret = (trade['entry'] - current_close) / trade['entry'] - cost_pct
 
-                # V20.2 FIX: Optimal Label Selection
-                # We MUST explicitely label Chop (0) when both sides fail.
-                # Previously this was falling back to the "least bad" option,
-                # teaching the model to trade even when there was no Alpha.
-                if buy_ret > 0 and buy_ret > sell_ret:
+                # V20.3 FIX: REVERT BASE MODEL TO BINARY
+                # To prevent probability collapse, the Base Model must always pick a side.
+                # The MetaLabeler is responsible for filtering out the 0 (Noise) trades.
+                if buy_ret > sell_ret:
                     optimal_label = 1
                     optimal_ret = buy_ret
-                elif sell_ret > 0 and sell_ret > buy_ret:
+                elif sell_ret > buy_ret:
                     optimal_label = -1
                     optimal_ret = sell_ret
                 else:
-                    # Both lost money, or absolute 0 return. This is pure Noise/Chop.
-                    optimal_label = 0
-                    optimal_ret = max(buy_ret, sell_ret)
+                    # Absolute tie breaker (prevents class 0 injection into Base Model)
+                    optimal_label = 1 if current_close >= trade['entry'] else -1
+                    optimal_ret = buy_ret
                     
                 # Proposed Action Outcome (crucial to defeat survivorship bias)
                 proposed_action = trade.get('proposed_action', 0)
@@ -884,7 +885,7 @@ class AdaptiveTripleBarrier:
 
 class ProbabilityCalibrator:
     """
-    V20.2 Bootstrap Protocol:
+    V20.3 Bootstrap Protocol:
     Calibrates raw output probabilities to true empirical probabilities.
     Insulated against NaN crashes during probability collapse.
     """
@@ -906,7 +907,7 @@ class ProbabilityCalibrator:
     def calibrate(self, raw_prob: float) -> float:
         if not ML_AVAILABLE: return raw_prob
         
-        # V20.2 FIX: Gently floor early probabilities so WFO trials don't stall out
+        # V20.3 FIX: Gently floor early probabilities so WFO trials don't stall out
         if self.samples_seen < 100:
             return max(0.50, raw_prob)
             
@@ -936,6 +937,7 @@ class MetaLabeler:
         if not ML_AVAILABLE or primary_action == 0:
             return
         
+        # This is where NOISE is filtered. 1 = Profit, 0 = Loss.
         y_meta = 1 if outcome_pnl > 0 else 0
         try:
             meta_feats = self._enrich(features, primary_action)
@@ -949,7 +951,7 @@ class MetaLabeler:
         if not ML_AVAILABLE or primary_action == 0:
             return False
             
-        # V20.2 FIX: Allow 100 free trades before enforcing Meta-Labeler
+        # V20.3 FIX: Allow 100 free trades before enforcing Meta-Labeler
         if len(self.buffer) < 100: return True 
             
         try:
@@ -1292,8 +1294,6 @@ class EntropyMonitor:
             prices = list(self.buffer)
             returns = np.diff(prices)
             
-            # V20.2 FIX: If standard deviation is effectively zero, there is 
-            # no information entropy. Return 0.0 instead of default 0.5.
             if np.std(returns) < 1e-9: return 0.0
                 
             hist, _ = np.histogram(returns, bins=10, density=True)
@@ -1384,9 +1384,6 @@ def calculate_hurst(ts):
     Calculates the Hurst Exponent using Numba-optimized standard deviation analysis.
     Uses explicit manual linear regression (O(N)) to replace np.linalg.lstsq, 
     ensuring stability across Numpy versions in Numba.
-    
-    V20.2 FIX: Cast internal np.zeros arrays to float64 to ensure Numba JIT stability 
-    regardless of the type of the incoming `ts` array.
     """
     n = len(ts)
     if n < 20: return 0.5

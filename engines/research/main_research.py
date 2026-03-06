@@ -49,7 +49,7 @@ setup_logging("Research")
 log = logging.getLogger("Research")
 
 # =============================================================================
-# PHOENIX RESEARCH ENGINE V20.2 – ORDER-FLOW SWING PROTOCOL (PROFITABILITY PATCH)
+# PHOENIX RESEARCH ENGINE V20.5 – EXACT HEURISTIC PARITY & STRICT R:R
 # =============================================================================
 
 class EmojiCallback:
@@ -184,7 +184,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             space = CONFIG['optimization_search_space']
             params = CONFIG['online_learning'].copy()
             
-            # --- V20.2 CRITICAL FIX: FORCE RISK SCALING FOR WFO ---
+            # --- V20.5 CRITICAL FIX: FORCE RISK SCALING FOR WFO ---
             # Even if Live mode uses fixed 0.01 lots, the Optimizer MUST see 
             # actual compounded dollars to calculate PF/SQN accurately.
             params['risk_management'] = CONFIG.get('risk_management', {}).copy()
@@ -200,14 +200,23 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             params['entropy_threshold'] = trial.suggest_float('entropy_threshold', space['entropy_threshold']['min'], space['entropy_threshold']['max'])
             params['vpin_threshold'] = trial.suggest_float('vpin_threshold', space['vpin_threshold']['min'], space['vpin_threshold']['max'])
             
+            # --- V20.5: STRICT 1:2 R:R ENFORCEMENT ---
+            sl_atr_mult = float(CONFIG.get('risk_management', {}).get('stop_loss_atr_mult', 1.5))
+            min_barrier = max(float(space['tbm_barrier_width']['min']), sl_atr_mult * 2.0)
+            max_barrier = max(float(space['tbm_barrier_width']['max']), min_barrier + 0.5)
+            min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 30.0))
+            
             params['tbm'] = {
-                'barrier_width': trial.suggest_float('barrier_width', space['tbm_barrier_width']['min'], space['tbm_barrier_width']['max']),
+                'barrier_width': trial.suggest_float('barrier_width', min_barrier, max_barrier),
                 'horizon_minutes': trial.suggest_int('horizon_minutes', space['tbm_horizon_minutes']['min'], space['tbm_horizon_minutes']['max'], step=space['tbm_horizon_minutes']['step']),
                 'drift_threshold': trial.suggest_float('drift_threshold', space['tbm_drift_threshold']['min'], space['tbm_drift_threshold']['max']),
-                'min_profit_pips': 12.0 
+                'min_profit_pips': min_profit_pips 
             }
             
-            params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
+            # --- V20.5: 60% CONFIDENCE FLOOR ---
+            min_conf_floor = max(float(space['min_calibrated_probability']['min']), 0.60)
+            max_conf_ceiling = max(float(space['min_calibrated_probability']['max']), min_conf_floor + 0.05)
+            params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', min_conf_floor, max_conf_ceiling)
             
             risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0025, 0.0050])
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
@@ -258,11 +267,10 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 daily_penalty = daily_hits * 10000.0
                 return -10000.0 + total_ret - dd_penalty - daily_penalty
 
-            # V20.2 SOFTER SIGNIFICANCE FILTER: Lowered penalty to allow AI to explore
-            min_trades = 30 # Lowered from 50 to allow medium-frequency trials
+            min_trades = int(CONFIG.get('wfo', {}).get('min_trades_optimization', 20))
             if trades < min_trades:
                 trial.set_user_attr("pruned", True)
-                trade_shortfall = (min_trades - trades) * 10.0 # Softened penalty so it doesn't crush scores
+                trade_shortfall = (min_trades - trades) * 10.0 
                 return -100.0 + total_ret - trade_shortfall 
                 
             return score
@@ -323,8 +331,23 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 params['risk_management']['sizing_method'] = 'risk_percentage'
                 
                 params['n_models'] = trial.suggest_int('n_models', 30, 60)
-                params['barrier_width'] = trial.suggest_float('barrier_width', space['tbm_barrier_width']['min'], space['tbm_barrier_width']['max'])
-                params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', space['min_calibrated_probability']['min'], space['min_calibrated_probability']['max'])
+                
+                # --- V20.5 WFO PARITY FIX ---
+                sl_atr_mult = float(CONFIG.get('risk_management', {}).get('stop_loss_atr_mult', 1.5))
+                min_barrier = max(float(space['tbm_barrier_width']['min']), sl_atr_mult * 2.0)
+                max_barrier = max(float(space['tbm_barrier_width']['max']), min_barrier + 0.5)
+                min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 30.0))
+
+                params['tbm'] = params.get('tbm', {}).copy()
+                params['tbm']['barrier_width'] = trial.suggest_float('barrier_width', min_barrier, max_barrier)
+                params['tbm']['min_profit_pips'] = min_profit_pips
+                params['tbm']['horizon_minutes'] = CONFIG['online_learning']['tbm'].get('horizon_minutes', 720)
+                params['tbm']['drift_threshold'] = CONFIG['online_learning']['tbm'].get('drift_threshold', 1.5)
+                
+                min_conf_floor = max(float(space['min_calibrated_probability']['min']), 0.60)
+                max_conf_ceiling = max(float(space['min_calibrated_probability']['max']), min_conf_floor + 0.05)
+                params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', min_conf_floor, max_conf_ceiling)
+                
                 params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', [0.0025, 0.0050])
                 
                 pipeline = ResearchPipeline()
@@ -338,15 +361,43 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                     strat.on_data(snap, broker)
                     if getattr(broker, 'is_totally_blown', False): break
                 
-                pm = pipeline.calculate_performance_metrics(broker.trade_log)
+                pm = pipeline.calculate_performance_metrics(broker.trade_log, broker.initial_balance)
                 
-                if pm['total_trades'] < 5: return -100.0
-                return pm['total_pnl']
+                total_ret = pm['total_pnl']
+                max_dd = pm['max_dd_pct']
+                trades = pm['total_trades']
+                sqn = pm['sqn']
+                pf = pm['profit_factor']
+                safe_dd = max_dd if max_dd > 0.001 else 0.001
+                calmar = (total_ret / 50000.0) / safe_dd
+                
+                daily_hits = getattr(broker, 'daily_limit_hits', 0)
+                total_blown = getattr(broker, 'is_totally_blown', False)
+                
+                if total_blown or max_dd > 0.08 or daily_hits > 0:
+                    dd_penalty = (max_dd - 0.08) * 500000.0 if max_dd > 0.08 else 0
+                    daily_penalty = daily_hits * 10000.0
+                    return -10000.0 + total_ret - dd_penalty - daily_penalty
+                
+                min_trades = int(CONFIG.get('wfo', {}).get('min_trades_optimization', 20))
+                if trades < min_trades: 
+                    trade_shortfall = (min_trades - trades) * 10.0
+                    return -100.0 + total_ret - trade_shortfall
+                    
+                score = total_ret + (sqn * 1000.0) + (pf * 500.0) + (calmar * 10.0)
+                return score
 
             study.optimize(wfo_objective, n_trials=n_trials)
             
             final_p = CONFIG['online_learning'].copy()
             final_p.update(study.best_params)
+            
+            # WFO OOS Setup
+            final_p['risk_management'] = CONFIG.get('risk_management', {}).copy()
+            final_p['risk_management']['sizing_method'] = 'risk_percentage'
+            if 'tbm' not in final_p: final_p['tbm'] = CONFIG['online_learning'].get('tbm', {}).copy()
+            final_p['tbm']['barrier_width'] = study.best_params.get('barrier_width', 3.0)
+            final_p['tbm']['min_profit_pips'] = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 30.0))
             
             pipe = ResearchPipeline()
             broker_oos = BacktestBroker(initial_balance=50000.0)
@@ -358,7 +409,7 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 broker_oos.process_pending(snap)
                 strat_oos.on_data(snap, broker_oos)
             
-            oos_m = pipe.calculate_performance_metrics(broker_oos.trade_log)
+            oos_m = pipe.calculate_performance_metrics(broker_oos.trade_log, broker_oos.initial_balance)
             results.append({'window': win_id, 'pnl': oos_m['total_pnl']})
             curr_train_start += pd.DateOffset(months=test_months)
             
@@ -381,7 +432,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         
         if not study.trials: return
 
-        min_trades = 30 # V20.2 Matching
+        min_trades = int(CONFIG.get('wfo', {}).get('min_trades_optimization', 20)) 
         valid = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE 
                  and t.value is not None and t.user_attrs.get('trades', 0) >= min_trades
                  and not t.user_attrs.get('blown', False)]
@@ -404,9 +455,14 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         final_p['risk_management'] = CONFIG.get('risk_management', {}).copy()
         final_p['risk_management']['sizing_method'] = 'risk_percentage'
         
+        # Hydrate nested dicts
+        if 'tbm' not in final_p: final_p['tbm'] = CONFIG['online_learning'].get('tbm', {}).copy()
+        final_p['tbm']['barrier_width'] = best_params.get('barrier_width', 3.0)
+        final_p['tbm']['min_profit_pips'] = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 30.0))
+        
         pipe = ResearchPipeline()
         model = pipe.get_fresh_model(final_p)
-        broker = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
+        broker = BacktestBroker(initial_balance=CONFIG['env'].get('initial_balance', 50000.0))
         strat = ResearchStrategy(model, symbol, final_p)
 
         for idx, row in df.iterrows():
@@ -416,11 +472,12 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
 
         # Persistence
         for name, obj in [("river_pipeline", strat.model), ("meta_model", strat.meta_labeler), 
-                          ("calibrators", {'buy': strat.calibrator_buy, 'sell': strat.calibrator_sell})]:
+                          ("calibrators", {'buy': strat.calibrator_buy, 'sell': strat.calibrator_sell}),
+                          ("labeler", strat.labeler)]: 
             with open(models_dir / f"{name}_{symbol}.pkl", "wb") as f:
                 pickle.dump(obj, f)
             
-        log.info(f"✅ FINALIZED {symbol} | Metrics: {pipe.calculate_performance_metrics(broker.trade_log)}")
+        log.info(f"✅ FINALIZED {symbol} | Metrics: {pipe.calculate_performance_metrics(broker.trade_log, broker.initial_balance)}")
         gc.collect()
         
     except Exception as e:
@@ -474,7 +531,7 @@ class ResearchPipeline:
         return m
 
     def run_training(self, fresh_start: bool = False):
-        log.info(f"{LogSymbols.TRAINING} STARTING V20.2 SWARM OPTIMIZATION...")
+        log.info(f"{LogSymbols.TRAINING} STARTING V20.5 SWARM OPTIMIZATION...")
         if fresh_start:
             for p in self.models_dir.glob("*.pkl"): p.unlink()
             for s in self.symbols:
@@ -513,9 +570,12 @@ class ResearchPipeline:
             # FORCE RISK PERCENTAGE FOR FINAL VERIFICATION BACKTEST
             params['risk_management'] = CONFIG.get('risk_management', {}).copy()
             params['risk_management']['sizing_method'] = 'risk_percentage'
+            if 'tbm' not in params: params['tbm'] = CONFIG['online_learning'].get('tbm', {}).copy()
+            params['tbm']['barrier_width'] = params.get('barrier_width', 3.0)
+            params['tbm']['min_profit_pips'] = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 30.0))
 
             strat = ResearchStrategy(model, s, params)
-            broker = BacktestBroker(initial_balance=CONFIG['env']['initial_balance'])
+            broker = BacktestBroker(initial_balance=CONFIG['env'].get('initial_balance', 50000.0))
             for idx, row in df.iterrows():
                 snap = MarketSnapshot(timestamp=idx, data=row)
                 broker.process_pending(snap); strat.on_data(snap, broker)
@@ -528,7 +588,7 @@ class ResearchPipeline:
         df['Exit_Time'] = pd.to_datetime(df['Exit_Time'])
         df = df.sort_values('Exit_Time')
         df['Equity'] = 50000.0 + df['Net_PnL'].cumsum()
-        log.info("="*60 + "\nPHOENIX V20.2 FINAL REPORT\n" + "="*60)
+        log.info("="*60 + "\nPHOENIX V20.5 FINAL REPORT\n" + "="*60)
         log.info(f"Total Trades: {len(df)} | Net Profit: ${df['Net_PnL'].sum():,.2f}")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         df.to_csv(self.reports_dir / f"backtest_trades_{timestamp}.csv")
