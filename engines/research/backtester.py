@@ -19,7 +19,7 @@ from shared.domain.models import VolumeBar
 logger = logging.getLogger("Backtester")
 
 # =============================================================================
-# PHOENIX RESEARCH ENGINE V20.5 – BACKTEST BROKER (UNCHOKED PROTOCOL)
+# PHOENIX RESEARCH ENGINE V20.6 – BACKTEST BROKER (UNCHOKED PROTOCOL)
 # =============================================================================
 
 @dataclass(frozen=True)
@@ -113,7 +113,7 @@ class BacktestOrder:
 
 class BacktestBroker:
     """
-    V20.5 PARITY: Simulates a Broker environment:
+    V20.6 PARITY: Simulates a Broker environment:
     - Order Execution (Immediate Fill with VOLATILITY SLIPPAGE)
     - PnL Tracking (Equity/Balance)
     - Strict 1:2 R:R Guard at the Metal Layer
@@ -142,7 +142,7 @@ class BacktestBroker:
         self.daily_limit_hits = 0
 
         # Load Configured Costs
-        self.commission_per_lot = 3.0 # V20.5: Hardcoded FTMO standard ($3/lot per side)
+        self.commission_per_lot = 3.0 # V20.6: Hardcoded FTMO standard ($3/lot per side)
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         self.default_spread = self.spread_map.get('default', 1.6)
 
@@ -398,7 +398,7 @@ class BacktestBroker:
         """
         Public API called by ResearchStrategy.
         Applies STRICT REALITY INJECTION (Volatility Penalty) AND FIXED LOT CLAMP.
-        V20.5: Enforces exact 1:2 R:R at the Metal Layer.
+        V20.6: Enforces exact 1:2 R:R at the Metal Layer.
         """
         risk_conf = CONFIG.get('risk_management', {})
         if risk_conf.get('sizing_method') == 'fixed_lots':
@@ -432,7 +432,7 @@ class BacktestBroker:
             
         order.slippage_penalty = vol_penalty
 
-        # V20.5 FIX: GEOMETRIC PARITY SHIFT (Double Spread Penalty Cure)
+        # V20.6 FIX: GEOMETRIC PARITY SHIFT (Double Spread Penalty Cure)
         if order.action == "BUY":
             # Buy Limit/Market fills at Ask
             execution_price = order.entry_price + spread_cost + vol_penalty
@@ -450,7 +450,7 @@ class BacktestBroker:
             if order.stop_loss > 0: order.stop_loss += offset
             if order.take_profit > 0: order.take_profit += offset
 
-        # --- V20.5: STRICT R:R ENFORCEMENT AT THE METAL LAYER ---
+        # --- V20.6: STRICT R:R ENFORCEMENT AT THE METAL LAYER ---
         if order.stop_loss > 0 and order.take_profit > 0:
             risk_dist = abs(order.entry_price - order.stop_loss)
             reward_dist = abs(order.take_profit - order.entry_price)
@@ -553,7 +553,8 @@ class BacktestBroker:
             'Duration_Min': (close_time - trade.timestamp_created).total_seconds() / 60,
             'Regime': clean_metadata.get('regime', 'Unknown'),
             'Confidence': clean_metadata.get('confidence', 0.0),
-            'Tighten_Stops': clean_metadata.get('tighten_stops', False)
+            'Tighten_Stops': clean_metadata.get('tighten_stops', False),
+            'Risk_Taken_Pct': clean_metadata.get('risk_taken_pct', 0.0) # V20.6 Audit Trace
         })
 
     def get_stats(self) -> Dict[str, Any]:
@@ -651,7 +652,7 @@ class BacktestBroker:
 
 class AdaptiveImbalanceBarGenerator:
     """
-    V20.5 Parity: Generates Tick Imbalance Bars (TIBs).
+    V20.6 Parity: Generates Tick Imbalance Bars (TIBs).
     Replaces time-based sampling with information-driven sampling.
     """
     def __init__(self, symbol: str, initial_threshold: float = 10.0, alpha: float = 0.05):
@@ -761,13 +762,15 @@ class AdaptiveImbalanceBarGenerator:
         )
 
         # 4. Update Expectations (EWMA)
+        # We update the expected imbalance threshold based on the actual imbalance seen.
+        # This allows the sampling rate to speed up (lower threshold) or slow down.
         current_abs_imb = abs(self.current_imbalance)
         self.expected_imbalance = (self.alpha * current_abs_imb) + \
                                   ((1 - self.alpha) * self.expected_imbalance)
         
         # Clamp threshold to avoid sampling every tick or never sampling
-        # V20.5 Parity: Clamped to 10.0 lower, 50000.0 upper
-        self.expected_imbalance = max(10.0, min(self.expected_imbalance, 50000.0))
+        # V20.6 Parity: Clamped to 10.0 lower, 2000.0 upper (Starvation Fix)
+        self.expected_imbalance = max(10.0, min(self.expected_imbalance, 2000.0))
 
         # Reset State
         self.current_imbalance = 0.0
@@ -794,7 +797,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
         return pd.DataFrame()
 
     # 2. AGGREGATION: ADAPTIVE IMBALANCE BARS WITH AUTO-CALIBRATION
-    # V20.5 Parity: Using 10.0 as default config threshold and 0.05 alpha.
+    # V20.6 Parity: Using 10.0 as default config threshold and 0.05 alpha.
     config_threshold = CONFIG['data'].get('volume_bar_threshold', 10.0) 
     alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
     
@@ -850,7 +853,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
             break
         else:
             attempts += 1
-            # V20.5 FIX: Hard floor to prevent micro-bar flatline collapse
+            # V20.6 FIX: Hard floor to prevent micro-bar flatline collapse. Lower multiplier to 0.5.
             new_threshold = max(10.0, current_threshold * 0.5) 
             logger.warning(f"⚠️ {symbol}: Insufficient bars ({bar_count}). Retrying with threshold {new_threshold}...")
             current_threshold = new_threshold

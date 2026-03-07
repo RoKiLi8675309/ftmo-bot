@@ -71,8 +71,7 @@ class TradeDispatcher:
     Handles the reliable transmission of trade orders from the Logic Engine
     to the Execution Engine (Windows Producer) via Redis Streams.
     
-    UPDATED: FORCE MARKET EXECUTION ONLY.
-    V20.4 FIX: STRICT IMMUTABLE RISK PERSISTENCE FOR SWING TRADING.
+    V20.6 FIX: STRICT IMMUTABLE RISK PERSISTENCE & R:R METAL GUARD.
     """
     def __init__(self, stream_mgr: RedisStreamManager, pending_tracker: dict[str, Any], lock: threading.RLock):
         self.stream_mgr = stream_mgr
@@ -87,7 +86,20 @@ class TradeDispatcher:
             order_id = uuid.uuid4()
             short_id = str(order_id)[:8]
             
-            # --- V20.4 FIX: PERSIST INITIAL RISK DISTANCE ---
+            # --- V20.6 FIX: STRICT R:R ENFORCEMENT AT THE DISPATCH LAYER ---
+            # Even if the logic layer requests a trade, we mathematically verify it here 
+            # before it ever touches Redis or MT5.
+            if trade.action in ["BUY", "SELL"] and trade.stop_loss > 0 and trade.take_profit > 0:
+                risk_dist = abs(trade.entry_price - trade.stop_loss)
+                reward_dist = abs(trade.take_profit - trade.entry_price)
+                if risk_dist > 0:
+                    rr_ratio = reward_dist / risk_dist
+                    # 1.90 allows for minor float rounding from the 2.0x target
+                    if rr_ratio < 1.90:
+                        logger.error(f"🛑 REJECTED BY DISPATCHER: {trade.symbol} R:R Ratio is {rr_ratio:.2f} (Target >= 2.0). Blocked to prevent spread bleed.")
+                        return  # Abort dispatch immediately
+
+            # --- V20.6 FIX: PERSIST INITIAL RISK DISTANCE ---
             try:
                 initial_risk_dist = abs(trade.entry_price - trade.stop_loss)
                 if initial_risk_dist > 0:
@@ -133,6 +145,11 @@ class TradeDispatcher:
             else:
                 action_payload = str(mt5_action)
 
+            # Sanitize floats
+            safe_sl = float(trade.stop_loss) if math.isfinite(trade.stop_loss) else 0.0
+            safe_tp = float(trade.take_profit) if math.isfinite(trade.take_profit) else 0.0
+            safe_vol = float(trade.volume) if math.isfinite(trade.volume) else 0.01
+
             payload = {
                 "id": str(order_id),
                 "uuid": str(order_id),  
@@ -143,15 +160,15 @@ class TradeDispatcher:
                 "type": str(mt5_type),
                 
                 # Explicit formatting to prevent float precision errors
-                "volume": "{:.2f}".format(float(trade.volume)),
+                "volume": "{:.2f}".format(safe_vol),
                 
                 # FORCE ZERO PRICE for Market Execution
                 "entry_price": final_price,
                 "price": final_price, 
                 
                 # CRITICAL MAPPING: Producer looks for 'sl' and 'tp', NOT 'stop_loss'
-                "sl": "{:.5f}".format(trade.stop_loss),
-                "tp": "{:.5f}".format(trade.take_profit),
+                "sl": "{:.5f}".format(safe_sl),
+                "tp": "{:.5f}".format(safe_tp),
                 
                 "magic_number": str(self.magic_number),
                 "magic": str(self.magic_number), 
@@ -189,7 +206,9 @@ class TradeDispatcher:
                         symbol = data['symbol']
                         
                         for pos in open_positions.values():
-                            if pos.get('symbol') == symbol and short_id in pos.get('comment', ''):
+                            # V20.6 FIX: Robustly cast comment to string to prevent TypeError on None
+                            comment = str(pos.get('comment', ''))
+                            if pos.get('symbol') == symbol and short_id in comment:
                                 is_zombie_match = True
                                 break
                     
@@ -217,10 +236,11 @@ class TradeDispatcher:
 # --- WORKER PROCESS FOR OFF-MAIN-THREAD COMPUTE ---
 class LogicWorker(multiprocessing.Process):
     def __init__(self, tick_queue: multiprocessing.Queue, signal_queue: multiprocessing.Queue, 
-                 config: Dict, symbols: List[str]):
+                 ack_queue: multiprocessing.Queue, config: Dict, symbols: List[str]):
         super().__init__()
         self.tick_queue = tick_queue
         self.signal_queue = signal_queue
+        self.ack_queue = ack_queue
         self.config = config
         self.symbols = symbols
         self.running = True
@@ -232,7 +252,7 @@ class LogicWorker(multiprocessing.Process):
     def run(self):
         setup_logging("LogicWorker")
         worker_log = logging.getLogger("LogicWorker")
-        worker_log.info(f"{LogSymbols.ONLINE} Logic Worker Started (PID: {os.getpid()}) | V20.5 Unchoked Protocol Active")
+        worker_log.info(f"{LogSymbols.ONLINE} Logic Worker Started (PID: {os.getpid()}) | V20.6 IPC Ack Protocol Active")
         
         threshold_map = self._calibrate_thresholds(worker_log)
         
@@ -252,6 +272,14 @@ class LogicWorker(multiprocessing.Process):
         
         while self.running:
             try:
+                # V20.6 IPC FIX: Process Acknowledgment Queue to seal Memory Leaks
+                while not self.ack_queue.empty():
+                    try:
+                        ack = self.ack_queue.get_nowait()
+                        predictor.confirm_execution(ack['symbol'], ack['signal_id'])
+                    except queue.Empty:
+                        break
+
                 try:
                     tick_data = self.tick_queue.get(timeout=1.0)
                 except queue.Empty:
@@ -444,13 +472,15 @@ class LiveTradingEngine:
         
         self.last_dispatch_time = defaultdict(float)
         
-        # 4. Logic Worker Setup 
+        # 4. Logic Worker Setup (V20.6 IPC Added)
         self.tick_queue = multiprocessing.Queue(maxsize=10000)
         self.signal_queue = multiprocessing.Queue(maxsize=1000)
+        self.ack_queue = multiprocessing.Queue(maxsize=1000)
         
         self.logic_worker = LogicWorker(
             tick_queue=self.tick_queue,
             signal_queue=self.signal_queue,
+            ack_queue=self.ack_queue,
             config=CONFIG,
             symbols=self.symbols
         )
@@ -507,7 +537,6 @@ class LiveTradingEngine:
         self.mgmt_thread = threading.Thread(target=self._manage_active_positions_loop, daemon=True)
         self.mgmt_thread.start()
 
-        # V20.5: Start MT5 Execution Logger Thread (PubSub from Windows)
         self.execution_log_thread = threading.Thread(target=self._execution_logger_loop, daemon=True)
         self.execution_log_thread.start()
 
@@ -727,6 +756,9 @@ class LiveTradingEngine:
         return sqn
         
     def _check_circuit_breaker(self, symbol: str) -> bool:
+        """
+        V20.6 FIX: Thread-safe locking applied around dict access to prevent RuntimeError.
+        """
         current_anchor = self._get_producer_anchor_timestamp()
         
         with self.stats_lock:
@@ -796,7 +828,6 @@ class LiveTradingEngine:
         total_open_tickets += local_pending_total
         symbol_open_tickets += local_pending_symbol
 
-        # V20.5 FIX: Remove arbitrary global limits that choke scale. Fallback to 100.
         config_max = CONFIG.get('risk_management', {}).get('max_open_trades', 100)
         max_global = config_max
 
@@ -804,10 +835,8 @@ class LiveTradingEngine:
             logger.warning(f"🚫 Global Trade Limit Reached ({total_open_tickets}/{max_global}). Margin Protected.")
             return False
 
-        # V20.5 FIX: STRICT 1 TRADE PER PAIR
-        # We completely bypass the buggy pyramiding loop. If 1 trade exists, block new ones.
+        # V20.6 FIX: STRICT 1 TRADE PER PAIR
         if symbol_open_tickets >= 1:
-            # Silently drop to avoid console spam during high-frequency signals on an open pair
             return False
             
         return True
@@ -848,6 +877,10 @@ class LiveTradingEngine:
                 parkinson_vol = signal.meta_data.get('parkinson_vol', 0.0) 
                 risk_percent_override = signal.meta_data.get('risk_percent_override')
                 
+                tbm_config = CONFIG.get('online_learning', {}).get('tbm', {})
+                default_rr = max(float(tbm_config.get('barrier_width', 3.0)), 2.0)
+                current_reward_target = signal.meta_data.get('optimized_rr', default_rr)
+                
                 sqn_score = self._calculate_sqn(symbol)
                 
                 try:
@@ -881,7 +914,9 @@ class LiveTradingEngine:
                         symbol=symbol,
                         price=current_price,
                         stop_loss_price=0.0,
-                        account_equity=self.ftmo_guard.equity
+                        account_equity=self.ftmo_guard.equity,
+                        account_currency="USD",
+                        risk_reward_ratio=current_reward_target
                     ),
                     conf=signal.confidence,
                     volatility=volatility,
@@ -919,6 +954,10 @@ class LiveTradingEngine:
                 logger.info(f"📤 Dispatching MARKET {trade_intent.action} {symbol} ({trade_intent.volume} lots) @ ~{entry_ref:.5f} | SL: {trade_intent.stop_loss:.5f} | TP: {trade_intent.take_profit:.5f}")
                 self.dispatcher.send_order(trade_intent, risk_usd)
                 self.last_dispatch_time[symbol] = time.time()
+                
+                # V20.6 IPC ACK: Confirm back to LogicWorker that the signal was successfully executed
+                if hasattr(signal, 'id') and signal.id:
+                    self.ack_queue.put({'symbol': symbol, 'signal_id': signal.id})
                 
             except Exception as e:
                 logger.error(f"Signal Listener Error: {e}", exc_info=True)
@@ -1000,42 +1039,51 @@ class LiveTradingEngine:
                             risk_dist = abs(entry_price - sl_price)
                             if risk_dist < 1e-5: continue
                         
-                        trail_conf = CONFIG.get('risk_management', {}).get('trailing_stop', {})
-                        activation_r = float(trail_conf.get('activation_r', 1.5))
-                        trail_dist_r = float(trail_conf.get('trail_dist_r', 0.5))
-
                         new_sl = None
+                        reason = ""
                         
+                        # ============================================================
+                        # V13.2 FIX: "Let Winners Run" Protocol
+                        # Eliminates asphyxiating Trailing Stops that kill positive expectancy.
+                        # ============================================================
                         if pos_type == "BUY":
                             dist_pnl = current_price - entry_price
                             r_multiple = dist_pnl / risk_dist
                             
-                            if r_multiple >= activation_r:
-                                trail_pips = risk_dist * trail_dist_r
-                                target_sl = current_price - trail_pips
-                                
-                                min_lock = entry_price + (risk_dist * 0.1)
-                                target_sl = max(target_sl, min_lock)
-                                
+                            # Deep Profit (>2R): Allow 1.0R of breathing room
+                            if r_multiple >= 2.0:
+                                target_sl = current_price - (risk_dist * 1.0)
                                 if target_sl > sl_price:
                                     new_sl = target_sl
+                                    reason = f"Trail ({r_multiple:.1f}R)"
+                            # Initial Profit (>1R): Lock in Break-Even + tiny profit (0.1R)
+                            elif r_multiple >= 1.0:
+                                target_sl = entry_price + (risk_dist * 0.1)
+                                if target_sl > sl_price:
+                                    new_sl = target_sl
+                                    reason = "BE Lock"
 
                         elif pos_type == "SELL":
                             dist_pnl = entry_price - current_price
                             r_multiple = dist_pnl / risk_dist
                             
-                            if r_multiple >= activation_r:
-                                trail_pips = risk_dist * trail_dist_r
-                                target_sl = current_price + trail_pips
-                                
-                                min_lock = entry_price - (risk_dist * 0.1)
-                                target_sl = min(target_sl, min_lock)
-                                
+                            if r_multiple >= 2.0:
+                                target_sl = current_price + (risk_dist * 1.0)
                                 if target_sl < sl_price:
                                     new_sl = target_sl
+                                    reason = f"Trail ({r_multiple:.1f}R)"
+                            elif r_multiple >= 1.0:
+                                target_sl = entry_price - (risk_dist * 0.1)
+                                if target_sl < sl_price:
+                                    new_sl = target_sl
+                                    reason = "BE Lock"
 
                         if new_sl:
-                            logger.info(f"🛡️ TRAILING STOP: {sym} (R={r_multiple:.2f}) -> New SL {new_sl:.5f}")
+                            # Prevent MT5 comment bloat by only tagging structural changes
+                            if "Trail" not in comment and "BE Lock" not in comment:
+                                pass # Keep it simple for the dispatch log
+                            
+                            logger.info(f"🛡️ TRAILING STOP: {sym} (R={r_multiple:.2f}) -> New SL {new_sl:.5f} ({reason})")
                             modify_intent = Trade(
                                 symbol=sym,
                                 action="MODIFY",
@@ -1044,7 +1092,7 @@ class LiveTradingEngine:
                                 stop_loss=new_sl,
                                 take_profit=tp_price,
                                 ticket=ticket,
-                                comment=f"Trail {r_multiple:.1f}R"
+                                comment=reason
                             )
                             self.dispatcher.send_order(modify_intent, 0.0)
 
@@ -1201,7 +1249,7 @@ class LiveTradingEngine:
             try:
                 if not self.logic_worker.is_alive():
                     logger.critical("🚨 Logic Worker DIED! Restarting...")
-                    self.logic_worker = LogicWorker(self.tick_queue, self.signal_queue, CONFIG, self.symbols)
+                    self.logic_worker = LogicWorker(self.tick_queue, self.signal_queue, self.ack_queue, CONFIG, self.symbols)
                     self.logic_worker.start()
 
                 if self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['midnight_freeze']):
@@ -1266,7 +1314,7 @@ class LiveTradingEngine:
 
     def _execution_logger_loop(self):
         """
-        V20.5: Listens to Redis PubSub for real-time trade execution updates from Windows Producer.
+        V20.6: Listens to Redis PubSub for real-time trade execution updates from Windows Producer.
         Brings MT5 terminal visibility directly into the Linux VS Code console.
         """
         logger.info(f"{LogSymbols.ONLINE} MT5 Execution Logger Thread Started.")

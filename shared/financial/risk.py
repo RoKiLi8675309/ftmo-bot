@@ -55,7 +55,7 @@ class RiskManager:
     def get_pip_info(symbol: str) -> Tuple[float, int]:
         """
         Returns (pip_size, digits).
-        V20.2 FIX: Strict MT5 standard alignment for non-forex pairs.
+        Strict MT5 standard alignment for non-forex pairs.
         """
         s = symbol.upper()
         if "JPY" in s: return 0.01, 3
@@ -152,7 +152,7 @@ class RiskManager:
     def _calculate_max_margin_volume(symbol: str, free_margin: float, contract_size: float, price: float, conversion_rate: float) -> float:
         """
         Calculates maximum volume allowed by free margin (Leverage Guard).
-        V20.2 FIX: Guard against Infinity or NaN on zero division.
+        Guard against Infinity or NaN on zero division.
         """
         if free_margin <= 0 or contract_size <= 0 or price <= 0 or conversion_rate <= 0: 
             return 0.0
@@ -202,7 +202,7 @@ class RiskManager:
         parkinson_vol: float = 0.0  
     ) -> Tuple[Trade, float]:
         """
-        V20.2 UPDATE: Strict Geometric Synchronization.
+        V20.6 UPDATE: Strict Geometric Synchronization.
         Ensures the TradeIntent TP/SL distances perfectly match the AdaptiveTripleBarrier's
         internal realities (including dynamic reward multipliers, volatility boosts, and minimum pip floors).
         """
@@ -221,13 +221,13 @@ class RiskManager:
             c_size = RiskManager.get_contract_size(symbol)
         
         # 2. Stop Loss Geometry (Parity with AdaptiveTripleBarrier)
-        atr_mult_sl = float(risk_conf.get('stop_loss_atr_mult', 2.0)) 
+        atr_mult_sl = float(risk_conf.get('stop_loss_atr_mult', 1.5)) 
         
         # Pull dynamic reward multiplier directly from context if strategy modified it
         if hasattr(context, 'risk_reward_ratio') and context.risk_reward_ratio and context.risk_reward_ratio > 0:
             current_reward_mult = context.risk_reward_ratio
         else:
-            current_reward_mult = float(risk_conf.get('take_profit_atr_mult', 2.5))
+            current_reward_mult = float(risk_conf.get('take_profit_atr_mult', 3.0))
             
         # Mirrors the exact expansion math in AdaptiveTripleBarrier to prevent TP/SL hallucination.
         adaptive_scalar = 1.0 + (volatility * 100.0)
@@ -245,11 +245,11 @@ class RiskManager:
         pip_val_raw, _ = RiskManager.get_pip_info(symbol)
         if pip_val_raw <= 0: pip_val_raw = 0.0001
         
-        # Absolute Hard Floor (8.0 pips default)
-        config_min_pips = float(risk_conf.get('min_stop_loss_pips', 8.0))
+        # Absolute Hard Floor (15.0 pips default for V20.6)
+        config_min_pips = float(risk_conf.get('min_stop_loss_pips', 15.0))
         min_stop_hard_floor = config_min_pips * pip_val_raw
         
-        # V20.2 FIX: Asset-specific floor safety nets to prevent instant spread blowout
+        # Asset-specific floor safety nets to prevent instant spread blowout
         if "BTC" in symbol or "ETH" in symbol:
             min_stop_hard_floor = max(min_stop_hard_floor, 50.0 * pip_val_raw) # 50.0 distance floor
         elif any(idx in symbol for idx in ["US30", "GER30", "NAS100", "SPX500"]):
@@ -302,15 +302,15 @@ class RiskManager:
             return trade, implied_risk_usd
 
         # =========================================================
-        # DYNAMIC PERCENTAGE LOGIC
+        # DYNAMIC PERCENTAGE LOGIC (V20.6 Parity)
         # =========================================================
         
         lots = 0.0
         calculated_risk_usd = 0.0
         
-        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.0050)
-        buffer_threshold = risk_conf.get('profit_buffer_threshold', 0.02)
-        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.0075)
+        default_base_risk = float(risk_conf.get('base_risk_per_trade_percent', 0.0050))
+        buffer_threshold = float(risk_conf.get('profit_buffer_threshold', 0.02))
+        scaled_risk_val = float(risk_conf.get('scaled_risk_percent', 0.0075))
         
         scaling_comment = ""
         
@@ -323,16 +323,16 @@ class RiskManager:
             else:
                 risk_pct = default_base_risk * 100.0
         
-        # SQN Scaling
+        # V20.6 FIX: SQN Scaling logic corrected to not punish successful ratchet scaling.
         if performance_score != 0.0:
             if performance_score < -2.0:
-                risk_pct = 0.1 # Toxic
+                risk_pct = 0.1 # Toxic (Hard floor of 0.1%)
                 scaling_comment += "|Toxic"
             elif performance_score < 0.0:
-                risk_pct = 0.25 # Cold
+                risk_pct = min(risk_pct, 0.25) # Cold (Max 0.25%)
                 scaling_comment += "|Cold"
             elif performance_score > 2.5:
-                risk_pct = min(risk_pct * 1.1, 0.5) # Hot (Capped)
+                risk_pct = min(risk_pct * 1.1, 1.0) # Hot (Capped at 1.0%, allows profit buffer to thrive)
                 scaling_comment += "|Hot"
 
         # Calculate Lots
@@ -378,7 +378,7 @@ class RiskManager:
 class SessionGuard:
     """
     Enforces trading windows based on Server Time and New York Time.
-    V17.5 FIX: STRICT FRIDAY CLOSING using NY Timezone to avoid Server Offset drift.
+    STRICT FRIDAY CLOSING using NY Timezone to avoid Server Offset drift.
     """
     def __init__(self):
         risk_conf = CONFIG.get('risk_management', {})
@@ -388,7 +388,7 @@ class SessionGuard:
         except Exception:
             self.market_tz = pytz.timezone('Europe/Prague')
             
-        # V17.5: NY Timezone for Robust Friday Guard
+        # NY Timezone for Robust Friday Guard
         self.ny_tz = pytz.timezone('America/New_York')
             
         self.friday_cutoff = dt_time(19, 0)
@@ -543,7 +543,7 @@ class HierarchicalRiskParity:
             return {c: 1.0/len(cols) for c in cols}
         
         try:
-            # V20.2 FIX: Guard against flatline zero-variance which causes NaN in correlation
+            # Guard against flatline zero-variance which causes NaN in correlation
             df_safe = returns_df.fillna(0.0)
             corr = df_safe.corr().fillna(0.0)
             dist = ssd.pdist(corr, metric='euclidean')
@@ -597,12 +597,16 @@ class PortfolioRiskManager:
         data = {s: self.returns_buffer[s][-min_len:] for s in self.symbols}
         df = pd.DataFrame(data)
         
-        # V20.2 FIX: Guard against NaN correlations from flat price action arrays
+        # Guard against NaN correlations from flat price action arrays
         df = df.fillna(0.0)
         corr = df.corr()
         self.correlation_matrix = corr.fillna(0.0)
 
-    def get_correlation_count(self, symbol: str, threshold: float = 0.7) -> int:
+    def get_correlation_count(self, symbol: str, threshold: float = 0.85) -> int:
+        """
+        V20.6 FIX: Shifted default threshold from 0.70 to 0.85 to align with config.
+        Prevents harmless pair groupings from being unfairly penalized.
+        """
         if self.correlation_matrix.empty or symbol not in self.correlation_matrix.columns: return 0
         count = 0
         for held_symbol in self.active_positions:

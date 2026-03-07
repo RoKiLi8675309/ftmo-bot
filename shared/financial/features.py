@@ -6,9 +6,12 @@ import os
 import warnings
 import contextlib
 import io
+import copy
+import threading
 import numpy as np
 from collections import deque
 from typing import Dict, Any, Optional, List, Tuple
+from concurrent.futures import ThreadPoolExecutor
 
 # Shared Config
 from shared.core.config import CONFIG
@@ -50,31 +53,34 @@ logger = logging.getLogger("Features")
 
 class WelfordScaler:
     """
-    Online Standardization using Welford's Algorithm.
-    Computes running Mean and Variance in a single pass (O(1)).
+    V20.6 FIX: Upgraded from Infinite Welford to Exponential Moving Average (EMA) Scaler.
+    Prevents Stationarity Lockup where N becomes so large that recent volatility 
+    expansions are ignored due to the sheer mass of historical data.
     """
-    def __init__(self):
-        self.n = 0
+    def __init__(self, alpha: float = 0.05):
+        self.alpha = alpha
         self.mean = 0.0
-        self.M2 = 0.0  # Sum of squares of differences from the current mean
+        self.var = 0.0
+        self.initialized = False
 
     def update(self, x: float) -> float:
-        """Updates statistics and returns the Z-Score of the new value."""
+        """Updates statistics via EWMA and returns the Z-Score of the new value."""
         if x is None or not math.isfinite(x):
             return 0.0
             
-        self.n += 1
-        delta = x - self.mean
-        self.mean += delta / self.n
-        delta2 = x - self.mean
-        self.M2 += delta * delta2
-        
-        if self.n < 2:
+        if not self.initialized:
+            self.mean = x
+            self.var = 0.0
+            self.initialized = True
             return 0.0
             
-        # Variance = M2 / (n - 1)
-        variance = self.M2 / (self.n - 1)
-        stdev = math.sqrt(variance)
+        # EWMA Variance and Mean Update
+        diff = x - self.mean
+        incr = self.alpha * diff
+        self.mean += incr
+        self.var = (1 - self.alpha) * (self.var + diff * incr)
+        
+        stdev = math.sqrt(self.var)
         
         if stdev < 1e-9:
             return 0.0
@@ -325,7 +331,6 @@ class MicrostructureAnalyzer:
 class KaufmanEfficiencyRatio:
     """
     Quantifies trend efficiency (Signal vs Noise).
-    CRITICAL: Must be > 0.10 for V9 Breakout Strategy.
     """
     def __init__(self, window: int = 10):
         self.window = window
@@ -374,7 +379,8 @@ class FractalDimensionIndex:
 class RegimeDetector:
     """
     Online Hidden Markov Model (HMM) for regime classification.
-    Robust against convergence failures (Hard Reset Logic).
+    V20.6 FIX: Asynchronous fitting prevents the Python GIL from blocking
+    the live tick stream and triggering massive network latency drops.
     """
     def __init__(self, n_states: int = 2, window: int = 100):
         self.n_states = n_states
@@ -384,6 +390,12 @@ class RegimeDetector:
         self.model = None
         self.fit_failures = 0
         self.fit_counter = 0
+        self.state_map = {i: i for i in range(n_states)}
+        
+        # Concurrency protections
+        self.lock = threading.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.is_fitting = False
         
         if HMM_AVAILABLE:
             logging.getLogger("hmmlearn").setLevel(logging.ERROR)
@@ -422,43 +434,64 @@ class RegimeDetector:
                 return self.last_regime
 
             # Retrain periodically or early on
-            should_fit = (self.fit_counter % 50 == 0) or (self.fit_counter < 200)
+            should_fit = (self.fit_counter % 50 == 0) or (self.fit_counter < 200 and self.fit_counter % 10 == 0)
             
-            if should_fit:
-                # HARD RESET LOGIC: If model fails to converge repeatedly, scramble it.
-                if self.fit_failures > 5:
-                    self.model.init_params = "stmc" # Re-init weights
-                    self.fit_failures = 0
-                elif hasattr(self.model, 'startprob_'):
-                    self.model.init_params = "" # Keep weights, refine them
-                
-                # Suppress Stdout/Stderr from C-level HMM code
-                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        self.model.fit(data)
-                
-                if self.model.monitor_.converged:
-                    # Sort states by Variance (Low Var = 0 = Quiet, High Var = 1 = Volatile)
-                    variances = np.array([np.mean(np.diag(c)) for c in self.model.covars_])
-                    sort_order = np.argsort(variances)
-                    self.state_map = {old: new for new, old in enumerate(sort_order)}
-                    self.fit_failures = 0
+            if should_fit and not self.is_fitting:
+                self.is_fitting = True
+                fit_data = data.copy()
+                # Execute heavy math off the main event loop thread
+                self.executor.submit(self._async_fit, fit_data)
+            
+            # Predict current state (Non-blocking Thread-Safe Read)
+            with self.lock:
+                if hasattr(self.model, 'startprob_'):
+                    raw_state = int(self.model.predict(data[-1].reshape(1, -1))[0])
                 else:
-                    self.fit_failures += 1
-                    # Fallback Identity map
-                    self.state_map = {i: i for i in range(self.n_states)}
-            
-            # Predict current state
-            raw_state = int(self.model.predict(data[-1].reshape(1, -1))[0])
+                    raw_state = 0
+                    
             mapped_state = self.state_map.get(raw_state, raw_state)
             
             self.last_regime = mapped_state
             return mapped_state
             
         except Exception:
-            self.fit_failures += 1
             return self.last_regime
+            
+    def _async_fit(self, data):
+        """Background thread execution to prevent tick starvation."""
+        try:
+            with self.lock:
+                model_clone = copy.deepcopy(self.model)
+            
+            # HARD RESET LOGIC: If model fails to converge repeatedly, scramble it.
+            if self.fit_failures > 5:
+                model_clone.init_params = "stmc" # Re-init weights
+            elif hasattr(model_clone, 'startprob_'):
+                model_clone.init_params = "" # Keep weights, refine them
+                
+            # Suppress Stdout/Stderr from C-level HMM code
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    model_clone.fit(data)
+            
+            if model_clone.monitor_.converged:
+                # Sort states by Variance (Low Var = 0 = Quiet, High Var = 1 = Volatile)
+                variances = np.array([np.mean(np.diag(c)) for c in model_clone.covars_])
+                sort_order = np.argsort(variances)
+                new_map = {old: new for new, old in enumerate(sort_order)}
+                
+                # Hot-swap the model back into the main thread
+                with self.lock:
+                    self.model = model_clone
+                    self.state_map = new_map
+                    self.fit_failures = 0
+            else:
+                self.fit_failures += 1
+        except Exception:
+            self.fit_failures += 1
+        finally:
+            self.is_fitting = False
 
 # --- 4. STREAMING INDICATORS ---
 
@@ -700,12 +733,13 @@ class StreamingIndicators:
         self.prev_close = price
         return features
 
-# --- 5. ADAPTIVE TRIPLE BARRIER (V20.3 RE-ENGINEERED) ---
+# --- 5. ADAPTIVE TRIPLE BARRIER ---
 
 class AdaptiveTripleBarrier:
     """
-    V20.3 Reality-Injected Labeling Engine.
-    Simulates actual broker execution constraints during ML training.
+    Reality-Injected Labeling Engine.
+    V20.6 FIX: Added spread_in_price and comm_in_price to eliminate Asymmetric Slippage Leakage.
+    The ML model no longer trains in a frictionless utopia, preventing optimistic bias.
     """
     def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.0, reward_mult: float = 2.0, 
                  drift_threshold: float = 0.75, horizon_type: str = 'TIME', horizon_value: float = 0.0):
@@ -721,13 +755,12 @@ class AdaptiveTripleBarrier:
 
     def add_trade_opportunity(self, features: Dict[str, float], entry_price: float, current_atr: float, 
                               timestamp: float, parkinson_vol: float = 0.0, 
-                              min_stop_dist: float = 0.0, cost_in_price: float = 0.0, 
-                              min_profit_dist: float = 0.0,
+                              min_stop_dist: float = 0.0, spread_in_price: float = 0.0, 
+                              comm_in_price: float = 0.0, min_profit_dist: float = 0.0,
                               proposed_action: int = 0, pred_proba: float = 0.5,
                               override_reward_mult: float = None):
         """
-        Calculates exact broker geometry.
-        Now explicitly tracks the proposed action to train the calibrator on actual failures.
+        Calculates exact broker geometry including strict spread and commission penalties.
         """
         if current_atr <= 0: current_atr = entry_price * 0.0001
         
@@ -749,20 +782,15 @@ class AdaptiveTripleBarrier:
         actual_reward_dist = actual_risk_dist * (effective_reward_mult / effective_risk_mult)
         
         # 2. Broker Reality Injection
-        # A BUY trade pays the spread twice (Ask entry, Bid exit). 
-        # So TP is pushed further away by cost. SL is pulled closer by cost.
-        buy_tp = entry_price + actual_reward_dist + cost_in_price
-        buy_sl = entry_price - actual_risk_dist + cost_in_price
+        # V20.6 FIX: Training labels now respect the exact same spread penalties as live execution.
+        buy_tp = entry_price + actual_reward_dist + spread_in_price
+        buy_sl = entry_price - actual_risk_dist + spread_in_price
         
-        # A SELL trade sells at Bid, buys back at Ask. 
-        # TP is pushed lower by cost. SL is pushed higher (sooner) by cost.
-        sell_tp = entry_price - actual_reward_dist - cost_in_price
-        sell_sl = entry_price + actual_risk_dist - cost_in_price
+        sell_tp = entry_price - actual_reward_dist - spread_in_price
+        sell_sl = entry_price + actual_risk_dist - spread_in_price
 
-        # Minimum required profit after costs
-        min_profit_pct = (min_profit_dist + cost_in_price) / entry_price if entry_price > 0 else 0.0
+        min_profit_pct = (min_profit_dist + spread_in_price + comm_in_price) / entry_price if entry_price > 0 else 0.0
         
-        # Inject minimum profit requirement into features so Strategy loop can retrieve it
         feats_copy = features.copy()
         feats_copy['min_profit_pct'] = min_profit_pct
 
@@ -778,8 +806,8 @@ class AdaptiveTripleBarrier:
             'age': 0,
             'cum_vol': 0.0,
             'cum_volatility': 0.0,
-            'cost_pct': cost_in_price / entry_price if entry_price > 0 else 0.0,
-            'min_profit_pct': min_profit_pct,
+            'spread_pct': spread_in_price / entry_price if entry_price > 0 else 0.0,
+            'comm_pct': comm_in_price / entry_price if entry_price > 0 else 0.0,
             'proposed_action': proposed_action,
             'pred_proba': pred_proba
         })
@@ -825,27 +853,26 @@ class AdaptiveTripleBarrier:
             if buy_status != 0 or sell_status != 0 or is_expired:
                 buy_ret = 0.0
                 sell_ret = 0.0
-                cost_pct = trade['cost_pct']
+                spread_pct = trade['spread_pct']
+                comm_pct = trade['comm_pct']
 
-                # Calculate Net Return (BUY)
+                # Calculate Net Return (BUY) with Slippage
                 if buy_status == 1: 
-                    buy_ret = (trade['buy_tp'] - trade['entry']) / trade['entry'] - cost_pct
+                    buy_ret = (trade['buy_tp'] - trade['entry']) / trade['entry'] - spread_pct - comm_pct
                 elif buy_status == -1: 
-                    buy_ret = (trade['buy_sl'] - trade['entry']) / trade['entry'] - cost_pct
+                    buy_ret = (trade['buy_sl'] - trade['entry']) / trade['entry'] - spread_pct - comm_pct
                 elif is_expired: 
-                    buy_ret = (current_close - trade['entry']) / trade['entry'] - cost_pct
+                    buy_ret = (current_close - trade['entry']) / trade['entry'] - spread_pct - comm_pct
 
-                # Calculate Net Return (SELL)
+                # Calculate Net Return (SELL) with Slippage
                 if sell_status == 1: 
-                    sell_ret = (trade['entry'] - trade['sell_tp']) / trade['entry'] - cost_pct
+                    sell_ret = (trade['entry'] - trade['sell_tp']) / trade['entry'] - spread_pct - comm_pct
                 elif sell_status == -1: 
-                    sell_ret = (trade['entry'] - trade['sell_sl']) / trade['entry'] - cost_pct
+                    sell_ret = (trade['entry'] - trade['sell_sl']) / trade['entry'] - spread_pct - comm_pct
                 elif is_expired: 
-                    sell_ret = (trade['entry'] - current_close) / trade['entry'] - cost_pct
+                    sell_ret = (trade['entry'] - current_close) / trade['entry'] - spread_pct - comm_pct
 
-                # V20.3 FIX: REVERT BASE MODEL TO BINARY
-                # To prevent probability collapse, the Base Model must always pick a side.
-                # The MetaLabeler is responsible for filtering out the 0 (Noise) trades.
+                # REVERT BASE MODEL TO BINARY
                 if buy_ret > sell_ret:
                     optimal_label = 1
                     optimal_ret = buy_ret
@@ -885,9 +912,10 @@ class AdaptiveTripleBarrier:
 
 class ProbabilityCalibrator:
     """
-    V20.3 Bootstrap Protocol:
-    Calibrates raw output probabilities to true empirical probabilities.
-    Insulated against NaN crashes during probability collapse.
+    V20.7 BOOTSTRAP PROTOCOL:
+    Platt Scaling Calibrator adapted for swing trading confidence.
+    Guarantees smooth, continuous probability outputs (0.01 to 0.99).
+    V20.7 FIX: Returns RAW base model probability during immaturity so the strategy isn't choked by flat 1.0 or 0.5 values.
     """
     def __init__(self, window: int = 1000):
         self.calibrator = None
@@ -898,25 +926,33 @@ class ProbabilityCalibrator:
                 l2=0.1
             )
         self.samples_seen = 0
+        self.pos_count = 0
+        self.neg_count = 0
 
     def update(self, prob: float, label: int):
         if ML_AVAILABLE and math.isfinite(prob):
             self.calibrator.learn_one({'raw_prob': prob}, label)
             self.samples_seen += 1
+            if label == 1:
+                self.pos_count += 1
+            else:
+                self.neg_count += 1
 
     def calibrate(self, raw_prob: float) -> float:
         if not ML_AVAILABLE: return raw_prob
         
-        # V20.3 FIX: Gently floor early probabilities so WFO trials don't stall out
-        if self.samples_seen < 100:
-            return max(0.50, raw_prob)
+        # V20.7 FIX: ML Confidence Pegging Bug.
+        # Lowered threshold from 50 to 10.
+        # Return the RAW PROBABILITY instead of a flat fallback so the base model can filter!
+        if self.pos_count < 10 or self.neg_count < 10:
+            return raw_prob 
             
         try:
             calibrated_dict = self.calibrator.predict_proba_one({'raw_prob': raw_prob})
             calibrated = calibrated_dict.get(1, raw_prob)
             return max(0.01, min(calibrated, 0.99))
         except Exception:
-            return max(0.50, raw_prob)
+            return raw_prob
 
 class MetaLabeler:
     """
@@ -925,6 +961,8 @@ class MetaLabeler:
     def __init__(self):
         self.model = None
         self.buffer = deque(maxlen=1000)
+        self.pos_count = 0
+        self.neg_count = 0
         
         if ML_AVAILABLE:
             self.model = forest.ARFClassifier(
@@ -939,6 +977,12 @@ class MetaLabeler:
         
         # This is where NOISE is filtered. 1 = Profit, 0 = Loss.
         y_meta = 1 if outcome_pnl > 0 else 0
+        
+        if y_meta == 1:
+            self.pos_count += 1
+        else:
+            self.neg_count += 1
+            
         try:
             meta_feats = self._enrich(features, primary_action)
             clean_features = self._sanitize(meta_feats)
@@ -951,8 +995,10 @@ class MetaLabeler:
         if not ML_AVAILABLE or primary_action == 0:
             return False
             
-        # V20.3 FIX: Allow 100 free trades before enforcing Meta-Labeler
-        if len(self.buffer) < 100: return True 
+        # V20.7 FIX: Lower maturity threshold to 10.
+        # Default to True (allow base model to trade) until meta-model is smart enough to veto.
+        if self.pos_count < 10 or self.neg_count < 10: 
+            return True 
             
         try:
             meta_feats = self._enrich(features, primary_action)
@@ -962,7 +1008,7 @@ class MetaLabeler:
             return prob_profit >= threshold
         except Exception as e:
             logger.debug(f"MetaLabeler Predict Error: {e}")
-            return False
+            return True
 
     def _enrich(self, features: Dict[str, float], action: int) -> Dict[str, float]:
         clean = features.copy()
@@ -993,9 +1039,9 @@ class OnlineFeatureEngineer:
         
         self.indicators = StreamingIndicators()
         
-        # Welford Scaler for Volume (Infinite Window Stationarity)
-        self.welford_volume = WelfordScaler()
-        self.welford_ofi = WelfordScaler()
+        # Welford Scaler for Volume (Infinite Window Stationarity Fix applied)
+        self.welford_volume = WelfordScaler(alpha=0.05)
+        self.welford_ofi = WelfordScaler(alpha=0.05)
         
         # Regime Indicators
         self.ker = KaufmanEfficiencyRatio(window=10)
@@ -1379,16 +1425,19 @@ class VolatilityMonitor:
         return val if math.isfinite(val) else 0.001
 
 @njit
-def calculate_hurst(ts):
+def calculate_hurst(returns_ts):
     """
-    Calculates the Hurst Exponent using Numba-optimized standard deviation analysis.
-    Uses explicit manual linear regression (O(N)) to replace np.linalg.lstsq, 
-    ensuring stability across Numpy versions in Numba.
+    V20.6 FIX: Calculates the Hurst Exponent correctly by integrating returns 
+    into a random walk (price path) before computing lag standard deviations.
     """
-    n = len(ts)
+    n = len(returns_ts)
     if n < 20: return 0.5
     
-    # 1. Variance Check (Math Guard)
+    # 1. Reconstruct the price path from log returns (Cumulative Sum)
+    # CRITICAL FIX: Hurst must be calculated on the random walk (price), not the stationary noise (returns).
+    ts = np.cumsum(returns_ts)
+    
+    # 1b. Variance Check (Math Guard)
     if np.std(ts) < 1e-9: return 0.5
     
     # Prepare lags (2..19)
@@ -1398,7 +1447,7 @@ def calculate_hurst(ts):
     
     for i in range(len(lags)):
         lag = int(lags[i])
-        # Calculate diffs for this lag
+        # Calculate diffs for this lag over the random walk
         diff = ts[lag:] - ts[:-lag]
         std_diff = np.std(diff)
         
@@ -1409,7 +1458,6 @@ def calculate_hurst(ts):
             tau[i] = std_diff
     
     # Safe Log (Avoid log(0))
-    # Using np.maximum is safe in Numba
     log_lags = np.log(lags)
     log_tau = np.log(tau)
     

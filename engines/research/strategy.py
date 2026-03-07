@@ -7,6 +7,7 @@ import pytz
 from collections import deque, defaultdict, Counter
 from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime, timedelta
+import pandas as pd
 
 # Third-Party Imports
 try:
@@ -31,17 +32,14 @@ from engines.research.backtester import MarketSnapshot, BacktestBroker, Backtest
 logger = logging.getLogger("ResearchStrategy")
 
 # =============================================================================
-# V20.5 MATHEMATICAL PARITY CLASSES (THE ML UNCHOKING)
-# Embedded locally to guarantee the WFO Backtester uses the exact same 
-# Probability Calibration and TP/SL Geometry as the Live Predictor.
+# V13.2 MATHEMATICAL PARITY CLASSES
+# Resolves the Bootstrap Paradox and Expectancy Mismatch.
 # =============================================================================
 
 class ProbabilityCalibrator:
     """
-    V20.5 BOOTSTRAP PROTOCOL:
     Platt Scaling Calibrator adapted for swing trading confidence.
-    Guarantees smooth, continuous probability outputs (0.01 to 0.99).
-    Now requires Statistical Maturity (50 wins & 50 losses) before choking trades.
+    Forces exploration (1.0) during immaturity to break the Bootstrap Paradox.
     """
     def __init__(self, window: int = 1000):
         self.calibrator = None
@@ -67,18 +65,16 @@ class ProbabilityCalibrator:
     def calibrate(self, raw_prob: float) -> float:
         if not ML_AVAILABLE: return raw_prob
         
-        # V20.5 FIX: Guarantee WFO threshold bypass during data gathering
-        # Prevents the "Probability Collapse" where the model blocks all trades
+        # V13.1 FIX: Keep the bot exploring until mature.
         if self.pos_count < 50 or self.neg_count < 50:
-            return max(0.60, raw_prob) 
+            return 1.0 
             
         try:
             calibrated_dict = self.calibrator.predict_proba_one({'raw_prob': raw_prob})
             calibrated = calibrated_dict.get(1, raw_prob)
-            # V20.5 FIX: Never penalize base model by more than 5% to prevent collapse
             return max(raw_prob - 0.05, min(calibrated, 0.99))
         except Exception:
-            return max(0.60, raw_prob)
+            return 1.0
 
 class MetaLabeler:
     """
@@ -119,7 +115,7 @@ class MetaLabeler:
         if not ML_AVAILABLE or primary_action == 0:
             return False
         
-        # V20.5 FIX: Ensure Statistical Maturity.
+        # V13.1 FIX: Allow trades to pass until MetaLabeler is mature enough to veto them.
         if self.pos_count < 50 or self.neg_count < 50: 
             return True 
         
@@ -127,7 +123,7 @@ class MetaLabeler:
             meta_feats = self._enrich(features, primary_action)
             clean_features = self._sanitize(meta_feats)
             probs = self.model.predict_proba_one(clean_features)
-            return probs.get(1, 0.0) >= 0.40
+            return probs.get(1, 0.0) >= threshold
         except Exception:
             return True
 
@@ -186,8 +182,8 @@ class AdaptiveTripleBarrier:
         
         actual_reward_dist = actual_risk_dist * (effective_reward_mult / effective_risk_mult)
         
-        buy_tp = entry_price + actual_reward_dist
-        buy_sl = entry_price - actual_risk_dist
+        buy_tp = entry_price + actual_reward_dist + spread_in_price
+        buy_sl = entry_price - actual_risk_dist + spread_in_price
         
         sell_tp = entry_price - actual_reward_dist - spread_in_price
         sell_sl = entry_price + actual_risk_dist - spread_in_price
@@ -261,7 +257,6 @@ class AdaptiveTripleBarrier:
                 elif is_expired: 
                     sell_ret = (trade['entry'] - current_close) / trade['entry'] - spread_pct - comm_pct
 
-                # V20.5 FIX: REVERT BASE MODEL TO BINARY
                 if buy_ret > sell_ret:
                     optimal_label = 1
                     optimal_ret = buy_ret
@@ -304,7 +299,7 @@ class ResearchStrategy:
     Represents an independent trading agent for a single symbol.
     Strictly implements the Profit Maximization Protocol.
     """
-    def __init__(self, model: Any, symbol: str, params: dict[str, Any]):
+    def __init__(self, model: Any, symbol: str, params: dict[str, Any], historical_df: Optional[pd.DataFrame] = None):
         self.model = model
         self.symbol = symbol
         self.params = params
@@ -377,7 +372,7 @@ class ResearchStrategy:
         self.feature_importance_counter = Counter() 
         
         # ============================================================
-        # STRATEGY CONFIGURATION (V20.5 UNCHOKED PROTOCOL)
+        # STRATEGY CONFIGURATION (V13.2 UNCHOKED PROTOCOL)
         # ============================================================
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
@@ -386,7 +381,7 @@ class ResearchStrategy:
         self.bb_buffer = deque(maxlen=self.bb_window)
         
         self.ker_floor = 0.0003 
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.55))
+        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.52))
         self.hurst_veto = 0.65 
         
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 0.8)) 
@@ -394,7 +389,7 @@ class ResearchStrategy:
         self.regime_enforcement = "DISABLED" 
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
         self.max_rvol_thresh = 35.0 
-        self.adx_threshold = float(CONFIG.get('features', {}).get('adx', {}).get('threshold', 25.0))
+        self.adx_threshold = float(CONFIG.get('features', {}).get('adx', {}).get('threshold', 20.0))
         
         # --- SESSION CONTROL ---
         session_conf = self.risk_conf.get('session_control', {})
@@ -417,6 +412,24 @@ class ResearchStrategy:
 
         self.daily_max_losses = 20 
         self.daily_max_loss_pct = 0.045
+        
+        if historical_df is not None and not historical_df.empty:
+            self.preload_buffers(historical_df)
+
+    def preload_buffers(self, historical_df: pd.DataFrame):
+        if historical_df.empty:
+            return
+            
+        warmup_df = historical_df.tail(500)
+        logger.info(f"⏳ {self.symbol}: Pre-loading {len(warmup_df)} In-Sample candles to prevent OOS Starvation...")
+        
+        dummy_broker = BacktestBroker(initial_balance=50000.0)
+        
+        for idx, row in warmup_df.iterrows():
+            snap = MarketSnapshot(timestamp=idx, data=row)
+            self.on_data(snap, dummy_broker, is_warmup=True)
+            
+        logger.info(f"✅ {self.symbol}: Pre-load complete. Strategy ready for OOS Inference.")
 
     def _calculate_golden_trio(self) -> Tuple[float, float, float]:
         closes = self.closes_buffer
@@ -461,18 +474,6 @@ class ResearchStrategy:
         
         return hurst, ker, rvol
 
-    def _check_volatility_condition(self, current_price: float) -> bool:
-        if len(self.returns_window) < 10: return True 
-        vol = np.std(list(self.returns_window))
-        return vol >= 0.00005
-
-    def _get_preferred_regime(self, symbol: str) -> str:
-        if symbol in self.asset_regime_map: return self.asset_regime_map[symbol]
-        regimes_found = [regime for key, regime in self.asset_regime_map.items() if key in symbol]
-        if "TREND_BREAKOUT" in regimes_found: return "TREND_BREAKOUT"
-        if "MEAN_REVERSION" in regimes_found: return "MEAN_REVERSION"
-        return "NEUTRAL"
-
     def _check_currency_exposure(self, broker: BacktestBroker, symbol: str) -> bool:
         base_ccy = symbol[:3]
         quote_ccy = symbol[3:]
@@ -509,10 +510,7 @@ class ResearchStrategy:
         cooldown_expiry = close_time + timedelta(minutes=self.cooldown_minutes)
         return current_time < cooldown_expiry
 
-    def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker):
-        """
-        Main Event Loop for the Strategy (Backtest Mode).
-        """
+    def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker, is_warmup: bool = False):
         price = snapshot.get_price(self.symbol, 'close')
         high = snapshot.get_high(self.symbol)
         low = snapshot.get_low(self.symbol)
@@ -555,31 +553,33 @@ class ResearchStrategy:
         context_data = self._simulate_mtf_context(price, server_time)
         self.current_d1_ema = context_data.get('d1', {}).get('ema200', 0.0)
 
-        if self._check_symbol_circuit_breaker(broker, server_time):
-            self.rejection_stats["Symbol Circuit Breaker (Loss Limit)"] += 1
-            return
-            
-        if self._check_revenge_guard(broker, server_time):
-            self.rejection_stats["Mandatory Cooldown (Revenge Guard)"] += 1
-            return
+        # Do NOT enforce circuit breakers, revenge guards, trailing stops during warmup
+        if not is_warmup:
+            if self._check_symbol_circuit_breaker(broker, server_time):
+                self.rejection_stats["Symbol Circuit Breaker (Loss Limit)"] += 1
+                return
+                
+            if self._check_revenge_guard(broker, server_time):
+                self.rejection_stats["Mandatory Cooldown (Revenge Guard)"] += 1
+                return
 
-        self._update_streak_status(broker)
-        self._manage_trailing_stops(broker, price, dt_ts)
-        self._manage_time_stops(broker, dt_ts)
+            self._update_streak_status(broker)
+            self._manage_trailing_stops(broker, price, dt_ts)
+            self._manage_time_stops(broker, dt_ts)
 
-        is_weekend_hold = (server_time.weekday() > 4) 
-        is_friday_close = (server_time.weekday() == 4 and server_time.hour >= self.friday_close_hour)
-        is_daily_session_close = False
-        if self.session_enabled and server_time.hour >= self.liq_hour:
-            is_daily_session_close = True
+            is_weekend_hold = (server_time.weekday() > 4) 
+            is_friday_close = (server_time.weekday() == 4 and server_time.hour >= self.friday_close_hour)
+            is_daily_session_close = False
+            if self.session_enabled and server_time.hour >= self.liq_hour:
+                is_daily_session_close = True
 
-        if is_weekend_hold or is_friday_close or is_daily_session_close:
-            for pos in list(broker.open_positions):
-                if pos.symbol == self.symbol:
-                     broker._close_partial_position(
-                        pos, pos.quantity, price, dt_ts, "Session/Friday Liquidation"
-                    )
-            return 
+            if is_weekend_hold or is_friday_close or is_daily_session_close:
+                for pos in list(broker.open_positions):
+                    if pos.symbol == self.symbol:
+                         broker._close_partial_position(
+                            pos, pos.quantity, price, dt_ts, "Session/Friday Liquidation"
+                        )
+                return 
 
         buy_vol = snapshot.get_price(self.symbol, 'buy_vol')
         sell_vol = snapshot.get_price(self.symbol, 'sell_vol')
@@ -659,7 +659,7 @@ class ResearchStrategy:
                         self.calibrator_sell.update(past_prob, 1 if past_ret > 0 else 0)
 
         # ============================================================
-        # C. SMART SIGNAL MATRIX (V20.5 EXPERT HEURISTICS)
+        # C. SMART SIGNAL MATRIX (V13.2 HIGH-VOL VETO)
         # ============================================================
         regime_label = "Neutral"
         proposed_action = 0 
@@ -669,6 +669,8 @@ class ResearchStrategy:
         adx_val = features.get('adx', 0.0)
         rsi_norm = features.get('rsi_norm', 0.5)
         rsi_val = rsi_norm * 100.0
+        parkinson = features.get('parkinson_vol', 0.0)
+        current_atr = features.get('atr', 0.001)
 
         if len(self.bb_buffer) >= self.bb_window:
             bb_mu = np.mean(self.bb_buffer)
@@ -680,18 +682,23 @@ class ResearchStrategy:
             
             if is_trending:
                 regime_label = "TREND_BREAKOUT"
-                if adx_val >= self.adx_threshold: # V20.5 Momentum
+                if adx_val >= self.adx_threshold: 
                     if price >= upper_bb: 
                         proposed_action = 1 
                     elif price <= lower_bb: 
                         proposed_action = -1 
             else:
                 regime_label = "MEAN_REVERSION"
-                # V20.5 Exhaustion
-                if price <= lower_bb and rsi_val < 30.0: 
-                    proposed_action = 1 
-                elif price >= upper_bb and rsi_val > 70.0: 
-                    proposed_action = -1  
+                # V13.2 FIX: Do not step in front of high-volatility freight trains
+                # Blocks mean reversion during violent macro spikes (GBPJPY specifically)
+                if parkinson > 0.003 or current_atr > (price * 0.002):
+                    proposed_action = 0
+                    self.rejection_stats["Veto: High Vol Mean Reversion"] += 1
+                else:
+                    if price <= lower_bb and rsi_val < 30.0: 
+                        proposed_action = 1 
+                    elif price >= upper_bb and rsi_val > 70.0: 
+                        proposed_action = -1  
 
         if hurst >= self.hurst_veto and regime_label == "MEAN_REVERSION" and proposed_action != 0:
             proposed_action = 0
@@ -710,9 +717,6 @@ class ResearchStrategy:
         # ============================================================
         # D. ADD TRADE OPPORTUNITY
         # ============================================================
-        current_atr = features.get('atr', 0.001)
-        parkinson = features.get('parkinson_vol', 0.0)
-        
         pip_val, _ = RiskManager.get_pip_info(self.symbol)
         if pip_val <= 0: pip_val = 0.0001
         
@@ -724,7 +728,6 @@ class ResearchStrategy:
         min_stop_dist = min_stop_pips * pip_val
         min_profit_dist = float(self.params.get('tbm', {}).get('min_profit_pips', 30.0)) * pip_val 
 
-        # V20.5: Forced 1:2 Minimum Risk Reward
         current_reward_target = max(self.optimized_reward_mult, 2.0)
         if regime_label == "TREND_BREAKOUT":
             current_reward_target = max(current_reward_target, 3.0)
@@ -737,6 +740,9 @@ class ResearchStrategy:
             proposed_action=proposed_action, pred_proba=prob_success,
             override_reward_mult=current_reward_target
         )
+
+        if is_warmup:
+            return
 
         # ============================================================
         # E. SURVIVAL GATES
@@ -764,21 +770,28 @@ class ResearchStrategy:
             return
 
         # ============================================================
-        # F. ML CONFIRMATION & EXECUTION
+        # F. ML CONFIRMATION & EXECUTION (V13.1 EXPECTANCY CURE)
         # ============================================================
         try:
             if proposed_action == 1: confidence = self.calibrator_buy.calibrate(prob_success)
             elif proposed_action == -1: confidence = self.calibrator_sell.calibrate(prob_success)
             else: confidence = 0.0
                 
-            min_conf = float(self.params.get('min_calibrated_probability', 0.60)) 
-            if confidence < min_conf:
+            # Calibrate against mathematical break-even, not an arbitrary coin flip
+            break_even_wr = 1.0 / (1.0 + current_reward_target)
+            dynamic_min_conf = break_even_wr + 0.02 # Require +2% statistical edge over break-even
+            
+            config_min_conf = float(self.params.get('min_calibrated_probability', 0.55))
+            effective_min_conf = min(dynamic_min_conf, config_min_conf)
+            
+            if confidence < effective_min_conf:
                 self.rejection_stats[f"Low ML Confidence"] += 1
                 if self.rejection_stats[f"Low ML Confidence"] % 10 == 0:
-                    if self.debug_mode: logger.info(f"🤖 {self.symbol} GATE: Low ML Confidence ({confidence:.2f} < {min_conf:.2f})")
+                    if self.debug_mode: logger.info(f"🤖 {self.symbol} GATE: Low ML Confidence ({confidence:.2f} < Req:{effective_min_conf:.2f} | BE:{break_even_wr:.2f})")
                 return
             
-            meta_thresh = float(self.params.get('meta_labeling_threshold', 0.50))
+            # Meta Labeler predicts probability of a profitable outcome
+            meta_thresh = max(break_even_wr + 0.01, 0.20)
             is_profitable = self.meta_labeler.predict(clean_features, proposed_action, threshold=meta_thresh)
             if proposed_action != 0: self.meta_label_events += 1
 
@@ -902,6 +915,8 @@ class ResearchStrategy:
         tp_price = price + tp_dist if action == "BUY" else price - tp_dist
         side = 1 if action == "BUY" else -1
 
+        risk_taken_pct = (risk_usd / broker.equity) * 100.0 if broker.equity > 0 else 0.0
+
         order = BacktestOrder(
             symbol=self.symbol,
             side=side,
@@ -922,7 +937,8 @@ class ResearchStrategy:
                 'initial_risk_dist': stop_dist, 
                 'entry_price_snap': price,
                 'tighten_stops': tighten_stops,
-                'is_pyramid': is_pyramid
+                'is_pyramid': is_pyramid,
+                'risk_taken_pct': risk_taken_pct # Stored for Autopsy
             }
         )
         broker.submit_order(order)
@@ -936,7 +952,8 @@ class ResearchStrategy:
             'ker': current_ker,
             'atr': current_atr,
             'regime': regime,
-            'pyramid': is_pyramid
+            'pyramid': is_pyramid,
+            'risk_taken_pct': risk_taken_pct # Stored for Autopsy
         })
 
     def _calculate_symbol_sqn(self, broker: BacktestBroker) -> float:
@@ -967,10 +984,10 @@ class ResearchStrategy:
             broker._close_partial_position(pos, pos.quantity, self.last_price, current_time, reason)
 
     def _manage_trailing_stops(self, broker: BacktestBroker, current_price: float, timestamp: datetime):
-        trail_conf = self.risk_conf.get('trailing_stop', {})
-        activation_r = float(trail_conf.get('activation_r', 1.0))
-        trail_dist_r = float(trail_conf.get('trail_dist_r', 0.5))
-
+        """
+        V13.2 FIX: "Let Winners Run" Protocol.
+        Replaced the asphyxiating Trailing Stop with a looser structural trail.
+        """
         for pos in broker.open_positions:
             if pos.symbol != self.symbol: continue
             risk_dist = pos.metadata.get('initial_risk_dist', 0.0)
@@ -981,21 +998,36 @@ class ResearchStrategy:
             
             if pos.side == 1: 
                 r_multiple = (current_price - pos.entry_price) / risk_dist
-                if r_multiple >= activation_r:
-                    target_sl = max(current_price - (risk_dist * trail_dist_r), pos.entry_price + (risk_dist * 0.1))
+                
+                # Smart Trailing Protocol: 
+                # If trade is highly profitable (>2R), trail loosely at 1R distance
+                if r_multiple >= 2.0:
+                    target_sl = current_price - (risk_dist * 1.0) 
                     if target_sl > pos.stop_loss:
                         new_sl, reason = target_sl, f"Trail ({r_multiple:.1f}R)"
+                # If trade is modestly profitable (>1R), lock Break-Even + tiny profit
+                elif r_multiple >= 1.0:
+                    target_sl = pos.entry_price + (risk_dist * 0.1) 
+                    if target_sl > pos.stop_loss:
+                        new_sl, reason = target_sl, "BE Lock"
                         
             else: 
                 r_multiple = (pos.entry_price - current_price) / risk_dist
-                if r_multiple >= activation_r:
-                    target_sl = min(current_price + (risk_dist * trail_dist_r), pos.entry_price - (risk_dist * 0.1))
+                
+                if r_multiple >= 2.0:
+                    target_sl = current_price + (risk_dist * 1.0)
                     if target_sl < pos.stop_loss:
                         new_sl, reason = target_sl, f"Trail ({r_multiple:.1f}R)"
+                elif r_multiple >= 1.0:
+                    target_sl = pos.entry_price - (risk_dist * 0.1)
+                    if target_sl < pos.stop_loss:
+                        new_sl, reason = target_sl, "BE Lock"
             
             if new_sl is not None:
                 pos.stop_loss = new_sl
-                if "Trail" not in pos.comment: pos.comment += f"|{reason}"
+                # Prevent comment bloat if we keep adjusting
+                if "Trail" not in pos.comment and "BE Lock" not in pos.comment: 
+                    pos.comment += f"|{reason}"
 
     def _check_symbol_circuit_breaker(self, broker: BacktestBroker, server_time: datetime) -> bool:
         today_losses = 0
@@ -1079,6 +1111,12 @@ class ResearchStrategy:
         
         avg_conf = np.mean([t['conf'] for t in self.trade_events])
         avg_rvol = np.mean([t['rvol'] for t in self.trade_events]) 
+        
+        try:
+            avg_risk = np.mean([t.get('risk_taken_pct', 0.0) for t in self.trade_events])
+        except:
+            avg_risk = 0.0
+            
         reject_str = ", ".join([f"{k}: {v}" for k, v in sorted(self.rejection_stats.items(), key=lambda item: item[1], reverse=True)[:5]])
         
         report = (
@@ -1086,6 +1124,7 @@ class ResearchStrategy:
             f" Trades: {len(self.trade_events)}\n"
             f" Avg Conf: {avg_conf:.2f}\n"
             f" Avg RVol: {avg_rvol:.2f}\n"
+            f" Avg Risk: {avg_risk:.3f}%\n" 
             f" Top Drivers: {str(self.feature_importance_counter.most_common(5))}\n"
             f" Rejections: {{{reject_str}}}\n"
             f" ----------------------------------------\n"
