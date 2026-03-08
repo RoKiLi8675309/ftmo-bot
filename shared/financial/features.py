@@ -381,6 +381,7 @@ class RegimeDetector:
     Online Hidden Markov Model (HMM) for regime classification.
     V20.6 FIX: Asynchronous fitting prevents the Python GIL from blocking
     the live tick stream and triggering massive network latency drops.
+    V20.8 FIX: Added __getstate__ and __setstate__ to prevent threading.Lock pickle crashes.
     """
     def __init__(self, n_states: int = 2, window: int = 100):
         self.n_states = n_states
@@ -415,6 +416,22 @@ class RegimeDetector:
             except Exception as e:
                 logger.error(f"HMM Init Failed: {e}")
                 self.model = None
+
+    def __getstate__(self):
+        """Prepares object for pickling by stripping non-serializable threading objects."""
+        state = self.__dict__.copy()
+        if 'lock' in state:
+            del state['lock']
+        if 'executor' in state:
+            del state['executor']
+        return state
+
+    def __setstate__(self, state):
+        """Restores the object after being unpickled."""
+        self.__dict__.update(state)
+        self.lock = threading.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.is_fitting = False
     
     def update(self, ret: float) -> int:
         self.returns.append(ret * 100.0)
@@ -738,8 +755,8 @@ class StreamingIndicators:
 class AdaptiveTripleBarrier:
     """
     Reality-Injected Labeling Engine.
-    V20.6 FIX: Added spread_in_price and comm_in_price to eliminate Asymmetric Slippage Leakage.
-    The ML model no longer trains in a frictionless utopia, preventing optimistic bias.
+    V20.8 FIX: Restored signal_id and current_timestamp arguments to ensure strict IPC compatibility 
+    with the Live Engine (which utilizes these for execution confirmation and true time decay).
     """
     def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.0, reward_mult: float = 2.0, 
                  drift_threshold: float = 0.75, horizon_type: str = 'TIME', horizon_value: float = 0.0):
@@ -758,7 +775,7 @@ class AdaptiveTripleBarrier:
                               min_stop_dist: float = 0.0, spread_in_price: float = 0.0, 
                               comm_in_price: float = 0.0, min_profit_dist: float = 0.0,
                               proposed_action: int = 0, pred_proba: float = 0.5,
-                              override_reward_mult: float = None):
+                              override_reward_mult: float = None, signal_id: str = None):
         """
         Calculates exact broker geometry including strict spread and commission penalties.
         """
@@ -782,7 +799,6 @@ class AdaptiveTripleBarrier:
         actual_reward_dist = actual_risk_dist * (effective_reward_mult / effective_risk_mult)
         
         # 2. Broker Reality Injection
-        # V20.6 FIX: Training labels now respect the exact same spread penalties as live execution.
         buy_tp = entry_price + actual_reward_dist + spread_in_price
         buy_sl = entry_price - actual_risk_dist + spread_in_price
         
@@ -795,6 +811,8 @@ class AdaptiveTripleBarrier:
         feats_copy['min_profit_pct'] = min_profit_pct
 
         self.buffer.append({
+            'signal_id': signal_id,       # V20.8 IPC Fix
+            'is_executed': False,         # V20.8 IPC Fix
             'features': feats_copy,
             'entry': entry_price,
             'buy_tp': buy_tp,
@@ -813,10 +831,11 @@ class AdaptiveTripleBarrier:
         })
 
     def resolve_labels(self, current_high: float, current_low: float, current_close: float = None, 
-                       current_volume: float = 0.0, current_log_ret: float = 0.0) -> List[Tuple[Dict[str, float], int, float, int, float, float]]:
+                       current_volume: float = 0.0, current_log_ret: float = 0.0,
+                       current_timestamp: float = 0.0) -> List[Tuple[Dict[str, float], int, float, int, float, float, bool]]:
         """
         Evaluates independent virtual BUY and SELL trades to solve Asymmetry.
-        Returns: (features, optimal_label, optimal_ret, proposed_action, pred_proba, proposed_ret)
+        Returns: (features, optimal_label, optimal_ret, proposed_action, pred_proba, proposed_ret, is_executed)
         """
         resolved = []
         active = deque()
@@ -830,7 +849,12 @@ class AdaptiveTripleBarrier:
 
             is_expired = False
             if self.horizon_type == 'TIME':
-                if trade['age'] >= self.time_limit: is_expired = True
+                # Use real wall-clock time difference if timestamp provided, else fallback to tick age
+                if current_timestamp > 0 and trade.get('start_time', 0) > 0:
+                    duration_sec = current_timestamp - trade['start_time']
+                    if duration_sec >= (self.time_limit * 60): is_expired = True
+                else:
+                    if trade['age'] >= self.time_limit: is_expired = True
             elif self.horizon_type == 'VOLUME':
                 thresh = self.horizon_threshold if self.horizon_threshold > 0 else current_volume * 100
                 if trade['cum_vol'] >= thresh: is_expired = True
@@ -894,13 +918,16 @@ class AdaptiveTripleBarrier:
                 elif proposed_action == -1:
                     proposed_ret = sell_ret
 
+                is_executed = trade.get('is_executed', False) # V20.8 IPC Fix
+
                 resolved.append((
                     trade['features'], 
                     optimal_label, 
                     optimal_ret,
                     proposed_action,
                     pred_proba,
-                    proposed_ret
+                    proposed_ret,
+                    is_executed
                 ))
             else:
                 active.append(trade)

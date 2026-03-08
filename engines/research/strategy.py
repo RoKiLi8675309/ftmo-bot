@@ -4,6 +4,7 @@ import sys
 import numpy as np
 import math
 import pytz
+import uuid
 from collections import deque, defaultdict, Counter
 from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime, timedelta
@@ -32,14 +33,15 @@ from engines.research.backtester import MarketSnapshot, BacktestBroker, Backtest
 logger = logging.getLogger("ResearchStrategy")
 
 # =============================================================================
-# V13.2 MATHEMATICAL PARITY CLASSES
-# Resolves the Bootstrap Paradox and Expectancy Mismatch.
+# V20.8 MATHEMATICAL PARITY CLASSES
+# Resolves the Bootstrap Paradox, Expectancy Mismatch, and IPC Signature Crashes
 # =============================================================================
 
 class ProbabilityCalibrator:
     """
     Platt Scaling Calibrator adapted for swing trading confidence.
-    Forces exploration (1.0) during immaturity to break the Bootstrap Paradox.
+    V20.8 FIX: Returns RAW base model probability during immaturity so the strategy 
+    isn't choked by flat 1.0 or 0.5 values, aligning with the live engine.
     """
     def __init__(self, window: int = 1000):
         self.calibrator = None
@@ -65,16 +67,16 @@ class ProbabilityCalibrator:
     def calibrate(self, raw_prob: float) -> float:
         if not ML_AVAILABLE: return raw_prob
         
-        # V13.1 FIX: Keep the bot exploring until mature.
-        if self.pos_count < 50 or self.neg_count < 50:
-            return 1.0 
+        # V20.8 FIX: Keep the bot exploring but using raw probabilities until mature.
+        if self.pos_count < 10 or self.neg_count < 10:
+            return raw_prob 
             
         try:
             calibrated_dict = self.calibrator.predict_proba_one({'raw_prob': raw_prob})
             calibrated = calibrated_dict.get(1, raw_prob)
-            return max(raw_prob - 0.05, min(calibrated, 0.99))
+            return max(0.01, min(calibrated, 0.99))
         except Exception:
-            return 1.0
+            return raw_prob
 
 class MetaLabeler:
     """
@@ -115,15 +117,16 @@ class MetaLabeler:
         if not ML_AVAILABLE or primary_action == 0:
             return False
         
-        # V13.1 FIX: Allow trades to pass until MetaLabeler is mature enough to veto them.
-        if self.pos_count < 50 or self.neg_count < 50: 
+        # V20.8 FIX: Allow trades to pass until MetaLabeler is mature enough to veto them.
+        if self.pos_count < 10 or self.neg_count < 10: 
             return True 
-        
+            
         try:
             meta_feats = self._enrich(features, primary_action)
             clean_features = self._sanitize(meta_feats)
             probs = self.model.predict_proba_one(clean_features)
-            return probs.get(1, 0.0) >= threshold
+            prob_profit = probs.get(1, 0.0)
+            return prob_profit >= threshold
         except Exception:
             return True
 
@@ -144,6 +147,7 @@ class AdaptiveTripleBarrier:
     """
     SPREAD TRAP CURE & CHOP LABELING.
     Simulates actual broker execution constraints perfectly aligned with RiskManager.
+    V20.8 FIX: Restored signal_id and current_timestamp to ensure pipeline execution parity.
     """
     def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.5, reward_mult: float = 3.0, 
                  drift_threshold: float = 0.75, horizon_type: str = 'TIME', horizon_value: float = 0.0):
@@ -162,7 +166,7 @@ class AdaptiveTripleBarrier:
                               min_stop_dist: float = 0.0, spread_in_price: float = 0.0, 
                               comm_in_price: float = 0.0, min_profit_dist: float = 0.0,
                               proposed_action: int = 0, pred_proba: float = 0.5,
-                              override_reward_mult: float = None):
+                              override_reward_mult: float = None, signal_id: str = None):
         
         if current_atr <= 0: current_atr = entry_price * 0.0001
         
@@ -189,6 +193,8 @@ class AdaptiveTripleBarrier:
         sell_sl = entry_price + actual_risk_dist - spread_in_price
 
         self.buffer.append({
+            'signal_id': signal_id,       # V20.8 IPC Match
+            'is_executed': False,         # V20.8 IPC Match
             'features': features.copy(),
             'entry': entry_price,
             'buy_tp': buy_tp,
@@ -207,7 +213,8 @@ class AdaptiveTripleBarrier:
         })
 
     def resolve_labels(self, current_high: float, current_low: float, current_close: float = None, 
-                       current_volume: float = 0.0, current_log_ret: float = 0.0) -> List[Tuple[Dict[str, float], int, float, int, float, float]]:
+                       current_volume: float = 0.0, current_log_ret: float = 0.0,
+                       current_timestamp: float = 0.0) -> List[Tuple[Dict[str, float], int, float, int, float, float, bool]]:
         resolved = []
         active = deque()
         if current_close is None: current_close = (current_high + current_low) / 2.0
@@ -220,7 +227,12 @@ class AdaptiveTripleBarrier:
 
             is_expired = False
             if self.horizon_type == 'TIME':
-                if trade['age'] >= self.time_limit: is_expired = True
+                # V20.8 Fix: Uses true wall-clock diff if timestamp provided
+                if current_timestamp > 0 and trade.get('start_time', 0) > 0:
+                    duration_sec = current_timestamp - trade['start_time']
+                    if duration_sec >= (self.time_limit * 60): is_expired = True
+                else:
+                    if trade['age'] >= self.time_limit: is_expired = True
             elif self.horizon_type == 'VOLUME':
                 thresh = self.horizon_threshold if self.horizon_threshold > 0 else current_volume * 100
                 if trade['cum_vol'] >= thresh: is_expired = True
@@ -276,13 +288,16 @@ class AdaptiveTripleBarrier:
                 elif proposed_action == -1:
                     proposed_ret = sell_ret
 
+                is_executed = trade.get('is_executed', False) # V20.8 Match
+
                 resolved.append((
                     trade['features'], 
                     optimal_label, 
                     optimal_ret,
                     proposed_action,
                     pred_proba,
-                    proposed_ret
+                    proposed_ret,
+                    is_executed
                 ))
             else:
                 active.append(trade)
@@ -620,16 +635,19 @@ class ResearchStrategy:
                 self.dynamic_ker_offset = min(0.0, self.dynamic_ker_offset + 0.001)
 
         # ============================================================
-        # B. DELAYED TRAINING
+        # B. DELAYED TRAINING (V20.8 UNPACK FIX)
         # ============================================================
         log_ret = features.get('log_ret', 0.0)
         
+        # V20.8 IPC Fix: Pass current_timestamp to accurately calculate expiration
         resolved_labels = self.labeler.resolve_labels(
-            high, low, current_close=price, current_volume=volume, current_log_ret=log_ret
+            high, low, current_close=price, current_volume=volume, current_log_ret=log_ret,
+            current_timestamp=timestamp
         )
         
         if resolved_labels:
-            for (stored_feats, optimal_label, optimal_ret, past_action, past_prob, past_ret) in resolved_labels:
+            # V20.8 IPC Fix: Unpack the 7th element (is_executed)
+            for (stored_feats, optimal_label, optimal_ret, past_action, past_prob, past_ret, is_executed) in resolved_labels:
                 
                 w_pos = float(self.params.get('positive_class_weight', 1.0))
                 w_neg = float(self.params.get('negative_class_weight', 1.0))
@@ -659,7 +677,7 @@ class ResearchStrategy:
                         self.calibrator_sell.update(past_prob, 1 if past_ret > 0 else 0)
 
         # ============================================================
-        # C. SMART SIGNAL MATRIX (V13.2 HIGH-VOL VETO)
+        # C. SMART SIGNAL MATRIX
         # ============================================================
         regime_label = "Neutral"
         proposed_action = 0 
@@ -689,8 +707,6 @@ class ResearchStrategy:
                         proposed_action = -1 
             else:
                 regime_label = "MEAN_REVERSION"
-                # V13.2 FIX: Do not step in front of high-volatility freight trains
-                # Blocks mean reversion during violent macro spikes (GBPJPY specifically)
                 if parkinson > 0.003 or current_atr > (price * 0.002):
                     proposed_action = 0
                     self.rejection_stats["Veto: High Vol Mean Reversion"] += 1
@@ -715,7 +731,7 @@ class ResearchStrategy:
             prob_success = 0.0
 
         # ============================================================
-        # D. ADD TRADE OPPORTUNITY
+        # D. ADD TRADE OPPORTUNITY (V20.8 IPC FIX)
         # ============================================================
         pip_val, _ = RiskManager.get_pip_info(self.symbol)
         if pip_val <= 0: pip_val = 0.0001
@@ -732,13 +748,17 @@ class ResearchStrategy:
         if regime_label == "TREND_BREAKOUT":
             current_reward_target = max(current_reward_target, 3.0)
 
+        # V20.8 IPC Fix: Inject a unique signal_id for tracking
+        signal_id = str(uuid.uuid4())
+
         self.labeler.add_trade_opportunity(
             features=features, entry_price=price, current_atr=current_atr, 
             timestamp=timestamp, parkinson_vol=parkinson,
             min_stop_dist=min_stop_dist, spread_in_price=spread_in_price,
             comm_in_price=comm_in_price, min_profit_dist=min_profit_dist,
             proposed_action=proposed_action, pred_proba=prob_success,
-            override_reward_mult=current_reward_target
+            override_reward_mult=current_reward_target,
+            signal_id=signal_id # ADDED
         )
 
         if is_warmup:
@@ -770,16 +790,15 @@ class ResearchStrategy:
             return
 
         # ============================================================
-        # F. ML CONFIRMATION & EXECUTION (V13.1 EXPECTANCY CURE)
+        # F. ML CONFIRMATION & EXECUTION
         # ============================================================
         try:
             if proposed_action == 1: confidence = self.calibrator_buy.calibrate(prob_success)
             elif proposed_action == -1: confidence = self.calibrator_sell.calibrate(prob_success)
             else: confidence = 0.0
                 
-            # Calibrate against mathematical break-even, not an arbitrary coin flip
             break_even_wr = 1.0 / (1.0 + current_reward_target)
-            dynamic_min_conf = break_even_wr + 0.02 # Require +2% statistical edge over break-even
+            dynamic_min_conf = break_even_wr + 0.02 
             
             config_min_conf = float(self.params.get('min_calibrated_probability', 0.55))
             effective_min_conf = min(dynamic_min_conf, config_min_conf)
@@ -790,7 +809,6 @@ class ResearchStrategy:
                     if self.debug_mode: logger.info(f"🤖 {self.symbol} GATE: Low ML Confidence ({confidence:.2f} < Req:{effective_min_conf:.2f} | BE:{break_even_wr:.2f})")
                 return
             
-            # Meta Labeler predicts probability of a profitable outcome
             meta_thresh = max(break_even_wr + 0.01, 0.20)
             is_profitable = self.meta_labeler.predict(clean_features, proposed_action, threshold=meta_thresh)
             if proposed_action != 0: self.meta_label_events += 1

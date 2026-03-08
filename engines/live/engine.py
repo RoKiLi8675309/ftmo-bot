@@ -50,6 +50,8 @@ logger = logging.getLogger("LiveEngine")
 MAX_TICK_LATENCY_SEC = 45.0 
 
 # --- MT5 CONSTANTS (HARDCODED FOR LINUX) ---
+# Since we cannot import MetaTrader5 on Linux, we define the standard constants here.
+# These MUST match the Windows Producer's expectation.
 MT5_ORDER_TYPE_BUY = 0
 MT5_ORDER_TYPE_SELL = 1
 MT5_TRADE_ACTION_DEAL = 1
@@ -71,7 +73,7 @@ class TradeDispatcher:
     Handles the reliable transmission of trade orders from the Logic Engine
     to the Execution Engine (Windows Producer) via Redis Streams.
     
-    V20.6 FIX: STRICT IMMUTABLE RISK PERSISTENCE & R:R METAL GUARD.
+    V20.8 FIX: STRICT IMMUTABLE RISK PERSISTENCE & R:R METAL GUARD.
     """
     def __init__(self, stream_mgr: RedisStreamManager, pending_tracker: dict[str, Any], lock: threading.RLock):
         self.stream_mgr = stream_mgr
@@ -87,8 +89,6 @@ class TradeDispatcher:
             short_id = str(order_id)[:8]
             
             # --- V20.6 FIX: STRICT R:R ENFORCEMENT AT THE DISPATCH LAYER ---
-            # Even if the logic layer requests a trade, we mathematically verify it here 
-            # before it ever touches Redis or MT5.
             if trade.action in ["BUY", "SELL"] and trade.stop_loss > 0 and trade.take_profit > 0:
                 risk_dist = abs(trade.entry_price - trade.stop_loss)
                 reward_dist = abs(trade.take_profit - trade.entry_price)
@@ -206,7 +206,7 @@ class TradeDispatcher:
                         symbol = data['symbol']
                         
                         for pos in open_positions.values():
-                            # V20.6 FIX: Robustly cast comment to string to prevent TypeError on None
+                            # V20.8 FIX: Robust comment parsing. short_id will survive even if Windows strips "_"
                             comment = str(pos.get('comment', ''))
                             if pos.get('symbol') == symbol and short_id in comment:
                                 is_zombie_match = True
@@ -252,7 +252,7 @@ class LogicWorker(multiprocessing.Process):
     def run(self):
         setup_logging("LogicWorker")
         worker_log = logging.getLogger("LogicWorker")
-        worker_log.info(f"{LogSymbols.ONLINE} Logic Worker Started (PID: {os.getpid()}) | V20.6 IPC Ack Protocol Active")
+        worker_log.info(f"{LogSymbols.ONLINE} Logic Worker Started (PID: {os.getpid()}) | V20.8 IPC Ack Protocol Active")
         
         threshold_map = self._calibrate_thresholds(worker_log)
         
@@ -272,7 +272,7 @@ class LogicWorker(multiprocessing.Process):
         
         while self.running:
             try:
-                # V20.6 IPC FIX: Process Acknowledgment Queue to seal Memory Leaks
+                # V20.8 IPC FIX: Process Acknowledgment Queue to seal Memory Leaks
                 while not self.ack_queue.empty():
                     try:
                         ack = self.ack_queue.get_nowait()
@@ -472,7 +472,7 @@ class LiveTradingEngine:
         
         self.last_dispatch_time = defaultdict(float)
         
-        # 4. Logic Worker Setup (V20.6 IPC Added)
+        # 4. Logic Worker Setup
         self.tick_queue = multiprocessing.Queue(maxsize=10000)
         self.signal_queue = multiprocessing.Queue(maxsize=1000)
         self.ack_queue = multiprocessing.Queue(maxsize=1000)
@@ -756,9 +756,6 @@ class LiveTradingEngine:
         return sqn
         
     def _check_circuit_breaker(self, symbol: str) -> bool:
-        """
-        V20.6 FIX: Thread-safe locking applied around dict access to prevent RuntimeError.
-        """
         current_anchor = self._get_producer_anchor_timestamp()
         
         with self.stats_lock:
@@ -835,8 +832,13 @@ class LiveTradingEngine:
             logger.warning(f"🚫 Global Trade Limit Reached ({total_open_tickets}/{max_global}). Margin Protected.")
             return False
 
-        # V20.6 FIX: STRICT 1 TRADE PER PAIR
-        if symbol_open_tickets >= 1:
+        # V20.8 FIX: STRICT 1 TRADE PER PAIR unless Pyramiding is enabled
+        max_per_symbol = 1
+        pyramid_conf = CONFIG.get('risk_management', {}).get('pyramiding', {})
+        if pyramid_conf.get('enabled', False):
+            max_per_symbol += int(pyramid_conf.get('max_adds', 1))
+
+        if symbol_open_tickets >= max_per_symbol:
             return False
             
         return True
@@ -955,7 +957,7 @@ class LiveTradingEngine:
                 self.dispatcher.send_order(trade_intent, risk_usd)
                 self.last_dispatch_time[symbol] = time.time()
                 
-                # V20.6 IPC ACK: Confirm back to LogicWorker that the signal was successfully executed
+                # V20.8 IPC ACK: Confirm back to LogicWorker that the signal was successfully executed
                 if hasattr(signal, 'id') and signal.id:
                     self.ack_queue.put({'symbol': symbol, 'signal_id': signal.id})
                 
@@ -1020,17 +1022,27 @@ class LiveTradingEngine:
                         tp_price = float(pos.get('tp', 0.0))
                         pos_type = pos.get('type') 
                         ticket = pos.get('ticket')
-                        comment = str(pos.get('comment', ''))
-
+                        
                         if entry_price == 0 or sl_price == 0: continue
 
                         risk_dist = 0.0
                         try:
-                            parts = comment.split('_')
-                            if len(parts) >= 2 and parts[0] == "Auto":
-                                short_id = parts[1]
+                            # V20.8 IPC FIX: Robust comment parsing. 
+                            # Windows producer strips "_" and prepends UUID.
+                            comment = str(pos.get('comment', ''))
+                            short_id = None
+                            
+                            # MT5 limits comments to 31 chars, check formats
+                            if "Auto_" in comment:
+                                parts = comment.split('_')
+                                if len(parts) >= 2: short_id = parts[1][:8]
+                            elif len(comment) >= 8:
+                                # Windows Fallback: "1234abcd Auto Algo"
+                                short_id = comment[:8]
+                                
+                            if short_id:
                                 stored_risk = self.stream_mgr.r.hget("bot:initial_risk", short_id)
-                                if stored_risk:
+                                if stored_risk: 
                                     risk_dist = float(stored_risk)
                         except Exception as e:
                             logger.warning(f"Failed to fetch initial risk from Redis for {sym}: {e}")
@@ -1080,7 +1092,8 @@ class LiveTradingEngine:
 
                         if new_sl:
                             # Prevent MT5 comment bloat by only tagging structural changes
-                            if "Trail" not in comment and "BE Lock" not in comment:
+                            comment_str = str(pos.get('comment', ''))
+                            if "Trail" not in comment_str and "BE Lock" not in comment_str:
                                 pass # Keep it simple for the dispatch log
                             
                             logger.info(f"🛡️ TRAILING STOP: {sym} (R={r_multiple:.2f}) -> New SL {new_sl:.5f} ({reason})")
@@ -1314,7 +1327,7 @@ class LiveTradingEngine:
 
     def _execution_logger_loop(self):
         """
-        V20.6: Listens to Redis PubSub for real-time trade execution updates from Windows Producer.
+        Listens to Redis PubSub for real-time trade execution updates from Windows Producer.
         Brings MT5 terminal visibility directly into the Linux VS Code console.
         """
         logger.info(f"{LogSymbols.ONLINE} MT5 Execution Logger Thread Started.")
