@@ -252,7 +252,7 @@ class LogicWorker(multiprocessing.Process):
     def run(self):
         setup_logging("LogicWorker")
         worker_log = logging.getLogger("LogicWorker")
-        worker_log.info(f"{LogSymbols.ONLINE} Logic Worker Started (PID: {os.getpid()}) | V20.8 IPC Ack Protocol Active")
+        worker_log.info(f"{LogSymbols.ONLINE} Logic Worker Started (PID: {os.getpid()}) | V20.10 IPC Protocol Active")
         
         threshold_map = self._calibrate_thresholds(worker_log)
         
@@ -311,6 +311,7 @@ class LogicWorker(multiprocessing.Process):
                 try:
                     price = float(tick_data.get('price', 0.0))
                     volume = float(tick_data.get('volume', 1.0))
+                    # The Feature Engineer/Aggregator needs MARKET time, not publish time.
                     ts = float(tick_data.get('time', 0.0))
                     if ts > 100_000_000_000: 
                         ts /= 1000.0 
@@ -352,8 +353,19 @@ class LogicWorker(multiprocessing.Process):
         worker_log.info("Logic Worker Shutdown Complete.")
 
     def _check_latency(self, tick_data: Dict, predictor: MultiAssetPredictor, log: logging.Logger) -> bool:
+        """
+        V20.10 LATENCY FIX: Uses 'publish_time' (when Producer sent it to Redis) instead of 
+        'time' (when the last MT5 trade occurred) to calculate network/processing latency. 
+        This solves the "Latency Guard Death Spiral" during slow market hours.
+        """
         try:
-            ts = float(tick_data.get('time', 0.0))
+            # 1. Prefer publish_time (pipeline latency) over time (market latency)
+            publish_ts = tick_data.get('publish_time')
+            if publish_ts:
+                ts = float(publish_ts)
+            else:
+                ts = float(tick_data.get('time', 0.0))
+                
             if ts > 100_000_000_000: 
                 ts /= 1000.0
             
@@ -1055,22 +1067,21 @@ class LiveTradingEngine:
                         reason = ""
                         
                         # ============================================================
-                        # V13.2 FIX: "Let Winners Run" Protocol
-                        # Eliminates asphyxiating Trailing Stops that kill positive expectancy.
+                        # V20.9 FIX: "Let Winners Run" Protocol updated.
+                        # Trailers are now looser (0.5R locked at 1.5R) and BE is locked earlier (0.8R) 
+                        # to protect against mean reversion whip-saws while still capturing the 2.0R target.
                         # ============================================================
                         if pos_type == "BUY":
                             dist_pnl = current_price - entry_price
                             r_multiple = dist_pnl / risk_dist
                             
-                            # Deep Profit (>2R): Allow 1.0R of breathing room
-                            if r_multiple >= 2.0:
-                                target_sl = current_price - (risk_dist * 1.0)
+                            if r_multiple >= 1.5:
+                                target_sl = entry_price + (risk_dist * 0.5) 
                                 if target_sl > sl_price:
                                     new_sl = target_sl
                                     reason = f"Trail ({r_multiple:.1f}R)"
-                            # Initial Profit (>1R): Lock in Break-Even + tiny profit (0.1R)
-                            elif r_multiple >= 1.0:
-                                target_sl = entry_price + (risk_dist * 0.1)
+                            elif r_multiple >= 0.8:
+                                target_sl = entry_price + (risk_dist * 0.1) 
                                 if target_sl > sl_price:
                                     new_sl = target_sl
                                     reason = "BE Lock"
@@ -1079,12 +1090,12 @@ class LiveTradingEngine:
                             dist_pnl = entry_price - current_price
                             r_multiple = dist_pnl / risk_dist
                             
-                            if r_multiple >= 2.0:
-                                target_sl = current_price + (risk_dist * 1.0)
+                            if r_multiple >= 1.5:
+                                target_sl = entry_price - (risk_dist * 0.5)
                                 if target_sl < sl_price:
                                     new_sl = target_sl
                                     reason = f"Trail ({r_multiple:.1f}R)"
-                            elif r_multiple >= 1.0:
+                            elif r_multiple >= 0.8:
                                 target_sl = entry_price - (risk_dist * 0.1)
                                 if target_sl < sl_price:
                                     new_sl = target_sl

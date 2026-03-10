@@ -50,7 +50,7 @@ class Signal:
 
 class ProbabilityCalibrator:
     """
-    V20.8 BOOTSTRAP PROTOCOL:
+    V20.9 BOOTSTRAP PROTOCOL:
     Platt Scaling Calibrator adapted for swing trading confidence.
     Guarantees smooth, continuous probability outputs (0.01 to 0.99).
     """
@@ -620,8 +620,6 @@ class MultiAssetPredictor:
         proposed_action = 0
         
         adx_val = features.get('adx', 0.0)
-        rsi_norm = features.get('rsi_norm', 0.5)
-        rsi_val = rsi_norm * 100.0
         
         if len(self.bb_buffers[symbol]) >= self.bb_window:
             bb_mu = np.mean(self.bb_buffers[symbol])
@@ -639,17 +637,9 @@ class MultiAssetPredictor:
                     elif bar.close <= lower_bb: 
                         proposed_action = -1 
             else:
+                # V20.9 FIX: Kill Mean Reversion structurally to align with 1:2 R:R constraint.
                 regime_label = "MEAN_REVERSION"
-                if parkinson > 0.003 or current_atr > (bar.close * 0.002):
-                    proposed_action = 0
-                else:
-                    if bar.close <= lower_bb and rsi_val < 30.0: 
-                        proposed_action = 1 
-                    elif bar.close >= upper_bb and rsi_val > 70.0: 
-                        proposed_action = -1  
-
-        if hurst >= self.hurst_veto and regime_label == "MEAN_REVERSION" and proposed_action != 0:
-            proposed_action = 0
+                proposed_action = 0
 
         clean_features = {k: float(v) for k, v in features.items() if math.isfinite(v)}
         try:
@@ -844,8 +834,6 @@ class MultiAssetPredictor:
         is_trending = hurst >= self.hurst_breakout
         
         adx_val = features.get('adx', 0.0)
-        rsi_norm = features.get('rsi_norm', 0.5)
-        rsi_val = rsi_norm * 100.0
         
         if len(self.bb_buffers[symbol]) >= self.bb_window:
             bb_mu = np.mean(self.bb_buffers[symbol])
@@ -863,19 +851,10 @@ class MultiAssetPredictor:
                     elif price <= lower_bb: 
                         proposed_action = -1 
             else:
+                # V20.9 FIX: Kill Mean Reversion to align with 1:2 R:R constraint.
                 regime_label = "MEAN_REVERSION"
-                if parkinson > 0.003 or current_atr > (price * 0.002):
-                    proposed_action = 0
-                    stats["Veto: High Vol Mean Reversion"] += 1
-                else:
-                    if price <= lower_bb and rsi_val < 30.0: 
-                        proposed_action = 1 
-                    elif price >= upper_bb and rsi_val > 70.0: 
-                        proposed_action = -1  
-
-        if hurst >= self.hurst_veto and regime_label == "MEAN_REVERSION" and proposed_action != 0:
-            proposed_action = 0
-            stats["Veto: Hyper Trend (Hurst)"] += 1
+                proposed_action = 0
+                stats["Veto: Mean Reversion Disabled"] += 1
 
         clean_features = {k: float(v) for k, v in features.items() if math.isfinite(v)}
         try:
@@ -923,10 +902,14 @@ class MultiAssetPredictor:
             else: confidence = 0.0
                 
             break_even_wr = 1.0 / (1.0 + current_reward_target)
-            dynamic_min_conf = break_even_wr + 0.02 
             
-            config_min_conf = float(CONFIG['online_learning'].get('min_calibrated_probability', 0.55))
-            effective_min_conf = min(dynamic_min_conf, config_min_conf)
+            # V20.10 ML UNCHOKE FIX: 
+            # We completely remove the hardcoded config_min_conf (e.g. 0.55).
+            # In a 3-class model (Buy/Sell/Chop), random chance is 33%.
+            # With a 1:3 R:R, break-even is 25%. Asking for 55% guarantees starvation.
+            # We now demand mathematical break-even + a 2% edge.
+            dynamic_min_conf = break_even_wr + 0.02 
+            effective_min_conf = dynamic_min_conf
             
             if confidence < effective_min_conf:
                 stats["Low ML Confidence"] += 1
@@ -986,7 +969,6 @@ class MultiAssetPredictor:
 
             if is_profitable:
                 action_str = "BUY" if proposed_action == 1 else "SELL"
-                self.active_signals[symbol].append(action_str)
                 
                 imp_feats = [regime_label]
                 if rvol_val > 2.0: imp_feats.append('High_Fuel')

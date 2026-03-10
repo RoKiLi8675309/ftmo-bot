@@ -49,7 +49,7 @@ setup_logging("Research")
 log = logging.getLogger("Research")
 
 # =============================================================================
-# PHOENIX RESEARCH ENGINE V20.7 – WFO PIPELINE & TEARSHEET
+# PHOENIX RESEARCH ENGINE V20.10 – WFO PIPELINE & TEARSHEET
 # =============================================================================
 
 class EmojiCallback:
@@ -77,7 +77,7 @@ class EmojiCallback:
         if attrs.get('blown', False):
             icon = "💀" # Blown Account or Daily Breach
             status = "BLOWN"
-        elif dd > 4.0: # V20.7 FIX: Tightened Risk Warning to 4.0%
+        elif dd > 4.0: # V20.9 FIX: Tightened Risk Warning to 4.0%
             icon = "⚠️" 
             status = "RISKY"
         elif attrs.get('pruned', False):
@@ -303,11 +303,11 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             params['entropy_threshold'] = trial.suggest_float('entropy_threshold', space['entropy_threshold']['min'], space['entropy_threshold']['max'])
             params['vpin_threshold'] = trial.suggest_float('vpin_threshold', space['vpin_threshold']['min'], space['vpin_threshold']['max'])
             
-            # --- V20.6: STRICT 1:2 R:R ENFORCEMENT ---
+            # --- V20.9: STRICT 1:2 R:R ENFORCEMENT ---
             sl_atr_mult = float(CONFIG.get('risk_management', {}).get('stop_loss_atr_mult', 1.5))
             min_barrier = max(sl_atr_mult * 2.0, float(space['tbm_barrier_width']['min']))
             max_barrier = max(min_barrier + 0.5, float(space['tbm_barrier_width']['max']))
-            min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 30.0))
+            min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
             
             params['tbm'] = {
                 'barrier_width': trial.suggest_float('barrier_width', min_barrier, max_barrier),
@@ -316,11 +316,9 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'min_profit_pips': min_profit_pips 
             }
             
-            min_conf_floor = max(float(space['min_calibrated_probability']['min']), 0.52)
-            max_conf_ceiling = max(min_conf_floor + 0.05, float(space['min_calibrated_probability']['max']))
-            params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', min_conf_floor, max_conf_ceiling)
+            # V20.10 ML UNCHOKE FIX: Dead parameter `min_calibrated_probability` successfully removed from search space.
             
-            risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0025, 0.0050])
+            risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0050, 0.0075, 0.0100])
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             trial.set_user_attr("risk_pct", params['risk_per_trade_percent'] * 100)
             
@@ -369,10 +367,10 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             daily_hits = getattr(broker, 'daily_limit_hits', 0)
             total_blown = getattr(broker, 'is_totally_blown', False)
             
-            # V20.7 FIX: Tighter DD penalty (6% max drawdown limit for FTMO buffer to force safer strategies)
-            if total_blown or max_dd > 0.06 or daily_hits > 0:
+            # V20.9 FIX: Tighter DD penalty (4% max drawdown limit for FTMO buffer to force safer strategies)
+            if total_blown or max_dd > 0.040 or daily_hits > 0:
                 trial.set_user_attr("blown", True)
-                dd_penalty = (max_dd - 0.06) * 1000000.0 if max_dd > 0.06 else 0
+                dd_penalty = (max_dd - 0.040) * 1000000.0 if max_dd > 0.040 else 0
                 daily_penalty = daily_hits * 20000.0
                 return -20000.0 + total_ret - dd_penalty - daily_penalty
 
@@ -438,24 +436,32 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 params['risk_management'] = CONFIG.get('risk_management', {}).copy()
                 params['risk_management']['sizing_method'] = 'risk_percentage'
                 
-                params['n_models'] = trial.suggest_int('n_models', 30, 60)
+                # V20.9 FIX: Align WFO exactly with standard optimization bounds
+                params['n_models'] = trial.suggest_int('n_models', space['n_models']['min'], space['n_models']['max'], step=space['n_models']['step'])
+                params['grace_period'] = trial.suggest_int('grace_period', space['grace_period']['min'], space['grace_period']['max'], step=space['grace_period']['step'])
+                params['delta'] = trial.suggest_float('delta', float(space['delta']['min']), float(space['delta']['max']), log=space['delta'].get('log', True))
+                params['lambda_value'] = trial.suggest_int('lambda_value', space['lambda_value']['min'], space['lambda_value']['max'], step=space['lambda_value']['step'])
+                params['max_features'] = trial.suggest_categorical('max_features', ['log2', 'sqrt'])
+                
+                params['entropy_threshold'] = trial.suggest_float('entropy_threshold', space['entropy_threshold']['min'], space['entropy_threshold']['max'])
+                params['vpin_threshold'] = trial.suggest_float('vpin_threshold', space['vpin_threshold']['min'], space['vpin_threshold']['max'])
                 
                 sl_atr_mult = float(CONFIG.get('risk_management', {}).get('stop_loss_atr_mult', 1.5))
                 min_barrier = max(sl_atr_mult * 2.0, float(space['tbm_barrier_width']['min']))
                 max_barrier = max(min_barrier + 0.5, float(space['tbm_barrier_width']['max']))
-                min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 30.0))
+                min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
 
-                params['tbm'] = params.get('tbm', {}).copy()
-                params['tbm']['barrier_width'] = trial.suggest_float('barrier_width', min_barrier, max_barrier)
-                params['tbm']['min_profit_pips'] = min_profit_pips
-                params['tbm']['horizon_minutes'] = CONFIG['online_learning']['tbm'].get('horizon_minutes', 720)
-                params['tbm']['drift_threshold'] = CONFIG['online_learning']['tbm'].get('drift_threshold', 1.5)
+                params['tbm'] = {
+                    'barrier_width': trial.suggest_float('barrier_width', min_barrier, max_barrier),
+                    'horizon_minutes': trial.suggest_int('horizon_minutes', space['tbm_horizon_minutes']['min'], space['tbm_horizon_minutes']['max'], step=space['tbm_horizon_minutes']['step']),
+                    'drift_threshold': trial.suggest_float('drift_threshold', space['tbm_drift_threshold']['min'], space['tbm_drift_threshold']['max']),
+                    'min_profit_pips': min_profit_pips 
+                }
                 
-                min_conf_floor = max(float(space['min_calibrated_probability']['min']), 0.52)
-                max_conf_ceiling = max(min_conf_floor + 0.05, float(space['min_calibrated_probability']['max']))
-                params['min_calibrated_probability'] = trial.suggest_float('min_calibrated_probability', min_conf_floor, max_conf_ceiling)
+                # V20.10 ML UNCHOKE FIX: Dead parameter `min_calibrated_probability` successfully removed from WFO search space.
                 
-                params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', [0.0025, 0.0050])
+                risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0050, 0.0075, 0.0100])
+                params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
                 
                 pipeline = ResearchPipeline()
                 broker = BacktestBroker(initial_balance=50000.0)
@@ -488,9 +494,9 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 daily_hits = getattr(broker, 'daily_limit_hits', 0)
                 total_blown = getattr(broker, 'is_totally_blown', False)
                 
-                # V20.7 FIX: Tighter DD penalty
-                if total_blown or max_dd > 0.06 or daily_hits > 0:
-                    dd_penalty = (max_dd - 0.06) * 1000000.0 if max_dd > 0.06 else 0
+                # V20.9 FIX: Tighter DD penalty
+                if total_blown or max_dd > 0.040 or daily_hits > 0:
+                    dd_penalty = (max_dd - 0.040) * 1000000.0 if max_dd > 0.040 else 0
                     daily_penalty = daily_hits * 20000.0
                     return -20000.0 + total_ret - dd_penalty - daily_penalty
                 
@@ -516,14 +522,17 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
             final_p['risk_management']['sizing_method'] = 'risk_percentage'
             if 'tbm' not in final_p: final_p['tbm'] = CONFIG['online_learning'].get('tbm', {}).copy()
             final_p['tbm']['barrier_width'] = study.best_params.get('barrier_width', 3.0)
-            final_p['tbm']['min_profit_pips'] = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 30.0))
+            final_p['tbm']['min_profit_pips'] = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
+            if 'horizon_minutes' in study.best_params:
+                final_p['tbm']['horizon_minutes'] = study.best_params['horizon_minutes']
+            if 'drift_threshold' in study.best_params:
+                final_p['tbm']['drift_threshold'] = study.best_params['drift_threshold']
             
             pipe = ResearchPipeline()
             broker_oos = BacktestBroker(initial_balance=50000.0)
             model_oos = pipe.get_fresh_model(final_p)
             
             # V13.2 FIX: WFO DATA LEAKAGE & STARVATION CURE
-            # Pass the entire train dataset to the OOS strategy so it preloads context!
             strat_oos = ResearchStrategy(model_oos, symbol, final_p, historical_df=df_train)
             
             for idx, row in df_test.iterrows():
@@ -563,7 +572,6 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
             best_trial = max(valid, key=lambda t: t.value)
             
             # --- V20.7 STRICT VETO GUARD ---
-            # Do not deploy models that survived the DD limits but still lost money overall
             pnl = best_trial.user_attrs.get('pnl', 0.0)
             if best_trial.value < 0 or pnl <= 0:
                 log.warning(f"🛑 VETO GUARD: Best valid trial for {symbol} lost money (PnL: ${pnl:.2f}). PRUNING PAIR.")
@@ -572,7 +580,6 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
             log.info(f"✅ Selected Robust Trial {best_trial.number} (Trades: {best_trial.user_attrs.get('trades')}, Score: {best_trial.value:.2f})")
         else:
             # --- V20.7 STRICT VETO GUARD ---
-            # Never fallback to a blown outlier. If we hit this block, the pair is toxic.
             log.warning(f"🛑 VETO GUARD: No trials survived safety constraints for {symbol}. PRUNING PAIR.")
             return
             
@@ -588,7 +595,13 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         
         if 'tbm' not in final_p: final_p['tbm'] = CONFIG['online_learning'].get('tbm', {}).copy()
         final_p['tbm']['barrier_width'] = best_params.get('barrier_width', 3.0)
-        final_p['tbm']['min_profit_pips'] = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 30.0))
+        final_p['tbm']['min_profit_pips'] = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
+        
+        # V20.9 FIX: Ensure WFO parameters transfer to final model configuration perfectly
+        if 'horizon_minutes' in best_params:
+            final_p['tbm']['horizon_minutes'] = best_params['horizon_minutes']
+        if 'drift_threshold' in best_params:
+            final_p['tbm']['drift_threshold'] = best_params['drift_threshold']
         
         pipe = ResearchPipeline()
         model = pipe.get_fresh_model(final_p)
@@ -690,7 +703,7 @@ class ResearchPipeline:
         return m
 
     def run_training(self, fresh_start: bool = False):
-        log.info(f"{LogSymbols.TRAINING} STARTING V20.7 SWARM OPTIMIZATION...")
+        log.info(f"{LogSymbols.TRAINING} STARTING V20.9 SWARM OPTIMIZATION...")
         if fresh_start:
             for p in self.models_dir.glob("*.pkl"): p.unlink()
             for s in self.symbols:
@@ -736,7 +749,7 @@ class ResearchPipeline:
             params['risk_management']['sizing_method'] = 'risk_percentage' # Ensure dynamically sized
             if 'tbm' not in params: params['tbm'] = CONFIG['online_learning'].get('tbm', {}).copy()
             params['tbm']['barrier_width'] = params.get('barrier_width', 3.0)
-            params['tbm']['min_profit_pips'] = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 30.0))
+            params['tbm']['min_profit_pips'] = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
 
             # V13.2 FIX: Final Verification backtest also needs preload to match production
             if len(df) > 500:
@@ -757,7 +770,7 @@ class ResearchPipeline:
 
     def _generate_report(self, trade_log: List[Dict]):
         """
-        V20.6: Generates a beautiful, FTMO-centric console Tearsheet.
+        V20.9: Generates a beautiful, FTMO-centric console Tearsheet.
         """
         if not trade_log:
             log.warning("No trades generated during backtest. Report aborted.")
@@ -793,7 +806,7 @@ class ResearchPipeline:
         
         report = f"""
         =================================================================
-        🦅 PROJECT PHOENIX V20.7 - FTMO TEARSHEET
+        🦅 PROJECT PHOENIX V20.10 - FTMO TEARSHEET
         =================================================================
         Initial Balance:      ${initial_balance:,.2f}
         Final Equity:         ${initial_balance + total_pnl:,.2f}

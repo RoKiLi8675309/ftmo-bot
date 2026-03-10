@@ -202,9 +202,9 @@ class RiskManager:
         parkinson_vol: float = 0.0  
     ) -> Tuple[Trade, float]:
         """
-        V20.6 UPDATE: Strict Geometric Synchronization.
+        V20.9 UPDATE: Strict Geometric Synchronization.
         Ensures the TradeIntent TP/SL distances perfectly match the AdaptiveTripleBarrier's
-        internal realities (including dynamic reward multipliers, volatility boosts, and minimum pip floors).
+        internal realities. SQN scaling softened to prevent WFO parameter choking.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -245,7 +245,7 @@ class RiskManager:
         pip_val_raw, _ = RiskManager.get_pip_info(symbol)
         if pip_val_raw <= 0: pip_val_raw = 0.0001
         
-        # Absolute Hard Floor (15.0 pips default for V20.6)
+        # Absolute Hard Floor (15.0 pips default)
         config_min_pips = float(risk_conf.get('min_stop_loss_pips', 15.0))
         min_stop_hard_floor = config_min_pips * pip_val_raw
         
@@ -302,7 +302,7 @@ class RiskManager:
             return trade, implied_risk_usd
 
         # =========================================================
-        # DYNAMIC PERCENTAGE LOGIC (V20.6 Parity)
+        # DYNAMIC PERCENTAGE LOGIC (V20.9 Parity)
         # =========================================================
         
         lots = 0.0
@@ -323,16 +323,17 @@ class RiskManager:
             else:
                 risk_pct = default_base_risk * 100.0
         
-        # V20.6 FIX: SQN Scaling logic corrected to not punish successful ratchet scaling.
+        # V20.9 FIX: Softened SQN Scaling. 
+        # Do not use hard caps (like min(risk_pct, 0.25)) which destroy the WFO 1.0% risk parameter.
         if performance_score != 0.0:
             if performance_score < -2.0:
-                risk_pct = 0.1 # Toxic (Hard floor of 0.1%)
+                risk_pct = risk_pct * 0.5  # Toxic: Cut risk in half
                 scaling_comment += "|Toxic"
             elif performance_score < 0.0:
-                risk_pct = min(risk_pct, 0.25) # Cold (Max 0.25%)
+                risk_pct = risk_pct * 0.8  # Cold: Reduce risk by 20%
                 scaling_comment += "|Cold"
-            elif performance_score > 2.5:
-                risk_pct = min(risk_pct * 1.1, 1.0) # Hot (Capped at 1.0%, allows profit buffer to thrive)
+            elif performance_score > 2.0:
+                risk_pct = min(risk_pct * 1.25, 2.0)  # Hot: Increase risk, cap at 2.0%
                 scaling_comment += "|Hot"
 
         # Calculate Lots
@@ -501,6 +502,7 @@ class FTMORiskMonitor:
         if self.equity < effective_floor: return False
         
         current_daily_loss = self.starting_equity_of_day - self.equity
+        # V20.9 FIX: Enforce against initial_balance to match FTMO rules
         current_daily_limit = self.initial_balance * self.max_daily_loss_pct
         
         if current_daily_loss >= current_daily_limit: return False
@@ -528,6 +530,7 @@ class FTMORiskMonitor:
         if self.equity < total_limit: return f"Total Drawdown Breach"
         
         current_daily_loss = self.starting_equity_of_day - self.equity
+        # V20.9 FIX: Enforce against initial_balance to match FTMO rules
         daily_limit = self.initial_balance * self.max_daily_loss_pct
         
         if current_daily_loss >= daily_limit: return f"Daily Drawdown Breach"

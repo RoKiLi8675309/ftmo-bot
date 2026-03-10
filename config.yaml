@@ -1,11 +1,13 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V20.7 (FTMO DRAWDOWN CURE)
+# config.yaml – PROJECT PHOENIX V20.10 (ML UNCHOKE PROTOCOL)
 # STATUS: LIVE TRADING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGY FIXES (V20.7):
-# 1. TOXIC PAIR PRUNING: GBPJPY, EURUSD, USDCAD, AUDUSD moved to auxiliary.
-# 2. WFO FIX: min_trades_optimization lowered to 8 to prevent blown outlier selection.
-# 3. SAFETY BUFFER: max_daily_loss_pct tightened to 4.0%.
+# STRATEGY FIXES (V20.10):
+# 1. ML UNCHOKE: Removed rigid 55% confidence floor. Sizing dynamically utilizes 
+#    mathematical break-even probabilities based on 1:3 R:R targets.
+# 2. LATENCY GUARD REWRITE: Pipeline latency now evaluated using publish_time 
+#    rather than market tick silence to prevent False Positive drops.
+# 3. WFO OPTIMIZATION: Scrubbed dead search space dimensions for faster convergence.
 # =============================================================================
 
 # --- 🌍 ENVIRONMENT SPECIFIC ---
@@ -133,17 +135,16 @@ phoenix_strategy:
   regime_enforcement: "DISABLED" 
   
   asset_regime_map:
+    # V20.9 FIX: All tradable assets must be treated as Trend Breakout 
+    # to mathematically satisfy the 1:2 R:R constraint.
     GBPJPY: "TREND_BREAKOUT" 
     USDJPY: "TREND_BREAKOUT"
     EURJPY: "TREND_BREAKOUT"
     AUDJPY: "TREND_BREAKOUT"
-    GBPUSD: "NEUTRAL"
-    EURUSD: "NEUTRAL"
-    AUDUSD: "MEAN_REVERSION" 
-    USDCAD: "MEAN_REVERSION" 
-    CAD: "NEUTRAL"   
-    CHF: "NEUTRAL"   
-    USD: "NEUTRAL"
+    GBPUSD: "TREND_BREAKOUT"
+    EURUSD: "TREND_BREAKOUT"
+    AUDUSD: "TREND_BREAKOUT" 
+    USDCAD: "TREND_BREAKOUT" 
 
   enable_regime_a_entries: true          
   require_d1_trend: false  
@@ -159,7 +160,7 @@ phoenix_strategy:
   max_relative_volume: 35.0          
   volume_gate_ratio: 0.7            
   aggressor_threshold: 0.55          
-  ml_confirmation_threshold: 0.53     # V20.7 FIX: Slightly lowered to allow solid edges through    
+  ml_confirmation_threshold: 0.55     # Hard floor     
   choppiness_threshold: 65.0       
   
   vpin_bucket_size: 1000
@@ -196,34 +197,31 @@ optimization_search_space:
     min: 2.0  # FORCE 1:2 R:R Minimum
     max: 4.0  
   tbm_horizon_minutes:
-    min: 240  # Give trades 4 to 24 hours to play out
-    max: 1440  
-    step: 60
+    # V20.9 FIX: Drastically increased to let winners run. (12h to 48h)
+    min: 720  
+    max: 2880  
+    step: 120
   tbm_drift_threshold:
     min: 1.0
     max: 2.0
-  
-  min_calibrated_probability:
-    min: 0.52 
-    max: 0.58
 
 # --- 🛡️ RISK MANAGEMENT (FTMO COMPLIANCE) ---
 risk_management:
   account_currency: "USD"
   
-  max_daily_loss_pct: 0.040 # V20.7 FIX: Tightened to 4.0% to provide a 1% safety buffer against FTMO limits
+  max_daily_loss_pct: 0.040 # Hardened to 4.0% to provide a 1% safety buffer against FTMO limits
   
   sizing_method: "risk_percentage" 
   fixed_lot_size: 0.01        
   
-  base_risk_per_trade_percent: 0.0050  # Risk 0.5% per trade
-  scaled_risk_percent: 0.0075          # Risk 0.75% when in profit buffer
+  base_risk_per_trade_percent: 0.0050  # Base Risk: 0.5% per trade
+  scaled_risk_percent: 0.0075          # Scaled Risk: 0.75% when in profit buffer
   
   loss_cooldown_minutes: 15  
   min_margin_level_percent: 200.0
 
   pyramiding:
-    enabled: false # Disabled to strictly enforce 1 trade per pair
+    enabled: false # Disabled to strictly enforce 1 trade per pair to prevent overexposure
     max_adds: 0 
     add_on_profit_r: 1.0  
     risk_per_add_percent: 0.0025 
@@ -249,13 +247,14 @@ risk_management:
   max_lot_size: 50.0 
   min_lot_size: 0.01
   
-  stop_loss_atr_mult: 1.5        # Tighter Stop
-  take_profit_atr_mult: 3.0      # 1:2 Risk to Reward Ratio Minimum
+  stop_loss_atr_mult: 1.5        
+  take_profit_atr_mult: 3.0      # 1:2 Risk to Reward Ratio Baseline
   
   trailing_stop:
+    # V20.9 Fix: We use the Python Engine's custom structural trail now.
     enabled: true        
-    activation_r: 1.0        
-    trail_trigger_r: 1.0        
+    activation_r: 0.8        
+    trail_trigger_r: 1.5        
     trail_dist_r: 0.5     
   
   risk_timezone: "Europe/Athens"
@@ -281,18 +280,18 @@ risk_management:
 # --- 📈 TRADING PORTFOLIO ---
 trading:
   symbols:
-    # V20.7 FIX: Only trade the Alpha Generators. Toxic pairs have been pruned.
+    # 8 Pairs Fully Restored
     - "EURJPY"  
     - "GBPUSD"  
     - "USDJPY"  
     - "AUDJPY"  
-  
-  auxiliary_symbols:
-    # V20.7 FIX: Choppy/Toxic pairs moved here. Data is streamed but trades are not executed.
     - "EURUSD"
     - "GBPJPY"
     - "USDCAD"
     - "AUDUSD"
+  
+  auxiliary_symbols:
+    # Context streaming
     - "NZDUSD"  
     - "USDCHF"  
     
@@ -314,7 +313,7 @@ online_learning:
   max_features: 'sqrt'    
   metric: "LogLoss"        
   
-  burn_in_periods: 20    # V20.7 FIX: Increased burn-in to allow features to fully saturate
+  burn_in_periods: 20    # Allows features to fully saturate
   
   volatility_gate:
     enabled: true
@@ -326,13 +325,12 @@ online_learning:
   meta_labeling_threshold: 0.50 
   
   tbm:
-    horizon_minutes: 720        
+    horizon_minutes: 1440        
     barrier_width: 3.0        
-    min_profit_pips: 30.0     
+    min_profit_pips: 40.0    # V20.9 FIX: Raised to 40 pips to absolutely dwarf spreads
     drift_threshold: 1.5 
   
   learning_horizon_sec: 900 
-  min_calibrated_probability: 0.53 
 
 # --- 📰 NEWS FILTER ---
 news_filter:
@@ -373,5 +371,7 @@ wfo:
   n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 8 # V20.7 FIX: Lowered from 20 to prevent the Optimizer from falling back to blown/toxic trials
-  risk_per_trade_options: [0.0025, 0.0050]
+  min_trades_optimization: 8 # Prevent the Optimizer from falling back to blown/toxic trials
+  
+  # V20.9 FIX: Pushed risk options to 0.5% and 1.0% to actually clear the 10% FTMO target
+  risk_per_trade_options: [0.0050, 0.0075, 0.0100]

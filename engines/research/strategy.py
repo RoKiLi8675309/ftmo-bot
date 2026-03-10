@@ -33,15 +33,14 @@ from engines.research.backtester import MarketSnapshot, BacktestBroker, Backtest
 logger = logging.getLogger("ResearchStrategy")
 
 # =============================================================================
-# V20.8 MATHEMATICAL PARITY CLASSES
+# V20.10 MATHEMATICAL PARITY CLASSES
 # Resolves the Bootstrap Paradox, Expectancy Mismatch, and IPC Signature Crashes
 # =============================================================================
 
 class ProbabilityCalibrator:
     """
     Platt Scaling Calibrator adapted for swing trading confidence.
-    V20.8 FIX: Returns RAW base model probability during immaturity so the strategy 
-    isn't choked by flat 1.0 or 0.5 values, aligning with the live engine.
+    V20.8 FIX: Returns RAW base model probability during immaturity.
     """
     def __init__(self, window: int = 1000):
         self.calibrator = None
@@ -67,7 +66,7 @@ class ProbabilityCalibrator:
     def calibrate(self, raw_prob: float) -> float:
         if not ML_AVAILABLE: return raw_prob
         
-        # V20.8 FIX: Keep the bot exploring but using raw probabilities until mature.
+        # Keep the bot exploring but using raw probabilities until mature.
         if self.pos_count < 10 or self.neg_count < 10:
             return raw_prob 
             
@@ -117,7 +116,7 @@ class MetaLabeler:
         if not ML_AVAILABLE or primary_action == 0:
             return False
         
-        # V20.8 FIX: Allow trades to pass until MetaLabeler is mature enough to veto them.
+        # Allow trades to pass until MetaLabeler is mature enough to veto them.
         if self.pos_count < 10 or self.neg_count < 10: 
             return True 
             
@@ -147,7 +146,6 @@ class AdaptiveTripleBarrier:
     """
     SPREAD TRAP CURE & CHOP LABELING.
     Simulates actual broker execution constraints perfectly aligned with RiskManager.
-    V20.8 FIX: Restored signal_id and current_timestamp to ensure pipeline execution parity.
     """
     def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.5, reward_mult: float = 3.0, 
                  drift_threshold: float = 0.75, horizon_type: str = 'TIME', horizon_value: float = 0.0):
@@ -184,7 +182,8 @@ class AdaptiveTripleBarrier:
         raw_risk_dist = effective_risk_mult * current_atr
         actual_risk_dist = max(raw_risk_dist, min_stop_dist) 
         
-        actual_reward_dist = actual_risk_dist * (effective_reward_mult / effective_risk_mult)
+        raw_reward_dist = actual_risk_dist * (effective_reward_mult / effective_risk_mult)
+        actual_reward_dist = max(raw_reward_dist, min_profit_dist)
         
         buy_tp = entry_price + actual_reward_dist + spread_in_price
         buy_sl = entry_price - actual_risk_dist + spread_in_price
@@ -193,8 +192,8 @@ class AdaptiveTripleBarrier:
         sell_sl = entry_price + actual_risk_dist - spread_in_price
 
         self.buffer.append({
-            'signal_id': signal_id,       # V20.8 IPC Match
-            'is_executed': False,         # V20.8 IPC Match
+            'signal_id': signal_id,       
+            'is_executed': False,         
             'features': features.copy(),
             'entry': entry_price,
             'buy_tp': buy_tp,
@@ -227,7 +226,7 @@ class AdaptiveTripleBarrier:
 
             is_expired = False
             if self.horizon_type == 'TIME':
-                # V20.8 Fix: Uses true wall-clock diff if timestamp provided
+                # Use real wall-clock time difference if timestamp provided, else fallback to tick age
                 if current_timestamp > 0 and trade.get('start_time', 0) > 0:
                     duration_sec = current_timestamp - trade['start_time']
                     if duration_sec >= (self.time_limit * 60): is_expired = True
@@ -243,18 +242,22 @@ class AdaptiveTripleBarrier:
             buy_status = 0
             sell_status = 0
 
+            # Evaluate VIRTUAL BUY
             if current_low <= trade['buy_sl']: buy_status = -1
             elif current_high >= trade['buy_tp']: buy_status = 1
             
+            # Evaluate VIRTUAL SELL
             if current_high >= trade['sell_sl']: sell_status = -1
             elif current_low <= trade['sell_tp']: sell_status = 1
 
+            # Resolve if triggered or expired
             if buy_status != 0 or sell_status != 0 or is_expired:
                 buy_ret = 0.0
                 sell_ret = 0.0
                 spread_pct = trade['spread_pct']
                 comm_pct = trade['comm_pct']
 
+                # Calculate Net Return (BUY) with Slippage
                 if buy_status == 1: 
                     buy_ret = (trade['buy_tp'] - trade['entry']) / trade['entry'] - spread_pct - comm_pct
                 elif buy_status == -1: 
@@ -262,6 +265,7 @@ class AdaptiveTripleBarrier:
                 elif is_expired: 
                     buy_ret = (current_close - trade['entry']) / trade['entry'] - spread_pct - comm_pct
 
+                # Calculate Net Return (SELL) with Slippage
                 if sell_status == 1: 
                     sell_ret = (trade['entry'] - trade['sell_tp']) / trade['entry'] - spread_pct - comm_pct
                 elif sell_status == -1: 
@@ -269,6 +273,7 @@ class AdaptiveTripleBarrier:
                 elif is_expired: 
                     sell_ret = (trade['entry'] - current_close) / trade['entry'] - spread_pct - comm_pct
 
+                # REVERT BASE MODEL TO BINARY
                 if buy_ret > sell_ret:
                     optimal_label = 1
                     optimal_ret = buy_ret
@@ -276,9 +281,11 @@ class AdaptiveTripleBarrier:
                     optimal_label = -1
                     optimal_ret = sell_ret
                 else:
+                    # Absolute tie breaker (prevents class 0 injection into Base Model)
                     optimal_label = 1 if current_close >= trade['entry'] else -1
                     optimal_ret = buy_ret
                     
+                # Proposed Action Outcome (crucial to defeat survivorship bias)
                 proposed_action = trade.get('proposed_action', 0)
                 pred_proba = trade.get('pred_proba', 0.5)
                 proposed_ret = 0.0
@@ -288,7 +295,7 @@ class AdaptiveTripleBarrier:
                 elif proposed_action == -1:
                     proposed_ret = sell_ret
 
-                is_executed = trade.get('is_executed', False) # V20.8 Match
+                is_executed = trade.get('is_executed', False) # V20.8 IPC Fix
 
                 resolved.append((
                     trade['features'], 
@@ -387,7 +394,7 @@ class ResearchStrategy:
         self.feature_importance_counter = Counter() 
         
         # ============================================================
-        # STRATEGY CONFIGURATION (V13.2 UNCHOKED PROTOCOL)
+        # STRATEGY CONFIGURATION (V20.9 PROFIT PROTOCOL)
         # ============================================================
         phx_conf = CONFIG.get('phoenix_strategy', {})
         
@@ -635,18 +642,16 @@ class ResearchStrategy:
                 self.dynamic_ker_offset = min(0.0, self.dynamic_ker_offset + 0.001)
 
         # ============================================================
-        # B. DELAYED TRAINING (V20.8 UNPACK FIX)
+        # B. DELAYED TRAINING
         # ============================================================
         log_ret = features.get('log_ret', 0.0)
         
-        # V20.8 IPC Fix: Pass current_timestamp to accurately calculate expiration
         resolved_labels = self.labeler.resolve_labels(
             high, low, current_close=price, current_volume=volume, current_log_ret=log_ret,
             current_timestamp=timestamp
         )
         
         if resolved_labels:
-            # V20.8 IPC Fix: Unpack the 7th element (is_executed)
             for (stored_feats, optimal_label, optimal_ret, past_action, past_prob, past_ret, is_executed) in resolved_labels:
                 
                 w_pos = float(self.params.get('positive_class_weight', 1.0))
@@ -685,8 +690,6 @@ class ResearchStrategy:
         is_trending = hurst >= self.hurst_breakout
         
         adx_val = features.get('adx', 0.0)
-        rsi_norm = features.get('rsi_norm', 0.5)
-        rsi_val = rsi_norm * 100.0
         parkinson = features.get('parkinson_vol', 0.0)
         current_atr = features.get('atr', 0.001)
 
@@ -706,19 +709,10 @@ class ResearchStrategy:
                     elif price <= lower_bb: 
                         proposed_action = -1 
             else:
+                # V20.9 FIX: Mean Reversion structurally fails against rigid 1:2 R:R limits. Killed completely.
                 regime_label = "MEAN_REVERSION"
-                if parkinson > 0.003 or current_atr > (price * 0.002):
-                    proposed_action = 0
-                    self.rejection_stats["Veto: High Vol Mean Reversion"] += 1
-                else:
-                    if price <= lower_bb and rsi_val < 30.0: 
-                        proposed_action = 1 
-                    elif price >= upper_bb and rsi_val > 70.0: 
-                        proposed_action = -1  
-
-        if hurst >= self.hurst_veto and regime_label == "MEAN_REVERSION" and proposed_action != 0:
-            proposed_action = 0
-            self.rejection_stats["Veto: Hyper Trend (Hurst)"] += 1
+                proposed_action = 0 
+                self.rejection_stats["Veto: Mean Reversion Disabled"] += 1
 
         clean_features = {k: float(v) for k, v in features.items() if math.isfinite(v)}
         try:
@@ -731,7 +725,7 @@ class ResearchStrategy:
             prob_success = 0.0
 
         # ============================================================
-        # D. ADD TRADE OPPORTUNITY (V20.8 IPC FIX)
+        # D. ADD TRADE OPPORTUNITY 
         # ============================================================
         pip_val, _ = RiskManager.get_pip_info(self.symbol)
         if pip_val <= 0: pip_val = 0.0001
@@ -748,7 +742,6 @@ class ResearchStrategy:
         if regime_label == "TREND_BREAKOUT":
             current_reward_target = max(current_reward_target, 3.0)
 
-        # V20.8 IPC Fix: Inject a unique signal_id for tracking
         signal_id = str(uuid.uuid4())
 
         self.labeler.add_trade_opportunity(
@@ -758,7 +751,7 @@ class ResearchStrategy:
             comm_in_price=comm_in_price, min_profit_dist=min_profit_dist,
             proposed_action=proposed_action, pred_proba=prob_success,
             override_reward_mult=current_reward_target,
-            signal_id=signal_id # ADDED
+            signal_id=signal_id 
         )
 
         if is_warmup:
@@ -790,7 +783,7 @@ class ResearchStrategy:
             return
 
         # ============================================================
-        # F. ML CONFIRMATION & EXECUTION
+        # F. ML CONFIRMATION & EXECUTION (V20.10 FIX)
         # ============================================================
         try:
             if proposed_action == 1: confidence = self.calibrator_buy.calibrate(prob_success)
@@ -798,10 +791,14 @@ class ResearchStrategy:
             else: confidence = 0.0
                 
             break_even_wr = 1.0 / (1.0 + current_reward_target)
-            dynamic_min_conf = break_even_wr + 0.02 
             
-            config_min_conf = float(self.params.get('min_calibrated_probability', 0.55))
-            effective_min_conf = min(dynamic_min_conf, config_min_conf)
+            # V20.10 ML UNCHOKE FIX: 
+            # We completely remove the hardcoded config_min_conf (e.g. 0.55).
+            # In a 3-class model (Buy/Sell/Chop), random chance is 33%.
+            # With a 1:3 R:R, break-even is 25%. Asking for 55% guarantees starvation.
+            # We now demand mathematical break-even + a 2% edge.
+            dynamic_min_conf = break_even_wr + 0.02 
+            effective_min_conf = dynamic_min_conf
             
             if confidence < effective_min_conf:
                 self.rejection_stats[f"Low ML Confidence"] += 1
@@ -956,7 +953,7 @@ class ResearchStrategy:
                 'entry_price_snap': price,
                 'tighten_stops': tighten_stops,
                 'is_pyramid': is_pyramid,
-                'risk_taken_pct': risk_taken_pct # Stored for Autopsy
+                'risk_taken_pct': risk_taken_pct 
             }
         )
         broker.submit_order(order)
@@ -971,7 +968,7 @@ class ResearchStrategy:
             'atr': current_atr,
             'regime': regime,
             'pyramid': is_pyramid,
-            'risk_taken_pct': risk_taken_pct # Stored for Autopsy
+            'risk_taken_pct': risk_taken_pct 
         })
 
     def _calculate_symbol_sqn(self, broker: BacktestBroker) -> float:
@@ -1003,8 +1000,9 @@ class ResearchStrategy:
 
     def _manage_trailing_stops(self, broker: BacktestBroker, current_price: float, timestamp: datetime):
         """
-        V13.2 FIX: "Let Winners Run" Protocol.
-        Replaced the asphyxiating Trailing Stop with a looser structural trail.
+        V20.9 FIX: "Let Winners Run" Protocol updated.
+        Trailers are now looser (0.5R locked at 1.5R) and BE is locked earlier (0.8R) 
+        to protect against mean reversion whip-saws while still capturing the 2.0R target.
         """
         for pos in broker.open_positions:
             if pos.symbol != self.symbol: continue
@@ -1017,14 +1015,11 @@ class ResearchStrategy:
             if pos.side == 1: 
                 r_multiple = (current_price - pos.entry_price) / risk_dist
                 
-                # Smart Trailing Protocol: 
-                # If trade is highly profitable (>2R), trail loosely at 1R distance
-                if r_multiple >= 2.0:
-                    target_sl = current_price - (risk_dist * 1.0) 
+                if r_multiple >= 1.5:
+                    target_sl = pos.entry_price + (risk_dist * 0.5) 
                     if target_sl > pos.stop_loss:
                         new_sl, reason = target_sl, f"Trail ({r_multiple:.1f}R)"
-                # If trade is modestly profitable (>1R), lock Break-Even + tiny profit
-                elif r_multiple >= 1.0:
+                elif r_multiple >= 0.8:
                     target_sl = pos.entry_price + (risk_dist * 0.1) 
                     if target_sl > pos.stop_loss:
                         new_sl, reason = target_sl, "BE Lock"
@@ -1032,18 +1027,17 @@ class ResearchStrategy:
             else: 
                 r_multiple = (pos.entry_price - current_price) / risk_dist
                 
-                if r_multiple >= 2.0:
-                    target_sl = current_price + (risk_dist * 1.0)
+                if r_multiple >= 1.5:
+                    target_sl = pos.entry_price - (risk_dist * 0.5)
                     if target_sl < pos.stop_loss:
                         new_sl, reason = target_sl, f"Trail ({r_multiple:.1f}R)"
-                elif r_multiple >= 1.0:
+                elif r_multiple >= 0.8:
                     target_sl = pos.entry_price - (risk_dist * 0.1)
                     if target_sl < pos.stop_loss:
                         new_sl, reason = target_sl, "BE Lock"
             
             if new_sl is not None:
                 pos.stop_loss = new_sl
-                # Prevent comment bloat if we keep adjusting
                 if "Trail" not in pos.comment and "BE Lock" not in pos.comment: 
                     pos.comment += f"|{reason}"
 

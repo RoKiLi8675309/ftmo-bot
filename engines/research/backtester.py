@@ -19,7 +19,7 @@ from shared.domain.models import VolumeBar
 logger = logging.getLogger("Backtester")
 
 # =============================================================================
-# PHOENIX RESEARCH ENGINE V20.6 – BACKTEST BROKER (UNCHOKED PROTOCOL)
+# PHOENIX RESEARCH ENGINE V20.9 – BACKTEST BROKER (UNCHOKED PROTOCOL)
 # =============================================================================
 
 @dataclass(frozen=True)
@@ -113,7 +113,7 @@ class BacktestOrder:
 
 class BacktestBroker:
     """
-    V20.6 PARITY: Simulates a Broker environment:
+    V20.9 PARITY: Simulates a Broker environment:
     - Order Execution (Immediate Fill with VOLATILITY SLIPPAGE)
     - PnL Tracking (Equity/Balance)
     - Strict 1:2 R:R Guard at the Metal Layer
@@ -142,7 +142,8 @@ class BacktestBroker:
         self.daily_limit_hits = 0
 
         # Load Configured Costs
-        self.commission_per_lot = 3.0 # V20.6: Hardcoded FTMO standard ($3/lot per side)
+        risk_conf = CONFIG.get('risk_management', {})
+        self.commission_per_lot = float(risk_conf.get('commission_per_lot_rt', 6.0)) # V20.9: Sync with config
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         self.default_spread = self.spread_map.get('default', 1.6)
 
@@ -152,11 +153,10 @@ class BacktestBroker:
         # --- DAILY ANCHOR TRACKING ---
         self.daily_start_equity = initial_balance
         self.current_day_date = None
-        # Max Daily Loss Pct (e.g., 0.045 for 4.5%)
-        self.max_daily_loss_pct = CONFIG['risk_management'].get('max_daily_loss_pct', 0.045)
+        self.max_daily_loss_pct = risk_conf.get('max_daily_loss_pct', 0.040) # V20.9: 4.0%
         
         # Timezone for Midnight Reset
-        tz_str = CONFIG['risk_management'].get('risk_timezone', 'Europe/Prague')
+        tz_str = risk_conf.get('risk_timezone', 'Europe/Prague')
         try:
             self.market_tz = pytz.timezone(tz_str)
         except:
@@ -372,7 +372,9 @@ class BacktestBroker:
         # Check Daily Drawdown relative to Anchor
         if self.daily_start_equity > 0:
             daily_loss_amount = self.daily_start_equity - self.equity
-            daily_loss_limit = self.daily_start_equity * self.max_daily_loss_pct
+            # V20.9 FIX: FTMO Daily Loss is a static % of INITIAL balance (e.g. 5% of 50k = 2500)
+            # It is NOT a % of the starting daily equity.
+            daily_loss_limit = self.initial_balance * self.max_daily_loss_pct
             
             if daily_loss_amount > daily_loss_limit and not self.is_blown:
                 self.is_blown = True # Suspend for today
@@ -652,7 +654,7 @@ class BacktestBroker:
 
 class AdaptiveImbalanceBarGenerator:
     """
-    V20.6 Parity: Generates Tick Imbalance Bars (TIBs).
+    V20.9 Parity: Generates Tick Imbalance Bars (TIBs).
     Replaces time-based sampling with information-driven sampling.
     """
     def __init__(self, symbol: str, initial_threshold: float = 10.0, alpha: float = 0.05):
@@ -769,8 +771,8 @@ class AdaptiveImbalanceBarGenerator:
                                   ((1 - self.alpha) * self.expected_imbalance)
         
         # Clamp threshold to avoid sampling every tick or never sampling
-        # V20.6 Parity: Clamped to 10.0 lower, 2000.0 upper (Starvation Fix)
-        self.expected_imbalance = max(10.0, min(self.expected_imbalance, 2000.0))
+        # V20.9 Parity: Clamped upper bound fixed to 10000.0 to match the Live Engine
+        self.expected_imbalance = max(10.0, min(self.expected_imbalance, 10000.0))
 
         # Reset State
         self.current_imbalance = 0.0
@@ -797,7 +799,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
         return pd.DataFrame()
 
     # 2. AGGREGATION: ADAPTIVE IMBALANCE BARS WITH AUTO-CALIBRATION
-    # V20.6 Parity: Using 10.0 as default config threshold and 0.05 alpha.
+    # V20.9 Parity
     config_threshold = CONFIG['data'].get('volume_bar_threshold', 10.0) 
     alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
     
@@ -853,7 +855,6 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
             break
         else:
             attempts += 1
-            # V20.6 FIX: Hard floor to prevent micro-bar flatline collapse. Lower multiplier to 0.5.
             new_threshold = max(10.0, current_threshold * 0.5) 
             logger.warning(f"⚠️ {symbol}: Insufficient bars ({bar_count}). Retrying with threshold {new_threshold}...")
             current_threshold = new_threshold
@@ -913,7 +914,7 @@ def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 
     """
     Offline batch processor using AdaptiveImbalanceBarGenerator Logic.
     
-    AUDIT FIX: Now defaults to CONFIG['data']['imbalance_alpha'] (0.05) to match Live Engine.
+    AUDIT FIX: Defaults to CONFIG['data']['imbalance_alpha'] (0.05) to match Live Engine.
     """
     bars = []
     
