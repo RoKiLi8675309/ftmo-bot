@@ -98,6 +98,7 @@ class MetaLabeler:
         if not ML_AVAILABLE or primary_action == 0:
             return
         
+        # This is where NOISE is filtered. 1 = Profit, 0 = Loss.
         y_meta = 1 if outcome_pnl > 0 else 0
         
         if y_meta == 1:
@@ -115,8 +116,9 @@ class MetaLabeler:
     def predict(self, features: Dict[str, float], primary_action: int, threshold: float = 0.50) -> bool:
         if not ML_AVAILABLE or primary_action == 0:
             return False
-        
-        # Allow trades to pass until MetaLabeler is mature enough to veto them.
+            
+        # V20.7 FIX: Lower maturity threshold to 10.
+        # Default to True (allow base model to trade) until meta-model is smart enough to veto.
         if self.pos_count < 10 or self.neg_count < 10: 
             return True 
             
@@ -126,7 +128,8 @@ class MetaLabeler:
             probs = self.model.predict_proba_one(clean_features)
             prob_profit = probs.get(1, 0.0)
             return prob_profit >= threshold
-        except Exception:
+        except Exception as e:
+            logger.debug(f"MetaLabeler Predict Error: {e}")
             return True
 
     def _enrich(self, features: Dict[str, float], action: int) -> Dict[str, float]:
@@ -136,11 +139,16 @@ class MetaLabeler:
         clean['hurst_x_action'] = (clean.get('hurst', 0.5) - 0.5) * action
         clean['vpin_x_action'] = clean.get('vpin', 0.5) * action
         clean['ker_x_action'] = clean.get('ker', 0.5) * action
-        clean['aggressor_x_action'] = (clean.get('aggressor_ratio', 0.5) - 0.5) * action
         return clean
 
     def _sanitize(self, features: Dict[str, float]) -> Dict[str, float]:
-        return {k: float(v) for k, v in features.items() if v is not None and math.isfinite(v)}
+        clean = {}
+        for k, v in features.items():
+            if v is not None and math.isfinite(v):
+                clean[k] = float(v)
+            else:
+                clean[k] = 0.0
+        return clean
 
 class AdaptiveTripleBarrier:
     """
@@ -165,7 +173,9 @@ class AdaptiveTripleBarrier:
                               comm_in_price: float = 0.0, min_profit_dist: float = 0.0,
                               proposed_action: int = 0, pred_proba: float = 0.5,
                               override_reward_mult: float = None, signal_id: str = None):
-        
+        """
+        Calculates exact broker geometry including strict spread and commission penalties.
+        """
         if current_atr <= 0: current_atr = entry_price * 0.0001
         
         volatility = features.get('volatility', 0.0)
@@ -179,22 +189,28 @@ class AdaptiveTripleBarrier:
         effective_risk_mult = (self.risk_mult + vol_boost) * adaptive_scalar
         effective_reward_mult = (actual_reward_mult + vol_boost) * adaptive_scalar
         
+        # 1. Base Geometry
         raw_risk_dist = effective_risk_mult * current_atr
         actual_risk_dist = max(raw_risk_dist, min_stop_dist) 
         
-        raw_reward_dist = actual_risk_dist * (effective_reward_mult / effective_risk_mult)
-        actual_reward_dist = max(raw_reward_dist, min_profit_dist)
+        actual_reward_dist = actual_risk_dist * (effective_reward_mult / effective_risk_mult)
         
+        # 2. Broker Reality Injection
         buy_tp = entry_price + actual_reward_dist + spread_in_price
         buy_sl = entry_price - actual_risk_dist + spread_in_price
         
         sell_tp = entry_price - actual_reward_dist - spread_in_price
         sell_sl = entry_price + actual_risk_dist - spread_in_price
 
+        min_profit_pct = (min_profit_dist + spread_in_price + comm_in_price) / entry_price if entry_price > 0 else 0.0
+        
+        feats_copy = features.copy()
+        feats_copy['min_profit_pct'] = min_profit_pct
+
         self.buffer.append({
-            'signal_id': signal_id,       
-            'is_executed': False,         
-            'features': features.copy(),
+            'signal_id': signal_id,       # V20.8 IPC Fix
+            'is_executed': False,         # V20.8 IPC Fix
+            'features': feats_copy,
             'entry': entry_price,
             'buy_tp': buy_tp,
             'buy_sl': buy_sl,
@@ -214,6 +230,10 @@ class AdaptiveTripleBarrier:
     def resolve_labels(self, current_high: float, current_low: float, current_close: float = None, 
                        current_volume: float = 0.0, current_log_ret: float = 0.0,
                        current_timestamp: float = 0.0) -> List[Tuple[Dict[str, float], int, float, int, float, float, bool]]:
+        """
+        Evaluates independent virtual BUY and SELL trades to solve Asymmetry.
+        Returns: (features, optimal_label, optimal_ret, proposed_action, pred_proba, proposed_ret, is_executed)
+        """
         resolved = []
         active = deque()
         if current_close is None: current_close = (current_high + current_low) / 2.0
@@ -694,35 +714,38 @@ class ResearchStrategy:
         current_atr = features.get('atr', 0.001)
 
         if len(self.bb_buffer) >= self.bb_window:
-            bb_mu = np.mean(self.bb_buffer)
-            bb_std = np.std(self.bb_buffer)
-            if bb_std < 1e-9: bb_std = 1e-9 
-            
-            upper_bb = bb_mu + (self.bb_std * bb_std)
-            lower_bb = bb_mu - (self.bb_std * bb_std)
-            
-            if is_trending:
-                regime_label = "TREND_BREAKOUT"
-                if adx_val >= self.adx_threshold: 
-                    if price >= upper_bb: 
-                        proposed_action = 1 
-                    elif price <= lower_bb: 
-                        proposed_action = -1 
-            else:
-                # V20.9 FIX: Mean Reversion structurally fails against rigid 1:2 R:R limits. Killed completely.
-                regime_label = "MEAN_REVERSION"
-                proposed_action = 0 
-                self.rejection_stats["Veto: Mean Reversion Disabled"] += 1
+            pass # V20.10: Removed hardcoded BB heuristics to grant full ML freedom
+
+        regime_label = "TREND_BREAKOUT" if is_trending else "MEAN_REVERSION"
 
         clean_features = {k: float(v) for k, v in features.items() if math.isfinite(v)}
+        
+        # --- ML FREEDOM PROTOCOL ---
+        prob_buy = 0.0
+        prob_sell = 0.0
         try:
-            if ML_AVAILABLE:
+            if ML_AVAILABLE and self.model:
                 pred_proba = self.model.predict_proba_one(clean_features)
-                prob_success = pred_proba.get(proposed_action, 0.0)
+                prob_buy = pred_proba.get(1, 0.0)
+                prob_sell = pred_proba.get(-1, 0.0)
             else:
-                prob_success = 0.5
+                prob_buy, prob_sell = 0.5, 0.5
         except:
+            prob_buy, prob_sell = 0.0, 0.0
+
+        if prob_buy > prob_sell:
+            proposed_action = 1
+            prob_success = prob_buy
+        elif prob_sell > prob_buy:
+            proposed_action = -1
+            prob_success = prob_sell
+        else:
+            proposed_action = 0
             prob_success = 0.0
+
+        current_reward_target = max(self.optimized_reward_mult, 2.0)
+        if regime_label == "TREND_BREAKOUT":
+            current_reward_target = max(current_reward_target, 3.0)
 
         # ============================================================
         # D. ADD TRADE OPPORTUNITY 
@@ -737,10 +760,6 @@ class ResearchStrategy:
         min_stop_pips = float(self.risk_conf.get('min_stop_loss_pips', 15.0))
         min_stop_dist = min_stop_pips * pip_val
         min_profit_dist = float(self.params.get('tbm', {}).get('min_profit_pips', 30.0)) * pip_val 
-
-        current_reward_target = max(self.optimized_reward_mult, 2.0)
-        if regime_label == "TREND_BREAKOUT":
-            current_reward_target = max(current_reward_target, 3.0)
 
         signal_id = str(uuid.uuid4())
 

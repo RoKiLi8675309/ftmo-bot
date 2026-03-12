@@ -9,12 +9,14 @@
 #   - CLEANUP: Removed initialization print statement to reduce console spam.
 #   - SILENCE: Added 'hmmlearn', 'river', 'joblib' to noisy_libs.
 #   - ROBUSTNESS: Added missing LogSymbols (TRASH, TRAINING, SAVE, BACKTEST).
+#   - TIME PARITY (V20.13): Enforced time.gmtime to align logs with True UTC.
 # =============================================================================
 
 import logging
 import logging.handlers
 import sys
 import os
+import time
 import warnings
 from typing import Optional
 from .config import CONFIG
@@ -131,6 +133,11 @@ def setup_logging(component_name: str = "FTMO_Bot", log_level_override: Optional
         '%(asctime)sZ [%(levelname)-8s] %(message)s (%(name)s:%(lineno)d)',
         datefmt='%Y-%m-%dT%H:%M:%S'
     )
+    
+    # V20.13 TIME PARITY FIX: Force logging to use absolute UTC (gmtime) to prevent 
+    # local machine timezone offsets (e.g. EDT) from masquerading as UTC ('Z') 
+    # and desyncing log analysis from true Broker Time.
+    formatter.converter = time.gmtime
 
     # 3. File Handler (Rotating)
     # Saves to logs/ftmo_bot.log (or component specific)

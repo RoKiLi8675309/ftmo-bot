@@ -8,6 +8,7 @@
 # 2. LATENCY GUARD REWRITE: Pipeline latency now evaluated using publish_time 
 #    rather than market tick silence to prevent False Positive drops.
 # 3. WFO OPTIMIZATION: Scrubbed dead search space dimensions for faster convergence.
+# 4. ADX UNCHOKE: Hardcoded ADX threshold to 0.0 to pass control purely to the ML model.
 # =============================================================================
 
 # --- 🌍 ENVIRONMENT SPECIFIC ---
@@ -123,7 +124,7 @@ features:
     
   adx:
     period: 14
-    threshold: 20.0 
+    threshold: 0.0 # V20.10 FIX: Hardcoded to 0.0 for ML Freedom Protocol (Unchoked)
   
   cyclical_time: true
   session_awareness: true
@@ -160,7 +161,7 @@ phoenix_strategy:
   max_relative_volume: 35.0          
   volume_gate_ratio: 0.7            
   aggressor_threshold: 0.55          
-  ml_confirmation_threshold: 0.55     # Hard floor     
+  ml_confirmation_threshold: 0.55     # Replaced by dynamic break-even math in python logic     
   choppiness_threshold: 65.0       
   
   vpin_bucket_size: 1000

@@ -6,6 +6,7 @@ import os
 import multiprocessing
 import queue
 import numpy as np
+import pandas as pd # <--- FIX: Added missing pandas import
 import math
 import pytz
 import uuid
@@ -50,8 +51,6 @@ logger = logging.getLogger("LiveEngine")
 MAX_TICK_LATENCY_SEC = 45.0 
 
 # --- MT5 CONSTANTS (HARDCODED FOR LINUX) ---
-# Since we cannot import MetaTrader5 on Linux, we define the standard constants here.
-# These MUST match the Windows Producer's expectation.
 MT5_ORDER_TYPE_BUY = 0
 MT5_ORDER_TYPE_SELL = 1
 MT5_TRADE_ACTION_DEAL = 1
@@ -60,7 +59,7 @@ MT5_TRADE_ACTION_SLTP = 6
 MT5_TRADE_ACTION_MODIFY = 6
 MT5_TRADE_ACTION_REMOVE = 8
 
-# MT5 TICK FLAGS (For True Institutional Order Flow)
+# MT5 TICK FLAGS
 TICK_FLAG_BID = 1
 TICK_FLAG_ASK = 2
 TICK_FLAG_LAST = 4
@@ -72,8 +71,6 @@ class TradeDispatcher:
     """
     Handles the reliable transmission of trade orders from the Logic Engine
     to the Execution Engine (Windows Producer) via Redis Streams.
-    
-    V20.8 FIX: STRICT IMMUTABLE RISK PERSISTENCE & R:R METAL GUARD.
     """
     def __init__(self, stream_mgr: RedisStreamManager, pending_tracker: dict[str, Any], lock: threading.RLock):
         self.stream_mgr = stream_mgr
@@ -88,18 +85,17 @@ class TradeDispatcher:
             order_id = uuid.uuid4()
             short_id = str(order_id)[:8]
             
-            # --- V20.6 FIX: STRICT R:R ENFORCEMENT AT THE DISPATCH LAYER ---
+            # --- STRICT R:R ENFORCEMENT AT THE DISPATCH LAYER ---
             if trade.action in ["BUY", "SELL"] and trade.stop_loss > 0 and trade.take_profit > 0:
                 risk_dist = abs(trade.entry_price - trade.stop_loss)
                 reward_dist = abs(trade.take_profit - trade.entry_price)
                 if risk_dist > 0:
                     rr_ratio = reward_dist / risk_dist
-                    # 1.90 allows for minor float rounding from the 2.0x target
                     if rr_ratio < 1.90:
                         logger.error(f"🛑 REJECTED BY DISPATCHER: {trade.symbol} R:R Ratio is {rr_ratio:.2f} (Target >= 2.0). Blocked to prevent spread bleed.")
                         return  # Abort dispatch immediately
 
-            # --- V20.6 FIX: PERSIST INITIAL RISK DISTANCE ---
+            # --- PERSIST INITIAL RISK DISTANCE ---
             try:
                 initial_risk_dist = abs(trade.entry_price - trade.stop_loss)
                 if initial_risk_dist > 0:
@@ -159,14 +155,14 @@ class TradeDispatcher:
                 "action": action_payload,
                 "type": str(mt5_type),
                 
-                # Explicit formatting to prevent float precision errors
                 "volume": "{:.2f}".format(safe_vol),
                 
                 # FORCE ZERO PRICE for Market Execution
                 "entry_price": final_price,
                 "price": final_price, 
                 
-                # CRITICAL MAPPING: Producer looks for 'sl' and 'tp', NOT 'stop_loss'
+                "intended_price": "{:.5f}".format(trade.entry_price),
+                
                 "sl": "{:.5f}".format(safe_sl),
                 "tp": "{:.5f}".format(safe_tp),
                 
@@ -206,7 +202,6 @@ class TradeDispatcher:
                         symbol = data['symbol']
                         
                         for pos in open_positions.values():
-                            # V20.8 FIX: Robust comment parsing. short_id will survive even if Windows strips "_"
                             comment = str(pos.get('comment', ''))
                             if pos.get('symbol') == symbol and short_id in comment:
                                 is_zombie_match = True
@@ -252,7 +247,7 @@ class LogicWorker(multiprocessing.Process):
     def run(self):
         setup_logging("LogicWorker")
         worker_log = logging.getLogger("LogicWorker")
-        worker_log.info(f"{LogSymbols.ONLINE} Logic Worker Started (PID: {os.getpid()}) | V20.10 IPC Protocol Active")
+        worker_log.info(f"{LogSymbols.ONLINE} Logic Worker Started (PID: {os.getpid()}) | V20.14 IPC Protocol Active")
         
         threshold_map = self._calibrate_thresholds(worker_log)
         
@@ -272,7 +267,7 @@ class LogicWorker(multiprocessing.Process):
         
         while self.running:
             try:
-                # V20.8 IPC FIX: Process Acknowledgment Queue to seal Memory Leaks
+                # Process Acknowledgment Queue
                 while not self.ack_queue.empty():
                     try:
                         ack = self.ack_queue.get_nowait()
@@ -311,7 +306,6 @@ class LogicWorker(multiprocessing.Process):
                 try:
                     price = float(tick_data.get('price', 0.0))
                     volume = float(tick_data.get('volume', 1.0))
-                    # The Feature Engineer/Aggregator needs MARKET time, not publish time.
                     ts = float(tick_data.get('time', 0.0))
                     if ts > 100_000_000_000: 
                         ts /= 1000.0 
@@ -353,21 +347,26 @@ class LogicWorker(multiprocessing.Process):
         worker_log.info("Logic Worker Shutdown Complete.")
 
     def _check_latency(self, tick_data: Dict, predictor: MultiAssetPredictor, log: logging.Logger) -> bool:
-        """
-        V20.10 LATENCY FIX: Uses 'publish_time' (when Producer sent it to Redis) instead of 
-        'time' (when the last MT5 trade occurred) to calculate network/processing latency. 
-        This solves the "Latency Guard Death Spiral" during slow market hours.
-        """
         try:
-            # 1. Prefer publish_time (pipeline latency) over time (market latency)
+            if not hasattr(self, 'clock_drift_offset'):
+                self.clock_drift_offset = None
+
             publish_ts = tick_data.get('publish_time')
             if publish_ts:
-                ts = float(publish_ts)
+                raw_ts = float(publish_ts)
+                if raw_ts > 100_000_000_000: 
+                    raw_ts /= 1000.0
+                
+                # Auto-calibrate clock drift between Windows and Linux
+                current_drift = time.time() - raw_ts
+                if self.clock_drift_offset is None or current_drift < self.clock_drift_offset:
+                    self.clock_drift_offset = current_drift 
+                
+                ts = raw_ts + self.clock_drift_offset
             else:
                 ts = float(tick_data.get('time', 0.0))
-                
-            if ts > 100_000_000_000: 
-                ts /= 1000.0
+                if ts > 100_000_000_000: 
+                    ts /= 1000.0
             
             now = time.time()
             latency = max(0.0, now - ts)
@@ -397,7 +396,8 @@ class LogicWorker(multiprocessing.Process):
         
         for sym in self.symbols:
             try:
-                df = load_real_data(sym, n_candles=50000, days=30)
+                # V20.14 FIX: Increased query size for safety
+                df = load_real_data(sym, n_candles=500000, days=30)
                 
                 if df is None or df.empty:
                     log.warning(f"No historical data for {sym}. Using default threshold: {config_thresh}")
@@ -413,15 +413,42 @@ class LogicWorker(multiprocessing.Process):
                     bar_count = 0
                     
                     for row in df.itertuples():
-                        price = getattr(row, 'price', getattr(row, 'close', None))
-                        vol = getattr(row, 'volume', 1.0)
-                        ts_val = getattr(row, 'Index', None).timestamp()
+                        # --- V20.14 FIX: ROBUST DICT PARSING ---
+                        try:
+                            row_dict = row._asdict()
+                        except AttributeError:
+                            row_dict = row.__dict__
+                            
+                        price = None
+                        vol = 1.0
+                        ts_val = 0.0
                         
-                        if price is None: 
+                        for k, v in row_dict.items():
+                            if v is None: continue
+                            k_str = str(k).lower()
+                            
+                            if 'close' in k_str or 'price' in k_str:
+                                try: price = float(v)
+                                except: pass
+                            elif 'volume' in k_str or 'tick_volume' in k_str:
+                                try: vol = float(v)
+                                except: pass
+                            elif k_str in ['index', 'time']:
+                                if isinstance(v, (datetime, pd.Timestamp)):
+                                    ts_val = v.timestamp()
+                                else:
+                                    try: ts_val = float(v)
+                                    except: pass
+                                    
+                        if price is None or math.isnan(price): 
                             continue
+                        if math.isnan(vol): 
+                            vol = 1.0
+                            
+                        # Default to 0.0 flow inference so gen correctly uses Tick Rule
+                        b_vol = getattr(row, 'buy_vol', 0.0)
+                        s_vol = getattr(row, 'sell_vol', 0.0)
                         
-                        b_vol = vol / 2
-                        s_vol = vol / 2
                         if gen.process_tick(price, vol, ts_val, b_vol, s_vol):
                             bar_count += 1
                     
@@ -435,7 +462,7 @@ class LogicWorker(multiprocessing.Process):
                 
                 log.info(f"✅ {sym} Worker Calibrated: {threshold_map[sym]:.1f}")
             except Exception as e:
-                log.error(f"Worker Calibration Error {sym}: {e}")
+                log.error(f"Worker Calibration Error {sym}: {e}", exc_info=True)
                 threshold_map[sym] = config_thresh
         
         return threshold_map
@@ -503,7 +530,7 @@ class LiveTradingEngine:
             self.news_thread = threading.Thread(target=self.fetch_news_loop, daemon=True)
             self.news_thread.start()
 
-        # 6. Performance Monitor (Circuit Breaker & SQN)
+        # 6. Performance Monitor
         self.stats_lock = threading.Lock()
         self.performance_stats = defaultdict(lambda: deque(maxlen=30))
         self.last_reset_ts = 0.0 
@@ -531,7 +558,6 @@ class LiveTradingEngine:
         self.latest_prices = {}
         
         self.latest_positions = defaultdict(list)
-        
         self._inject_fallback_prices()
         
         self.liquidation_triggered_map = {sym: False for sym in CONFIG['trading']['symbols']}
@@ -844,7 +870,6 @@ class LiveTradingEngine:
             logger.warning(f"🚫 Global Trade Limit Reached ({total_open_tickets}/{max_global}). Margin Protected.")
             return False
 
-        # V20.8 FIX: STRICT 1 TRADE PER PAIR unless Pyramiding is enabled
         max_per_symbol = 1
         pyramid_conf = CONFIG.get('risk_management', {}).get('pyramiding', {})
         if pyramid_conf.get('enabled', False):
@@ -969,7 +994,6 @@ class LiveTradingEngine:
                 self.dispatcher.send_order(trade_intent, risk_usd)
                 self.last_dispatch_time[symbol] = time.time()
                 
-                # V20.8 IPC ACK: Confirm back to LogicWorker that the signal was successfully executed
                 if hasattr(signal, 'id') and signal.id:
                     self.ack_queue.put({'symbol': symbol, 'signal_id': signal.id})
                 
@@ -1039,17 +1063,13 @@ class LiveTradingEngine:
 
                         risk_dist = 0.0
                         try:
-                            # V20.8 IPC FIX: Robust comment parsing. 
-                            # Windows producer strips "_" and prepends UUID.
                             comment = str(pos.get('comment', ''))
                             short_id = None
                             
-                            # MT5 limits comments to 31 chars, check formats
                             if "Auto_" in comment:
                                 parts = comment.split('_')
                                 if len(parts) >= 2: short_id = parts[1][:8]
                             elif len(comment) >= 8:
-                                # Windows Fallback: "1234abcd Auto Algo"
                                 short_id = comment[:8]
                                 
                             if short_id:
@@ -1066,11 +1086,6 @@ class LiveTradingEngine:
                         new_sl = None
                         reason = ""
                         
-                        # ============================================================
-                        # V20.9 FIX: "Let Winners Run" Protocol updated.
-                        # Trailers are now looser (0.5R locked at 1.5R) and BE is locked earlier (0.8R) 
-                        # to protect against mean reversion whip-saws while still capturing the 2.0R target.
-                        # ============================================================
                         if pos_type == "BUY":
                             dist_pnl = current_price - entry_price
                             r_multiple = dist_pnl / risk_dist
@@ -1102,10 +1117,9 @@ class LiveTradingEngine:
                                     reason = "BE Lock"
 
                         if new_sl:
-                            # Prevent MT5 comment bloat by only tagging structural changes
                             comment_str = str(pos.get('comment', ''))
                             if "Trail" not in comment_str and "BE Lock" not in comment_str:
-                                pass # Keep it simple for the dispatch log
+                                pass 
                             
                             logger.info(f"🛡️ TRAILING STOP: {sym} (R={r_multiple:.2f}) -> New SL {new_sl:.5f} ({reason})")
                             modify_intent = Trade(

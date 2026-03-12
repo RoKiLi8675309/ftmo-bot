@@ -5,12 +5,12 @@
 # DEPENDENCIES: unittest, numpy, redis, shared
 # DESCRIPTION: Pre-Flight Forensic Diagnostics & PIPELINE VERIFICATION.
 # 
-# PHOENIX V20.2 UPDATE (PROFITABILITY PATCH):
+# PHOENIX V20.10 UPDATE (ML FREEDOM PROTOCOL):
 # 1. SIZING VALIDATION: Accepts 'fixed_lots' for the data collection phase.
 # 2. CHOKE GUARD: Verifies trailing stops activate quickly at <= 1.0R.
-# 3. UNCHOKED GATES: Aligned with V20.2 standards (ADX 0.0, Hurst 0.50+).
-# 4. ML FREEDOM: Validates that hardcoded heuristic filters are removed.
-# 5. STATE VALIDATION: Ensures Feature Engineer buffers are correctly saturated.
+# 3. ML FREEDOM ENFORCEMENT: Strictly asserts ADX == 0.0 to guarantee 
+#    the Machine Learning model has absolute control over trade execution.
+# 4. REGIME ENFORCEMENT: Asserts Regime Enforcement is completely DISABLED.
 # =============================================================================
 import unittest
 import numpy as np
@@ -40,8 +40,8 @@ logger = logging.getLogger("Diagnose")
 
 class TestConfigurationIntegrity(unittest.TestCase):
     """
-    V20.2 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
-    with the Profit Maximization Protocol parameters.
+    V20.10 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
+    with the ML Freedom Protocol parameters to prevent trade starvation.
     """
     def test_aggressor_risk_params(self):
         """Verify Risk Management uses valid sizing (risk_percentage or fixed_lots)."""
@@ -52,7 +52,7 @@ class TestConfigurationIntegrity(unittest.TestCase):
         
         print(f"    [CONF] Sizing Method: {sizing_method} | Base Risk: {base_risk*100:.2f}% | Scaled Risk: {scaled_risk*100:.2f}%")
         
-        # V20.2 REQUIREMENT: Allow fixed_lots for 2-week burn in, or risk_percentage for scale.
+        # V20.10 REQUIREMENT: Allow fixed_lots for burn in, or risk_percentage for scale.
         self.assertIn(sizing_method, ["risk_percentage", "fixed_lots"], "CRITICAL: Must use dynamic 'risk_percentage' or 'fixed_lots' for data collection")
         
         # Ensure we are risking at least 0.25% per trade to allow sufficient statistical attempts (when using percentage)
@@ -61,8 +61,8 @@ class TestConfigurationIntegrity(unittest.TestCase):
         # Scaled Risk should be greater than or equal to base risk
         self.assertGreaterEqual(scaled_risk, base_risk, "CRITICAL: Scaled Risk must be >= Base Risk")
 
-    def test_v20_2_execution_gates(self):
-        """Verify the V20.2 unchoked gates are active to prevent trade starvation."""
+    def test_v20_10_ml_freedom_protocol(self):
+        """Verify the V20.10 ML Freedom protocol is active to prevent trade starvation."""
         phx_conf = CONFIG.get('phoenix_strategy', {})
         features_conf = CONFIG.get('features', {})
         risk_conf = CONFIG.get('risk_management', {})
@@ -73,22 +73,21 @@ class TestConfigurationIntegrity(unittest.TestCase):
         
         print(f"    [CONF] ADX: {adx_thresh} | Hurst: {hurst_thresh} | Trail Act: {trail_act}R")
         
-        # V20.2 UNCHOKED GATES: 
-        # We now set ADX to 0.0 to let ML decide on trend quality. 
-        # Hurst is optimized to 0.52 to capture momentum.
-        self.assertGreaterEqual(adx_thresh, 0.0, "CRITICAL: ADX threshold must be >= 0.0 (Unchoked Standard)")
+        # V20.10 ML FREEDOM GATES: 
+        # We strictly enforce ADX == 0.0 so heuristic filters never choke the ML model.
+        self.assertEqual(adx_thresh, 0.0, "CRITICAL: ADX threshold MUST be exactly 0.0 to grant ML full freedom (Unchoked Standard).")
         self.assertGreaterEqual(hurst_thresh, 0.50, "CRITICAL: Hurst breakout threshold must be >= 0.50")
         self.assertLessEqual(trail_act, 1.0, "CRITICAL: Trailing stop activation must be <= 1.0R to lock in profits quickly")
 
     def test_regime_settings(self):
-        """Verify Regime Enforcement is DISABLED to prevent over-filtering."""
+        """Verify Regime Enforcement is DISABLED to prevent heuristic over-filtering."""
         phx_conf = CONFIG.get('phoenix_strategy', {})
         regime_mode = phx_conf.get('regime_enforcement')
         print(f"    [CONF] Regime Mode: {regime_mode}")
-        self.assertEqual(regime_mode, "DISABLED", "CRITICAL: Regime Enforcement must be DISABLED in V20.2")
+        self.assertEqual(regime_mode, "DISABLED", "CRITICAL: Regime Enforcement MUST be DISABLED in V20.10 to allow ML to dictate trades.")
 
     def test_leverage_map_integrity(self):
-        """V14.0+: Verify Leverage Map exists for Asset Classes."""
+        """Verify Leverage Map exists for Asset Classes."""
         risk_conf = CONFIG.get('risk_management', {})
         lev_map = risk_conf.get('leverage', {})
         required_keys = ['default', 'minor', 'gold', 'indices', 'crypto']
@@ -245,5 +244,5 @@ class TestRiskCalculations(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    print(f"\n🔍 RUNNING PHOENIX V20.2 PIPELINE DIAGNOSTICS...")
+    print(f"\n🔍 RUNNING PHOENIX V20.10 PIPELINE DIAGNOSTICS...")
     unittest.main(verbosity=2)
