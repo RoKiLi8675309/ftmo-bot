@@ -16,8 +16,10 @@ import pandas as pd
 # Third-Party ML Imports
 try:
     from river import forest, compose, preprocessing, metrics, drift, linear_model, optim
+    ML_AVAILABLE = True  # <-- FIX: Define ML_AVAILABLE on successful import
 except ImportError:
     print("CRITICAL: 'river' library not found. Install with: conda install -c conda-forge river")
+    ML_AVAILABLE = False # <-- FIX: Define ML_AVAILABLE on failure
     import sys
     sys.exit(1)
 
@@ -44,18 +46,20 @@ class Signal:
         self.id = signal_id or str(uuid.uuid4())
 
 class ProbabilityCalibrator:
-    def __init__(self):
-        self.calibrator = linear_model.LogisticRegression(
-            optimizer=optim.SGD(0.05),
-            loss=optim.losses.Log(),
-            l2=0.1 
-        )
+    def __init__(self, window: int = 1000):
+        self.calibrator = None
+        if ML_AVAILABLE:
+            self.calibrator = linear_model.LogisticRegression(
+                optimizer=optim.SGD(0.05),
+                loss=optim.losses.Log(),
+                l2=0.1
+            )
         self.samples_seen = 0
         self.pos_count = 0
         self.neg_count = 0
 
     def update(self, prob: float, label: int):
-        if math.isfinite(prob):
+        if ML_AVAILABLE and math.isfinite(prob):
             self.calibrator.learn_one({'raw_prob': prob}, label)
             self.samples_seen += 1
             if label == 1:
@@ -64,6 +68,9 @@ class ProbabilityCalibrator:
                 self.neg_count += 1
 
     def calibrate(self, raw_prob: float) -> float:
+        if not ML_AVAILABLE: return raw_prob
+        
+        # Keep the bot exploring but using raw probabilities until mature.
         if self.pos_count < 10 or self.neg_count < 10:
             return raw_prob 
             
@@ -76,19 +83,23 @@ class ProbabilityCalibrator:
 
 class MetaLabeler:
     def __init__(self):
-        self.model = forest.ARFClassifier(
-            n_models=10,
-            seed=42,
-            metric=metrics.F1()
-        )
+        self.model = None
         self.buffer = deque(maxlen=1000)
         self.pos_count = 0
         self.neg_count = 0
+        
+        if ML_AVAILABLE:
+            self.model = forest.ARFClassifier(
+                n_models=10, 
+                seed=42, 
+                metric=metrics.F1()
+            )
 
     def update(self, features: Dict[str, float], primary_action: int, outcome_pnl: float):
-        if primary_action == 0:
+        if not ML_AVAILABLE or primary_action == 0:
             return
         
+        # 1 = Profit, 0 = Loss.
         y_meta = 1 if outcome_pnl > 0 else 0
         
         if y_meta == 1:
@@ -101,11 +112,10 @@ class MetaLabeler:
             clean_features = self._sanitize(meta_feats)
             self.model.learn_one(clean_features, y_meta)
             self.buffer.append((clean_features, y_meta))
-        except Exception as e:
-            logger.debug(f"MetaLabeler Update Error: {e}")
+        except Exception: pass
 
     def predict(self, features: Dict[str, float], primary_action: int, threshold: float = 0.50) -> bool:
-        if primary_action == 0:
+        if not ML_AVAILABLE or primary_action == 0:
             return False
             
         if self.pos_count < 10 or self.neg_count < 10: 
@@ -128,7 +138,6 @@ class MetaLabeler:
         clean['hurst_x_action'] = (clean.get('hurst', 0.5) - 0.5) * action
         clean['vpin_x_action'] = clean.get('vpin', 0.5) * action
         clean['ker_x_action'] = clean.get('ker', 0.5) * action
-        clean['aggressor_x_action'] = (clean.get('aggressor_ratio', 0.5) - 0.5) * action
         return clean
 
     def _sanitize(self, features: Dict[str, float]) -> Dict[str, float]:
@@ -141,8 +150,8 @@ class MetaLabeler:
         return clean
 
 class AdaptiveTripleBarrier:
-    def __init__(self, horizon_ticks: int = 720, risk_mult: float = 1.5, reward_mult: float = 3.0, 
-                 drift_threshold: float = 1.5, horizon_type: str = 'TIME', horizon_value: float = 0.0):
+    def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.5, reward_mult: float = 3.0, 
+                 drift_threshold: float = 0.75, horizon_type: str = 'TIME', horizon_value: float = 0.0):
         self.buffer = deque()
         self.time_limit = horizon_ticks
         self.risk_mult = risk_mult
@@ -176,8 +185,7 @@ class AdaptiveTripleBarrier:
         raw_risk_dist = effective_risk_mult * current_atr
         actual_risk_dist = max(raw_risk_dist, min_stop_dist) 
         
-        raw_reward_dist = actual_risk_dist * (effective_reward_mult / effective_risk_mult)
-        actual_reward_dist = max(raw_reward_dist, min_profit_dist)
+        actual_reward_dist = actual_risk_dist * (effective_reward_mult / effective_risk_mult)
         
         buy_tp = entry_price + actual_reward_dist + spread_in_price
         buy_sl = entry_price - actual_risk_dist + spread_in_price
@@ -185,17 +193,22 @@ class AdaptiveTripleBarrier:
         sell_tp = entry_price - actual_reward_dist - spread_in_price
         sell_sl = entry_price + actual_risk_dist - spread_in_price
 
+        min_profit_pct = (min_profit_dist + spread_in_price + comm_in_price) / entry_price if entry_price > 0 else 0.0
+        
+        feats_copy = features.copy()
+        feats_copy['min_profit_pct'] = min_profit_pct
+
         self.buffer.append({
             'signal_id': signal_id,
-            'is_executed': False,  
-            'features': features.copy(),
+            'is_executed': False,
+            'features': feats_copy,
             'entry': entry_price,
             'buy_tp': buy_tp,
             'buy_sl': buy_sl,
             'sell_tp': sell_tp,
             'sell_sl': sell_sl,
             'atr': current_atr,
-            'start_time': timestamp,
+            'start_time': timestamp, 
             'age': 0,
             'cum_vol': 0.0,
             'cum_volatility': 0.0,
@@ -208,7 +221,6 @@ class AdaptiveTripleBarrier:
     def resolve_labels(self, current_high: float, current_low: float, current_close: float = None, 
                        current_volume: float = 0.0, current_log_ret: float = 0.0,
                        current_timestamp: float = 0.0) -> List[Tuple[Dict[str, float], int, float, int, float, float, bool]]:
-        
         resolved = []
         active = deque()
         if current_close is None: current_close = (current_high + current_low) / 2.0
@@ -236,9 +248,11 @@ class AdaptiveTripleBarrier:
             buy_status = 0
             sell_status = 0
 
+            # Evaluate VIRTUAL BUY
             if current_low <= trade['buy_sl']: buy_status = -1
             elif current_high >= trade['buy_tp']: buy_status = 1
             
+            # Evaluate VIRTUAL SELL
             if current_high >= trade['sell_sl']: sell_status = -1
             elif current_low <= trade['sell_tp']: sell_status = 1
 
@@ -248,6 +262,7 @@ class AdaptiveTripleBarrier:
                 spread_pct = trade['spread_pct']
                 comm_pct = trade['comm_pct']
 
+                # Calculate Net Return (BUY) with Slippage
                 if buy_status == 1: 
                     buy_ret = (trade['buy_tp'] - trade['entry']) / trade['entry'] - spread_pct - comm_pct
                 elif buy_status == -1: 
@@ -255,6 +270,7 @@ class AdaptiveTripleBarrier:
                 elif is_expired: 
                     buy_ret = (current_close - trade['entry']) / trade['entry'] - spread_pct - comm_pct
 
+                # Calculate Net Return (SELL) with Slippage
                 if sell_status == 1: 
                     sell_ret = (trade['entry'] - trade['sell_tp']) / trade['entry'] - spread_pct - comm_pct
                 elif sell_status == -1: 
@@ -262,15 +278,16 @@ class AdaptiveTripleBarrier:
                 elif is_expired: 
                     sell_ret = (trade['entry'] - current_close) / trade['entry'] - spread_pct - comm_pct
 
-                if buy_ret > sell_ret:
+                # 3-CLASS LOGIC (Including Hold = 0)
+                if buy_ret > 0 and buy_ret > sell_ret:
                     optimal_label = 1
                     optimal_ret = buy_ret
-                elif sell_ret > buy_ret:
+                elif sell_ret > 0 and sell_ret > buy_ret:
                     optimal_label = -1
                     optimal_ret = sell_ret
                 else:
-                    optimal_label = 1 if current_close >= trade['entry'] else -1
-                    optimal_ret = buy_ret
+                    optimal_label = 0
+                    optimal_ret = max(buy_ret, sell_ret)
                     
                 proposed_action = trade.get('proposed_action', 0)
                 pred_proba = trade.get('pred_proba', 0.5)
@@ -287,10 +304,10 @@ class AdaptiveTripleBarrier:
                     trade['features'], 
                     optimal_label, 
                     optimal_ret,
-                    proposed_action, 
+                    proposed_action,
                     pred_proba,
                     proposed_ret,
-                    is_executed 
+                    is_executed
                 ))
             else:
                 active.append(trade)
@@ -298,7 +315,14 @@ class AdaptiveTripleBarrier:
         self.buffer = active
         return resolved
 
+# =============================================================================
+# STRATEGY ENGINE
+# =============================================================================
+
 class MultiAssetPredictor:
+    """
+    Live prediction engine applying V20.14 Conviction Math.
+    """
     def __init__(self, symbols: List[str], threshold_map: Optional[Dict[str, float]] = None):
         self.symbols = symbols
         self.models_dir = Path("models")
@@ -351,7 +375,7 @@ class MultiAssetPredictor:
         self.hurst_veto = 0.65 
         self.rvol_trigger = 0.8 
         self.max_rvol_thresh = 35.0 
-        self.adx_threshold = float(CONFIG.get('features', {}).get('adx', {}).get('threshold', 20.0))
+        self.adx_threshold = 0.0 # V20.10 FIX: Hardcoded to 0.0 for ML Freedom Protocol
 
         for s in symbols:
             s_risk = risk_mult_conf
@@ -591,10 +615,11 @@ class MultiAssetPredictor:
                 hist_ker = stored_feats.get('ker', 0.5)
                 final_weight = base_weight * ret_scalar * (hist_ker * 2.0)
                 
+                # Boost Hold weighting to recognize chop
                 if optimal_label == 0:
-                    final_weight *= 0.05
+                    final_weight *= 0.25 
                 
-                if optimal_label != 0:
+                if ML_AVAILABLE:
                     model.learn_one(clean_stored, optimal_label, sample_weight=final_weight)
                 
                 if past_action != 0:
@@ -614,48 +639,60 @@ class MultiAssetPredictor:
         spread_in_price = spread_pips * pip_val
         comm_in_price = 0.5 * pip_val
         
-        min_stop_pips = float(CONFIG.get('risk_management', {}).get('min_stop_loss_pips', 15.0))
+        min_stop_pips = float(CONFIG.get('risk_management', {}).get('min_stop_loss_pips', 20.0))
         min_stop_dist = min_stop_pips * pip_val
-        min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 30.0))
+        min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
         min_profit_dist = min_profit_pips * pip_val
 
         is_trending = hurst >= self.hurst_breakout
         proposed_action = 0
         
-        adx_val = features.get('adx', 0.0)
-        
-        if len(self.bb_buffers[symbol]) >= self.bb_window:
-            pass # V20.10: Removed hardcoded BB heuristics to grant full ML freedom
-
         clean_features = {k: float(v) for k, v in features.items() if math.isfinite(v)}
         
-        # --- ML FREEDOM PROTOCOL ---
+        # --- V20.14 FIX: 3-CLASS EV PROTOCOL ---
         prob_buy = 0.0
         prob_sell = 0.0
+        prob_hold = 1.0 
         try:
             if model:
                 pred_proba = model.predict_proba_one(clean_features)
                 prob_buy = pred_proba.get(1, 0.0)
                 prob_sell = pred_proba.get(-1, 0.0)
+                prob_hold = pred_proba.get(0, 0.0)
             else:
-                prob_buy, prob_sell = 0.5, 0.5
+                prob_buy, prob_sell, prob_hold = 0.33, 0.33, 0.34
         except:
-            prob_buy, prob_sell = 0.0, 0.0
+            prob_buy, prob_sell, prob_hold = 0.0, 0.0, 1.0
 
-        if prob_buy > prob_sell:
+        current_reward_target = max(self.labelers[symbol].reward_mult, 2.0)
+        if is_trending:
+            current_reward_target = max(current_reward_target, 3.0)
+
+        break_even_wr = 1.0 / (1.0 + current_reward_target)
+        
+        # EXPERT TRADER TILT PREVENTION: 
+        # For every consecutive loss, the mathematical edge required to enter a new trade increases by +3%.
+        streak = self.consecutive_losses.get(symbol, 0)
+        tilt_penalty = 0.03 * streak
+        
+        # V20.14 FIX: Enforce a strict minimum 2% edge + tilt penalty
+        required_prob = break_even_wr + 0.02 + tilt_penalty
+        
+        cal_prob_buy = self.calibrators[symbol]['buy'].calibrate(prob_buy)
+        cal_prob_sell = self.calibrators[symbol]['sell'].calibrate(prob_sell)
+        
+        buy_edge = cal_prob_buy - required_prob
+        sell_edge = cal_prob_sell - required_prob
+
+        if buy_edge > 0 and buy_edge >= sell_edge:
             proposed_action = 1
-            prob_success = prob_buy
-        elif prob_sell > prob_buy:
+            prob_success = prob_buy 
+        elif sell_edge > 0 and sell_edge > buy_edge:
             proposed_action = -1
-            prob_success = prob_sell
+            prob_success = prob_sell 
         else:
             proposed_action = 0
-            prob_success = 0.0
-
-        regime_label = "TREND_BREAKOUT" if is_trending else "MEAN_REVERSION"
-        current_reward_target = max(self.labelers[symbol].reward_mult, 2.0)
-        if regime_label == "TREND_BREAKOUT":
-            current_reward_target = max(current_reward_target, 3.0)
+            prob_success = prob_hold
 
         signal_id = str(uuid.uuid4())
 
@@ -815,7 +852,7 @@ class MultiAssetPredictor:
                     final_weight = base_weight * ret_scalar * (hist_ker * 2.0)
                     
                     if optimal_label == 0:
-                        final_weight *= 0.05
+                        final_weight *= 0.25
                     
                     clean_stored = {k: float(v) for k, v in stored_feats.items() if math.isfinite(v)}
                     
@@ -839,51 +876,65 @@ class MultiAssetPredictor:
         spread_in_price = spread_pips * pip_val
         comm_in_price = 0.5 * pip_val
         
-        min_stop_pips = float(CONFIG.get('risk_management', {}).get('min_stop_loss_pips', 15.0))
+        min_stop_pips = float(CONFIG.get('risk_management', {}).get('min_stop_loss_pips', 20.0))
         min_stop_dist = min_stop_pips * pip_val
-        min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 30.0))
+        min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
         min_profit_dist = min_profit_pips * pip_val
 
-        regime_label = "Neutral"
+        is_trending = hurst >= self.hurst_breakout
         proposed_action = 0 
         
-        is_trending = hurst >= self.hurst_breakout
-        
-        adx_val = features.get('adx', 0.0)
-        
-        if len(self.bb_buffers[symbol]) >= self.bb_window:
-            pass # V20.10: Removed hardcoded BB heuristics to grant full ML freedom
-
         regime_label = "TREND_BREAKOUT" if is_trending else "MEAN_REVERSION"
 
         clean_features = {k: float(v) for k, v in features.items() if math.isfinite(v)}
         
-        # --- ML FREEDOM PROTOCOL ---
+        # --- V20.14 FIX: 3-CLASS EV PROTOCOL ---
         prob_buy = 0.0
         prob_sell = 0.0
+        prob_hold = 1.0 
         try:
             if model:
                 pred_proba = model.predict_proba_one(clean_features)
                 prob_buy = pred_proba.get(1, 0.0)
                 prob_sell = pred_proba.get(-1, 0.0)
+                prob_hold = pred_proba.get(0, 0.0)
             else:
-                prob_buy, prob_sell = 0.5, 0.5
+                prob_buy, prob_sell, prob_hold = 0.33, 0.33, 0.34
         except:
-            prob_buy, prob_sell = 0.0, 0.0
-
-        if prob_buy > prob_sell:
-            proposed_action = 1
-            prob_success = prob_buy
-        elif prob_sell > prob_buy:
-            proposed_action = -1
-            prob_success = prob_sell
-        else:
-            proposed_action = 0
-            prob_success = 0.0
+            prob_buy, prob_sell, prob_hold = 0.0, 0.0, 1.0
 
         current_reward_target = max(self.labelers[symbol].reward_mult, 2.0)
-        if regime_label == "TREND_BREAKOUT":
+        if is_trending:
             current_reward_target = max(current_reward_target, 3.0)
+
+        break_even_wr = 1.0 / (1.0 + current_reward_target)
+        
+        # EXPERT TRADER TILT PREVENTION: 
+        # For every consecutive loss, the mathematical edge required to enter a new trade increases by +3%.
+        streak = self.consecutive_losses.get(symbol, 0)
+        tilt_penalty = 0.03 * streak
+        
+        # V20.14 FIX: Enforce a strict minimum 2% edge + tilt penalty
+        required_prob = break_even_wr + 0.02 + tilt_penalty
+        
+        cal_prob_buy = self.calibrators[symbol]['buy'].calibrate(prob_buy)
+        cal_prob_sell = self.calibrators[symbol]['sell'].calibrate(prob_sell)
+        
+        buy_edge = cal_prob_buy - required_prob
+        sell_edge = cal_prob_sell - required_prob
+
+        if buy_edge > 0 and buy_edge >= sell_edge:
+            proposed_action = 1
+            prob_success = prob_buy 
+            confidence = cal_prob_buy
+        elif sell_edge > 0 and sell_edge > buy_edge:
+            proposed_action = -1
+            prob_success = prob_sell 
+            confidence = cal_prob_sell
+        else:
+            proposed_action = 0
+            prob_success = prob_hold
+            confidence = max(cal_prob_buy, cal_prob_sell)
 
         signal_id = str(uuid.uuid4())
 
@@ -904,8 +955,8 @@ class MultiAssetPredictor:
             return Signal(symbol, "HOLD", 0.0, {"reason": "Bridging Gap"})
 
         if proposed_action == 0:
-            stats["No Trigger"] += 1
-            return Signal(symbol, "HOLD", 0.0, {"reason": "No Trigger"})
+            stats["Negative EV (Math Hold)"] += 1
+            return Signal(symbol, "HOLD", 0.0, {"reason": "Negative EV"})
 
         effective_ker_thresh = max(0.0001, self.ker_floor + self.dynamic_ker_offsets[symbol])
         if ker_val < effective_ker_thresh:
@@ -915,23 +966,8 @@ class MultiAssetPredictor:
             return Signal(symbol, "HOLD", 0.0, {"reason": "Low KER"})
 
         try:
-            if proposed_action == 1: confidence = self.calibrators[symbol]['buy'].calibrate(prob_success)
-            elif proposed_action == -1: confidence = self.calibrators[symbol]['sell'].calibrate(prob_success)
-            else: confidence = 0.0
-                
-            break_even_wr = 1.0 / (1.0 + current_reward_target)
-            
-            # V20.10 ML UNCHOKE FIX
-            dynamic_min_conf = break_even_wr + 0.02 
-            effective_min_conf = dynamic_min_conf
-            
-            if confidence < effective_min_conf:
-                stats["Low ML Confidence"] += 1
-                if stats["Low ML Confidence"] % 10 == 0:
-                    logger.info(f"🤖 {symbol} GATE: Low ML Confidence ({confidence:.2f} < Req:{effective_min_conf:.2f} | BE:{break_even_wr:.2f})")
-                return Signal(symbol, "HOLD", confidence, {"reason": f"Low ML Confidence ({confidence:.2f})"})
-            
-            meta_thresh = max(break_even_wr + 0.01, 0.20)
+            # V20.14 FIX: Meta-Labeler MUST beat 55%, increasing by +2% for each loss in the streak.
+            meta_thresh = max(break_even_wr + 0.05 + (0.02 * streak), 0.55)
             is_profitable = meta_labeler.predict(clean_features, proposed_action, threshold=meta_thresh)
             
             open_positions = context_data.get('positions', {}) if context_data else {}
@@ -940,7 +976,7 @@ class MultiAssetPredictor:
             if symbol in open_positions:
                 pyramid_config = CONFIG.get('risk_management', {}).get('pyramiding', {})
                 if not pyramid_config.get('enabled', False):
-                    return Signal(symbol, "HOLD", confidence, {"reason": "Pyramiding Disabled"})
+                    return Signal(symbol, "HOLD", confidence, {"reason": "Pyramiding Disabled (Trade Open)"})
                 
                 pos = open_positions[symbol]
                 entry_price = float(pos.get('entry_price', 0.0))

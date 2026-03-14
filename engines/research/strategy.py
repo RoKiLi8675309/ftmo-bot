@@ -33,14 +33,13 @@ from engines.research.backtester import MarketSnapshot, BacktestBroker, Backtest
 logger = logging.getLogger("ResearchStrategy")
 
 # =============================================================================
-# V20.10 MATHEMATICAL PARITY CLASSES
-# Resolves the Bootstrap Paradox, Expectancy Mismatch, and IPC Signature Crashes
+# V20.14 MATHEMATICAL PARITY CLASSES (EV PROTOCOL)
+# Resolves the Forced Coin-Flip Bug & Replaces Chokes with Pure EV Math
 # =============================================================================
 
 class ProbabilityCalibrator:
     """
     Platt Scaling Calibrator adapted for swing trading confidence.
-    V20.8 FIX: Returns RAW base model probability during immaturity.
     """
     def __init__(self, window: int = 1000):
         self.calibrator = None
@@ -117,8 +116,6 @@ class MetaLabeler:
         if not ML_AVAILABLE or primary_action == 0:
             return False
             
-        # V20.7 FIX: Lower maturity threshold to 10.
-        # Default to True (allow base model to trade) until meta-model is smart enough to veto.
         if self.pos_count < 10 or self.neg_count < 10: 
             return True 
             
@@ -153,7 +150,6 @@ class MetaLabeler:
 class AdaptiveTripleBarrier:
     """
     SPREAD TRAP CURE & CHOP LABELING.
-    Simulates actual broker execution constraints perfectly aligned with RiskManager.
     """
     def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.5, reward_mult: float = 3.0, 
                  drift_threshold: float = 0.75, horizon_type: str = 'TIME', horizon_value: float = 0.0):
@@ -173,9 +169,7 @@ class AdaptiveTripleBarrier:
                               comm_in_price: float = 0.0, min_profit_dist: float = 0.0,
                               proposed_action: int = 0, pred_proba: float = 0.5,
                               override_reward_mult: float = None, signal_id: str = None):
-        """
-        Calculates exact broker geometry including strict spread and commission penalties.
-        """
+        
         if current_atr <= 0: current_atr = entry_price * 0.0001
         
         volatility = features.get('volatility', 0.0)
@@ -189,13 +183,11 @@ class AdaptiveTripleBarrier:
         effective_risk_mult = (self.risk_mult + vol_boost) * adaptive_scalar
         effective_reward_mult = (actual_reward_mult + vol_boost) * adaptive_scalar
         
-        # 1. Base Geometry
         raw_risk_dist = effective_risk_mult * current_atr
         actual_risk_dist = max(raw_risk_dist, min_stop_dist) 
         
         actual_reward_dist = actual_risk_dist * (effective_reward_mult / effective_risk_mult)
         
-        # 2. Broker Reality Injection
         buy_tp = entry_price + actual_reward_dist + spread_in_price
         buy_sl = entry_price - actual_risk_dist + spread_in_price
         
@@ -208,8 +200,8 @@ class AdaptiveTripleBarrier:
         feats_copy['min_profit_pct'] = min_profit_pct
 
         self.buffer.append({
-            'signal_id': signal_id,       # V20.8 IPC Fix
-            'is_executed': False,         # V20.8 IPC Fix
+            'signal_id': signal_id,
+            'is_executed': False,
             'features': feats_copy,
             'entry': entry_price,
             'buy_tp': buy_tp,
@@ -230,10 +222,6 @@ class AdaptiveTripleBarrier:
     def resolve_labels(self, current_high: float, current_low: float, current_close: float = None, 
                        current_volume: float = 0.0, current_log_ret: float = 0.0,
                        current_timestamp: float = 0.0) -> List[Tuple[Dict[str, float], int, float, int, float, float, bool]]:
-        """
-        Evaluates independent virtual BUY and SELL trades to solve Asymmetry.
-        Returns: (features, optimal_label, optimal_ret, proposed_action, pred_proba, proposed_ret, is_executed)
-        """
         resolved = []
         active = deque()
         if current_close is None: current_close = (current_high + current_low) / 2.0
@@ -246,7 +234,6 @@ class AdaptiveTripleBarrier:
 
             is_expired = False
             if self.horizon_type == 'TIME':
-                # Use real wall-clock time difference if timestamp provided, else fallback to tick age
                 if current_timestamp > 0 and trade.get('start_time', 0) > 0:
                     duration_sec = current_timestamp - trade['start_time']
                     if duration_sec >= (self.time_limit * 60): is_expired = True
@@ -270,7 +257,6 @@ class AdaptiveTripleBarrier:
             if current_high >= trade['sell_sl']: sell_status = -1
             elif current_low <= trade['sell_tp']: sell_status = 1
 
-            # Resolve if triggered or expired
             if buy_status != 0 or sell_status != 0 or is_expired:
                 buy_ret = 0.0
                 sell_ret = 0.0
@@ -293,19 +279,17 @@ class AdaptiveTripleBarrier:
                 elif is_expired: 
                     sell_ret = (trade['entry'] - current_close) / trade['entry'] - spread_pct - comm_pct
 
-                # REVERT BASE MODEL TO BINARY
-                if buy_ret > sell_ret:
+                # 3-CLASS LOGIC
+                if buy_ret > 0 and buy_ret > sell_ret:
                     optimal_label = 1
                     optimal_ret = buy_ret
-                elif sell_ret > buy_ret:
+                elif sell_ret > 0 and sell_ret > buy_ret:
                     optimal_label = -1
                     optimal_ret = sell_ret
                 else:
-                    # Absolute tie breaker (prevents class 0 injection into Base Model)
-                    optimal_label = 1 if current_close >= trade['entry'] else -1
-                    optimal_ret = buy_ret
+                    optimal_label = 0
+                    optimal_ret = max(buy_ret, sell_ret)
                     
-                # Proposed Action Outcome (crucial to defeat survivorship bias)
                 proposed_action = trade.get('proposed_action', 0)
                 pred_proba = trade.get('pred_proba', 0.5)
                 proposed_ret = 0.0
@@ -315,7 +299,7 @@ class AdaptiveTripleBarrier:
                 elif proposed_action == -1:
                     proposed_ret = sell_ret
 
-                is_executed = trade.get('is_executed', False) # V20.8 IPC Fix
+                is_executed = trade.get('is_executed', False)
 
                 resolved.append((
                     trade['features'], 
@@ -339,7 +323,7 @@ class AdaptiveTripleBarrier:
 class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
-    Strictly implements the Profit Maximization Protocol.
+    Strictly implements the EV Profit Maximization Protocol.
     """
     def __init__(self, model: Any, symbol: str, params: dict[str, Any], historical_df: Optional[pd.DataFrame] = None):
         self.model = model
@@ -413,32 +397,21 @@ class ResearchStrategy:
         self.rejection_stats = defaultdict(int) 
         self.feature_importance_counter = Counter() 
         
-        # ============================================================
-        # STRATEGY CONFIGURATION (V20.9 PROFIT PROTOCOL)
-        # ============================================================
         phx_conf = CONFIG.get('phoenix_strategy', {})
-        
         self.bb_window = 20
         self.bb_std = float(phx_conf.get('bb_std_dev', 1.5)) 
         self.bb_buffer = deque(maxlen=self.bb_window)
         
         self.ker_floor = 0.0003 
         self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.52))
-        self.hurst_veto = 0.65 
         
         self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 0.8)) 
-        
-        self.regime_enforcement = "DISABLED" 
-        self.asset_regime_map = phx_conf.get('asset_regime_map', {})
-        self.max_rvol_thresh = 35.0 
-        self.adx_threshold = float(CONFIG.get('features', {}).get('adx', {}).get('threshold', 20.0))
         
         # --- SESSION CONTROL ---
         session_conf = self.risk_conf.get('session_control', {})
         self.session_enabled = session_conf.get('enabled', False)
         self.start_hour = session_conf.get('start_hour_server', 10)
         self.liq_hour = session_conf.get('liquidate_hour_server', 21)
-        
         self.friday_entry_cutoff = self.risk_conf.get('friday_entry_cutoff_hour', 16)
         self.friday_close_hour = self.risk_conf.get('friday_liquidation_hour_server', 21)
         
@@ -539,17 +512,41 @@ class ResearchStrategy:
         return True
 
     def _check_revenge_guard(self, broker: BacktestBroker, current_time: datetime) -> bool:
+        """
+        V20.14 FIX: Exponential Revenge Guard.
+        Strictly enforces cooldowns after a loss and penalizes consecutive losses heavily.
+        """
         my_closed_trades = [t for t in broker.closed_positions if t.symbol == self.symbol and t.close_time is not None]
         if not my_closed_trades: return False
             
-        last_trade = my_closed_trades[-1]
+        # Sort trades by closing time descending
+        sorted_trades = sorted(my_closed_trades, key=lambda x: x.close_time, reverse=True)
+        
+        # Calculate consecutive losing streak
+        consecutive_losses = 0
+        for trade in sorted_trades:
+            if trade.net_pnl < 0:
+                consecutive_losses += 1
+            else:
+                break
+                
+        last_trade = sorted_trades[0]
         close_time = last_trade.close_time
+        
+        # Ensure timezone consistency for timedelta math
         if close_time.tzinfo is None:
             close_time = close_time.replace(tzinfo=current_time.tzinfo)
         else:
             close_time = close_time.astimezone(current_time.tzinfo)
             
-        cooldown_expiry = close_time + timedelta(minutes=self.cooldown_minutes)
+        # Apply exponential multiplier for consecutive losses
+        if consecutive_losses > 0:
+            multiplier = 2 ** (consecutive_losses - 1)
+            effective_cooldown_mins = self.cooldown_minutes * multiplier
+        else:
+            effective_cooldown_mins = self.cooldown_minutes # Standard mandatory cooldown after a win/BE
+            
+        cooldown_expiry = close_time + timedelta(minutes=effective_cooldown_mins)
         return current_time < cooldown_expiry
 
     def on_data(self, snapshot: MarketSnapshot, broker: BacktestBroker, is_warmup: bool = False):
@@ -595,7 +592,6 @@ class ResearchStrategy:
         context_data = self._simulate_mtf_context(price, server_time)
         self.current_d1_ema = context_data.get('d1', {}).get('ema200', 0.0)
 
-        # Do NOT enforce circuit breakers, revenge guards, trailing stops during warmup
         if not is_warmup:
             if self._check_symbol_circuit_breaker(broker, server_time):
                 self.rejection_stats["Symbol Circuit Breaker (Loss Limit)"] += 1
@@ -687,11 +683,11 @@ class ResearchStrategy:
                 final_weight = base_weight * ret_scalar * ker_weight
                 
                 if optimal_label == 0:
-                    final_weight *= 0.05 
+                    final_weight *= 0.25 
                 
                 clean_stored = {k: float(v) for k, v in stored_feats.items() if math.isfinite(v)}
                 
-                if optimal_label != 0 and ML_AVAILABLE:
+                if ML_AVAILABLE:
                     self.model.learn_one(clean_stored, optimal_label, sample_weight=final_weight)
                 
                 if past_action != 0:
@@ -702,50 +698,62 @@ class ResearchStrategy:
                         self.calibrator_sell.update(past_prob, 1 if past_ret > 0 else 0)
 
         # ============================================================
-        # C. SMART SIGNAL MATRIX
+        # C. SMART SIGNAL MATRIX (V20.14 EV Protocol)
         # ============================================================
         regime_label = "Neutral"
         proposed_action = 0 
         
         is_trending = hurst >= self.hurst_breakout
-        
-        adx_val = features.get('adx', 0.0)
         parkinson = features.get('parkinson_vol', 0.0)
         current_atr = features.get('atr', 0.001)
-
-        if len(self.bb_buffer) >= self.bb_window:
-            pass # V20.10: Removed hardcoded BB heuristics to grant full ML freedom
 
         regime_label = "TREND_BREAKOUT" if is_trending else "MEAN_REVERSION"
 
         clean_features = {k: float(v) for k, v in features.items() if math.isfinite(v)}
         
-        # --- ML FREEDOM PROTOCOL ---
+        # --- 3-CLASS EV PROTOCOL ---
         prob_buy = 0.0
         prob_sell = 0.0
+        prob_hold = 1.0 
         try:
             if ML_AVAILABLE and self.model:
                 pred_proba = self.model.predict_proba_one(clean_features)
                 prob_buy = pred_proba.get(1, 0.0)
                 prob_sell = pred_proba.get(-1, 0.0)
+                prob_hold = pred_proba.get(0, 0.0)
             else:
-                prob_buy, prob_sell = 0.5, 0.5
+                prob_buy, prob_sell, prob_hold = 0.33, 0.33, 0.34
         except:
-            prob_buy, prob_sell = 0.0, 0.0
-
-        if prob_buy > prob_sell:
-            proposed_action = 1
-            prob_success = prob_buy
-        elif prob_sell > prob_buy:
-            proposed_action = -1
-            prob_success = prob_sell
-        else:
-            proposed_action = 0
-            prob_success = 0.0
+            prob_buy, prob_sell, prob_hold = 0.0, 0.0, 1.0
 
         current_reward_target = max(self.optimized_reward_mult, 2.0)
         if regime_label == "TREND_BREAKOUT":
             current_reward_target = max(current_reward_target, 3.0)
+
+        # PURE MATH: Is EV Positive? 
+        # EV = (WinRate * Reward) - ((1-WinRate) * Risk) > 0  => WinRate > Risk/(Risk+Reward)
+        break_even_wr = 1.0 / (1.0 + current_reward_target)
+        required_prob = break_even_wr + 0.02 # V20.14 FIX: Require a strict 2% mathematical edge to filter weak entries
+        
+        cal_prob_buy = self.calibrator_buy.calibrate(prob_buy)
+        cal_prob_sell = self.calibrator_sell.calibrate(prob_sell)
+        
+        buy_edge = cal_prob_buy - required_prob
+        sell_edge = cal_prob_sell - required_prob
+
+        # Select action purely based on highest positive edge
+        if buy_edge > 0 and buy_edge >= sell_edge:
+            proposed_action = 1
+            prob_success = prob_buy # Send raw probability to labeler state
+            confidence = cal_prob_buy
+        elif sell_edge > 0 and sell_edge > buy_edge:
+            proposed_action = -1
+            prob_success = prob_sell 
+            confidence = cal_prob_sell
+        else:
+            proposed_action = 0
+            prob_success = prob_hold
+            confidence = max(cal_prob_buy, cal_prob_sell)
 
         # ============================================================
         # D. ADD TRADE OPPORTUNITY 
@@ -791,7 +799,7 @@ class ResearchStrategy:
         if server_time.weekday() == 4 and server_time.hour >= self.friday_entry_cutoff: return 
 
         if proposed_action == 0:
-            self.rejection_stats["No Trigger"] += 1
+            self.rejection_stats["Negative EV (Math Hold)"] += 1
             return
             
         effective_ker_thresh = max(0.0001, self.ker_floor + self.dynamic_ker_offset)
@@ -802,29 +810,10 @@ class ResearchStrategy:
             return
 
         # ============================================================
-        # F. ML CONFIRMATION & EXECUTION (V20.10 FIX)
+        # F. ML CONFIRMATION & EXECUTION
         # ============================================================
         try:
-            if proposed_action == 1: confidence = self.calibrator_buy.calibrate(prob_success)
-            elif proposed_action == -1: confidence = self.calibrator_sell.calibrate(prob_success)
-            else: confidence = 0.0
-                
-            break_even_wr = 1.0 / (1.0 + current_reward_target)
-            
-            # V20.10 ML UNCHOKE FIX: 
-            # We completely remove the hardcoded config_min_conf (e.g. 0.55).
-            # In a 3-class model (Buy/Sell/Chop), random chance is 33%.
-            # With a 1:3 R:R, break-even is 25%. Asking for 55% guarantees starvation.
-            # We now demand mathematical break-even + a 2% edge.
-            dynamic_min_conf = break_even_wr + 0.02 
-            effective_min_conf = dynamic_min_conf
-            
-            if confidence < effective_min_conf:
-                self.rejection_stats[f"Low ML Confidence"] += 1
-                if self.rejection_stats[f"Low ML Confidence"] % 10 == 0:
-                    if self.debug_mode: logger.info(f"🤖 {self.symbol} GATE: Low ML Confidence ({confidence:.2f} < Req:{effective_min_conf:.2f} | BE:{break_even_wr:.2f})")
-                return
-            
+            # We already calculated EV logic. Only Meta-Labeler remains.
             meta_thresh = max(break_even_wr + 0.01, 0.20)
             is_profitable = self.meta_labeler.predict(clean_features, proposed_action, threshold=meta_thresh)
             if proposed_action != 0: self.meta_label_events += 1
@@ -1018,11 +1007,6 @@ class ResearchStrategy:
             broker._close_partial_position(pos, pos.quantity, self.last_price, current_time, reason)
 
     def _manage_trailing_stops(self, broker: BacktestBroker, current_price: float, timestamp: datetime):
-        """
-        V20.9 FIX: "Let Winners Run" Protocol updated.
-        Trailers are now looser (0.5R locked at 1.5R) and BE is locked earlier (0.8R) 
-        to protect against mean reversion whip-saws while still capturing the 2.0R target.
-        """
         for pos in broker.open_positions:
             if pos.symbol != self.symbol: continue
             risk_dist = pos.metadata.get('initial_risk_dist', 0.0)

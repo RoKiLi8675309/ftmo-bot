@@ -6,7 +6,7 @@ import os
 import multiprocessing
 import queue
 import numpy as np
-import pandas as pd # <--- FIX: Added missing pandas import
+import pandas as pd
 import math
 import pytz
 import uuid
@@ -396,7 +396,6 @@ class LogicWorker(multiprocessing.Process):
         
         for sym in self.symbols:
             try:
-                # V20.14 FIX: Increased query size for safety
                 df = load_real_data(sym, n_candles=500000, days=30)
                 
                 if df is None or df.empty:
@@ -413,7 +412,6 @@ class LogicWorker(multiprocessing.Process):
                     bar_count = 0
                     
                     for row in df.itertuples():
-                        # --- V20.14 FIX: ROBUST DICT PARSING ---
                         try:
                             row_dict = row._asdict()
                         except AttributeError:
@@ -691,7 +689,13 @@ class LiveTradingEngine:
             logger.warning(f"Initial Calendar Fetch Failed: {e}")
 
         while not self.shutdown_flag:
-            time.sleep(3600) 
+            # Responsive sleep to prevent hanging on shutdown
+            for _ in range(3600):
+                if self.shutdown_flag: break
+                time.sleep(1)
+            
+            if self.shutdown_flag: break
+            
             try:
                 events = self.news_monitor.fetch_events()
                 if events:
@@ -715,11 +719,12 @@ class LiveTradingEngine:
                     self.global_sentiment['GLOBAL'] = polarity
                     logger.info(f"{LogSymbols.NEWS} Market Sentiment Updated: {polarity:.3f}")
                 
-                time.sleep(300)
-                
             except Exception as e:
                 logger.error(f"News Fetch Error: {e}")
-                time.sleep(60)
+
+            for _ in range(300):
+                if self.shutdown_flag: break
+                time.sleep(1)
 
     def fetch_performance_loop(self):
         logger.info(f"{LogSymbols.INFO} Performance Monitor (SQN & Circuit Breaker) Thread Started.")
@@ -766,16 +771,19 @@ class LiveTradingEngine:
                                         else:
                                             logger.info(f"💰 PROFIT DETECTED {symbol}: ${net_pnl:.2f}")
 
-                                    self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=cooldown_mins)
-                                    
-                                    if net_pnl < 0:
-                                        logger.warning(f"🚫 {symbol} REVENGE GUARD: Locked for {cooldown_mins}m (Loss)")
-                                    else:
-                                        logger.info(f"🛡️ {symbol} MANDATORY COOLDOWN: Locked for {cooldown_mins}m (Win/Break-even)")
+                                self.portfolio_mgr.add_to_penalty_box(symbol, duration_minutes=cooldown_mins)
+                                
+                                if net_pnl < 0:
+                                    logger.warning(f"🚫 {symbol} REVENGE GUARD: Locked for {cooldown_mins}m (Loss)")
+                                else:
+                                    logger.info(f"🛡️ {symbol} MANDATORY COOLDOWN: Locked for {cooldown_mins}m (Win/Break-even)")
             
             except Exception as e:
                 logger.error(f"Performance Monitor Error: {e}")
-                time.sleep(5)
+                
+            for _ in range(5):
+                if self.shutdown_flag: break
+                time.sleep(1)
 
     def _calculate_sqn(self, symbol: str) -> float:
         with self.stats_lock:
@@ -901,10 +909,13 @@ class LiveTradingEngine:
                 if not self._check_risk_gates(symbol):
                     continue
                 
-                ttl_sec = CONFIG['trading'].get('limit_order_ttl_seconds', 60)
-                if time.time() - self.last_dispatch_time.get(symbol, 0) < ttl_sec:
+                # V20.10 FIX: Expert Trader Cooldown & Anti-Machine-Gunning
+                # Enforce a strict 15-minute global cooldown between ANY entries on the same symbol.
+                # This ensures patience and completely eliminates dispatch race conditions before MT5 sync.
+                entry_cooldown_sec = 15 * 60.0
+                if time.time() - self.last_dispatch_time.get(symbol, 0) < entry_cooldown_sec:
                     continue
-                
+                    
                 if not self._check_symbol_concurrency(symbol):
                     continue
 
@@ -1137,7 +1148,9 @@ class LiveTradingEngine:
             except Exception as e:
                 logger.error(f"Position Manager Error: {e}", exc_info=True)
             
-            time.sleep(1) 
+            for _ in range(5):
+                if self.shutdown_flag: break
+                time.sleep(1)
 
     def _reconcile_pending_orders(self, open_positions_map: Dict[str, List[Dict]]):
         try:
@@ -1291,7 +1304,9 @@ class LiveTradingEngine:
                     self.logic_worker.start()
 
                 if self.stream_mgr.r.exists(CONFIG['redis']['risk_keys']['midnight_freeze']):
-                    logger.info("❄️ Midnight Freeze Detected. Pausing Tick Consumption...")
+                    if time.time() - getattr(self, 'last_freeze_log_time', 0) > 60:
+                        logger.info("❄️ Midnight Freeze Detected. Pausing Tick Consumption...")
+                        self.last_freeze_log_time = time.time()
                     time.sleep(1)
                     continue
 

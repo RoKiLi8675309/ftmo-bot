@@ -9,6 +9,7 @@
 #    rather than market tick silence to prevent False Positive drops.
 # 3. WFO OPTIMIZATION: Scrubbed dead search space dimensions for faster convergence.
 # 4. ADX UNCHOKE: Hardcoded ADX threshold to 0.0 to pass control purely to the ML model.
+# 5. EXPERT COOLDOWN: 60-minute mandatory loss cooldown to prevent machine-gunning.
 # =============================================================================
 
 # --- 🌍 ENVIRONMENT SPECIFIC ---
@@ -218,7 +219,7 @@ risk_management:
   base_risk_per_trade_percent: 0.0050  # Base Risk: 0.5% per trade
   scaled_risk_percent: 0.0075          # Scaled Risk: 0.75% when in profit buffer
   
-  loss_cooldown_minutes: 15  
+  loss_cooldown_minutes: 60  # V20.10 FIX: Mandatory 1-hour walk-away to prevent machine gunning
   min_margin_level_percent: 200.0
 
   pyramiding:
@@ -276,7 +277,7 @@ risk_management:
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
   
-  min_stop_loss_pips: 15.0 # Escape the Spread Trap
+  min_stop_loss_pips: 20.0 # V20.10 FIX: Escape the Spread Trap with more breathing room
 
 # --- 📈 TRADING PORTFOLIO ---
 trading:

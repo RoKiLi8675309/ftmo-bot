@@ -5,12 +5,14 @@
 # DEPENDENCIES: unittest, numpy, redis, shared
 # DESCRIPTION: Pre-Flight Forensic Diagnostics & PIPELINE VERIFICATION.
 # 
-# PHOENIX V20.10 UPDATE (ML FREEDOM PROTOCOL):
+# PHOENIX V20.14 UPDATE (EXPERT TRADER PROTOCOL):
 # 1. SIZING VALIDATION: Accepts 'fixed_lots' for the data collection phase.
 # 2. CHOKE GUARD: Verifies trailing stops activate quickly at <= 1.0R.
 # 3. ML FREEDOM ENFORCEMENT: Strictly asserts ADX == 0.0 to guarantee 
 #    the Machine Learning model has absolute control over trade execution.
 # 4. REGIME ENFORCEMENT: Asserts Regime Enforcement is completely DISABLED.
+# 5. ANTI-MACHINE-GUNNING: Asserts mandatory 60-minute loss cooldown.
+# 6. SPREAD TRAP CURE: Asserts absolute minimum stop loss floor of 20.0 pips.
 # =============================================================================
 import unittest
 import numpy as np
@@ -78,6 +80,18 @@ class TestConfigurationIntegrity(unittest.TestCase):
         self.assertEqual(adx_thresh, 0.0, "CRITICAL: ADX threshold MUST be exactly 0.0 to grant ML full freedom (Unchoked Standard).")
         self.assertGreaterEqual(hurst_thresh, 0.50, "CRITICAL: Hurst breakout threshold must be >= 0.50")
         self.assertLessEqual(trail_act, 1.0, "CRITICAL: Trailing stop activation must be <= 1.0R to lock in profits quickly")
+
+    def test_v20_14_expert_trader_protocol(self):
+        """Verify the V20.14 Expert Trader protocol is active to prevent machine gunning."""
+        risk_conf = CONFIG.get('risk_management', {})
+        cooldown = risk_conf.get('loss_cooldown_minutes', 0)
+        min_sl = risk_conf.get('min_stop_loss_pips', 0.0)
+        
+        print(f"    [CONF] Cooldown: {cooldown}m | Min SL Floor: {min_sl} pips")
+        
+        # V20.14 EXPERT TRADER GATES:
+        self.assertGreaterEqual(cooldown, 60, "CRITICAL: Loss cooldown must be >= 60 minutes to prevent machine-gunning.")
+        self.assertGreaterEqual(min_sl, 20.0, "CRITICAL: Minimum Stop Loss must be >= 20.0 pips to escape spread traps.")
 
     def test_regime_settings(self):
         """Verify Regime Enforcement is DISABLED to prevent heuristic over-filtering."""
@@ -244,5 +258,5 @@ class TestRiskCalculations(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    print(f"\n🔍 RUNNING PHOENIX V20.10 PIPELINE DIAGNOSTICS...")
+    print(f"\n🔍 RUNNING PHOENIX V20.14 PIPELINE DIAGNOSTICS...")
     unittest.main(verbosity=2)

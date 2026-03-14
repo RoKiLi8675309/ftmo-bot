@@ -245,8 +245,8 @@ class RiskManager:
         pip_val_raw, _ = RiskManager.get_pip_info(symbol)
         if pip_val_raw <= 0: pip_val_raw = 0.0001
         
-        # Absolute Hard Floor (15.0 pips default)
-        config_min_pips = float(risk_conf.get('min_stop_loss_pips', 15.0))
+        # Absolute Hard Floor (20.0 pips default - V20.14 Expert Trader Protocol Parity)
+        config_min_pips = float(risk_conf.get('min_stop_loss_pips', 20.0))
         min_stop_hard_floor = config_min_pips * pip_val_raw
         
         # Asset-specific floor safety nets to prevent instant spread blowout
