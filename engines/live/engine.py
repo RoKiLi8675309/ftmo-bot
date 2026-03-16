@@ -3,6 +3,7 @@ import time
 import json
 import threading
 import os
+import sys
 import multiprocessing
 import queue
 import numpy as np
@@ -14,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 from typing import Any, Optional, Dict, List, Set
 
-# Third-Party NLP (Guarded)
+# Third-Party NLP (Guarded for Conda environments)
 try:
     from newspaper import Article
     from textblob import TextBlob
@@ -50,7 +51,7 @@ logger = logging.getLogger("LiveEngine")
 # CONSTANTS
 MAX_TICK_LATENCY_SEC = 45.0 
 
-# --- MT5 CONSTANTS (HARDCODED FOR LINUX) ---
+# --- MT5 CONSTANTS (HARDCODED FOR LINUX / REDIS PROTOCOL) ---
 MT5_ORDER_TYPE_BUY = 0
 MT5_ORDER_TYPE_SELL = 1
 MT5_TRADE_ACTION_DEAL = 1
@@ -71,6 +72,7 @@ class TradeDispatcher:
     """
     Handles the reliable transmission of trade orders from the Logic Engine
     to the Execution Engine (Windows Producer) via Redis Streams.
+    V20.18 DUAL-MODEL UPGRADE: Fully supports independent directional EV processing.
     """
     def __init__(self, stream_mgr: RedisStreamManager, pending_tracker: dict[str, Any], lock: threading.RLock):
         self.stream_mgr = stream_mgr
@@ -85,14 +87,15 @@ class TradeDispatcher:
             order_id = uuid.uuid4()
             short_id = str(order_id)[:8]
             
-            # --- STRICT R:R ENFORCEMENT AT THE DISPATCH LAYER ---
+            # --- V20.18 FIX: STRICT R:R ENFORCEMENT AT THE DISPATCH LAYER ---
             if trade.action in ["BUY", "SELL"] and trade.stop_loss > 0 and trade.take_profit > 0:
                 risk_dist = abs(trade.entry_price - trade.stop_loss)
                 reward_dist = abs(trade.take_profit - trade.entry_price)
                 if risk_dist > 0:
                     rr_ratio = reward_dist / risk_dist
-                    if rr_ratio < 1.90:
-                        logger.error(f"🛑 REJECTED BY DISPATCHER: {trade.symbol} R:R Ratio is {rr_ratio:.2f} (Target >= 2.0). Blocked to prevent spread bleed.")
+                    # Target >= 1.5. Blocked at 1.40 to permit minor spread slippage variance.
+                    if rr_ratio < 1.40:
+                        logger.error(f"🛑 REJECTED BY DISPATCHER: {trade.symbol} {trade.action} R:R Ratio is {rr_ratio:.2f} (Target >= 1.5). Blocked to prevent spread bleed.")
                         return  # Abort dispatch immediately
 
             # --- PERSIST INITIAL RISK DISTANCE ---
@@ -122,7 +125,7 @@ class TradeDispatcher:
             else:
                 mt5_type = MT5_ORDER_TYPE_BUY 
             
-            # B. FORCE MARKET EXECUTION
+            # FORCE MARKET EXECUTION
             if trade.action in ["BUY", "SELL"]:
                 mt5_action = MT5_TRADE_ACTION_DEAL
                 final_price = "0.0" 
@@ -219,8 +222,8 @@ class TradeDispatcher:
                     try:
                         short_id = str(oid)[:8]
                         self.stream_mgr.r.hdel("bot:initial_risk", short_id)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Failed to clear Redis hash for {short_id}: {e}")
                         
                     del self.pending_tracker[oid]
         
@@ -247,7 +250,7 @@ class LogicWorker(multiprocessing.Process):
     def run(self):
         setup_logging("LogicWorker")
         worker_log = logging.getLogger("LogicWorker")
-        worker_log.info(f"{LogSymbols.ONLINE} Logic Worker Started (PID: {os.getpid()}) | V20.14 IPC Protocol Active")
+        worker_log.info(f"{LogSymbols.ONLINE} Logic Worker Started (PID: {os.getpid()}) | V20.18 DUAL-MODEL ACTIVE")
         
         threshold_map = self._calibrate_thresholds(worker_log)
         
@@ -389,7 +392,7 @@ class LogicWorker(multiprocessing.Process):
             return True 
 
     def _calibrate_thresholds(self, log: logging.Logger) -> Dict[str, float]:
-        log.info(f"{LogSymbols.TRAINING} Logic Worker: Auto-Calibrating Thresholds...")
+        log.info(f"{LogSymbols.TRAINING} Logic Worker: Auto-Calibrating Imbalance Thresholds...")
         threshold_map = {}
         alpha = self.config['data'].get('imbalance_alpha', 0.05)
         config_thresh = self.config['data'].get('volume_bar_threshold', 10.0) 
@@ -481,11 +484,11 @@ class LiveTradingEngine:
 
         # 2. Risk & Compliance
         initial_bal = CONFIG['env'].get('initial_balance', 50000.0) 
-        max_daily_loss = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
+        self.daily_max_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.040)
         
         self.ftmo_guard = FTMORiskMonitor(
             initial_balance=initial_bal,
-            max_daily_loss_pct=max_daily_loss,
+            max_daily_loss_pct=self.daily_max_loss_pct,
             redis_client=self.stream_mgr.r
         )
         self.portfolio_mgr = PortfolioRiskManager(symbols=self.symbols)
@@ -528,9 +531,10 @@ class LiveTradingEngine:
             self.news_thread = threading.Thread(target=self.fetch_news_loop, daemon=True)
             self.news_thread.start()
 
-        # 6. Performance Monitor
+        # 6. Performance Monitor (V20.18 DUAL MODEL FIX)
         self.stats_lock = threading.Lock()
-        self.performance_stats = defaultdict(lambda: deque(maxlen=30))
+        # Track tuples of {'pnl': float, 'action': str}
+        self.performance_stats = defaultdict(lambda: deque(maxlen=60)) 
         self.last_reset_ts = 0.0 
         self.daily_execution_stats = defaultdict(lambda: {'losses': 0, 'pnl': 0.0, 'tickets': set()})
         
@@ -615,6 +619,7 @@ class LiveTradingEngine:
                     net_pnl = float(data.get('net_pnl', 0.0))
                     timestamp_raw = float(data.get('timestamp', 0))
                     ticket = str(data.get('ticket', '')) 
+                    action = data.get('action', 'UNKNOWN') # Fetched if Producer sends it
                     
                     if timestamp_raw < self.last_reset_ts:
                         continue
@@ -630,7 +635,8 @@ class LiveTradingEngine:
                     if net_pnl < 0:
                         self.daily_execution_stats[symbol]['losses'] += 1
                     
-                    self.performance_stats[symbol].append(net_pnl)
+                    # Store as dict to track distinct Dual-Model directions
+                    self.performance_stats[symbol].append({'pnl': net_pnl, 'action': action})
                     restored_count += 1
             
             if restored_count > 0:
@@ -646,7 +652,7 @@ class LiveTradingEngine:
 
     def _restore_penalty_box_state(self):
         logger.info(f"{LogSymbols.DATABASE} Restoring Penalty Box State (Revenge Guard)...")
-        cooldown_mins = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 60)
+        cooldown_mins = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 15)
         
         now_ts = datetime.now(timezone.utc).timestamp()
         start_ts = now_ts - (cooldown_mins * 60 + 600) 
@@ -689,7 +695,6 @@ class LiveTradingEngine:
             logger.warning(f"Initial Calendar Fetch Failed: {e}")
 
         while not self.shutdown_flag:
-            # Responsive sleep to prevent hanging on shutdown
             for _ in range(3600):
                 if self.shutdown_flag: break
                 time.sleep(1)
@@ -731,7 +736,7 @@ class LiveTradingEngine:
         stream_key = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
         
         last_id = '$' 
-        cooldown_mins = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 60)
+        cooldown_mins = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 15)
 
         while not self.shutdown_flag:
             try:
@@ -752,13 +757,14 @@ class LiveTradingEngine:
                             net_pnl = float(data.get('net_pnl', 0.0))
                             ticket = str(data.get('ticket', ''))
                             ts_raw = float(data.get('timestamp', 0))
+                            action = data.get('action', 'UNKNOWN') # In case producer includes it
                             
                             if ts_raw < self.last_reset_ts:
                                 continue
                             
                             if symbol:
                                 with self.stats_lock:
-                                    self.performance_stats[symbol].append(net_pnl)
+                                    self.performance_stats[symbol].append({'pnl': net_pnl, 'action': action})
                                     
                                     if ticket and ticket not in self.daily_execution_stats[symbol]['tickets']:
                                         self.daily_execution_stats[symbol]['pnl'] += net_pnl
@@ -787,7 +793,7 @@ class LiveTradingEngine:
 
     def _calculate_sqn(self, symbol: str) -> float:
         with self.stats_lock:
-            trades = list(self.performance_stats[symbol])
+            trades = [t['pnl'] for t in self.performance_stats[symbol]]
             
         if len(trades) < 5: 
             return 0.0 
@@ -889,7 +895,7 @@ class LiveTradingEngine:
         return True
 
     def _signal_listener(self):
-        logger.info(f"{LogSymbols.SIGNAL} Signal Dispatcher Thread Active.")
+        logger.info(f"{LogSymbols.SIGNAL} Signal Dispatcher Thread Active (V20.18 Dual-Model Asymmetry Mode).")
         
         while not self.shutdown_flag:
             try:
@@ -909,10 +915,29 @@ class LiveTradingEngine:
                 if not self._check_risk_gates(symbol):
                     continue
                 
-                # V20.10 FIX: Expert Trader Cooldown & Anti-Machine-Gunning
-                # Enforce a strict 15-minute global cooldown between ANY entries on the same symbol.
-                # This ensures patience and completely eliminates dispatch race conditions before MT5 sync.
-                entry_cooldown_sec = 15 * 60.0
+                # V20.18 FIX: Independent Directional Exponential Revenge Guard
+                base_cooldown_mins = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 15)
+                
+                consecutive_losses = 0
+                with self.stats_lock:
+                    if self.performance_stats[symbol]:
+                        for trade in reversed(self.performance_stats[symbol]):
+                            # Only count consecutive losses if they were the SAME direction as proposed action
+                            # (or UNKNOWN if producer hasn't upgraded its payload yet)
+                            if trade['action'] in [signal.action, 'UNKNOWN']:
+                                if trade['pnl'] < 0:
+                                    consecutive_losses += 1
+                                else:
+                                    break
+                
+                if consecutive_losses > 0:
+                    multiplier = 2 ** (consecutive_losses - 1)
+                    effective_cooldown_mins = base_cooldown_mins * multiplier
+                    logger.info(f"🔍 ASYMMETRY GUARD: {symbol} has {consecutive_losses} distinct {signal.action} losses in a row.")
+                else:
+                    effective_cooldown_mins = 5 # 5-minute breather after a win
+                    
+                entry_cooldown_sec = effective_cooldown_mins * 60.0
                 if time.time() - self.last_dispatch_time.get(symbol, 0) < entry_cooldown_sec:
                     continue
                     
@@ -928,7 +953,7 @@ class LiveTradingEngine:
                 risk_percent_override = signal.meta_data.get('risk_percent_override')
                 
                 tbm_config = CONFIG.get('online_learning', {}).get('tbm', {})
-                default_rr = max(float(tbm_config.get('barrier_width', 3.0)), 2.0)
+                default_rr = max(float(tbm_config.get('barrier_width', 3.0)), 1.5)
                 current_reward_target = signal.meta_data.get('optimized_rr', default_rr)
                 
                 sqn_score = self._calculate_sqn(symbol)

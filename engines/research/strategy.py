@@ -33,7 +33,7 @@ from engines.research.backtester import MarketSnapshot, BacktestBroker, Backtest
 logger = logging.getLogger("ResearchStrategy")
 
 # =============================================================================
-# V20.14 MATHEMATICAL PARITY CLASSES (EV PROTOCOL)
+# V20.18 MATHEMATICAL PARITY CLASSES (DUAL-MODEL ASYMMETRY PROTOCOL)
 # Resolves the Forced Coin-Flip Bug & Replaces Chokes with Pure EV Math
 # =============================================================================
 
@@ -149,7 +149,7 @@ class MetaLabeler:
 
 class AdaptiveTripleBarrier:
     """
-    SPREAD TRAP CURE & CHOP LABELING.
+    SPREAD TRAP CURE & DUAL ASYMMETRY LABELING.
     """
     def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.5, reward_mult: float = 3.0, 
                  drift_threshold: float = 0.75, horizon_type: str = 'TIME', horizon_value: float = 0.0):
@@ -200,8 +200,8 @@ class AdaptiveTripleBarrier:
         feats_copy['min_profit_pct'] = min_profit_pct
 
         self.buffer.append({
-            'signal_id': signal_id,
-            'is_executed': False,
+            'signal_id': signal_id, 
+            'is_executed': False, 
             'features': feats_copy,
             'entry': entry_price,
             'buy_tp': buy_tp,
@@ -221,7 +221,7 @@ class AdaptiveTripleBarrier:
 
     def resolve_labels(self, current_high: float, current_low: float, current_close: float = None, 
                        current_volume: float = 0.0, current_log_ret: float = 0.0,
-                       current_timestamp: float = 0.0) -> List[Tuple[Dict[str, float], int, float, int, float, float, bool]]:
+                       current_timestamp: float = 0.0) -> List[Tuple[Dict[str, float], int, int, float, float, int, float, float, bool]]:
         resolved = []
         active = deque()
         if current_close is None: current_close = (current_high + current_low) / 2.0
@@ -279,16 +279,10 @@ class AdaptiveTripleBarrier:
                 elif is_expired: 
                     sell_ret = (trade['entry'] - current_close) / trade['entry'] - spread_pct - comm_pct
 
-                # 3-CLASS LOGIC
-                if buy_ret > 0 and buy_ret > sell_ret:
-                    optimal_label = 1
-                    optimal_ret = buy_ret
-                elif sell_ret > 0 and sell_ret > buy_ret:
-                    optimal_label = -1
-                    optimal_ret = sell_ret
-                else:
-                    optimal_label = 0
-                    optimal_ret = max(buy_ret, sell_ret)
+                # V20.18 FIX: DUAL MODEL ASYMMETRY
+                # Return binary labels independently to prevent class-0 starvation.
+                buy_label = 1 if buy_ret > 0 else 0
+                sell_label = 1 if sell_ret > 0 else 0
                     
                 proposed_action = trade.get('proposed_action', 0)
                 pred_proba = trade.get('pred_proba', 0.5)
@@ -299,12 +293,14 @@ class AdaptiveTripleBarrier:
                 elif proposed_action == -1:
                     proposed_ret = sell_ret
 
-                is_executed = trade.get('is_executed', False)
+                is_executed = trade.get('is_executed', False) 
 
                 resolved.append((
                     trade['features'], 
-                    optimal_label, 
-                    optimal_ret,
+                    buy_label,
+                    sell_label,
+                    buy_ret,
+                    sell_ret,
                     proposed_action,
                     pred_proba,
                     proposed_ret,
@@ -323,10 +319,10 @@ class AdaptiveTripleBarrier:
 class ResearchStrategy:
     """
     Represents an independent trading agent for a single symbol.
-    Strictly implements the EV Profit Maximization Protocol.
+    Strictly implements the V20.18 Dual-Model EV Protocol.
     """
-    def __init__(self, model: Any, symbol: str, params: dict[str, Any], historical_df: Optional[pd.DataFrame] = None):
-        self.model = model
+    def __init__(self, model: Dict[str, Any], symbol: str, params: dict[str, Any], historical_df: Optional[pd.DataFrame] = None):
+        self.model = model  # V20.18: Expects a dictionary {'buy': Pipeline, 'sell': Pipeline}
         self.symbol = symbol
         self.params = params
         self.debug_mode = False 
@@ -513,8 +509,9 @@ class ResearchStrategy:
 
     def _check_revenge_guard(self, broker: BacktestBroker, current_time: datetime) -> bool:
         """
-        V20.14 FIX: Exponential Revenge Guard.
+        V20.18 FIX: Exponential Revenge Guard.
         Strictly enforces cooldowns after a loss and penalizes consecutive losses heavily.
+        Applies a tiny 5-minute breather after a win.
         """
         my_closed_trades = [t for t in broker.closed_positions if t.symbol == self.symbol and t.close_time is not None]
         if not my_closed_trades: return False
@@ -544,7 +541,7 @@ class ResearchStrategy:
             multiplier = 2 ** (consecutive_losses - 1)
             effective_cooldown_mins = self.cooldown_minutes * multiplier
         else:
-            effective_cooldown_mins = self.cooldown_minutes # Standard mandatory cooldown after a win/BE
+            effective_cooldown_mins = 5 # 5-minute breather after a win
             
         cooldown_expiry = close_time + timedelta(minutes=effective_cooldown_mins)
         return current_time < cooldown_expiry
@@ -658,7 +655,7 @@ class ResearchStrategy:
                 self.dynamic_ker_offset = min(0.0, self.dynamic_ker_offset + 0.001)
 
         # ============================================================
-        # B. DELAYED TRAINING
+        # B. DELAYED TRAINING (DUAL MODEL ASYMMETRY)
         # ============================================================
         log_ret = features.get('log_ret', 0.0)
         
@@ -668,27 +665,33 @@ class ResearchStrategy:
         )
         
         if resolved_labels:
-            for (stored_feats, optimal_label, optimal_ret, past_action, past_prob, past_ret, is_executed) in resolved_labels:
+            for (stored_feats, buy_label, sell_label, buy_ret, sell_ret, past_action, past_prob, past_ret, is_executed) in resolved_labels:
                 
+                if is_executed:
+                    if past_ret > 0: self.consecutive_losses = 0
+                    elif past_ret < 0: self.consecutive_losses += 1
+
                 w_pos = float(self.params.get('positive_class_weight', 1.0))
                 w_neg = float(self.params.get('negative_class_weight', 1.0))
-                base_weight = w_pos if optimal_label != 0 else w_neg
                 
-                ret_scalar = math.log1p(abs(optimal_ret) * 100.0)
-                ret_scalar = max(0.5, min(ret_scalar, 5.0))
-                
+                # Buy Model Training Weights
+                buy_base_weight = w_pos if buy_label == 1 else w_neg
+                buy_ret_scalar = math.log1p(abs(buy_ret) * 100.0)
+                buy_ret_scalar = max(0.5, min(buy_ret_scalar, 5.0))
                 hist_ker = stored_feats.get('ker', 0.5)
-                ker_weight = hist_ker * 2.0 
+                buy_final_weight = buy_base_weight * buy_ret_scalar * (hist_ker * 2.0)
                 
-                final_weight = base_weight * ret_scalar * ker_weight
-                
-                if optimal_label == 0:
-                    final_weight *= 0.25 
+                # Sell Model Training Weights
+                sell_base_weight = w_pos if sell_label == 1 else w_neg
+                sell_ret_scalar = math.log1p(abs(sell_ret) * 100.0)
+                sell_ret_scalar = max(0.5, min(sell_ret_scalar, 5.0))
+                sell_final_weight = sell_base_weight * sell_ret_scalar * (hist_ker * 2.0)
                 
                 clean_stored = {k: float(v) for k, v in stored_feats.items() if math.isfinite(v)}
                 
-                if ML_AVAILABLE:
-                    self.model.learn_one(clean_stored, optimal_label, sample_weight=final_weight)
+                if ML_AVAILABLE and isinstance(self.model, dict):
+                    self.model['buy'].learn_one(clean_stored, buy_label, sample_weight=buy_final_weight)
+                    self.model['sell'].learn_one(clean_stored, sell_label, sample_weight=sell_final_weight)
                 
                 if past_action != 0:
                     self.meta_labeler.update(clean_stored, primary_action=past_action, outcome_pnl=past_ret)
@@ -698,7 +701,7 @@ class ResearchStrategy:
                         self.calibrator_sell.update(past_prob, 1 if past_ret > 0 else 0)
 
         # ============================================================
-        # C. SMART SIGNAL MATRIX (V20.14 EV Protocol)
+        # C. SMART SIGNAL MATRIX (V20.18 Dual-Model EV Protocol)
         # ============================================================
         regime_label = "Neutral"
         proposed_action = 0 
@@ -711,29 +714,34 @@ class ResearchStrategy:
 
         clean_features = {k: float(v) for k, v in features.items() if math.isfinite(v)}
         
-        # --- 3-CLASS EV PROTOCOL ---
         prob_buy = 0.0
         prob_sell = 0.0
-        prob_hold = 1.0 
+        
         try:
-            if ML_AVAILABLE and self.model:
-                pred_proba = self.model.predict_proba_one(clean_features)
-                prob_buy = pred_proba.get(1, 0.0)
-                prob_sell = pred_proba.get(-1, 0.0)
-                prob_hold = pred_proba.get(0, 0.0)
+            if ML_AVAILABLE and self.model and isinstance(self.model, dict):
+                pred_proba_buy = self.model['buy'].predict_proba_one(clean_features)
+                prob_buy = pred_proba_buy.get(1, 0.0)
+                
+                pred_proba_sell = self.model['sell'].predict_proba_one(clean_features)
+                prob_sell = pred_proba_sell.get(1, 0.0)
             else:
-                prob_buy, prob_sell, prob_hold = 0.33, 0.33, 0.34
+                prob_buy, prob_sell = 0.5, 0.5
         except:
-            prob_buy, prob_sell, prob_hold = 0.0, 0.0, 1.0
+            prob_buy, prob_sell = 0.5, 0.5
 
         current_reward_target = max(self.optimized_reward_mult, 2.0)
         if regime_label == "TREND_BREAKOUT":
             current_reward_target = max(current_reward_target, 3.0)
 
         # PURE MATH: Is EV Positive? 
-        # EV = (WinRate * Reward) - ((1-WinRate) * Risk) > 0  => WinRate > Risk/(Risk+Reward)
         break_even_wr = 1.0 / (1.0 + current_reward_target)
-        required_prob = break_even_wr + 0.02 # V20.14 FIX: Require a strict 2% mathematical edge to filter weak entries
+        
+        streak = self.consecutive_losses
+        tilt_penalty = 0.03 * streak
+        
+        # V20.18 FIX: Use dynamic edge threshold from Optuna (defaults to strict 1%)
+        edge_thresh = self.params.get('model_edge_threshold', 0.01)
+        required_prob = break_even_wr + edge_thresh + tilt_penalty
         
         cal_prob_buy = self.calibrator_buy.calibrate(prob_buy)
         cal_prob_sell = self.calibrator_sell.calibrate(prob_sell)
@@ -744,7 +752,7 @@ class ResearchStrategy:
         # Select action purely based on highest positive edge
         if buy_edge > 0 and buy_edge >= sell_edge:
             proposed_action = 1
-            prob_success = prob_buy # Send raw probability to labeler state
+            prob_success = prob_buy 
             confidence = cal_prob_buy
         elif sell_edge > 0 and sell_edge > buy_edge:
             proposed_action = -1
@@ -752,7 +760,7 @@ class ResearchStrategy:
             confidence = cal_prob_sell
         else:
             proposed_action = 0
-            prob_success = prob_hold
+            prob_success = 0.0
             confidence = max(cal_prob_buy, cal_prob_sell)
 
         # ============================================================
@@ -813,8 +821,10 @@ class ResearchStrategy:
         # F. ML CONFIRMATION & EXECUTION
         # ============================================================
         try:
-            # We already calculated EV logic. Only Meta-Labeler remains.
-            meta_thresh = max(break_even_wr + 0.01, 0.20)
+            # V20.18: Let Optuna perfectly balance the Meta-Filter strictness
+            base_meta_thresh = self.params.get('meta_labeling_threshold', 0.50)
+            meta_thresh = max(base_meta_thresh + (0.02 * streak), 0.40)
+            
             is_profitable = self.meta_labeler.predict(clean_features, proposed_action, threshold=meta_thresh)
             if proposed_action != 0: self.meta_label_events += 1
 

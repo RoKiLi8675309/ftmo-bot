@@ -49,7 +49,7 @@ setup_logging("Research")
 log = logging.getLogger("Research")
 
 # =============================================================================
-# PHOENIX RESEARCH ENGINE V20.14 – WFO PIPELINE & TEARSHEET
+# PHOENIX RESEARCH ENGINE V20.18 – DUAL-MODEL ASYMMETRY PIPELINE
 # =============================================================================
 
 class EmojiCallback:
@@ -77,7 +77,7 @@ class EmojiCallback:
         if attrs.get('blown', False):
             icon = "💀" # Blown Account or Daily Breach
             status = "BLOWN"
-        elif dd > 4.0: # V20.14 FIX: Tightened Risk Warning to 4.0%
+        elif dd > 8.5: 
             icon = "⚠️" 
             status = "RISKY"
         elif attrs.get('pruned', False):
@@ -115,7 +115,7 @@ class EmojiCallback:
 
 class LocalAdaptiveImbalanceBarGenerator:
     """
-    V20.14 Parity: Local instance to prevent pickling errors in Loky workers.
+    V20.15 Parity: Local instance to prevent pickling errors in Loky workers.
     Contains the critical Fix for Data Starvation.
     """
     def __init__(self, symbol: str, initial_threshold: float = 10.0, alpha: float = 0.05):
@@ -173,7 +173,7 @@ class LocalAdaptiveImbalanceBarGenerator:
             self.current_buy_vol += (volume / 2)
             self.current_sell_vol += (volume / 2)
 
-        if abs(self.current_imbalance) >= self.expected_imbalance or self.ticks_in_bar >= 1000:
+        if abs(self.current_imbalance) >= self.expected_imbalance or self.ticks_in_bar >= 200:
             return self._finalize_bar(timestamp, price)
 
         return None
@@ -197,9 +197,7 @@ class LocalAdaptiveImbalanceBarGenerator:
         current_abs_imb = abs(self.current_imbalance)
         self.expected_imbalance = (self.alpha * current_abs_imb) + ((1 - self.alpha) * self.expected_imbalance)
         
-        # Capped ceiling at 2,000 instead of 50,000 to ensure we get dozens of bars per day 
-        # even if falling back to highly aggregated MT5 OHLCV data.
-        self.expected_imbalance = max(10.0, min(self.expected_imbalance, 2000.0))
+        self.expected_imbalance = max(2.0, min(self.expected_imbalance, 1000.0))
 
         self.current_imbalance = 0.0
         self.ticks_in_bar = 0
@@ -278,7 +276,6 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
         df = process_data_into_bars(symbol, n_ticks=train_candles)
         if df.empty: return
 
-        # V13.2 FIX: Split the dataframe into warmup and evaluation
         if len(df) > 500:
             warmup_df = df.head(500)
             eval_df = df.iloc[500:]
@@ -291,7 +288,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             params = CONFIG['online_learning'].copy()
             
             params['risk_management'] = CONFIG.get('risk_management', {}).copy()
-            params['risk_management']['sizing_method'] = 'risk_percentage' # Ensure scale
+            params['risk_management']['sizing_method'] = 'risk_percentage' 
             
             # 1. Hyperparameter Suggestions
             params['n_models'] = trial.suggest_int('n_models', space['n_models']['min'], space['n_models']['max'], step=space['n_models']['step'])
@@ -303,7 +300,10 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             params['entropy_threshold'] = trial.suggest_float('entropy_threshold', space['entropy_threshold']['min'], space['entropy_threshold']['max'])
             params['vpin_threshold'] = trial.suggest_float('vpin_threshold', space['vpin_threshold']['min'], space['vpin_threshold']['max'])
             
-            # --- V20.14: STRICT 1:2 R:R ENFORCEMENT ---
+            # V20.18 FIX: Meta-Filter tuning & Edge Tuning
+            params['meta_labeling_threshold'] = trial.suggest_float('meta_labeling_threshold', space['meta_labeling_threshold']['min'], space['meta_labeling_threshold']['max'])
+            params['model_edge_threshold'] = trial.suggest_float('model_edge_threshold', space['model_edge_threshold']['min'], space['model_edge_threshold']['max'])
+            
             sl_atr_mult = float(CONFIG.get('risk_management', {}).get('stop_loss_atr_mult', 1.5))
             min_barrier = max(sl_atr_mult * 2.0, float(space['tbm_barrier_width']['min']))
             max_barrier = max(min_barrier + 0.5, float(space['tbm_barrier_width']['max']))
@@ -316,9 +316,7 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
                 'min_profit_pips': min_profit_pips 
             }
             
-            # V20.14 ML UNCHOKE FIX: Dead parameter `min_calibrated_probability` successfully removed from search space.
-            
-            risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0050, 0.0075, 0.0100])
+            risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0100, 0.0150, 0.0200])
             params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
             trial.set_user_attr("risk_pct", params['risk_per_trade_percent'] * 100)
             
@@ -326,9 +324,10 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             init_bal = CONFIG['env'].get('initial_balance', 50000.0)
             
             broker = BacktestBroker(initial_balance=init_bal)
+            
+            # V20.18 FIX: model is now a dict containing 'buy' and 'sell' pipelines
             model = pipeline_inst.get_fresh_model(params)
             
-            # V13.2 FIX: Pre-load the warmup buffer directly into the strategy
             strategy = ResearchStrategy(model, symbol, params, historical_df=warmup_df)
             
             for index, row in eval_df.iterrows():
@@ -357,29 +356,29 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             trial.set_user_attr("risk_reward_ratio", pm['risk_reward_ratio'])
             trial.set_user_attr("sqn", sqn)
 
-            if total_ret <= 0:
-                score = total_ret # Pure penalty
-            else:
-                safe_sqn = max(0.1, sqn)
-                safe_pf = max(0.1, min(pf, 10.0))
-                score = total_ret * safe_pf * safe_sqn
-
             daily_hits = getattr(broker, 'daily_limit_hits', 0)
             total_blown = getattr(broker, 'is_totally_blown', False)
             
-            # V20.14 EXPERT TRADER PROTOCOL: Tighter DD penalty (4% max drawdown limit for FTMO buffer to force safer strategies)
-            if total_blown or max_dd > 0.040 or daily_hits > 0:
+            if total_blown or max_dd > 0.085 or daily_hits > 0:
                 trial.set_user_attr("blown", True)
-                dd_penalty = (max_dd - 0.040) * 1000000.0 if max_dd > 0.040 else 0
+                dd_penalty = (max_dd - 0.085) * 1000000.0 if max_dd > 0.085 else 0
                 daily_penalty = daily_hits * 20000.0
                 return -20000.0 + total_ret - dd_penalty - daily_penalty
 
-            min_trades = max(5, int(CONFIG.get('wfo', {}).get('min_trades_optimization', 8)))
+            min_trades = max(5, int(CONFIG.get('wfo', {}).get('min_trades_optimization', 20)))
             if trades < min_trades:
                 trial.set_user_attr("pruned", True)
-                trade_shortfall = (min_trades - trades) * 100.0 
-                return -1000.0 + total_ret - trade_shortfall 
+                trade_shortfall = (min_trades - trades) * 500.0 
+                return -5000.0 + total_ret - trade_shortfall 
                 
+            if total_ret <= 0:
+                score = total_ret 
+            else:
+                safe_sqn = max(0.1, sqn)
+                safe_pf = max(0.1, min(pf, 10.0))
+                volume_multiplier = math.log10(max(10, trades))
+                score = total_ret * safe_pf * safe_sqn * volume_multiplier
+
             return score
 
         study_name = f"study_{symbol}"
@@ -436,7 +435,6 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 params['risk_management'] = CONFIG.get('risk_management', {}).copy()
                 params['risk_management']['sizing_method'] = 'risk_percentage'
                 
-                # V20.14 FIX: Align WFO exactly with standard optimization bounds
                 params['n_models'] = trial.suggest_int('n_models', space['n_models']['min'], space['n_models']['max'], step=space['n_models']['step'])
                 params['grace_period'] = trial.suggest_int('grace_period', space['grace_period']['min'], space['grace_period']['max'], step=space['grace_period']['step'])
                 params['delta'] = trial.suggest_float('delta', float(space['delta']['min']), float(space['delta']['max']), log=space['delta'].get('log', True))
@@ -445,6 +443,8 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 
                 params['entropy_threshold'] = trial.suggest_float('entropy_threshold', space['entropy_threshold']['min'], space['entropy_threshold']['max'])
                 params['vpin_threshold'] = trial.suggest_float('vpin_threshold', space['vpin_threshold']['min'], space['vpin_threshold']['max'])
+                params['meta_labeling_threshold'] = trial.suggest_float('meta_labeling_threshold', space['meta_labeling_threshold']['min'], space['meta_labeling_threshold']['max'])
+                params['model_edge_threshold'] = trial.suggest_float('model_edge_threshold', space['model_edge_threshold']['min'], space['model_edge_threshold']['max'])
                 
                 sl_atr_mult = float(CONFIG.get('risk_management', {}).get('stop_loss_atr_mult', 1.5))
                 min_barrier = max(sl_atr_mult * 2.0, float(space['tbm_barrier_width']['min']))
@@ -458,16 +458,13 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                     'min_profit_pips': min_profit_pips 
                 }
                 
-                # V20.14 ML UNCHOKE FIX: Dead parameter `min_calibrated_probability` successfully removed from WFO search space.
-                
-                risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0050, 0.0075, 0.0100])
+                risk_options = CONFIG.get('wfo', {}).get('risk_per_trade_options', [0.0100, 0.0150, 0.0200])
                 params['risk_per_trade_percent'] = trial.suggest_categorical('risk_per_trade_percent', risk_options)
                 
                 pipeline = ResearchPipeline()
                 broker = BacktestBroker(initial_balance=50000.0)
                 model = pipeline.get_fresh_model(params)
                 
-                # V13.2 FIX: Separate Train DF into Warmup and Eval inside WFO
                 if len(df_train) > 500:
                     train_warmup = df_train.head(500)
                     train_eval = df_train.iloc[500:]
@@ -494,23 +491,23 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 daily_hits = getattr(broker, 'daily_limit_hits', 0)
                 total_blown = getattr(broker, 'is_totally_blown', False)
                 
-                # V20.14 EXPERT TRADER PROTOCOL: Tighter DD penalty
-                if total_blown or max_dd > 0.040 or daily_hits > 0:
-                    dd_penalty = (max_dd - 0.040) * 1000000.0 if max_dd > 0.040 else 0
+                if total_blown or max_dd > 0.085 or daily_hits > 0:
+                    dd_penalty = (max_dd - 0.085) * 1000000.0 if max_dd > 0.085 else 0
                     daily_penalty = daily_hits * 20000.0
                     return -20000.0 + total_ret - dd_penalty - daily_penalty
                 
-                min_trades = max(5, int(CONFIG.get('wfo', {}).get('min_trades_optimization', 8)))
+                min_trades = max(5, int(CONFIG.get('wfo', {}).get('min_trades_optimization', 20)))
                 if trades < min_trades: 
-                    trade_shortfall = (min_trades - trades) * 100.0
-                    return -1000.0 + total_ret - trade_shortfall
+                    trade_shortfall = (min_trades - trades) * 500.0
+                    return -5000.0 + total_ret - trade_shortfall
                     
                 if total_ret <= 0:
                     score = total_ret
                 else:
                     safe_sqn = max(0.1, sqn)
                     safe_pf = max(0.1, min(pf, 10.0))
-                    score = total_ret * safe_pf * safe_sqn
+                    volume_multiplier = math.log10(max(10, trades))
+                    score = total_ret * safe_pf * safe_sqn * volume_multiplier
                 return score
 
             study.optimize(wfo_objective, n_trials=n_trials)
@@ -532,7 +529,6 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
             broker_oos = BacktestBroker(initial_balance=50000.0)
             model_oos = pipe.get_fresh_model(final_p)
             
-            # V13.2 FIX: WFO DATA LEAKAGE & STARVATION CURE
             strat_oos = ResearchStrategy(model_oos, symbol, final_p, historical_df=df_train)
             
             for idx, row in df_test.iterrows():
@@ -563,7 +559,7 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         
         if not study.trials: return
 
-        min_trades = max(5, int(CONFIG.get('wfo', {}).get('min_trades_optimization', 8))) 
+        min_trades = max(5, int(CONFIG.get('wfo', {}).get('min_trades_optimization', 20))) 
         valid = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE 
                  and t.value is not None and t.user_attrs.get('trades', 0) >= min_trades
                  and not t.user_attrs.get('blown', False)]
@@ -571,7 +567,6 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         if valid:
             best_trial = max(valid, key=lambda t: t.value)
             
-            # --- V20.14 STRICT VETO GUARD ---
             pnl = best_trial.user_attrs.get('pnl', 0.0)
             if best_trial.value < 0 or pnl <= 0:
                 log.warning(f"🛑 VETO GUARD: Best valid trial for {symbol} lost money (PnL: ${pnl:.2f}). PRUNING PAIR.")
@@ -579,7 +574,6 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
                 
             log.info(f"✅ Selected Robust Trial {best_trial.number} (Trades: {best_trial.user_attrs.get('trades')}, Score: {best_trial.value:.2f})")
         else:
-            # --- V20.14 STRICT VETO GUARD ---
             log.warning(f"🛑 VETO GUARD: No trials survived safety constraints for {symbol}. PRUNING PAIR.")
             return
             
@@ -597,17 +591,19 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         final_p['tbm']['barrier_width'] = best_params.get('barrier_width', 3.0)
         final_p['tbm']['min_profit_pips'] = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
         
-        # V20.14 FIX: Ensure WFO parameters transfer to final model configuration perfectly
         if 'horizon_minutes' in best_params:
             final_p['tbm']['horizon_minutes'] = best_params['horizon_minutes']
         if 'drift_threshold' in best_params:
             final_p['tbm']['drift_threshold'] = best_params['drift_threshold']
+        if 'meta_labeling_threshold' in best_params:
+            final_p['meta_labeling_threshold'] = best_params['meta_labeling_threshold']
+        if 'model_edge_threshold' in best_params:
+            final_p['model_edge_threshold'] = best_params['model_edge_threshold']
         
         pipe = ResearchPipeline()
         model = pipe.get_fresh_model(final_p)
         broker = BacktestBroker(initial_balance=CONFIG['env'].get('initial_balance', 50000.0))
         
-        # V13.2 FIX: Finalize model training using pre-load separation
         if len(df) > 500:
             warmup_df = df.head(500)
             eval_df = df.iloc[500:]
@@ -622,7 +618,10 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
             broker.process_pending(snap)
             strat.on_data(snap, broker)
 
-        for name, obj in [("river_pipeline", strat.model), ("meta_model", strat.meta_labeler), 
+        # V20.18 FIX: Save Dual Models independently
+        for name, obj in [("river_pipeline_buy", strat.model['buy']), 
+                          ("river_pipeline_sell", strat.model['sell']),
+                          ("meta_model", strat.meta_labeler), 
                           ("calibrators", {'buy': strat.calibrator_buy, 'sell': strat.calibrator_sell}),
                           ("labeler", strat.labeler)]: 
             with open(models_dir / f"{name}_{symbol}.pkl", "wb") as f:
@@ -646,18 +645,28 @@ class ResearchPipeline:
         log_cores = psutil.cpu_count(logical=True)
         self.total_cores = max(1, log_cores - 2) if log_cores else 10
 
-    def get_fresh_model(self, params: Dict[str, Any] = None) -> Any:
+    def get_fresh_model(self, params: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        V20.18 FIX: Returns a dictionary containing two completely independent models.
+        """
         if params is None: params = CONFIG['online_learning']
-        base_clf = forest.ARFClassifier(
-            n_models=params.get('n_models', 50), seed=42,
-            grace_period=params.get('grace_period', 200),
-            delta=params.get('delta', 1e-5),
-            lambda_value=params.get('lambda_value', 10),
-            metric=metrics.LogLoss(),
-            warning_detector=drift.ADWIN(delta=0.001),
-            drift_detector=drift.ADWIN(delta=1e-5)
-        )
-        return compose.Pipeline(preprocessing.StandardScaler(), base_clf)
+        
+        def create_pipeline():
+            base_clf = forest.ARFClassifier(
+                n_models=params.get('n_models', 50), seed=42,
+                grace_period=params.get('grace_period', 200),
+                delta=params.get('delta', 1e-5),
+                lambda_value=params.get('lambda_value', 10),
+                metric=metrics.LogLoss(),
+                warning_detector=drift.ADWIN(delta=0.001),
+                drift_detector=drift.ADWIN(delta=1e-5)
+            )
+            return compose.Pipeline(preprocessing.StandardScaler(), base_clf)
+            
+        return {
+            'buy': create_pipeline(),
+            'sell': create_pipeline()
+        }
 
     def calculate_performance_metrics(self, trade_log: List[Dict], symbol: str, initial_capital=50000.0) -> Dict[str, float]:
         m = {k: 0.0 for k in ['risk_reward_ratio', 'total_pnl', 'total_pips', 'max_dd_pct', 'win_rate', 'total_trades', 'profit_factor', 'sharpe', 'sortino', 'sqn', 'expectancy']}
@@ -703,7 +712,7 @@ class ResearchPipeline:
         return m
 
     def run_training(self, fresh_start: bool = False):
-        log.info(f"{LogSymbols.TRAINING} STARTING V20.14 SWARM OPTIMIZATION...")
+        log.info(f"{LogSymbols.TRAINING} STARTING V20.18 DUAL-MODEL SWARM OPTIMIZATION...")
         if fresh_start:
             for p in self.models_dir.glob("*.pkl"): p.unlink()
             for s in self.symbols:
@@ -736,22 +745,25 @@ class ResearchPipeline:
             df = process_data_into_bars(s, n_ticks=self.train_candles)
             if df.empty: return []
             
-            model_path = self.models_dir / f"river_pipeline_{s}.pkl"
-            # V20.14 FIX: If the model doesn't exist (because the Veto Guard pruned it), skip backtest gracefully.
-            if not model_path.exists():
+            # V20.18 FIX: Load Dual Models
+            buy_model_path = self.models_dir / f"river_pipeline_buy_{s}.pkl"
+            sell_model_path = self.models_dir / f"river_pipeline_sell_{s}.pkl"
+            if not buy_model_path.exists() or not sell_model_path.exists():
                 return []
                 
-            with open(model_path, "rb") as f: model = pickle.load(f)
+            with open(buy_model_path, "rb") as f: model_buy = pickle.load(f)
+            with open(sell_model_path, "rb") as f: model_sell = pickle.load(f)
+            model = {'buy': model_buy, 'sell': model_sell}
+            
             params = CONFIG['online_learning'].copy()
             with open(self.models_dir / f"best_params_{s}.json", "r") as f: params.update(json.load(f))
             
             params['risk_management'] = CONFIG.get('risk_management', {}).copy()
-            params['risk_management']['sizing_method'] = 'risk_percentage' # Ensure dynamically sized
+            params['risk_management']['sizing_method'] = 'risk_percentage' 
             if 'tbm' not in params: params['tbm'] = CONFIG['online_learning'].get('tbm', {}).copy()
             params['tbm']['barrier_width'] = params.get('barrier_width', 3.0)
             params['tbm']['min_profit_pips'] = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
 
-            # V13.2 FIX: Final Verification backtest also needs preload to match production
             if len(df) > 500:
                 warmup_df = df.head(500)
                 eval_df = df.iloc[500:]
@@ -770,7 +782,7 @@ class ResearchPipeline:
 
     def _generate_report(self, trade_log: List[Dict]):
         """
-        V20.14: Generates a beautiful, FTMO-centric console Tearsheet.
+        V20.18: Generates a beautiful, FTMO-centric console Tearsheet.
         """
         if not trade_log:
             log.warning("No trades generated during backtest. Report aborted.")
@@ -806,7 +818,7 @@ class ResearchPipeline:
         
         report = f"""
         =================================================================
-        🦅 PROJECT PHOENIX V20.14 - FTMO TEARSHEET
+        🦅 PROJECT PHOENIX V20.18 - FTMO TEARSHEET
         =================================================================
         Initial Balance:      ${initial_balance:,.2f}
         Final Equity:         ${initial_balance + total_pnl:,.2f}
@@ -826,7 +838,6 @@ class ResearchPipeline:
         =================================================================
         """
         
-        # We explicitly print this so it stands out massively in the WSL console
         print(report)
         log.info("FTMO Tearsheet generated.")
         

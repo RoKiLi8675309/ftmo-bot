@@ -1,15 +1,12 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V20.10 (ML UNCHOKE PROTOCOL)
+# config.yaml – PROJECT PHOENIX V20.18 (DUAL-MODEL ASYMMETRY PROTOCOL)
 # STATUS: LIVE TRADING | TARGET: PASS FTMO CHALLENGE (10% / 90 DAYS)
 #
-# STRATEGY FIXES (V20.10):
-# 1. ML UNCHOKE: Removed rigid 55% confidence floor. Sizing dynamically utilizes 
-#    mathematical break-even probabilities based on 1:3 R:R targets.
-# 2. LATENCY GUARD REWRITE: Pipeline latency now evaluated using publish_time 
-#    rather than market tick silence to prevent False Positive drops.
-# 3. WFO OPTIMIZATION: Scrubbed dead search space dimensions for faster convergence.
-# 4. ADX UNCHOKE: Hardcoded ADX threshold to 0.0 to pass control purely to the ML model.
-# 5. EXPERT COOLDOWN: 60-minute mandatory loss cooldown to prevent machine-gunning.
+# STRATEGY FIXES (V20.18):
+# 1. DUAL MODELS: Replaced 3-class logic with independent Buy/Sell models.
+# 2. EDGE TUNING: Added model_edge_threshold to Optuna to tune strictness.
+# 3. WFO BALANCE: min_trades_optimization set to 20 for statistical balance.
+# 4. SPREAD TRAP CURE: Minimum stop loss floor maintained at 20.0 pips.
 # =============================================================================
 
 # --- 🌍 ENVIRONMENT SPECIFIC ---
@@ -125,7 +122,7 @@ features:
     
   adx:
     period: 14
-    threshold: 0.0 # V20.10 FIX: Hardcoded to 0.0 for ML Freedom Protocol (Unchoked)
+    threshold: 0.0 # Hardcoded to 0.0 for ML Freedom Protocol
   
   cyclical_time: true
   session_awareness: true
@@ -137,8 +134,6 @@ phoenix_strategy:
   regime_enforcement: "DISABLED" 
   
   asset_regime_map:
-    # V20.9 FIX: All tradable assets must be treated as Trend Breakout 
-    # to mathematically satisfy the 1:2 R:R constraint.
     GBPJPY: "TREND_BREAKOUT" 
     USDJPY: "TREND_BREAKOUT"
     EURJPY: "TREND_BREAKOUT"
@@ -162,7 +157,6 @@ phoenix_strategy:
   max_relative_volume: 35.0          
   volume_gate_ratio: 0.7            
   aggressor_threshold: 0.55          
-  ml_confirmation_threshold: 0.55     # Replaced by dynamic break-even math in python logic     
   choppiness_threshold: 65.0       
   
   vpin_bucket_size: 1000
@@ -194,12 +188,19 @@ optimization_search_space:
   vpin_threshold:
     min: 0.80 
     max: 0.95
+    
+  meta_labeling_threshold:
+    min: 0.40
+    max: 0.70
+    
+  model_edge_threshold: # V20.18 FIX: Allow Swarm to tune the strictness of the required edge
+    min: 0.01
+    max: 0.05
   
   tbm_barrier_width:
-    min: 2.0  # FORCE 1:2 R:R Minimum
-    max: 4.0  
+    min: 1.5  
+    max: 3.5  
   tbm_horizon_minutes:
-    # V20.9 FIX: Drastically increased to let winners run. (12h to 48h)
     min: 720  
     max: 2880  
     step: 120
@@ -211,19 +212,19 @@ optimization_search_space:
 risk_management:
   account_currency: "USD"
   
-  max_daily_loss_pct: 0.040 # Hardened to 4.0% to provide a 1% safety buffer against FTMO limits
+  max_daily_loss_pct: 0.040 # 4.0% to provide a 1% safety buffer against FTMO limits
   
   sizing_method: "risk_percentage" 
   fixed_lot_size: 0.01        
   
-  base_risk_per_trade_percent: 0.0050  # Base Risk: 0.5% per trade
-  scaled_risk_percent: 0.0075          # Scaled Risk: 0.75% when in profit buffer
+  base_risk_per_trade_percent: 0.0100  # 1.0% per trade to hit FTMO targets
+  scaled_risk_percent: 0.0150          # 1.5% when in profit buffer
   
-  loss_cooldown_minutes: 60  # V20.10 FIX: Mandatory 1-hour walk-away to prevent machine gunning
+  loss_cooldown_minutes: 15  # Base 15m. Exponential multiplier will scale this up dynamically on losses.
   min_margin_level_percent: 200.0
 
   pyramiding:
-    enabled: false # Disabled to strictly enforce 1 trade per pair to prevent overexposure
+    enabled: false 
     max_adds: 0 
     add_on_profit_r: 1.0  
     risk_per_add_percent: 0.0025 
@@ -250,14 +251,13 @@ risk_management:
   min_lot_size: 0.01
   
   stop_loss_atr_mult: 1.5        
-  take_profit_atr_mult: 3.0      # 1:2 Risk to Reward Ratio Baseline
+  take_profit_atr_mult: 3.0      
   
   trailing_stop:
-    # V20.9 Fix: We use the Python Engine's custom structural trail now.
     enabled: true        
     activation_r: 0.8        
-    trail_trigger_r: 1.5        
-    trail_dist_r: 0.5     
+    trail_trigger_r: 2.0     
+    trail_dist_r: 1.0        
   
   risk_timezone: "Europe/Athens"
   
@@ -277,12 +277,11 @@ risk_management:
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
   
-  min_stop_loss_pips: 20.0 # V20.10 FIX: Escape the Spread Trap with more breathing room
+  min_stop_loss_pips: 20.0 
 
 # --- 📈 TRADING PORTFOLIO ---
 trading:
   symbols:
-    # 8 Pairs Fully Restored
     - "EURJPY"  
     - "GBPUSD"  
     - "USDJPY"  
@@ -293,7 +292,6 @@ trading:
     - "AUDUSD"
   
   auxiliary_symbols:
-    # Context streaming
     - "NZDUSD"  
     - "USDCHF"  
     
@@ -315,7 +313,7 @@ online_learning:
   max_features: 'sqrt'    
   metric: "LogLoss"        
   
-  burn_in_periods: 20    # Allows features to fully saturate
+  burn_in_periods: 20    
   
   volatility_gate:
     enabled: true
@@ -324,12 +322,10 @@ online_learning:
   positive_class_weight: 1.0 
   negative_class_weight: 1.0
   
-  meta_labeling_threshold: 0.50 
-  
   tbm:
     horizon_minutes: 1440        
     barrier_width: 3.0        
-    min_profit_pips: 40.0    # V20.9 FIX: Raised to 40 pips to absolutely dwarf spreads
+    min_profit_pips: 40.0    
     drift_threshold: 1.5 
   
   learning_horizon_sec: 900 
@@ -373,7 +369,6 @@ wfo:
   n_trials: 100
   train_years: 2
   test_months: 6
-  min_trades_optimization: 8 # Prevent the Optimizer from falling back to blown/toxic trials
+  min_trades_optimization: 20 # V20.18 FIX: Lowered to 20 for statistical balance 
   
-  # V20.9 FIX: Pushed risk options to 0.5% and 1.0% to actually clear the 10% FTMO target
-  risk_per_trade_options: [0.0050, 0.0075, 0.0100]
+  risk_per_trade_options: [0.0100, 0.0150, 0.0200]

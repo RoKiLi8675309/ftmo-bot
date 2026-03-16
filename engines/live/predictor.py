@@ -13,13 +13,13 @@ from typing import Dict, Any, List, Optional, Tuple
 import numpy as np 
 import pandas as pd
 
-# Third-Party ML Imports
+# Third-Party ML Imports (Use Conda for installation)
 try:
     from river import forest, compose, preprocessing, metrics, drift, linear_model, optim
-    ML_AVAILABLE = True  # <-- FIX: Define ML_AVAILABLE on successful import
+    ML_AVAILABLE = True
 except ImportError:
     print("CRITICAL: 'river' library not found. Install with: conda install -c conda-forge river")
-    ML_AVAILABLE = False # <-- FIX: Define ML_AVAILABLE on failure
+    ML_AVAILABLE = False
     import sys
     sys.exit(1)
 
@@ -45,7 +45,14 @@ class Signal:
         self.meta_data = meta_data
         self.id = signal_id or str(uuid.uuid4())
 
+# =============================================================================
+# V20.18 MATHEMATICAL PARITY CLASSES (DUAL-MODEL ASYMMETRY PROTOCOL)
+# =============================================================================
+
 class ProbabilityCalibrator:
+    """
+    Platt Scaling Calibrator adapted for swing trading confidence.
+    """
     def __init__(self, window: int = 1000):
         self.calibrator = None
         if ML_AVAILABLE:
@@ -82,6 +89,9 @@ class ProbabilityCalibrator:
             return raw_prob
 
 class MetaLabeler:
+    """
+    Secondary model that learns when the primary model is likely to be right or wrong.
+    """
     def __init__(self):
         self.model = None
         self.buffer = deque(maxlen=1000)
@@ -99,7 +109,7 @@ class MetaLabeler:
         if not ML_AVAILABLE or primary_action == 0:
             return
         
-        # 1 = Profit, 0 = Loss.
+        # This is where NOISE is filtered. 1 = Profit, 0 = Loss.
         y_meta = 1 if outcome_pnl > 0 else 0
         
         if y_meta == 1:
@@ -150,6 +160,9 @@ class MetaLabeler:
         return clean
 
 class AdaptiveTripleBarrier:
+    """
+    SPREAD TRAP CURE & DUAL ASYMMETRY LABELING.
+    """
     def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.5, reward_mult: float = 3.0, 
                  drift_threshold: float = 0.75, horizon_type: str = 'TIME', horizon_value: float = 0.0):
         self.buffer = deque()
@@ -199,8 +212,8 @@ class AdaptiveTripleBarrier:
         feats_copy['min_profit_pct'] = min_profit_pct
 
         self.buffer.append({
-            'signal_id': signal_id,
-            'is_executed': False,
+            'signal_id': signal_id, 
+            'is_executed': False, 
             'features': feats_copy,
             'entry': entry_price,
             'buy_tp': buy_tp,
@@ -220,7 +233,7 @@ class AdaptiveTripleBarrier:
 
     def resolve_labels(self, current_high: float, current_low: float, current_close: float = None, 
                        current_volume: float = 0.0, current_log_ret: float = 0.0,
-                       current_timestamp: float = 0.0) -> List[Tuple[Dict[str, float], int, float, int, float, float, bool]]:
+                       current_timestamp: float = 0.0) -> List[Tuple[Dict[str, float], int, int, float, float, int, float, float, bool]]:
         resolved = []
         active = deque()
         if current_close is None: current_close = (current_high + current_low) / 2.0
@@ -248,11 +261,9 @@ class AdaptiveTripleBarrier:
             buy_status = 0
             sell_status = 0
 
-            # Evaluate VIRTUAL BUY
             if current_low <= trade['buy_sl']: buy_status = -1
             elif current_high >= trade['buy_tp']: buy_status = 1
             
-            # Evaluate VIRTUAL SELL
             if current_high >= trade['sell_sl']: sell_status = -1
             elif current_low <= trade['sell_tp']: sell_status = 1
 
@@ -262,7 +273,6 @@ class AdaptiveTripleBarrier:
                 spread_pct = trade['spread_pct']
                 comm_pct = trade['comm_pct']
 
-                # Calculate Net Return (BUY) with Slippage
                 if buy_status == 1: 
                     buy_ret = (trade['buy_tp'] - trade['entry']) / trade['entry'] - spread_pct - comm_pct
                 elif buy_status == -1: 
@@ -270,7 +280,6 @@ class AdaptiveTripleBarrier:
                 elif is_expired: 
                     buy_ret = (current_close - trade['entry']) / trade['entry'] - spread_pct - comm_pct
 
-                # Calculate Net Return (SELL) with Slippage
                 if sell_status == 1: 
                     sell_ret = (trade['entry'] - trade['sell_tp']) / trade['entry'] - spread_pct - comm_pct
                 elif sell_status == -1: 
@@ -278,16 +287,8 @@ class AdaptiveTripleBarrier:
                 elif is_expired: 
                     sell_ret = (trade['entry'] - current_close) / trade['entry'] - spread_pct - comm_pct
 
-                # 3-CLASS LOGIC (Including Hold = 0)
-                if buy_ret > 0 and buy_ret > sell_ret:
-                    optimal_label = 1
-                    optimal_ret = buy_ret
-                elif sell_ret > 0 and sell_ret > buy_ret:
-                    optimal_label = -1
-                    optimal_ret = sell_ret
-                else:
-                    optimal_label = 0
-                    optimal_ret = max(buy_ret, sell_ret)
+                buy_label = 1 if buy_ret > 0 else 0
+                sell_label = 1 if sell_ret > 0 else 0
                     
                 proposed_action = trade.get('proposed_action', 0)
                 pred_proba = trade.get('pred_proba', 0.5)
@@ -298,12 +299,14 @@ class AdaptiveTripleBarrier:
                 elif proposed_action == -1:
                     proposed_ret = sell_ret
 
-                is_executed = trade.get('is_executed', False)
+                is_executed = trade.get('is_executed', False) 
 
                 resolved.append((
                     trade['features'], 
-                    optimal_label, 
-                    optimal_ret,
+                    buy_label,
+                    sell_label,
+                    buy_ret,
+                    sell_ret,
                     proposed_action,
                     pred_proba,
                     proposed_ret,
@@ -316,12 +319,12 @@ class AdaptiveTripleBarrier:
         return resolved
 
 # =============================================================================
-# STRATEGY ENGINE
+# STRATEGY ENGINE (LIVE PREDICTOR)
 # =============================================================================
 
 class MultiAssetPredictor:
     """
-    Live prediction engine applying V20.14 Conviction Math.
+    Live prediction engine applying V20.18 Dual-Model EV Math.
     """
     def __init__(self, symbols: List[str], threshold_map: Optional[Dict[str, float]] = None):
         self.symbols = symbols
@@ -375,7 +378,7 @@ class MultiAssetPredictor:
         self.hurst_veto = 0.65 
         self.rvol_trigger = 0.8 
         self.max_rvol_thresh = 35.0 
-        self.adx_threshold = 0.0 # V20.10 FIX: Hardcoded to 0.0 for ML Freedom Protocol
+        self.adx_threshold = 0.0 
 
         for s in symbols:
             s_risk = risk_mult_conf
@@ -407,9 +410,9 @@ class MultiAssetPredictor:
                 horizon_type=s_horizon_type, horizon_value=s_horizon_val
             )
 
-        self.models = {}
-        self.meta_labelers = {}
-        self.calibrators = {}
+        self.models = {s: {'buy': None, 'sell': None} for s in symbols}
+        self.meta_labelers = {s: MetaLabeler() for s in symbols}
+        self.calibrators = {s: {'buy': ProbabilityCalibrator(), 'sell': ProbabilityCalibrator()} for s in symbols}
         
         self.burn_in_counters = {s: 0 for s in symbols}
         self.burn_in_limit = 5
@@ -463,23 +466,25 @@ class MultiAssetPredictor:
         selected_metric = metric_map.get(conf.get('metric', 'LogLoss'), metrics.LogLoss())
         
         for sym in self.symbols:
-            base_clf = forest.ARFClassifier(
-                n_models=conf.get('n_models', 50),
-                grace_period=conf['grace_period'],
-                delta=conf['delta'],
-                split_criterion='gini',
-                leaf_prediction='mc',
-                max_features=conf.get('max_features', 'sqrt'),
-                lambda_value=conf.get('lambda_value', 10),
-                metric=selected_metric,
-                warning_detector=drift.ADWIN(delta=conf.get('warning_delta', 0.001)),
-                drift_detector=drift.ADWIN(delta=conf['delta'])
-            )
-            
-            self.models[sym] = compose.Pipeline(
-                preprocessing.StandardScaler(),
-                base_clf
-            )
+            def create_pipeline():
+                base_clf = forest.ARFClassifier(
+                    n_models=conf.get('n_models', 50),
+                    grace_period=conf['grace_period'],
+                    delta=conf['delta'],
+                    split_criterion='gini',
+                    leaf_prediction='mc',
+                    max_features=conf.get('max_features', 'sqrt'),
+                    lambda_value=conf.get('lambda_value', 10),
+                    metric=selected_metric,
+                    warning_detector=drift.ADWIN(delta=conf.get('warning_delta', 0.001)),
+                    drift_detector=drift.ADWIN(delta=conf['delta'])
+                )
+                return compose.Pipeline(preprocessing.StandardScaler(), base_clf)
+
+            self.models[sym] = {
+                'buy': create_pipeline(),
+                'sell': create_pipeline()
+            }
             self.meta_labelers[sym] = MetaLabeler()
             self.calibrators[sym] = {'buy': ProbabilityCalibrator(), 'sell': ProbabilityCalibrator()}
 
@@ -489,7 +494,10 @@ class MultiAssetPredictor:
         for sym in self.symbols:
             try:
                 df = load_real_data(sym, n_candles=500000, days=30)
-                if df.empty: continue
+                if df is None or df.empty: 
+                    # V20.18 FIX: explicitly warn if DB is empty to inform user of cold start.
+                    logger.warning(f"⚠️ {sym} Warm-Up Data Empty! Model will start completely cold and learn dynamically.")
+                    continue
                 
                 calibrated_thresh = self.threshold_map.get(sym)
                 config_thresh = CONFIG['data'].get('volume_bar_threshold', 10.0)
@@ -565,7 +573,8 @@ class MultiAssetPredictor:
         
         fe = self.feature_engineers[symbol]
         labeler = self.labelers[symbol]
-        model = self.models[symbol]
+        model_buy = self.models[symbol]['buy']
+        model_sell = self.models[symbol]['sell']
         
         self.closes_buffer[symbol].append(bar_close)
         self.volume_buffer[symbol].append(bar_volume)
@@ -603,24 +612,26 @@ class MultiAssetPredictor:
         )
         
         if resolved_labels:
-            for (stored_feats, optimal_label, optimal_ret, past_action, past_prob, past_ret, is_executed) in resolved_labels:
+            for (stored_feats, buy_label, sell_label, buy_ret, sell_ret, past_action, past_prob, past_ret, is_executed) in resolved_labels:
                 clean_stored = {k: float(v) for k, v in stored_feats.items() if math.isfinite(v)}
                 
                 w_pos = float(CONFIG['online_learning'].get('positive_class_weight', 1.0))
                 w_neg = float(CONFIG['online_learning'].get('negative_class_weight', 1.0))
-                base_weight = w_pos if optimal_label != 0 else w_neg
                 
-                ret_scalar = math.log1p(abs(optimal_ret) * 100.0)
-                ret_scalar = max(0.5, min(ret_scalar, 5.0))
+                buy_base_weight = w_pos if buy_label == 1 else w_neg
+                buy_ret_scalar = math.log1p(abs(buy_ret) * 100.0)
+                buy_ret_scalar = max(0.5, min(buy_ret_scalar, 5.0))
                 hist_ker = stored_feats.get('ker', 0.5)
-                final_weight = base_weight * ret_scalar * (hist_ker * 2.0)
+                buy_final_weight = buy_base_weight * buy_ret_scalar * (hist_ker * 2.0)
                 
-                # Boost Hold weighting to recognize chop
-                if optimal_label == 0:
-                    final_weight *= 0.25 
+                sell_base_weight = w_pos if sell_label == 1 else w_neg
+                sell_ret_scalar = math.log1p(abs(sell_ret) * 100.0)
+                sell_ret_scalar = max(0.5, min(sell_ret_scalar, 5.0))
+                sell_final_weight = sell_base_weight * sell_ret_scalar * (hist_ker * 2.0)
                 
                 if ML_AVAILABLE:
-                    model.learn_one(clean_stored, optimal_label, sample_weight=final_weight)
+                    model_buy.learn_one(clean_stored, buy_label, sample_weight=buy_final_weight)
+                    model_sell.learn_one(clean_stored, sell_label, sample_weight=sell_final_weight)
                 
                 if past_action != 0:
                     self.meta_labelers[symbol].update(clean_stored, primary_action=past_action, outcome_pnl=past_ret)
@@ -628,82 +639,6 @@ class MultiAssetPredictor:
                         self.calibrators[symbol]['buy'].update(past_prob, 1 if past_ret > 0 else 0)
                     elif past_action == -1:
                         self.calibrators[symbol]['sell'].update(past_prob, 1 if past_ret > 0 else 0)
-        
-        current_atr = features.get('atr', 0.001)
-        parkinson = features.get('parkinson_vol', 0.0)
-        
-        pip_val, _ = RiskManager.get_pip_info(symbol)
-        if pip_val <= 0: pip_val = 0.0001
-        
-        spread_pips = float(CONFIG.get('forensic_audit', {}).get('spread_pips', {}).get(symbol, 1.6))
-        spread_in_price = spread_pips * pip_val
-        comm_in_price = 0.5 * pip_val
-        
-        min_stop_pips = float(CONFIG.get('risk_management', {}).get('min_stop_loss_pips', 20.0))
-        min_stop_dist = min_stop_pips * pip_val
-        min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
-        min_profit_dist = min_profit_pips * pip_val
-
-        is_trending = hurst >= self.hurst_breakout
-        proposed_action = 0
-        
-        clean_features = {k: float(v) for k, v in features.items() if math.isfinite(v)}
-        
-        # --- V20.14 FIX: 3-CLASS EV PROTOCOL ---
-        prob_buy = 0.0
-        prob_sell = 0.0
-        prob_hold = 1.0 
-        try:
-            if model:
-                pred_proba = model.predict_proba_one(clean_features)
-                prob_buy = pred_proba.get(1, 0.0)
-                prob_sell = pred_proba.get(-1, 0.0)
-                prob_hold = pred_proba.get(0, 0.0)
-            else:
-                prob_buy, prob_sell, prob_hold = 0.33, 0.33, 0.34
-        except:
-            prob_buy, prob_sell, prob_hold = 0.0, 0.0, 1.0
-
-        current_reward_target = max(self.labelers[symbol].reward_mult, 2.0)
-        if is_trending:
-            current_reward_target = max(current_reward_target, 3.0)
-
-        break_even_wr = 1.0 / (1.0 + current_reward_target)
-        
-        # EXPERT TRADER TILT PREVENTION: 
-        # For every consecutive loss, the mathematical edge required to enter a new trade increases by +3%.
-        streak = self.consecutive_losses.get(symbol, 0)
-        tilt_penalty = 0.03 * streak
-        
-        # V20.14 FIX: Enforce a strict minimum 2% edge + tilt penalty
-        required_prob = break_even_wr + 0.02 + tilt_penalty
-        
-        cal_prob_buy = self.calibrators[symbol]['buy'].calibrate(prob_buy)
-        cal_prob_sell = self.calibrators[symbol]['sell'].calibrate(prob_sell)
-        
-        buy_edge = cal_prob_buy - required_prob
-        sell_edge = cal_prob_sell - required_prob
-
-        if buy_edge > 0 and buy_edge >= sell_edge:
-            proposed_action = 1
-            prob_success = prob_buy 
-        elif sell_edge > 0 and sell_edge > buy_edge:
-            proposed_action = -1
-            prob_success = prob_sell 
-        else:
-            proposed_action = 0
-            prob_success = prob_hold
-
-        signal_id = str(uuid.uuid4())
-
-        self.labelers[symbol].add_trade_opportunity(
-            features=features, entry_price=bar_close, current_atr=current_atr, 
-            timestamp=bar_ts, parkinson_vol=parkinson,
-            min_stop_dist=min_stop_dist, spread_in_price=spread_in_price,
-            comm_in_price=comm_in_price, min_profit_dist=min_profit_dist,
-            proposed_action=proposed_action, pred_proba=prob_success,
-            override_reward_mult=current_reward_target, signal_id=signal_id
-        )
 
     def _calculate_golden_trio(self, symbol: str) -> Tuple[float, float, float]:
         closes = self.closes_buffer[symbol]
@@ -766,7 +701,8 @@ class MultiAssetPredictor:
 
         fe = self.feature_engineers[symbol]
         labeler = self.labelers[symbol]
-        model = self.models[symbol]
+        model_buy = self.models[symbol]['buy']
+        model_sell = self.models[symbol]['sell']
         meta_labeler = self.meta_labelers[symbol]
         stats = self.rejection_stats[symbol]
         
@@ -836,7 +772,7 @@ class MultiAssetPredictor:
             )
             
             if resolved_labels:
-                for (stored_feats, optimal_label, optimal_ret, past_action, past_prob, past_ret, is_executed) in resolved_labels:
+                for (stored_feats, buy_label, sell_label, buy_ret, sell_ret, past_action, past_prob, past_ret, is_executed) in resolved_labels:
                     
                     if is_executed:
                         if past_ret > 0: self.consecutive_losses[symbol] = 0
@@ -844,20 +780,23 @@ class MultiAssetPredictor:
 
                     w_pos = float(CONFIG['online_learning'].get('positive_class_weight', 1.0))
                     w_neg = float(CONFIG['online_learning'].get('negative_class_weight', 1.0))
-                    base_weight = w_pos if optimal_label != 0 else w_neg
                     
-                    ret_scalar = math.log1p(abs(optimal_ret) * 100.0)
-                    ret_scalar = max(0.5, min(ret_scalar, 5.0))
+                    buy_base_weight = w_pos if buy_label == 1 else w_neg
+                    buy_ret_scalar = math.log1p(abs(buy_ret) * 100.0)
+                    buy_ret_scalar = max(0.5, min(buy_ret_scalar, 5.0))
                     hist_ker = stored_feats.get('ker', 0.5)
-                    final_weight = base_weight * ret_scalar * (hist_ker * 2.0)
+                    buy_final_weight = buy_base_weight * buy_ret_scalar * (hist_ker * 2.0)
                     
-                    if optimal_label == 0:
-                        final_weight *= 0.25
+                    sell_base_weight = w_pos if sell_label == 1 else w_neg
+                    sell_ret_scalar = math.log1p(abs(sell_ret) * 100.0)
+                    sell_ret_scalar = max(0.5, min(sell_ret_scalar, 5.0))
+                    sell_final_weight = sell_base_weight * sell_ret_scalar * (hist_ker * 2.0)
                     
                     clean_stored = {k: float(v) for k, v in stored_feats.items() if math.isfinite(v)}
                     
-                    if optimal_label != 0:
-                        model.learn_one(clean_stored, optimal_label, sample_weight=final_weight)
+                    if ML_AVAILABLE:
+                        model_buy.learn_one(clean_stored, buy_label, sample_weight=buy_final_weight)
+                        model_sell.learn_one(clean_stored, sell_label, sample_weight=sell_final_weight)
                     
                     if past_action != 0:
                         meta_labeler.update(clean_stored, primary_action=past_action, outcome_pnl=past_ret)
@@ -865,6 +804,7 @@ class MultiAssetPredictor:
                             self.calibrators[symbol]['buy'].update(past_prob, 1 if past_ret > 0 else 0)
                         elif past_action == -1:
                             self.calibrators[symbol]['sell'].update(past_prob, 1 if past_ret > 0 else 0)
+                            
         except Exception as e:
             logger.error(f"Training Loop Crash: {e}", exc_info=True)
 
@@ -888,20 +828,23 @@ class MultiAssetPredictor:
 
         clean_features = {k: float(v) for k, v in features.items() if math.isfinite(v)}
         
-        # --- V20.14 FIX: 3-CLASS EV PROTOCOL ---
+        # --- V20.18 FIX: DUAL MODEL EV PROTOCOL (With Cold Start Prevention) ---
         prob_buy = 0.0
         prob_sell = 0.0
-        prob_hold = 1.0 
+        
         try:
-            if model:
-                pred_proba = model.predict_proba_one(clean_features)
-                prob_buy = pred_proba.get(1, 0.0)
-                prob_sell = pred_proba.get(-1, 0.0)
-                prob_hold = pred_proba.get(0, 0.0)
+            if ML_AVAILABLE:
+                pred_proba_buy = model_buy.predict_proba_one(clean_features)
+                # If the model is completely untrained, it returns an empty dict {}. 
+                # We default to 0.5 (neutral prior) to prevent a perpetual cold-start lockup.
+                prob_buy = pred_proba_buy.get(1, 0.5 if not pred_proba_buy else 0.0)
+                
+                pred_proba_sell = model_sell.predict_proba_one(clean_features)
+                prob_sell = pred_proba_sell.get(1, 0.5 if not pred_proba_sell else 0.0)
             else:
-                prob_buy, prob_sell, prob_hold = 0.33, 0.33, 0.34
+                prob_buy, prob_sell = 0.5, 0.5
         except:
-            prob_buy, prob_sell, prob_hold = 0.0, 0.0, 1.0
+            prob_buy, prob_sell = 0.5, 0.5
 
         current_reward_target = max(self.labelers[symbol].reward_mult, 2.0)
         if is_trending:
@@ -909,13 +852,11 @@ class MultiAssetPredictor:
 
         break_even_wr = 1.0 / (1.0 + current_reward_target)
         
-        # EXPERT TRADER TILT PREVENTION: 
-        # For every consecutive loss, the mathematical edge required to enter a new trade increases by +3%.
         streak = self.consecutive_losses.get(symbol, 0)
         tilt_penalty = 0.03 * streak
         
-        # V20.14 FIX: Enforce a strict minimum 2% edge + tilt penalty
-        required_prob = break_even_wr + 0.02 + tilt_penalty
+        edge_thresh = self.optimized_params.get(symbol, {}).get('model_edge_threshold', 0.01)
+        required_prob = break_even_wr + edge_thresh + tilt_penalty
         
         cal_prob_buy = self.calibrators[symbol]['buy'].calibrate(prob_buy)
         cal_prob_sell = self.calibrators[symbol]['sell'].calibrate(prob_sell)
@@ -923,6 +864,7 @@ class MultiAssetPredictor:
         buy_edge = cal_prob_buy - required_prob
         sell_edge = cal_prob_sell - required_prob
 
+        # Select action purely based on highest positive edge
         if buy_edge > 0 and buy_edge >= sell_edge:
             proposed_action = 1
             prob_success = prob_buy 
@@ -933,7 +875,7 @@ class MultiAssetPredictor:
             confidence = cal_prob_sell
         else:
             proposed_action = 0
-            prob_success = prob_hold
+            prob_success = 0.0
             confidence = max(cal_prob_buy, cal_prob_sell)
 
         signal_id = str(uuid.uuid4())
@@ -954,8 +896,12 @@ class MultiAssetPredictor:
         if is_bridging_gap:
             return Signal(symbol, "HOLD", 0.0, {"reason": "Bridging Gap"})
 
+        # V20.18 FIX: Added occasional diagnostic logging so you can see the math working 
+        # when the bot holds due to negative expected value.
         if proposed_action == 0:
             stats["Negative EV (Math Hold)"] += 1
+            if stats["Negative EV (Math Hold)"] % 50 == 0:
+                logger.info(f"📐 {symbol} GATE: Negative EV | BuyEdge: {buy_edge:.2f} | SellEdge: {sell_edge:.2f}")
             return Signal(symbol, "HOLD", 0.0, {"reason": "Negative EV"})
 
         effective_ker_thresh = max(0.0001, self.ker_floor + self.dynamic_ker_offsets[symbol])
@@ -966,8 +912,9 @@ class MultiAssetPredictor:
             return Signal(symbol, "HOLD", 0.0, {"reason": "Low KER"})
 
         try:
-            # V20.14 FIX: Meta-Labeler MUST beat 55%, increasing by +2% for each loss in the streak.
-            meta_thresh = max(break_even_wr + 0.05 + (0.02 * streak), 0.55)
+            base_meta_thresh = self.optimized_params.get(symbol, {}).get('meta_labeling_threshold', 0.50)
+            meta_thresh = max(base_meta_thresh + (0.02 * streak), 0.40)
+            
             is_profitable = meta_labeler.predict(clean_features, proposed_action, threshold=meta_thresh)
             
             open_positions = context_data.get('positions', {}) if context_data else {}
@@ -1077,7 +1024,9 @@ class MultiAssetPredictor:
                 except Exception as e:
                     logger.debug(f"Skipped saving {filename}: {e}")
 
-            safe_dump(self.models[sym], f"river_pipeline_{sym}.pkl")
+            safe_dump(self.models[sym]['buy'], f"river_pipeline_buy_{sym}.pkl")
+            safe_dump(self.models[sym]['sell'], f"river_pipeline_sell_{sym}.pkl")
+            
             safe_dump(self.meta_labelers[sym], f"meta_model_{sym}.pkl")
             safe_dump(self.calibrators[sym], f"calibrators_{sym}.pkl")
             safe_dump(self.feature_engineers[sym], f"feature_engineer_{sym}.pkl")
@@ -1107,16 +1056,23 @@ class MultiAssetPredictor:
     def _load_state(self):
         loaded_count = 0
         for sym in self.symbols:
-            model_path = self.models_dir / f"river_pipeline_{sym}.pkl"
+            buy_model_path = self.models_dir / f"river_pipeline_buy_{sym}.pkl"
+            sell_model_path = self.models_dir / f"river_pipeline_sell_{sym}.pkl"
             meta_path = self.models_dir / f"meta_model_{sym}.pkl"
             fe_path = self.models_dir / f"feature_engineer_{sym}.pkl"
             buf_path = self.models_dir / f"buffers_{sym}.pkl"
             cal_path = self.models_dir / f"calibrators_{sym}.pkl"
             labeler_path = self.models_dir / f"labeler_{sym}.pkl"
             
-            if model_path.exists():
+            if buy_model_path.exists():
                 try:
-                    with open(model_path, "rb") as f: self.models[sym] = pickle.load(f)
+                    with open(buy_model_path, "rb") as f: self.models[sym]['buy'] = pickle.load(f)
+                    loaded_count += 1
+                except Exception: pass
+                
+            if sell_model_path.exists():
+                try:
+                    with open(sell_model_path, "rb") as f: self.models[sym]['sell'] = pickle.load(f)
                     loaded_count += 1
                 except Exception: pass
             
@@ -1159,4 +1115,4 @@ class MultiAssetPredictor:
                     logger.warning(f"Failed to load buffers for {sym}: {e}")
             
         if loaded_count > 0:
-            logger.info(f"{LogSymbols.SUCCESS} Loaded {loaded_count} existing models.")
+            logger.info(f"{LogSymbols.SUCCESS} Loaded {loaded_count} existing models (Dual-Model Format).")
