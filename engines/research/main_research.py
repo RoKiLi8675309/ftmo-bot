@@ -21,14 +21,11 @@ import optuna
 import numpy as np
 import pandas as pd
 import psutil
-import yaml
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
 from joblib import Parallel, delayed
-from river import compose, preprocessing, forest, metrics, ensemble, drift
+from river import compose, preprocessing, forest, metrics, drift
 
 # Ensure project root is in sys.path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +37,9 @@ if project_root not in sys.path:
 try:
     from engines.research.backtester import BacktestBroker, MarketSnapshot
     from engines.research.strategy import ResearchStrategy
-    from shared import CONFIG, setup_logging, load_real_data, LogSymbols, AdaptiveImbalanceBarGenerator, RiskManager
+    from shared import CONFIG, setup_logging, load_real_data, LogSymbols, RiskManager
+    # V20.18 DRY FIX: Import the unified generator to ensure total feature parity with Live Engine
+    from shared.financial.features import AdaptiveImbalanceBarGenerator
 except ImportError as e:
     print(f"CRITICAL: Failed to import dependencies. Ensure you are running from the project root or 'shared' is accessible.\nError: {e}")
     sys.exit(1)
@@ -112,106 +111,6 @@ class EmojiCallback:
             else:
                 log.info(f"\n🔎 FAILURE AUTOPSY (Trial {trial.number}): {autopsy_text}\n" + ("-" * 80))
 
-
-class LocalAdaptiveImbalanceBarGenerator:
-    """
-    V20.15 Parity: Local instance to prevent pickling errors in Loky workers.
-    Contains the critical Fix for Data Starvation.
-    """
-    def __init__(self, symbol: str, initial_threshold: float = 10.0, alpha: float = 0.05):
-        self.symbol = symbol
-        self.current_imbalance = 0.0
-        self.ticks_in_bar = 0
-        self.open_price = None
-        self.high_price = -float('inf')
-        self.low_price = float('inf')
-        self.close_price = None
-        self.volume_accum = 0.0
-        self.start_timestamp = None
-        self.current_buy_vol = 0.0
-        self.current_sell_vol = 0.0
-        self.vwap_sum = 0.0
-        self.prev_price = None
-        self.prev_tick_rule = 1 
-        self.expected_imbalance = initial_threshold
-        self.alpha = alpha 
-
-    def process_tick(self, price: float, volume: float, timestamp: float, 
-                     external_buy_vol: float = 0.0, external_sell_vol: float = 0.0) -> Optional[dict]:
-        if self.prev_price is None:
-            self.prev_price = price
-            self.open_price = price
-            self.start_timestamp = timestamp
-            return None
-
-        if external_buy_vol > 0 or external_sell_vol > 0:
-            tick_rule = 1 if external_buy_vol > external_sell_vol else -1
-            if external_buy_vol == external_sell_vol: tick_rule = 0
-            self.prev_tick_rule = tick_rule
-        else:
-            price_change = price - self.prev_price
-            if price_change != 0:
-                tick_rule = np.sign(price_change)
-                self.prev_tick_rule = tick_rule
-            else:
-                tick_rule = self.prev_tick_rule
-
-        self.current_imbalance += (tick_rule * volume)
-        self.ticks_in_bar += 1
-        self.volume_accum += volume
-        self.vwap_sum += (price * volume)
-        
-        if self.open_price is None: self.open_price = price
-        self.high_price = max(self.high_price, price)
-        self.low_price = min(self.low_price, price)
-        self.close_price = price
-        self.prev_price = price
-
-        if tick_rule == 1: self.current_buy_vol += volume
-        elif tick_rule == -1: self.current_sell_vol += volume
-        else:
-            self.current_buy_vol += (volume / 2)
-            self.current_sell_vol += (volume / 2)
-
-        if abs(self.current_imbalance) >= self.expected_imbalance or self.ticks_in_bar >= 200:
-            return self._finalize_bar(timestamp, price)
-
-        return None
-
-    def _finalize_bar(self, timestamp: float, close_price: float) -> dict:
-        vwap = self.vwap_sum / self.volume_accum if self.volume_accum > 0 else close_price
-
-        bar = {
-            'timestamp': timestamp,
-            'open': self.open_price,
-            'high': self.high_price,
-            'low': self.low_price,
-            'close': close_price,
-            'volume': self.volume_accum,
-            'vwap': vwap,
-            'tick_count': self.ticks_in_bar,
-            'buy_vol': self.current_buy_vol,
-            'sell_vol': self.current_sell_vol
-        }
-
-        current_abs_imb = abs(self.current_imbalance)
-        self.expected_imbalance = (self.alpha * current_abs_imb) + ((1 - self.alpha) * self.expected_imbalance)
-        
-        self.expected_imbalance = max(2.0, min(self.expected_imbalance, 1000.0))
-
-        self.current_imbalance = 0.0
-        self.ticks_in_bar = 0
-        self.open_price = None
-        self.high_price = -float('inf')
-        self.low_price = float('inf')
-        self.volume_accum = 0.0
-        self.vwap_sum = 0.0
-        self.current_buy_vol = 0.0
-        self.current_sell_vol = 0.0
-        self.start_timestamp = timestamp
-
-        return bar
-
 def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2)
     if raw_ticks.empty: return pd.DataFrame()
@@ -229,7 +128,8 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     final_thresh = config_threshold 
     
     for attempt in range(4):
-        gen = LocalAdaptiveImbalanceBarGenerator(symbol=symbol, initial_threshold=current_thresh, alpha=alpha)
+        # V20.18 FIX: Using the unified AdaptiveImbalanceBarGenerator
+        gen = AdaptiveImbalanceBarGenerator(symbol=symbol, initial_threshold=current_thresh, alpha=alpha)
         count = 0
         for row in cal_df.itertuples():
             p = getattr(row, 'price', getattr(row, 'close', None))
@@ -243,12 +143,13 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
             final_thresh = current_thresh
             break
         else:
-            current_thresh = max(2.0, current_thresh * 0.25)
+            # V20.18 Parity: Slower backoff (x0.5) and higher minimum (10.0)
+            current_thresh = max(10.0, current_thresh * 0.5)
             final_thresh = current_thresh
 
-    log.info(f"📊 {symbol}: Calibrated Imbalance Threshold to {final_thresh:.2f}")
+    log.info(f"📊 {symbol}: Calibrated Imbalance Threshold to {final_thresh:.2f} (V20.18 Parity)")
 
-    gen = LocalAdaptiveImbalanceBarGenerator(symbol=symbol, initial_threshold=final_thresh, alpha=alpha)
+    gen = AdaptiveImbalanceBarGenerator(symbol=symbol, initial_threshold=final_thresh, alpha=alpha)
     bars = []
     for row in raw_ticks.itertuples():
         p = getattr(row, 'price', getattr(row, 'close', None))
@@ -256,8 +157,22 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
         t = getattr(row, 'Index', getattr(row, 'time', None))
         ts_val = t.timestamp() if isinstance(t, (datetime, pd.Timestamp)) else float(t)
         if p is None: continue
+        
         bar = gen.process_tick(p, v, ts_val, 0.0, 0.0)
-        if bar: bars.append(bar)
+        if bar: 
+            # Convert VolumeBar dataclass back to dict format for dataframe construction
+            bars.append({
+                'timestamp': bar.timestamp,
+                'open': bar.open,
+                'high': bar.high,
+                'low': bar.low,
+                'close': bar.close,
+                'volume': bar.volume,
+                'vwap': bar.vwap,
+                'tick_count': bar.tick_count,
+                'buy_vol': bar.buy_vol,
+                'sell_vol': bar.sell_vol
+            })
 
     if not bars: return pd.DataFrame()
     df_bars = pd.DataFrame(bars)

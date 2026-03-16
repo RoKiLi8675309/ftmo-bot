@@ -28,7 +28,8 @@ class TradeDispatcher:
     to the Execution Engine (Windows Producer) via Redis Streams.
     
     UPDATED: FORCE MARKET EXECUTION ONLY.
-    V20.5 FIX: INJECTS STRICT 1:2 R:R METAL LAYER GUARD & SANITIZES SL/TP FLOATS.
+    V20.18 FIX: INJECTS STRICT 1.40 R:R METAL LAYER GUARD & SANITIZES SL/TP FLOATS
+    TO MATCH PRODUCER PARITY AND PREVENT DISPATCHER CHOKING.
     """
     def __init__(self, stream_mgr: RedisStreamManager, pending_tracker: dict[str, Any], lock: threading.RLock):
         """
@@ -53,7 +54,7 @@ class TradeDispatcher:
             order_id = uuid.uuid4()
             short_id = str(order_id)[:8]
             
-            # --- V20.5 FIX: STRICT R:R ENFORCEMENT AT THE DISPATCH LAYER ---
+            # --- V20.18 FIX: STRICT R:R ENFORCEMENT AT THE DISPATCH LAYER ---
             # Even if the logic layer requests a trade, we mathematically verify it here 
             # before it ever touches Redis or MT5.
             if trade.action in ["BUY", "SELL"] and trade.stop_loss > 0 and trade.take_profit > 0:
@@ -61,9 +62,10 @@ class TradeDispatcher:
                 reward_dist = abs(trade.take_profit - trade.entry_price)
                 if risk_dist > 0:
                     rr_ratio = reward_dist / risk_dist
-                    # 1.90 allows for minor float rounding from the 2.0x target
-                    if rr_ratio < 1.90:
-                        logger.error(f"🛑 REJECTED BY DISPATCHER: {trade.symbol} R:R Ratio is {rr_ratio:.2f} (Target >= 2.0). Blocked to prevent spread bleed.")
+                    # Target >= 1.5. Blocked at 1.40 to permit minor spread slippage variance.
+                    # This now PERFECTLY matches the Windows Producer parity.
+                    if rr_ratio < 1.40:
+                        logger.error(f"🛑 REJECTED BY DISPATCHER: {trade.symbol} {trade.action} R:R Ratio is {rr_ratio:.2f} (Target >= 1.5). Blocked to prevent spread bleed.")
                         return  # Abort dispatch immediately
 
             # --- V20.2 FIX: PERSIST INITIAL RISK DISTANCE ---
@@ -149,6 +151,8 @@ class TradeDispatcher:
                 "entry_price": final_price,
                 "price": final_price, 
                 
+                "intended_price": "{:.5f}".format(trade.entry_price),
+                
                 # CRITICAL MAPPING: Producer looks for 'sl' and 'tp', NOT 'stop_loss'
                 # Enforce string format to prevent scientific notation (e.g. 1e-5)
                 "sl": "{:.5f}".format(safe_sl),
@@ -206,7 +210,8 @@ class TradeDispatcher:
                         
                         for pos in open_positions.values():
                             # Check Symbol AND Comment match
-                            if pos.get('symbol') == symbol and short_id in pos.get('comment', ''):
+                            comment = str(pos.get('comment', ''))
+                            if pos.get('symbol') == symbol and short_id in comment:
                                 is_zombie_match = True
                                 break
                     
@@ -224,8 +229,8 @@ class TradeDispatcher:
                     try:
                         short_id = str(oid)[:8]
                         self.stream_mgr.r.hdel("bot:initial_risk", short_id)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Failed to clear Redis hash for {short_id}: {e}")
                         
                     del self.pending_tracker[oid]
         

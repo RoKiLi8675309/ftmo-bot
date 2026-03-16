@@ -9,12 +9,16 @@ import io
 import copy
 import threading
 import numpy as np
+import pandas as pd
 from collections import deque
 from typing import Dict, Any, Optional, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+import pytz
 
 # Shared Config
 from shared.core.config import CONFIG
+from shared.domain.models import VolumeBar
 
 # Numba for high-performance JIT compilation (Guarded)
 try:
@@ -40,7 +44,7 @@ except ImportError:
 
 # River / Sklearn imports (Guarded for Windows Producer compatibility)
 try:
-    from river import linear_model, forest, metrics, optim
+    from river import linear_model, forest, metrics, optim, drift, compose, preprocessing
     from sklearn.isotonic import IsotonicRegression
     from sklearn.exceptions import ConvergenceWarning
     ML_AVAILABLE = True
@@ -326,6 +330,165 @@ class MicrostructureAnalyzer:
         self.ofi_smoothed = (self.alpha * current_imbalance) + ((1 - self.alpha) * self.ofi_smoothed)
         return self.ofi_smoothed
 
+class AdaptiveImbalanceBarGenerator:
+    """
+    V20.18 Parity: Generates Tick Imbalance Bars (TIBs).
+    Replaces time-based sampling with information-driven sampling.
+    """
+    def __init__(self, symbol: str, initial_threshold: float = 10.0, alpha: float = 0.05):
+        self.symbol = symbol
+        
+        # State variables for the current bar
+        self.current_imbalance = 0.0
+        self.ticks_in_bar = 0
+        self.open_price = None
+        self.high_price = -float('inf')
+        self.low_price = float('inf')
+        self.close_price = None
+        self.volume_accum = 0.0
+        self.start_timestamp = None
+        
+        # Extended VPIN states
+        self.current_buy_vol = 0.0
+        self.current_sell_vol = 0.0
+        self.vwap_sum = 0.0
+
+        # State for Tick Rule (Aggressor Logic)
+        self.prev_price = None
+        self.prev_tick_rule = 1  # Default to Buy (1)
+
+        # Adaptive Threshold Logic (EWMA)
+        self.expected_imbalance = initial_threshold
+        self.alpha = alpha   # Forgetting factor for EWMA
+
+    def process_tick(self, price: float, volume: float, timestamp: float, 
+                     external_buy_vol: float = 0.0, external_sell_vol: float = 0.0) -> Optional[VolumeBar]:
+        """
+        Ingest a single tick and determine if a bar should be closed based on Imbalance.
+        """
+        # Initialize if first tick
+        if self.prev_price is None:
+            self.prev_price = price
+            self.open_price = price
+            self.start_timestamp = timestamp
+            return None
+
+        # 1. Apply Tick Rule (Infer Aggressor)
+        if external_buy_vol > 0 or external_sell_vol > 0:
+            tick_rule = 1 if external_buy_vol > external_sell_vol else -1
+            if external_buy_vol == external_sell_vol: tick_rule = 0
+            self.prev_tick_rule = tick_rule
+        else:
+            price_change = price - self.prev_price
+            if price_change != 0:
+                tick_rule = np.sign(price_change)
+                self.prev_tick_rule = tick_rule
+            else:
+                tick_rule = self.prev_tick_rule
+
+        # 2. Update Accumulators
+        self.current_imbalance += (tick_rule * volume)
+        self.ticks_in_bar += 1
+        self.volume_accum += volume
+        self.vwap_sum += (price * volume)
+        
+        if self.open_price is None: self.open_price = price
+        self.high_price = max(self.high_price, price)
+        self.low_price = min(self.low_price, price)
+        self.close_price = price
+        self.prev_price = price
+
+        if tick_rule == 1:
+            self.current_buy_vol += volume
+        elif tick_rule == -1:
+            self.current_sell_vol += volume
+        else:
+            self.current_buy_vol += (volume / 2)
+            self.current_sell_vol += (volume / 2)
+
+        # 3. Check Threshold Condition
+        if abs(self.current_imbalance) >= self.expected_imbalance or self.ticks_in_bar >= 1000:
+            return self._finalize_bar(timestamp, price)
+
+        return None
+
+    def _finalize_bar(self, timestamp: float, close_price: float) -> VolumeBar:
+        if isinstance(timestamp, (float, int)):
+            dt_ts = datetime.fromtimestamp(timestamp, pytz.utc)
+        else:
+            dt_ts = timestamp
+
+        vwap = self.vwap_sum / self.volume_accum if self.volume_accum > 0 else close_price
+
+        bar = VolumeBar(
+            timestamp=dt_ts,
+            open=self.open_price,
+            high=self.high_price,
+            low=self.low_price,
+            close=close_price,
+            volume=self.volume_accum,
+            vwap=vwap,
+            tick_count=self.ticks_in_bar,
+            buy_vol=self.current_buy_vol,
+            sell_vol=self.current_sell_vol
+        )
+
+        current_abs_imb = abs(self.current_imbalance)
+        self.expected_imbalance = (self.alpha * current_abs_imb) + ((1 - self.alpha) * self.expected_imbalance)
+        self.expected_imbalance = max(10.0, min(self.expected_imbalance, 10000.0))
+
+        self.current_imbalance = 0.0
+        self.ticks_in_bar = 0
+        self.open_price = None
+        self.high_price = -float('inf')
+        self.low_price = float('inf')
+        self.volume_accum = 0.0
+        self.vwap_sum = 0.0
+        self.current_buy_vol = 0.0
+        self.current_sell_vol = 0.0
+        self.start_timestamp = timestamp
+
+        return bar
+
+def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 10.0, alpha: Optional[float] = None) -> List[Dict[str, Any]]:
+    bars = []
+    if alpha is None:
+        alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
+
+    gen = AdaptiveImbalanceBarGenerator(symbol="BATCH", initial_threshold=volume_threshold, alpha=alpha)
+    
+    for row in tick_df.itertuples():
+        price = getattr(row, 'price', getattr(row, 'close', None))
+        vol = getattr(row, 'volume', 1.0)
+        ts = getattr(row, 'Index', getattr(row, 'time', None))
+        b_vol = getattr(row, 'buy_vol', 0.0)
+        s_vol = getattr(row, 'sell_vol', 0.0)
+        
+        if price is None: continue
+        
+        if isinstance(ts, (datetime, pd.Timestamp)):
+            ts_val = ts.timestamp()
+        else:
+            ts_val = float(ts)
+
+        bar = gen.process_tick(price, vol, ts_val, b_vol, s_vol)
+        
+        if bar:
+            bars.append({
+                'timestamp': bar.timestamp,
+                'open': bar.open,
+                'high': bar.high,
+                'low': bar.low,
+                'close': bar.close,
+                'volume': bar.volume,
+                'vwap': bar.vwap,
+                'tick_count': bar.tick_count,
+                'buy_vol': bar.buy_vol,
+                'sell_vol': bar.sell_vol
+            })
+            
+    return bars
+
 # --- 3. REGIME INDICATORS ---
 
 class KaufmanEfficiencyRatio:
@@ -406,7 +569,7 @@ class RegimeDetector:
                 self.model = hmm.GaussianHMM(
                     n_components=n_states,
                     covariance_type="diag",
-                    n_iter=100,
+                    n_iter=20, # V20.18 FIX: Reduced from 100 to prevent GIL blocking tick processing
                     random_state=42,
                     init_params="stmc",
                     verbose=False,
@@ -418,16 +581,12 @@ class RegimeDetector:
                 self.model = None
 
     def __getstate__(self):
-        """Prepares object for pickling by stripping non-serializable threading objects."""
         state = self.__dict__.copy()
-        if 'lock' in state:
-            del state['lock']
-        if 'executor' in state:
-            del state['executor']
+        if 'lock' in state: del state['lock']
+        if 'executor' in state: del state['executor']
         return state
 
     def __setstate__(self, state):
-        """Restores the object after being unpickled."""
         self.__dict__.update(state)
         self.lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=1)
@@ -446,20 +605,16 @@ class RegimeDetector:
         try:
             data = np.array(self.returns).reshape(-1, 1)
             
-            # MATH HARDENING: Check variance. If data is flat, HMM will crash.
             if np.var(data) < 1e-9 or np.isnan(data).any():
                 return self.last_regime
 
-            # Retrain periodically or early on
             should_fit = (self.fit_counter % 50 == 0) or (self.fit_counter < 200 and self.fit_counter % 10 == 0)
             
             if should_fit and not self.is_fitting:
                 self.is_fitting = True
                 fit_data = data.copy()
-                # Execute heavy math off the main event loop thread
                 self.executor.submit(self._async_fit, fit_data)
             
-            # Predict current state (Non-blocking Thread-Safe Read)
             with self.lock:
                 if hasattr(self.model, 'startprob_'):
                     raw_state = int(self.model.predict(data[-1].reshape(1, -1))[0])
@@ -475,30 +630,25 @@ class RegimeDetector:
             return self.last_regime
             
     def _async_fit(self, data):
-        """Background thread execution to prevent tick starvation."""
         try:
             with self.lock:
                 model_clone = copy.deepcopy(self.model)
             
-            # HARD RESET LOGIC: If model fails to converge repeatedly, scramble it.
             if self.fit_failures > 5:
                 model_clone.init_params = "stmc" # Re-init weights
             elif hasattr(model_clone, 'startprob_'):
                 model_clone.init_params = "" # Keep weights, refine them
                 
-            # Suppress Stdout/Stderr from C-level HMM code
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     model_clone.fit(data)
             
             if model_clone.monitor_.converged:
-                # Sort states by Variance (Low Var = 0 = Quiet, High Var = 1 = Volatile)
                 variances = np.array([np.mean(np.diag(c)) for c in model_clone.covars_])
                 sort_order = np.argsort(variances)
                 new_map = {old: new for new, old in enumerate(sort_order)}
                 
-                # Hot-swap the model back into the main thread
                 with self.lock:
                     self.model = model_clone
                     self.state_map = new_map
@@ -534,22 +684,18 @@ class StreamingVortex:
             self.prev_close = close
             return 1.0, 1.0
 
-        # 1. True Range
         tr1 = high - low
         tr2 = abs(high - self.prev_close)
         tr3 = abs(low - self.prev_close)
         tr = max(tr1, tr2, tr3)
         
-        # 2. Vortex Movements
         vm_plus = abs(high - self.prev_low)
         vm_minus = abs(low - self.prev_high)
         
-        # 3. Update Buffers
         self.tr_buffer.append(tr)
         self.vm_plus_buffer.append(vm_plus)
         self.vm_minus_buffer.append(vm_minus)
         
-        # 4. Update State
         self.prev_high = high
         self.prev_low = low
         self.prev_close = close
@@ -585,15 +731,13 @@ class StreamingChoppiness:
             self.prev_close = close
             self.high_buffer.append(high)
             self.low_buffer.append(low)
-            return 50.0 # Neutral start
+            return 50.0
 
-        # 1. True Range
         tr1 = high - low
         tr2 = abs(high - self.prev_close)
         tr3 = abs(low - self.prev_close)
         tr = max(tr1, tr2, tr3)
         
-        # 2. Update Buffers
         self.tr_buffer.append(tr)
         self.high_buffer.append(high)
         self.low_buffer.append(low)
@@ -602,7 +746,6 @@ class StreamingChoppiness:
         if len(self.tr_buffer) < self.period:
             return 50.0
             
-        # 3. Calculate CHOP
         sum_tr = sum(self.tr_buffer)
         max_hi = max(self.high_buffer)
         min_lo = min(self.low_buffer)
@@ -612,9 +755,8 @@ class StreamingChoppiness:
             return 50.0
             
         try:
-            # 100 * Log10(SumTR / Range) / Log10(n)
             ratio = sum_tr / rng
-            if ratio <= 0: return 50.0 # Guard log domain error
+            if ratio <= 0: return 50.0 
             
             numerator = math.log10(ratio)
             denominator = math.log10(self.period)
@@ -750,13 +892,123 @@ class StreamingIndicators:
         self.prev_close = price
         return features
 
-# --- 5. ADAPTIVE TRIPLE BARRIER ---
+# --- 5. META LABELING & PROBABILITY CALIBRATION ---
+
+class ProbabilityCalibrator:
+    """
+    Platt Scaling Calibrator adapted for swing trading confidence.
+    """
+    def __init__(self, window: int = 1000):
+        self.calibrator = None
+        if ML_AVAILABLE:
+            self.calibrator = linear_model.LogisticRegression(
+                optimizer=optim.SGD(0.05),
+                loss=optim.losses.Log(),
+                l2=0.1
+            )
+        self.samples_seen = 0
+        self.pos_count = 0
+        self.neg_count = 0
+
+    def update(self, prob: float, label: int):
+        if ML_AVAILABLE and math.isfinite(prob):
+            self.calibrator.learn_one({'raw_prob': prob}, label)
+            self.samples_seen += 1
+            if label == 1:
+                self.pos_count += 1
+            else:
+                self.neg_count += 1
+
+    def calibrate(self, raw_prob: float) -> float:
+        if not ML_AVAILABLE: return raw_prob
+        # Return RAW PROBABILITY until mature so the base model can filter natively
+        if self.pos_count < 10 or self.neg_count < 10:
+            return raw_prob 
+            
+        try:
+            calibrated_dict = self.calibrator.predict_proba_one({'raw_prob': raw_prob})
+            calibrated = calibrated_dict.get(1, raw_prob)
+            return max(0.01, min(calibrated, 0.99))
+        except Exception:
+            return raw_prob
+
+class MetaLabeler:
+    """
+    Secondary model that learns when the primary model is likely to be right or wrong.
+    """
+    def __init__(self):
+        self.model = None
+        self.buffer = deque(maxlen=1000)
+        self.pos_count = 0
+        self.neg_count = 0
+        
+        if ML_AVAILABLE:
+            self.model = forest.ARFClassifier(
+                n_models=10, 
+                seed=42, 
+                metric=metrics.F1()
+            )
+
+    def update(self, features: Dict[str, float], primary_action: int, outcome_pnl: float):
+        if not ML_AVAILABLE or primary_action == 0:
+            return
+        
+        y_meta = 1 if outcome_pnl > 0 else 0
+        
+        if y_meta == 1:
+            self.pos_count += 1
+        else:
+            self.neg_count += 1
+            
+        try:
+            meta_feats = self._enrich(features, primary_action)
+            clean_features = self._sanitize(meta_feats)
+            self.model.learn_one(clean_features, y_meta)
+            self.buffer.append((clean_features, y_meta))
+        except Exception as e:
+            logger.debug(f"MetaLabeler Update Error: {e}")
+
+    def predict(self, features: Dict[str, float], primary_action: int, threshold: float = 0.50) -> bool:
+        if not ML_AVAILABLE or primary_action == 0:
+            return False
+            
+        if self.pos_count < 10 or self.neg_count < 10: 
+            return True 
+            
+        try:
+            meta_feats = self._enrich(features, primary_action)
+            clean_features = self._sanitize(meta_feats)
+            probs = self.model.predict_proba_one(clean_features)
+            prob_profit = probs.get(1, 0.0)
+            return prob_profit >= threshold
+        except Exception as e:
+            logger.debug(f"MetaLabeler Predict Error: {e}")
+            return True
+
+    def _enrich(self, features: Dict[str, float], action: int) -> Dict[str, float]:
+        clean = features.copy()
+        clean['primary_action'] = float(action)
+        clean['vol_x_action'] = clean.get('volatility', 0.0) * action
+        clean['hurst_x_action'] = (clean.get('hurst', 0.5) - 0.5) * action
+        clean['vpin_x_action'] = clean.get('vpin', 0.5) * action
+        clean['ker_x_action'] = clean.get('ker', 0.5) * action
+        return clean
+
+    def _sanitize(self, features: Dict[str, float]) -> Dict[str, float]:
+        clean = {}
+        for k, v in features.items():
+            if v is not None and math.isfinite(v):
+                clean[k] = float(v)
+            else:
+                clean[k] = 0.0
+        return clean
+
+# --- 6. ADAPTIVE TRIPLE BARRIER ---
 
 class AdaptiveTripleBarrier:
     """
     Reality-Injected Labeling Engine.
-    V20.8 FIX: Restored signal_id and current_timestamp arguments to ensure strict IPC compatibility 
-    with the Live Engine (which utilizes these for execution confirmation and true time decay).
+    V20.8 FIX: Restored signal_id and current_timestamp arguments to ensure strict IPC compatibility.
     """
     def __init__(self, horizon_ticks: int = 144, risk_mult: float = 1.0, reward_mult: float = 2.0, 
                  drift_threshold: float = 0.75, horizon_type: str = 'TIME', horizon_value: float = 0.0):
@@ -776,9 +1028,6 @@ class AdaptiveTripleBarrier:
                               comm_in_price: float = 0.0, min_profit_dist: float = 0.0,
                               proposed_action: int = 0, pred_proba: float = 0.5,
                               override_reward_mult: float = None, signal_id: str = None):
-        """
-        Calculates exact broker geometry including strict spread and commission penalties.
-        """
         if current_atr <= 0: current_atr = entry_price * 0.0001
         
         volatility = features.get('volatility', 0.0)
@@ -792,13 +1041,11 @@ class AdaptiveTripleBarrier:
         effective_risk_mult = (self.risk_mult + vol_boost) * adaptive_scalar
         effective_reward_mult = (actual_reward_mult + vol_boost) * adaptive_scalar
         
-        # 1. Base Geometry
         raw_risk_dist = effective_risk_mult * current_atr
         actual_risk_dist = max(raw_risk_dist, min_stop_dist) 
         
         actual_reward_dist = actual_risk_dist * (effective_reward_mult / effective_risk_mult)
         
-        # 2. Broker Reality Injection
         buy_tp = entry_price + actual_reward_dist + spread_in_price
         buy_sl = entry_price - actual_risk_dist + spread_in_price
         
@@ -832,10 +1079,10 @@ class AdaptiveTripleBarrier:
 
     def resolve_labels(self, current_high: float, current_low: float, current_close: float = None, 
                        current_volume: float = 0.0, current_log_ret: float = 0.0,
-                       current_timestamp: float = 0.0) -> List[Tuple[Dict[str, float], int, float, int, float, float, bool]]:
+                       current_timestamp: float = 0.0) -> List[Tuple[Dict[str, float], int, int, float, float, int, float, float, bool]]:
         """
         Evaluates independent virtual BUY and SELL trades to solve Asymmetry.
-        Returns: (features, optimal_label, optimal_ret, proposed_action, pred_proba, proposed_ret, is_executed)
+        Returns: (features, buy_label, sell_label, buy_ret, sell_ret, proposed_action, pred_proba, proposed_ret, is_executed)
         """
         resolved = []
         active = deque()
@@ -849,7 +1096,6 @@ class AdaptiveTripleBarrier:
 
             is_expired = False
             if self.horizon_type == 'TIME':
-                # Use real wall-clock time difference if timestamp provided, else fallback to tick age
                 if current_timestamp > 0 and trade.get('start_time', 0) > 0:
                     duration_sec = current_timestamp - trade['start_time']
                     if duration_sec >= (self.time_limit * 60): is_expired = True
@@ -873,7 +1119,6 @@ class AdaptiveTripleBarrier:
             if current_high >= trade['sell_sl']: sell_status = -1
             elif current_low <= trade['sell_tp']: sell_status = 1
 
-            # Resolve if triggered or expired
             if buy_status != 0 or sell_status != 0 or is_expired:
                 buy_ret = 0.0
                 sell_ret = 0.0
@@ -896,19 +1141,10 @@ class AdaptiveTripleBarrier:
                 elif is_expired: 
                     sell_ret = (trade['entry'] - current_close) / trade['entry'] - spread_pct - comm_pct
 
-                # REVERT BASE MODEL TO BINARY
-                if buy_ret > sell_ret:
-                    optimal_label = 1
-                    optimal_ret = buy_ret
-                elif sell_ret > buy_ret:
-                    optimal_label = -1
-                    optimal_ret = sell_ret
-                else:
-                    # Absolute tie breaker (prevents class 0 injection into Base Model)
-                    optimal_label = 1 if current_close >= trade['entry'] else -1
-                    optimal_ret = buy_ret
+                # --- V20.18 FIX: DUAL-MODEL ASYMMETRY (TUPLE UNPACKING CURE) ---
+                buy_label = 1 if buy_ret > 0 else 0
+                sell_label = 1 if sell_ret > 0 else 0
                     
-                # Proposed Action Outcome (crucial to defeat survivorship bias)
                 proposed_action = trade.get('proposed_action', 0)
                 pred_proba = trade.get('pred_proba', 0.5)
                 proposed_ret = 0.0
@@ -922,8 +1158,10 @@ class AdaptiveTripleBarrier:
 
                 resolved.append((
                     trade['features'], 
-                    optimal_label, 
-                    optimal_ret,
+                    buy_label,
+                    sell_label,
+                    buy_ret,
+                    sell_ret,
                     proposed_action,
                     pred_proba,
                     proposed_ret,
@@ -935,426 +1173,7 @@ class AdaptiveTripleBarrier:
         self.buffer = active
         return resolved
 
-# --- 6. PROBABILITY CALIBRATOR & META LABELER ---
-
-class ProbabilityCalibrator:
-    """
-    V20.7 BOOTSTRAP PROTOCOL:
-    Platt Scaling Calibrator adapted for swing trading confidence.
-    Guarantees smooth, continuous probability outputs (0.01 to 0.99).
-    V20.7 FIX: Returns RAW base model probability during immaturity so the strategy isn't choked by flat 1.0 or 0.5 values.
-    """
-    def __init__(self, window: int = 1000):
-        self.calibrator = None
-        if ML_AVAILABLE:
-            self.calibrator = linear_model.LogisticRegression(
-                optimizer=optim.SGD(0.05),
-                loss=optim.losses.Log(),
-                l2=0.1
-            )
-        self.samples_seen = 0
-        self.pos_count = 0
-        self.neg_count = 0
-
-    def update(self, prob: float, label: int):
-        if ML_AVAILABLE and math.isfinite(prob):
-            self.calibrator.learn_one({'raw_prob': prob}, label)
-            self.samples_seen += 1
-            if label == 1:
-                self.pos_count += 1
-            else:
-                self.neg_count += 1
-
-    def calibrate(self, raw_prob: float) -> float:
-        if not ML_AVAILABLE: return raw_prob
-        
-        # V20.7 FIX: ML Confidence Pegging Bug.
-        # Lowered threshold from 50 to 10.
-        # Return the RAW PROBABILITY instead of a flat fallback so the base model can filter!
-        if self.pos_count < 10 or self.neg_count < 10:
-            return raw_prob 
-            
-        try:
-            calibrated_dict = self.calibrator.predict_proba_one({'raw_prob': raw_prob})
-            calibrated = calibrated_dict.get(1, raw_prob)
-            return max(0.01, min(calibrated, 0.99))
-        except Exception:
-            return raw_prob
-
-class MetaLabeler:
-    """
-    Secondary model that learns when the primary model is likely to be right or wrong.
-    """
-    def __init__(self):
-        self.model = None
-        self.buffer = deque(maxlen=1000)
-        self.pos_count = 0
-        self.neg_count = 0
-        
-        if ML_AVAILABLE:
-            self.model = forest.ARFClassifier(
-                n_models=10,
-                seed=42,
-                metric=metrics.F1()
-            )
-
-    def update(self, features: Dict[str, float], primary_action: int, outcome_pnl: float):
-        if not ML_AVAILABLE or primary_action == 0:
-            return
-        
-        # This is where NOISE is filtered. 1 = Profit, 0 = Loss.
-        y_meta = 1 if outcome_pnl > 0 else 0
-        
-        if y_meta == 1:
-            self.pos_count += 1
-        else:
-            self.neg_count += 1
-            
-        try:
-            meta_feats = self._enrich(features, primary_action)
-            clean_features = self._sanitize(meta_feats)
-            self.model.learn_one(clean_features, y_meta)
-            self.buffer.append((clean_features, y_meta))
-        except Exception as e:
-            logger.debug(f"MetaLabeler Update Error: {e}")
-
-    def predict(self, features: Dict[str, float], primary_action: int, threshold: float = 0.50) -> bool:
-        if not ML_AVAILABLE or primary_action == 0:
-            return False
-            
-        # V20.7 FIX: Lower maturity threshold to 10.
-        # Default to True (allow base model to trade) until meta-model is smart enough to veto.
-        if self.pos_count < 10 or self.neg_count < 10: 
-            return True 
-            
-        try:
-            meta_feats = self._enrich(features, primary_action)
-            clean_features = self._sanitize(meta_feats)
-            probs = self.model.predict_proba_one(clean_features)
-            prob_profit = probs.get(1, 0.0)
-            return prob_profit >= threshold
-        except Exception as e:
-            logger.debug(f"MetaLabeler Predict Error: {e}")
-            return True
-
-    def _enrich(self, features: Dict[str, float], action: int) -> Dict[str, float]:
-        clean = features.copy()
-        clean['primary_action'] = float(action)
-        clean['vol_x_action'] = clean.get('volatility', 0.0) * action
-        clean['hurst_x_action'] = (clean.get('hurst', 0.5) - 0.5) * action
-        clean['vpin_x_action'] = clean.get('vpin', 0.5) * action
-        clean['ker_x_action'] = clean.get('ker', 0.5) * action
-        return clean
-
-    def _sanitize(self, features: Dict[str, float]) -> Dict[str, float]:
-        clean = {}
-        for k, v in features.items():
-            if v is not None and math.isfinite(v):
-                clean[k] = float(v)
-            else:
-                clean[k] = 0.0
-        return clean
-
-# --- 7. ONLINE FEATURE ENGINEER ---
-
-class OnlineFeatureEngineer:
-    def __init__(self, window_size: int = 50):
-        self.window_size = window_size
-        self.prices = deque(maxlen=window_size)
-        self.volumes = deque(maxlen=window_size)
-        self.returns = deque(maxlen=window_size)
-        
-        self.indicators = StreamingIndicators()
-        
-        # Welford Scaler for Volume (Infinite Window Stationarity Fix applied)
-        self.welford_volume = WelfordScaler(alpha=0.05)
-        self.welford_ofi = WelfordScaler(alpha=0.05)
-        
-        # Regime Indicators
-        self.ker = KaufmanEfficiencyRatio(window=10)
-        self.fdi = FractalDimensionIndex(window=30)
-        self.regime_detector = RegimeDetector(n_states=2, window=100)
-        
-        # New Regime Filters (Anti-Chop)
-        self.vortex = StreamingVortex(period=14)
-        self.choppiness = StreamingChoppiness(period=14)
-        
-        # L1 Proxies
-        self.parkinson = StreamingParkinsonVolatility(alpha=0.1)
-        self.amihud = StreamingAmihudLiquidity(alpha=0.05)
-        self.rvol = StreamingRelativeVolume(window=20)
-        self.aggressor = StreamingAggressorRatio()
-        
-        # Momentum Logic: Bollinger Bands
-        self.bb = StreamingBollingerBands(window=20, num_std=1.0)
-
-        # Microstructure & Math Engines
-        self.entropy = EntropyMonitor(window=window_size)
-        self.vpin = VPINMonitor(bucket_size=1000)
-        self.frac_diff = StreamingFracDiff(d=0.4, window=window_size)
-        self.microstructure = MicrostructureAnalyzer(ema_alpha=0.1)
-        self.vol_monitor = VolatilityMonitor(window=20)
-        
-        self.last_price = None
-        self.ofi_window = deque(maxlen=20)
-        self.atr_ema = RecursiveEMA(alpha=0.05)
-        self.vol_baseline = RecursiveEMA(alpha=0.001)
-        self.ofi_ema = RecursiveEMA(alpha=CONFIG['features'].get('ofi_alpha', 0.1))
-
-    def update(self, price: float, timestamp: float, volume: float,
-               high: Optional[float] = None, low: Optional[float] = None,
-               buy_vol: float = 0.0, sell_vol: float = 0.0,
-               time_feats: Dict[str, float] = None,
-               sentiment: float = 0.0,
-               context_data: Dict[str, Any] = None) -> Dict[str, float]:
-        
-        if time_feats is None:
-            time_feats = {'sin_hour': 0.0, 'cos_hour': 0.0}
-        if high is None: high = price
-        if low is None: low = price
-        if not math.isfinite(price) or price <= 0: return None
-        if not math.isfinite(volume): volume = 0.0
-
-        self.prices.append(price)
-        self.volumes.append(volume)
-        
-        # Log Returns
-        ret_log = 0.0
-        if self.last_price and self.last_price > 0:
-            try:
-                ret_log = math.log(price / self.last_price)
-            except ValueError:
-                ret_log = 0.0
-            self.returns.append(ret_log)
-        else:
-            self.returns.append(0.0)
-
-        # Update Indicators
-        tech_feats = self.indicators.update(price, high, low)
-        current_atr = tech_feats.get('atr', 0.001)
-        
-        # Update Regime
-        ker_val = self.ker.update(price)
-        fdi_val = self.fdi.update(price)
-        regime_hmm = self.regime_detector.update(ret_log)
-        
-        # Update Anti-Chop Filters
-        vi_plus, vi_minus = self.vortex.update(high, low, price)
-        chop_index = self.choppiness.update(high, low, price)
-        
-        # Update L1 Proxies
-        parkinson_val = self.parkinson.update(high, low)
-        amihud_val = self.amihud.update(abs(ret_log), price, volume)
-        rvol_val = self.rvol.update(timestamp) # Fuel Gauge (Duration Intensity)
-        aggressor_val = self.aggressor.update(high, low, price)
-        
-        # Update Momentum
-        bb_feats = self.bb.update(price)
-
-        # Update Other Metrics
-        entropy_val = self.entropy.update(price)
-        vpin_val = self.vpin.update(volume, price, buy_vol, sell_vol)
-        volatility_val = self.vol_monitor.update(ret_log)
-
-        # FracDiff
-        fd_price = self.frac_diff.update(price)
-
-        # Microstructure (OFI)
-        raw_ofi_smoothed = self.microstructure.process_bar(buy_vol, sell_vol)
-        micro_ofi_z = self.welford_ofi.update(raw_ofi_smoothed)
-
-        # Volatility Ratio
-        self.vol_baseline.update(volatility_val)
-        baseline_vol = self.vol_baseline.get()
-        vol_ratio = volatility_val / baseline_vol if baseline_vol > 1e-9 else 1.0
-
-        # Hurst
-        hurst_val = 0.5
-        if len(self.returns) >= 20:
-            ret_arr = np.array(list(self.returns), dtype=np.float64)
-            hurst_val = calculate_hurst(ret_arr)
-
-        # Legacy OFI
-        denominator = volume if volume > 0 else 1.0
-        ofi_simple = (buy_vol - sell_vol) / denominator
-        self.ofi_window.append(ofi_simple)
-        cum_ofi = sum(self.ofi_window) / len(self.ofi_window) if self.ofi_window else 0.0
-        self.ofi_ema.update(ofi_simple)
-        ofi_trend = self.ofi_ema.get()
-
-        # Trends
-        regime_val = 1.0 if hurst_val > 0.55 else (-1.0 if hurst_val < 0.45 else 0.0)
-        self.atr_ema.update(current_atr)
-        atr_trend = self.atr_ema.get()
-        vol_breakout = 1.0 if current_atr > (atr_trend * 1.05) else 0.0
-
-        # ER
-        er_val = 0.5
-        if len(self.prices) >= 10:
-            price_list = list(self.prices)
-            changes = np.diff(price_list)
-            abs_change_sum = np.sum(np.abs(changes))
-            net_change = abs(price_list[-1] - price_list[0])
-            er_val = net_change / abs_change_sum if abs_change_sum > 0 else 0.0
-
-        # Candle Physics
-        candle_range = max(high - low, 1e-9)
-        prev_close = self.prices[-2] if len(self.prices) > 1 else price
-        body_size = abs(price - prev_close)
-        body_ratio = body_size / candle_range
-        upper_wick = high - max(price, prev_close)
-        lower_wick = min(price, prev_close) - low
-        upper_wick_ratio = upper_wick / candle_range
-        lower_wick_ratio = lower_wick / candle_range
-
-        # Normalized Oscillators
-        macd_norm = tech_feats['macd_line'] / price
-        rsi_norm = tech_feats['rsi'] / 100.0
-
-        self.last_price = price
-        volume_z = self.welford_volume.update(volume)
-
-        # MTF Context
-        d1_trend = 0.0
-        mtf_align = 0.0
-        
-        if context_data:
-            d1 = context_data.get('d1', {})
-            d1_ema = d1.get('ema200', 0.0)
-            if d1_ema > 0:
-                d1_trend = 1.0 if price > d1_ema else -1.0
-            
-            h4 = context_data.get('h4', {})
-            h4_rsi = h4.get('rsi', 50.0)
-            h4_trend = 1.0 if h4_rsi > 50 else -1.0
-            
-            m5_trend = 1.0 if tech_feats['macd_line'] > 0 else -1.0
-            
-            if d1_trend != 0 and (d1_trend == h4_trend == m5_trend):
-                mtf_align = 1.0
-
-        # --- FLOW IMBALANCE FEATURES ---
-        safe_total_vol = buy_vol + sell_vol
-        flow_imbalance = (buy_vol - sell_vol) / safe_total_vol if safe_total_vol > 0 else 0.0
-        
-        safe_sell = sell_vol if sell_vol > 0 else 1.0
-        flow_ratio = buy_vol / safe_sell
-        
-        raw_features = {
-            # Core
-            'log_ret': ret_log,
-            'volatility': volatility_val,
-            'atr': current_atr,
-            'atr_pct': current_atr / price,
-            
-            # L1 Proxies
-            'parkinson_vol': parkinson_val,
-            'amihud': amihud_val,
-            'rvol': rvol_val,
-            'aggressor': aggressor_val,
-            'flow_imbalance': flow_imbalance, 
-            'flow_ratio': flow_ratio,            
-            
-            # Momentum Features
-            'bb_breakout': bb_feats['bb_breakout'],
-            'bb_width': bb_feats['bb_width'],
-            'bb_pct_b': bb_feats['bb_pct_b'],
-            'bb_squeeze': bb_feats.get('bb_squeeze_percentile', 0.5),
-            
-            # Regime & Math
-            'ker': ker_val,
-            'fdi': fdi_val,
-            'hmm_regime': float(regime_hmm) / (self.regime_detector.n_states - 1) if self.regime_detector.n_states > 1 else 0.0,
-            'entropy': entropy_val,
-            'hurst': hurst_val,
-            'frac_diff': fd_price,
-            'vpin': vpin_val,
-            'choppiness': chop_index,    
-            'vortex_spread': vi_plus - vi_minus, 
-            
-            # Technicals
-            'rsi_norm': rsi_norm,
-            'macd_norm': macd_norm,
-            'macd_hist_norm': tech_feats['macd_hist'] / price,
-            'adx': tech_feats.get('adx', 0.0),
-            
-            # Context / Legacy
-            'vol_ratio': vol_ratio,
-            'volatility_log': math.log(volatility_val + 1e-9),
-            'micro_ofi': micro_ofi_z,
-            'ofi_simple': ofi_simple,
-            'efficiency_ratio': er_val,
-            'cum_ofi': cum_ofi,
-            'ofi_trend': ofi_trend,
-            'regime': regime_val,
-            'vol_breakout': vol_breakout,
-            'sentiment': sentiment,
-            
-            # MTF
-            'd1_trend': d1_trend,
-            'mtf_alignment': mtf_align,
-            
-            # Physics
-            'body_ratio': body_ratio,
-            'upper_wick_ratio': upper_wick_ratio,
-            'lower_wick_ratio': lower_wick_ratio,
-            'volume_z': volume_z,
-            
-            **time_feats
-        }
-        
-        return self._sanitize_features(raw_features)
-
-    def _sanitize_features(self, features: Dict[str, float]) -> Dict[str, float]:
-        clean = {}
-        for k, v in features.items():
-            if v is not None and math.isfinite(v):
-                clean[k] = float(v)
-            else:
-                clean[k] = 0.0
-        return clean
-
-# --- 8. LEGACY MONITORS (PRESERVED) ---
-
-class StreamingTripleBarrier:
-    def __init__(self, vol_multiplier: float = 2.0, barrier_len: int = 50, horizon_ticks: int = 100):
-        self.vol_multiplier = vol_multiplier
-        self.horizon_ticks = horizon_ticks
-        self.history = deque(maxlen=barrier_len)
-        self.pending_events = {}
-
-    def update(self, price: float, timestamp: float) -> List[Tuple[int, float]]:
-        self.history.append(price)
-        resolved = []
-        to_remove = []
-        
-        for origin_ts, params in self.pending_events.items():
-            if price >= params['top']:
-                resolved.append((1, origin_ts))
-                to_remove.append(origin_ts)
-            elif price <= params['bot']:
-                resolved.append((-1, origin_ts))
-                to_remove.append(origin_ts)
-            elif timestamp >= params['expiry']:
-                resolved.append((0, origin_ts))
-                to_remove.append(origin_ts)
-        
-        for ts in to_remove:
-            del self.pending_events[ts]
-            
-        if len(self.history) >= 20:
-            vol = np.std(list(self.history))
-            if vol < 1e-9: vol = price * 0.001
-            width = vol * self.vol_multiplier
-            
-            self.pending_events[timestamp] = {
-                'entry': price,
-                'top': price + width,
-                'bot': price - width,
-                'expiry': timestamp + (self.horizon_ticks * 60)
-            }
-        
-        return resolved
+# --- 7. PROXIES & UTILS ---
 
 class EntropyMonitor:
     def __init__(self, window: int = 50):
@@ -1446,7 +1265,6 @@ class VolatilityMonitor:
         return val if math.isfinite(val) else 0.001
 
     def get(self) -> float:
-        """Supported by Rec 2: Allow external querying of current volatility for latency checks."""
         if len(self.returns) < 5: return 0.001
         val = np.std(self.returns)
         return val if math.isfinite(val) else 0.001
@@ -1461,36 +1279,26 @@ def calculate_hurst(returns_ts):
     if n < 20: return 0.5
     
     # 1. Reconstruct the price path from log returns (Cumulative Sum)
-    # CRITICAL FIX: Hurst must be calculated on the random walk (price), not the stationary noise (returns).
     ts = np.cumsum(returns_ts)
     
     # 1b. Variance Check (Math Guard)
     if np.std(ts) < 1e-9: return 0.5
     
-    # Prepare lags (2..19)
-    # Explicit float64 casting for type stability in JIT
     lags = np.arange(2, 20, dtype=np.float64)
     tau = np.zeros(len(lags), dtype=np.float64)
     
     for i in range(len(lags)):
         lag = int(lags[i])
-        # Calculate diffs for this lag over the random walk
         diff = ts[lag:] - ts[:-lag]
         std_diff = np.std(diff)
         
-        # Guard against zero std dev in flat markets
         if std_diff < 1e-9:
             tau[i] = 1e-9
         else:
             tau[i] = std_diff
     
-    # Safe Log (Avoid log(0))
     log_lags = np.log(lags)
     log_tau = np.log(tau)
-    
-    # 2. MANUAL LINEAR REGRESSION (Least Squares)
-    # y = mx + c
-    # m = (N * sum(xy) - sum(x) * sum(y)) / (N * sum(x^2) - (sum(x))^2)
     
     N = float(len(lags))
     sum_x = np.sum(log_lags)
@@ -1505,10 +1313,7 @@ def calculate_hurst(returns_ts):
         
     slope = ((N * sum_xy) - (sum_x * sum_y)) / denominator
     
-    # Hurst = Slope (in this specific R/S proxy method)
     hurst = slope
-    
-    # Clamp result
     if hurst < 0.0: return 0.0
     if hurst > 1.0: return 1.0
     return hurst

@@ -1131,11 +1131,11 @@ class LiveTradingEngine:
                                 if target_sl > sl_price:
                                     new_sl = target_sl
                                     reason = f"Trail ({r_multiple:.1f}R)"
-                            elif r_multiple >= 0.8:
-                                target_sl = entry_price + (risk_dist * 0.1) 
+                            elif r_multiple >= 1.0: # V20.18 FIX: Spread Choking Cure
+                                target_sl = entry_price + (risk_dist * 0.25) 
                                 if target_sl > sl_price:
                                     new_sl = target_sl
-                                    reason = "BE Lock"
+                                    reason = "BE Lock (+0.25R)"
 
                         elif pos_type == "SELL":
                             dist_pnl = entry_price - current_price
@@ -1146,11 +1146,11 @@ class LiveTradingEngine:
                                 if target_sl < sl_price:
                                     new_sl = target_sl
                                     reason = f"Trail ({r_multiple:.1f}R)"
-                            elif r_multiple >= 0.8:
-                                target_sl = entry_price - (risk_dist * 0.1)
+                            elif r_multiple >= 1.0: # V20.18 FIX: Spread Choking Cure
+                                target_sl = entry_price - (risk_dist * 0.25)
                                 if target_sl < sl_price:
                                     new_sl = target_sl
-                                    reason = "BE Lock"
+                                    reason = "BE Lock (+0.25R)"
 
                         if new_sl:
                             comment_str = str(pos.get('comment', ''))

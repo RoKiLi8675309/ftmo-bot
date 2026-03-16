@@ -14,12 +14,13 @@ from shared.core.config import CONFIG
 from shared.core.logging_setup import LogSymbols
 from shared.data import load_real_data
 from shared.domain.models import VolumeBar  
+from shared.financial.features import AdaptiveImbalanceBarGenerator
 
 # Setup Logger
 logger = logging.getLogger("Backtester")
 
 # =============================================================================
-# PHOENIX RESEARCH ENGINE V20.9 – BACKTEST BROKER (UNCHOKED PROTOCOL)
+# PHOENIX RESEARCH ENGINE V20.18 – BACKTEST BROKER (DUAL-MODEL PARITY)
 # =============================================================================
 
 @dataclass(frozen=True)
@@ -113,10 +114,10 @@ class BacktestOrder:
 
 class BacktestBroker:
     """
-    V20.9 PARITY: Simulates a Broker environment:
+    V20.18 PARITY: Simulates a Broker environment:
     - Order Execution (Immediate Fill with VOLATILITY SLIPPAGE)
     - PnL Tracking (Equity/Balance)
-    - Strict 1:2 R:R Guard at the Metal Layer
+    - Strict 1.40 R:R Guard at the Metal Layer (Aligned with Live Engine)
     - Daily Hard Deck Enforcement
     """
     def __init__(self, initial_balance: float = 50000.0):
@@ -143,7 +144,7 @@ class BacktestBroker:
 
         # Load Configured Costs
         risk_conf = CONFIG.get('risk_management', {})
-        self.commission_per_lot = float(risk_conf.get('commission_per_lot_rt', 6.0)) # V20.9: Sync with config
+        self.commission_per_lot = float(risk_conf.get('commission_per_lot_rt', 6.0)) 
         self.spread_map = CONFIG.get('forensic_audit', {}).get('spread_pips', {})
         self.default_spread = self.spread_map.get('default', 1.6)
 
@@ -153,7 +154,7 @@ class BacktestBroker:
         # --- DAILY ANCHOR TRACKING ---
         self.daily_start_equity = initial_balance
         self.current_day_date = None
-        self.max_daily_loss_pct = risk_conf.get('max_daily_loss_pct', 0.040) # V20.9: 4.0%
+        self.max_daily_loss_pct = risk_conf.get('max_daily_loss_pct', 0.040) 
         
         # Timezone for Midnight Reset
         tz_str = risk_conf.get('risk_timezone', 'Europe/Prague')
@@ -372,8 +373,6 @@ class BacktestBroker:
         # Check Daily Drawdown relative to Anchor
         if self.daily_start_equity > 0:
             daily_loss_amount = self.daily_start_equity - self.equity
-            # V20.9 FIX: FTMO Daily Loss is a static % of INITIAL balance (e.g. 5% of 50k = 2500)
-            # It is NOT a % of the starting daily equity.
             daily_loss_limit = self.initial_balance * self.max_daily_loss_pct
             
             if daily_loss_amount > daily_loss_limit and not self.is_blown:
@@ -400,7 +399,7 @@ class BacktestBroker:
         """
         Public API called by ResearchStrategy.
         Applies STRICT REALITY INJECTION (Volatility Penalty) AND FIXED LOT CLAMP.
-        V20.6: Enforces exact 1:2 R:R at the Metal Layer.
+        V20.18: Enforces exact 1.40 R:R at the Metal Layer (Aligned with Windows Producer).
         """
         risk_conf = CONFIG.get('risk_management', {})
         if risk_conf.get('sizing_method') == 'fixed_lots':
@@ -452,15 +451,15 @@ class BacktestBroker:
             if order.stop_loss > 0: order.stop_loss += offset
             if order.take_profit > 0: order.take_profit += offset
 
-        # --- V20.6: STRICT R:R ENFORCEMENT AT THE METAL LAYER ---
+        # --- V20.18: STRICT R:R ENFORCEMENT AT THE METAL LAYER (DUAL-MODEL ALIGNMENT) ---
         if order.stop_loss > 0 and order.take_profit > 0:
             risk_dist = abs(order.entry_price - order.stop_loss)
             reward_dist = abs(order.take_profit - order.entry_price)
             if risk_dist > 0:
                 rr_ratio = reward_dist / risk_dist
-                # Ensure mathematically we never bleed out to spread trap.
-                # 1.90 allows for minor float rounding from the 2.0x target.
-                if rr_ratio < 1.90:
+                # Target >= 1.5. Blocked at 1.40 to permit minor spread slippage variance.
+                # Perfectly matches Windows Producer and Dispatcher parity.
+                if rr_ratio < 1.40:
                     # Drop the trade silently, mimicking windows_producer.py dropping it.
                     return None
 
@@ -556,7 +555,7 @@ class BacktestBroker:
             'Regime': clean_metadata.get('regime', 'Unknown'),
             'Confidence': clean_metadata.get('confidence', 0.0),
             'Tighten_Stops': clean_metadata.get('tighten_stops', False),
-            'Risk_Taken_Pct': clean_metadata.get('risk_taken_pct', 0.0) # V20.6 Audit Trace
+            'Risk_Taken_Pct': clean_metadata.get('risk_taken_pct', 0.0) 
         })
 
     def get_stats(self) -> Dict[str, Any]:
@@ -652,141 +651,6 @@ class BacktestBroker:
     def get_equity_curve(self) -> pd.DataFrame:
         return pd.DataFrame(self.equity_curve, columns=['time', 'equity'])
 
-class AdaptiveImbalanceBarGenerator:
-    """
-    V20.9 Parity: Generates Tick Imbalance Bars (TIBs).
-    Replaces time-based sampling with information-driven sampling.
-    """
-    def __init__(self, symbol: str, initial_threshold: float = 10.0, alpha: float = 0.05):
-        self.symbol = symbol
-        
-        # State variables for the current bar
-        self.current_imbalance = 0.0
-        self.ticks_in_bar = 0
-        self.open_price = None
-        self.high_price = -float('inf')
-        self.low_price = float('inf')
-        self.close_price = None
-        self.volume_accum = 0.0
-        self.start_timestamp = None
-        
-        # Extended VPIN states
-        self.current_buy_vol = 0.0
-        self.current_sell_vol = 0.0
-        self.vwap_sum = 0.0
-
-        # State for Tick Rule (Aggressor Logic)
-        self.prev_price = None
-        self.prev_tick_rule = 1  # Default to Buy (1)
-
-        # Adaptive Threshold Logic (EWMA)
-        self.expected_imbalance = initial_threshold
-        self.alpha = alpha   # Forgetting factor for EWMA
-
-    def process_tick(self, price: float, volume: float, timestamp: float, 
-                     external_buy_vol: float = 0.0, external_sell_vol: float = 0.0) -> Optional[VolumeBar]:
-        """
-        Ingest a single tick and determine if a bar should be closed based on Imbalance.
-        """
-        # Initialize if first tick
-        if self.prev_price is None:
-            self.prev_price = price
-            self.open_price = price
-            self.start_timestamp = timestamp
-            return None
-
-        # 1. Apply Tick Rule (Infer Aggressor)
-        # If external L2 data is provided, use it. Otherwise, use Tick Rule.
-        if external_buy_vol > 0 or external_sell_vol > 0:
-            # Trusted L2 Data
-            tick_rule = 1 if external_buy_vol > external_sell_vol else -1
-            if external_buy_vol == external_sell_vol: tick_rule = 0
-            self.prev_tick_rule = tick_rule
-        else:
-            # Standard Tick Rule
-            price_change = price - self.prev_price
-            if price_change != 0:
-                tick_rule = np.sign(price_change)
-                self.prev_tick_rule = tick_rule
-            else:
-                tick_rule = self.prev_tick_rule
-
-        # 2. Update Accumulators
-        self.current_imbalance += (tick_rule * volume)
-        
-        self.ticks_in_bar += 1
-        self.volume_accum += volume
-        self.vwap_sum += (price * volume)
-        
-        if self.open_price is None: self.open_price = price
-        self.high_price = max(self.high_price, price)
-        self.low_price = min(self.low_price, price)
-        self.close_price = price
-        self.prev_price = price
-
-        # Track flows for VPIN
-        if tick_rule == 1:
-            self.current_buy_vol += volume
-        elif tick_rule == -1:
-            self.current_sell_vol += volume
-        else:
-            self.current_buy_vol += (volume / 2)
-            self.current_sell_vol += (volume / 2)
-
-        # 3. Check Threshold Condition (Absolute Imbalance >= Expected)
-        if abs(self.current_imbalance) >= self.expected_imbalance or self.ticks_in_bar >= 1000:
-            return self._finalize_bar(timestamp, price)
-
-        return None
-
-    def _finalize_bar(self, timestamp: float, close_price: float) -> VolumeBar:
-        """Internal method to package the bar and update adaptive thresholds."""
-        
-        # Convert timestamp to datetime if float
-        if isinstance(timestamp, (float, int)):
-            dt_ts = datetime.fromtimestamp(timestamp, pytz.utc)
-        else:
-            dt_ts = timestamp
-
-        vwap = self.vwap_sum / self.volume_accum if self.volume_accum > 0 else close_price
-
-        bar = VolumeBar(
-            timestamp=dt_ts,
-            open=self.open_price,
-            high=self.high_price,
-            low=self.low_price,
-            close=close_price,
-            volume=self.volume_accum,
-            vwap=vwap,
-            tick_count=self.ticks_in_bar,
-            buy_vol=self.current_buy_vol,
-            sell_vol=self.current_sell_vol
-        )
-
-        # 4. Update Expectations (EWMA)
-        # We update the expected imbalance threshold based on the actual imbalance seen.
-        # This allows the sampling rate to speed up (lower threshold) or slow down.
-        current_abs_imb = abs(self.current_imbalance)
-        self.expected_imbalance = (self.alpha * current_abs_imb) + \
-                                  ((1 - self.alpha) * self.expected_imbalance)
-        
-        # Clamp threshold to avoid sampling every tick or never sampling
-        # V20.9 Parity: Clamped upper bound fixed to 10000.0 to match the Live Engine
-        self.expected_imbalance = max(10.0, min(self.expected_imbalance, 10000.0))
-
-        # Reset State
-        self.current_imbalance = 0.0
-        self.ticks_in_bar = 0
-        self.open_price = None
-        self.high_price = -float('inf')
-        self.low_price = float('inf')
-        self.volume_accum = 0.0
-        self.vwap_sum = 0.0
-        self.current_buy_vol = 0.0
-        self.current_sell_vol = 0.0
-        self.start_timestamp = timestamp
-
-        return bar
 
 def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
     """
@@ -799,7 +663,7 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
         return pd.DataFrame()
 
     # 2. AGGREGATION: ADAPTIVE IMBALANCE BARS WITH AUTO-CALIBRATION
-    # V20.9 Parity
+    # V20.18 Parity
     config_threshold = CONFIG['data'].get('volume_bar_threshold', 10.0) 
     alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
     
