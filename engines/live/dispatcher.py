@@ -1,9 +1,8 @@
 import logging
-import json
-import uuid
-import threading
 import time
 import math
+import uuid
+import threading
 from typing import Any, Dict, Optional
 
 # Shared Imports
@@ -11,7 +10,7 @@ from shared import CONFIG, LogSymbols, RedisStreamManager, Trade
 
 logger = logging.getLogger("TradeDispatcher")
 
-# --- MT5 CONSTANTS (HARDCODED FOR LINUX) ---
+# --- MT5 CONSTANTS (HARDCODED FOR LINUX / REDIS PROTOCOL) ---
 # Since we cannot import MetaTrader5 on Linux, we define the standard constants here.
 # These MUST match the Windows Producer's expectation.
 MT5_ORDER_TYPE_BUY = 0
@@ -26,17 +25,9 @@ class TradeDispatcher:
     """
     Handles the reliable transmission of trade orders from the Logic Engine
     to the Execution Engine (Windows Producer) via Redis Streams.
-    
-    UPDATED: FORCE MARKET EXECUTION ONLY.
-    V20.18 FIX: INJECTS STRICT 1.40 R:R METAL LAYER GUARD & SANITIZES SL/TP FLOATS
-    TO MATCH PRODUCER PARITY AND PREVENT DISPATCHER CHOKING.
+    V20.18 DUAL-MODEL UPGRADE: Fully supports independent directional EV processing.
     """
     def __init__(self, stream_mgr: RedisStreamManager, pending_tracker: dict[str, Any], lock: threading.RLock):
-        """
-        :param stream_mgr: Active RedisStreamManager instance.
-        :param pending_tracker: Reference to the Engine's pending order dictionary.
-        :param lock: Thread lock to ensure thread-safe updates to the tracker.
-        """
         self.stream_mgr = stream_mgr
         self.stream_key = CONFIG['redis']['trade_request_stream']
         self.magic_number = CONFIG['trading'].get('magic_number', 621001)
@@ -44,42 +35,29 @@ class TradeDispatcher:
         self.lock = lock
 
     def send_order(self, trade: Trade, estimated_risk_usd: float = 0.0) -> None:
-        """
-        Formats and dispatches a Trade object to Redis.
-        Strictly enforces Market Execution (Deal) protocol and guards against
-        float parsing errors in the Windows MT5 SDK.
-        """
         try:
             # 1. Generate IDs
             order_id = uuid.uuid4()
             short_id = str(order_id)[:8]
             
             # --- V20.18 FIX: STRICT R:R ENFORCEMENT AT THE DISPATCH LAYER ---
-            # Even if the logic layer requests a trade, we mathematically verify it here 
-            # before it ever touches Redis or MT5.
             if trade.action in ["BUY", "SELL"] and trade.stop_loss > 0 and trade.take_profit > 0:
                 risk_dist = abs(trade.entry_price - trade.stop_loss)
                 reward_dist = abs(trade.take_profit - trade.entry_price)
                 if risk_dist > 0:
                     rr_ratio = reward_dist / risk_dist
                     # Target >= 1.5. Blocked at 1.40 to permit minor spread slippage variance.
-                    # This now PERFECTLY matches the Windows Producer parity.
                     if rr_ratio < 1.40:
                         logger.error(f"🛑 REJECTED BY DISPATCHER: {trade.symbol} {trade.action} R:R Ratio is {rr_ratio:.2f} (Target >= 1.5). Blocked to prevent spread bleed.")
                         return  # Abort dispatch immediately
 
-            # --- V20.2 FIX: PERSIST INITIAL RISK DISTANCE ---
-            # We calculate the absolute price distance between the entry reference 
-            # and the initial stop loss. This is saved to a Redis hash so the 
-            # Trailing Stop and Pyramiding logic don't hallucinate shrinking 
-            # R-multiples as the SL physically moves closer to price.
+            # --- PERSIST INITIAL RISK DISTANCE ---
             try:
                 initial_risk_dist = abs(trade.entry_price - trade.stop_loss)
-                if initial_risk_dist > 0 and math.isfinite(initial_risk_dist):
+                if initial_risk_dist > 0:
                     self.stream_mgr.r.hset("bot:initial_risk", short_id, str(initial_risk_dist))
             except Exception as e:
                 logger.error(f"Failed to persist initial risk to Redis for {short_id}: {e}")
-            # ------------------------------------------------
             
             # 2. Register Pending (Thread-Safe)
             with self.lock:
@@ -93,58 +71,46 @@ class TradeDispatcher:
                 }
 
             # 3. Construct Payload (Strict Protocol Translation)
-            
-            # A. Translate Action (BUY/SELL -> 0/1) to 'type' field
-            # Windows Producer expects 'type' to be the direction.
             if trade.action == "BUY":
                 mt5_type = MT5_ORDER_TYPE_BUY
             elif trade.action == "SELL":
                 mt5_type = MT5_ORDER_TYPE_SELL
             else:
-                # Fallback for "CLOSE_ALL" or "MODIFY" which handle their own logic in Producer
                 mt5_type = MT5_ORDER_TYPE_BUY 
             
-            # B. FORCE MARKET EXECUTION
-            # We ignore trade.entry_type and force TRADE_ACTION_DEAL (1)
-            # Price must be 0.0 for Instant/Market Execution in MT5
+            # FORCE MARKET EXECUTION
             if trade.action in ["BUY", "SELL"]:
                 mt5_action = MT5_TRADE_ACTION_DEAL
                 final_price = "0.0" 
             else:
-                # MODIFY / CLOSE_ALL are handled specifically by Producer strings
                 mt5_action = MT5_TRADE_ACTION_DEAL 
                 final_price = "0.0"
 
             # Ensure Comment length compliance (MT5 limit)
-            # Shorten UUID for comment: "Auto_1234abcd"
             comment = f"Auto_{short_id}"
             if trade.comment:
-                # Truncate carefully to preserve key info within 31 chars
                 comment = f"{comment}_{trade.comment}"[:31]
 
             # Determine Action String for Producer Logic
-            # If standard trade, send integer. If special command, send string.
             if trade.action in ["MODIFY", "CLOSE_ALL"]:
                 action_payload = str(trade.action)
             else:
                 action_payload = str(mt5_action)
 
-            # --- V20.2 MATH GUARD: Sanitize Floats ---
-            # Prevents NaN or Infinity from crashing the MT5 SDK string parser
+            # Sanitize floats
             safe_sl = float(trade.stop_loss) if math.isfinite(trade.stop_loss) else 0.0
             safe_tp = float(trade.take_profit) if math.isfinite(trade.take_profit) else 0.0
             safe_vol = float(trade.volume) if math.isfinite(trade.volume) else 0.01
 
             payload = {
                 "id": str(order_id),
-                "uuid": str(order_id),  # CRITICAL for Producer Deduplication
+                "uuid": str(order_id),  
                 "symbol": str(trade.symbol),
                 
                 # --- PROTOCOL TRANSLATION ---
                 "action": action_payload,
                 "type": str(mt5_type),
                 
-                # Explicit formatting to prevent float precision errors
                 "volume": "{:.2f}".format(safe_vol),
                 
                 # FORCE ZERO PRICE for Market Execution
@@ -153,8 +119,6 @@ class TradeDispatcher:
                 
                 "intended_price": "{:.5f}".format(trade.entry_price),
                 
-                # CRITICAL MAPPING: Producer looks for 'sl' and 'tp', NOT 'stop_loss'
-                # Enforce string format to prevent scientific notation (e.g. 1e-5)
                 "sl": "{:.5f}".format(safe_sl),
                 "tp": "{:.5f}".format(safe_tp),
                 
@@ -162,14 +126,12 @@ class TradeDispatcher:
                 "magic": str(self.magic_number), 
                 
                 "comment": comment,
-                "timestamp": str(time.time()),  # ZOMBIE CHECK: High precision time
+                "timestamp": str(time.time()), 
                 
-                # Ticket required for MODIFY
                 "ticket": str(trade.ticket) if trade.ticket else "0"
             }
 
             # 4. Transmit to Redis
-            # Enforce maxlen to prevent stream from growing indefinitely
             self.stream_mgr.r.xadd(self.stream_key, payload, maxlen=50000, approximate=True)
             
             logger.info(
@@ -178,38 +140,24 @@ class TradeDispatcher:
             )
         except Exception as e:
             logger.error(f"{LogSymbols.ERROR} Dispatch Failed for {trade.symbol}: {e}", exc_info=True)
-            # Rollback tracker if send failed
             with self.lock:
                 if str(order_id) in self.pending_tracker:
                     del self.pending_tracker[str(order_id)]
 
     def cleanup_stale_orders(self, ttl_seconds: int = 600, open_positions: Optional[Dict] = None):
-        """
-        Removes orders that have been stuck in 'PENDING' for too long.
-        Cross-reference with open_positions (Zombie Check) to avoid
-        deleting a key for a trade that actually filled but lost connection.
-        
-        :param ttl_seconds: Max age of a pending order (Default 600s / 10m).
-        :param open_positions: Current live positions to check against.
-        """
         now = time.time()
         to_remove = []
         
         with self.lock:
             for oid, data in self.pending_tracker.items():
-                # 1. Time Check
                 if now - data['timestamp'] > ttl_seconds:
                     
-                    # 2. Zombie Check (If positions provided)
-                    # If we find a position for this symbol that looks like it belongs to us,
-                    # we assume it filled and just clear the pending flag safely.
                     is_zombie_match = False
                     if open_positions:
                         short_id = str(oid)[:8]
                         symbol = data['symbol']
                         
                         for pos in open_positions.values():
-                            # Check Symbol AND Comment match
                             comment = str(pos.get('comment', ''))
                             if pos.get('symbol') == symbol and short_id in comment:
                                 is_zombie_match = True
@@ -219,13 +167,11 @@ class TradeDispatcher:
                         logger.warning(f"🧟 ZOMBIE MATCH: Clearing stale pending {oid} (Found matching position).")
                         to_remove.append(oid)
                     else:
-                        # Genuine Timeout - Order likely rejected or lost
                         logger.warning(f"🧹 Clearing Stale Pending Order: {oid} ({data['symbol']}) - > {ttl_seconds}s")
                         to_remove.append(oid)
             
             for oid in to_remove:
                 if oid in self.pending_tracker:
-                    # Clean up the corresponding initial risk from Redis to prevent memory leaks over months
                     try:
                         short_id = str(oid)[:8]
                         self.stream_mgr.r.hdel("bot:initial_risk", short_id)

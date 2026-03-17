@@ -4,12 +4,17 @@ import pandas as pd
 import numpy as np
 import pytz
 import sys
+import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
 # Shared Imports
 from shared.core.config import CONFIG
 from shared.domain.models import VolumeBar
+# V20.18 DRY FIX: Import the exact same generator used in Live Engine to prevent data leakage/math mismatch.
+from shared.financial.features import AdaptiveImbalanceBarGenerator 
+
+logger = logging.getLogger("Data")
 
 class TemporalPipeline:
     """
@@ -82,143 +87,6 @@ class AdaptiveVolumeNormalizer:
         threshold = max(100.0, threshold) 
         
         return float(threshold)
-
-class AdaptiveImbalanceBarGenerator:
-    """
-    Generates Tick Imbalance Bars (TIBs).
-    Replaces time-based sampling with information-driven sampling.
-    """
-    def __init__(self, symbol: str, initial_threshold: float = 1000, alpha: float = 0.025):
-        self.symbol = symbol
-        
-        # State variables for the current bar
-        self.current_imbalance = 0.0
-        self.ticks_in_bar = 0
-        self.open_price = None
-        self.high_price = -float('inf')
-        self.low_price = float('inf')
-        self.close_price = None
-        self.volume_accum = 0.0
-        self.start_timestamp = None
-        
-        # Extended VPIN states
-        self.current_buy_vol = 0.0
-        self.current_sell_vol = 0.0
-        self.vwap_sum = 0.0
-
-        # State for Tick Rule (Aggressor Logic)
-        self.prev_price = None
-        self.prev_tick_rule = 1  # Default to Buy (1)
-
-        # Adaptive Threshold Logic (EWMA)
-        self.expected_imbalance = initial_threshold
-        self.alpha = alpha   # Forgetting factor for EWMA
-
-    def process_tick(self, price: float, volume: float, timestamp: float, 
-                     external_buy_vol: float = 0.0, external_sell_vol: float = 0.0) -> Optional[VolumeBar]:
-        """
-        Ingest a single tick and determine if a bar should be closed based on Imbalance.
-        """
-        # Initialize if first tick
-        if self.prev_price is None:
-            self.prev_price = price
-            self.open_price = price
-            self.start_timestamp = timestamp
-            return None
-
-        # 1. Apply Tick Rule (Infer Aggressor)
-        # If external L2 data is provided, use it. Otherwise, use Tick Rule.
-        if external_buy_vol > 0 or external_sell_vol > 0:
-            # Trusted L2 Data
-            tick_rule = 1 if external_buy_vol > external_sell_vol else -1
-            if external_buy_vol == external_sell_vol: tick_rule = 0
-            self.prev_tick_rule = tick_rule
-        else:
-            # Standard Tick Rule
-            price_change = price - self.prev_price
-            if price_change != 0:
-                tick_rule = np.sign(price_change)
-                self.prev_tick_rule = tick_rule
-            else:
-                tick_rule = self.prev_tick_rule
-
-        # 2. Update Accumulators
-        # Imbalance is Tick Direction (signed 1)
-        self.current_imbalance += tick_rule
-        
-        self.ticks_in_bar += 1
-        self.volume_accum += volume
-        self.vwap_sum += (price * volume)
-        
-        if self.open_price is None: self.open_price = price
-        self.high_price = max(self.high_price, price)
-        self.low_price = min(self.low_price, price)
-        self.close_price = price
-        self.prev_price = price
-
-        # Track flows for VPIN
-        if tick_rule == 1:
-            self.current_buy_vol += volume
-        elif tick_rule == -1:
-            self.current_sell_vol += volume
-        else:
-            self.current_buy_vol += (volume / 2)
-            self.current_sell_vol += (volume / 2)
-
-        # 3. Check Threshold Condition (Absolute Imbalance >= Expected)
-        if abs(self.current_imbalance) >= self.expected_imbalance:
-            return self._finalize_bar(timestamp, price)
-
-        return None
-
-    def _finalize_bar(self, timestamp: float, close_price: float) -> VolumeBar:
-        """Internal method to package the bar and update adaptive thresholds."""
-        
-        # Convert timestamp to datetime if float
-        if isinstance(timestamp, (float, int)):
-            dt_ts = datetime.fromtimestamp(timestamp, pytz.utc)
-        else:
-            dt_ts = timestamp
-
-        vwap = self.vwap_sum / self.volume_accum if self.volume_accum > 0 else close_price
-
-        bar = VolumeBar(
-            timestamp=dt_ts,
-            open=self.open_price,
-            high=self.high_price,
-            low=self.low_price,
-            close=close_price,
-            volume=self.volume_accum,
-            vwap=vwap,
-            tick_count=self.ticks_in_bar,
-            buy_vol=self.current_buy_vol,
-            sell_vol=self.current_sell_vol
-        )
-
-        # 4. Update Expectations (EWMA)
-        # We update the expected imbalance threshold based on the actual imbalance seen.
-        # This allows the sampling rate to speed up (lower threshold) or slow down.
-        current_abs_imb = abs(self.current_imbalance)
-        self.expected_imbalance = (self.alpha * current_abs_imb) + \
-                                  ((1 - self.alpha) * self.expected_imbalance)
-        
-        # Clamp threshold to avoid sampling every tick or never sampling
-        # Lower bound raised to 10.0 to filter micro-noise
-        self.expected_imbalance = max(10.0, min(self.expected_imbalance, 10000.0))
-
-        # Reset State
-        self.current_imbalance = 0.0
-        self.ticks_in_bar = 0
-        self.open_price = None
-        self.high_price = -float('inf')
-        self.low_price = float('inf')
-        self.volume_accum = 0.0
-        self.vwap_sum = 0.0
-        self.current_buy_vol = 0.0
-        self.current_sell_vol = 0.0
-        self.start_timestamp = timestamp
-
-        return bar
 
 class VolumeBarAggregator:
     """
@@ -381,7 +249,7 @@ def load_real_data(
     if db_config is None:
         db_config = CONFIG.get('postgres')
         if not db_config:
-            print("ERROR: No database configuration found.")
+            logger.error("ERROR: No database configuration found.")
             return pd.DataFrame()
 
     try:
@@ -430,7 +298,7 @@ def load_real_data(
                     df['flags'] = 0
 
         if df.empty:
-            print(f"WARNING: Database query returned 0 rows for {symbol}. Check DB population!")
+            logger.warning(f"WARNING: Database query returned 0 rows for {symbol}. Check DB population!")
             return pd.DataFrame()
 
         tp = TemporalPipeline()
@@ -454,12 +322,12 @@ def load_real_data(
         return df
         
     except ImportError as e:
-        print(f"❌ ERROR: Missing required database dependencies: {e}")
-        print(f"🔎 FORENSIC TELEMETRY: Python Interpreter is currently: {sys.executable}")
-        print(f"💡 FIX: Ensure your conda environment has 'sqlalchemy' and 'psycopg2-binary' installed.")
+        logger.error(f"❌ ERROR: Missing required database dependencies: {e}")
+        logger.error(f"🔎 FORENSIC TELEMETRY: Python Interpreter is currently: {sys.executable}")
+        logger.error("💡 THE FIX: Ensure your conda environment has 'sqlalchemy' and 'psycopg2-binary' installed.")
         return pd.DataFrame()
     except Exception as e:
-        print(f"ERROR: Database load failed for {symbol}: {e}")
+        logger.error(f"ERROR: Database load failed for {symbol}: {e}")
         return pd.DataFrame()
 
 def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 1000, alpha: Optional[float] = None) -> List[Dict[str, Any]]:
@@ -468,6 +336,7 @@ def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 
     
     AUDIT FIX (2025-12-25): Removed hardcoded alpha=0.025. 
     Now defaults to CONFIG['data']['imbalance_alpha'] (0.05) to match Live Engine.
+    Crucially, relies on the single source of truth AdaptiveImbalanceBarGenerator from shared.financial.features.
     """
     bars = []
     
@@ -475,7 +344,7 @@ def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 
     if alpha is None:
         alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
 
-    # Use the new generator for batch processing to ensure training data matches live data
+    # Use the unified generator for batch processing to ensure training data matches live data perfectly
     gen = AdaptiveImbalanceBarGenerator(symbol="BATCH", initial_threshold=volume_threshold, alpha=alpha)
     
     for row in tick_df.itertuples():
