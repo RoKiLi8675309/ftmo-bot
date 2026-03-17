@@ -51,11 +51,14 @@ class TradeDispatcher:
                         logger.error(f"🛑 REJECTED BY DISPATCHER: {trade.symbol} {trade.action} R:R Ratio is {rr_ratio:.2f} (Target >= 1.5). Blocked to prevent spread bleed.")
                         return  # Abort dispatch immediately
 
-            # --- PERSIST INITIAL RISK DISTANCE ---
+            # --- PERSIST INITIAL RISK DISTANCE (WITH GLOBAL TTL) ---
             try:
                 initial_risk_dist = abs(trade.entry_price - trade.stop_loss)
                 if initial_risk_dist > 0:
                     self.stream_mgr.r.hset("bot:initial_risk", short_id, str(initial_risk_dist))
+                    # V20.18.2 FIX: Decouple lifecycle by setting a global 48-hour TTL on the hash.
+                    # This prevents memory leaks while ensuring active trades always have their R-multiple data.
+                    self.stream_mgr.r.expire("bot:initial_risk", 172800) 
             except Exception as e:
                 logger.error(f"Failed to persist initial risk to Redis for {short_id}: {e}")
             
@@ -172,13 +175,7 @@ class TradeDispatcher:
             
             for oid in to_remove:
                 if oid in self.pending_tracker:
-                    try:
-                        short_id = str(oid)[:8]
-                        self.stream_mgr.r.hdel("bot:initial_risk", short_id)
-                    except Exception as e:
-                        logger.debug(f"Failed to clear Redis hash for {short_id}: {e}")
-                        
+                    # V20.18.2 FIX: Removed hdel call. 
+                    # We NO LONGER delete the initial_risk hash key here. We rely on the global 48h TTL
+                    # to clean it up so that active trades correctly resolve their R-multiples for trailing stops.
                     del self.pending_tracker[oid]
-        
-        if to_remove:
-            logger.info(f"Cleaned up {len(to_remove)} pending orders.")

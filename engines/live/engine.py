@@ -671,7 +671,8 @@ class LiveTradingEngine:
             
         current_equity = self.ftmo_guard.equity
         if current_equity > 0:
-            limit = current_equity * 0.01
+            # V20.18 FIX: Replaced hardcoded 1% limit with config-driven FTMO daily loss limit (e.g. 4.0%)
+            limit = current_equity * self.daily_max_loss_pct
             if pnl < -limit:
                 return True
                 
