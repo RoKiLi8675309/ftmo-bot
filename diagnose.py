@@ -5,15 +5,16 @@
 # DEPENDENCIES: unittest, numpy, redis, shared
 # DESCRIPTION: Pre-Flight Forensic Diagnostics & PIPELINE VERIFICATION.
 # 
-# PHOENIX V20.17 UPDATE (BINARY BASE + META FILTER PROTOCOL):
+# PHOENIX V20.18 UPDATE (BINARY BASE + META FILTER PROTOCOL):
 # 1. SIZING VALIDATION: Accepts 'fixed_lots' for the data collection phase.
-# 2. CHOKE GUARD: Verifies trailing stops activate quickly at <= 1.0R.
+# 2. CHOKE GUARD: Verifies trailing stops activate quickly at <= 0.75R.
 # 3. ML FREEDOM ENFORCEMENT: Strictly asserts ADX == 0.0 to guarantee 
 #    the Machine Learning model has absolute control over trade execution.
 # 4. REGIME ENFORCEMENT: Asserts Regime Enforcement is completely DISABLED.
 # 5. ANTI-MACHINE-GUNNING: Asserts base 15-minute cooldown (exponentially scales on losses).
 # 6. SPREAD TRAP CURE: Asserts absolute minimum stop loss floor of 20.0 pips.
-# 7. META FILTER CHECK: Asserts meta_labeling_threshold exists in the search space.
+# 7. META FILTER CHECK: Asserts meta_labeling_threshold exists in the search space and reaches 0.30.
+# 8. FE SIGNATURE PARITY: Matches the V20.18 OnlineFeatureEngineer arguments.
 # =============================================================================
 import unittest
 import numpy as np
@@ -43,7 +44,7 @@ logger = logging.getLogger("Diagnose")
 
 class TestConfigurationIntegrity(unittest.TestCase):
     """
-    V20.17 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
+    V20.18 PRE-FLIGHT CHECK: Verifies that config.yaml is correctly loaded
     with the Binary EV Protocol parameters to prevent trade starvation.
     """
     def test_aggressor_risk_params(self):
@@ -80,7 +81,8 @@ class TestConfigurationIntegrity(unittest.TestCase):
         # We strictly enforce ADX == 0.0 so heuristic filters never choke the ML model.
         self.assertEqual(adx_thresh, 0.0, "CRITICAL: ADX threshold MUST be exactly 0.0 to grant ML full freedom (Unchoked Standard).")
         self.assertGreaterEqual(hurst_thresh, 0.50, "CRITICAL: Hurst breakout threshold must be >= 0.50")
-        self.assertLessEqual(trail_act, 1.0, "CRITICAL: Trailing stop activation must be <= 1.0R to lock in profits quickly")
+        # V20.18 UPDATE: Ensure BE Lock activates quickly to protect spread
+        self.assertLessEqual(trail_act, 0.75, "CRITICAL: Trailing stop activation must be <= 0.75R to lock in profits quickly and prevent reversal losses as per V20.18 protocol")
 
     def test_v20_17_expert_trader_protocol(self):
         """Verify the V20.17 Expert Trader protocol is active to prevent machine gunning."""
@@ -94,11 +96,16 @@ class TestConfigurationIntegrity(unittest.TestCase):
         self.assertGreaterEqual(cooldown, 15, "CRITICAL: Base loss cooldown must be >= 15 minutes to prevent machine-gunning via exponential scaling.")
         self.assertGreaterEqual(min_sl, 20.0, "CRITICAL: Minimum Stop Loss must be >= 20.0 pips to escape spread traps.")
 
-    def test_v20_17_binary_meta_protocol(self):
-        """Verify Meta-Labeling Threshold is in the search space."""
+    def test_v20_18_binary_meta_protocol(self):
+        """Verify Meta-Labeling Threshold is in the search space and allows low-end tuning."""
         space = CONFIG.get('optimization_search_space', {})
         self.assertIn('meta_labeling_threshold', space, "CRITICAL: meta_labeling_threshold must be in the search space to tune the Binary EV filter.")
-        print(f"    [CONF] Meta-Labeling Tuning Enabled: {list(space['meta_labeling_threshold'].keys())}")
+        
+        # V20.18: Guarantee the optimizer can reach down to 0.30 to unchoke the filter
+        meta_min = space.get('meta_labeling_threshold', {}).get('min', 0.50)
+        self.assertLessEqual(meta_min, 0.30, "CRITICAL: Meta-labeling threshold minimum must be <= 0.30 to allow the optimizer to unchoke the filter as per V20.18.")
+        
+        print(f"    [CONF] Meta-Labeling Tuning Enabled: {list(space['meta_labeling_threshold'].keys())} | Min: {meta_min}")
 
     def test_regime_settings(self):
         """Verify Regime Enforcement is DISABLED to prevent heuristic over-filtering."""
@@ -213,7 +220,12 @@ class TestFeatureEngineering(unittest.TestCase):
         # Saturated the internal buffer (window_size=50) by calling update()
         # Shannon Entropy of a constant sequence must be 0.0.
         for i in range(60):
-            features = self.fe.update(price=100.0, timestamp=current_ts + i, volume=100)
+            # V20.18 FIX: Injecting dummy values for the expanded FE signature
+            features = self.fe.update(
+                price=100.0, timestamp=current_ts + i, volume=100.0,
+                high=100.0, low=100.0, buy_vol=50.0, sell_vol=50.0,
+                time_feats={}, context_data={}
+            )
         
         # Verify the key exists and the value is physically sound
         self.assertIsNotNone(features, "FE update should return a feature dict after saturation")
@@ -226,8 +238,17 @@ class TestFeatureEngineering(unittest.TestCase):
     def test_log_returns(self):
         """Verify log return calculation parity."""
         current_ts = 1000.0
-        self.fe.update(price=100.0, timestamp=current_ts, volume=100)
-        features = self.fe.update(price=101.0, timestamp=current_ts+1, volume=100)
+        # V20.18 FIX: Injecting dummy values for the expanded FE signature
+        self.fe.update(
+            price=100.0, timestamp=current_ts, volume=100.0,
+            high=100.0, low=100.0, buy_vol=50.0, sell_vol=50.0,
+            time_feats={}, context_data={}
+        )
+        features = self.fe.update(
+            price=101.0, timestamp=current_ts+1, volume=100.0,
+            high=101.0, low=101.0, buy_vol=50.0, sell_vol=50.0,
+            time_feats={}, context_data={}
+        )
         
         expected_ret = np.log(101.0 / 100.0)
         self.assertAlmostEqual(features['log_ret'], expected_ret, places=6)
@@ -265,5 +286,5 @@ class TestRiskCalculations(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    print(f"\n🔍 RUNNING PHOENIX V20.17 PIPELINE DIAGNOSTICS...")
+    print(f"\n🔍 RUNNING PHOENIX V20.18 PIPELINE DIAGNOSTICS...")
     unittest.main(verbosity=2)

@@ -30,7 +30,7 @@ from shared import (
     VolumeBar,
     RiskManager,
     load_real_data,            
-    get_redis_connection       
+    get_redis_connection        
 )
 from shared.financial.features import (
     OnlineFeatureEngineer,
@@ -64,7 +64,7 @@ class MultiAssetPredictor:
         self.models_dir.mkdir(exist_ok=True)
         
         self.threshold_map = threshold_map if threshold_map else {}
-        self.feature_engineers = {s: OnlineFeatureEngineer(window_size=CONFIG['features']['window_size']) for s in symbols}
+        self.feature_engineers = {s: OnlineFeatureEngineer(window_size=CONFIG['features']['window_size'], live_mode=True) for s in symbols}
         
         tbm_conf = CONFIG['online_learning']['tbm']
         risk_conf = CONFIG.get('risk_management', {})
@@ -85,8 +85,11 @@ class MultiAssetPredictor:
         self.closes_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         self.volume_buffer = {s: deque(maxlen=self.window_size_trio) for s in symbols}
         
+        # 🚨 V20.18.2 FIX: Microstructure Parameter Integration (Multi-Asset Parity)
+        # Refactored scalar variables into dictionaries so every pair retains its unique DNA.
+        phx_conf = CONFIG.get('phoenix_strategy', {})
         self.bb_window = 20
-        self.bb_std = 1.5 
+        self.bb_stds = {s: 1.5 for s in symbols} 
         self.bb_buffers = {s: deque(maxlen=self.bb_window) for s in symbols}
         
         self.sniper_closes = {s: deque(maxlen=200) for s in symbols} 
@@ -101,14 +104,13 @@ class MultiAssetPredictor:
         self.last_features = {s: None for s in symbols}
         self.prev_features = {s: None for s in symbols}
 
-        phx_conf = CONFIG.get('phoenix_strategy', {})
         self.regime_enforcement = "DISABLED" 
         self.asset_regime_map = phx_conf.get('asset_regime_map', {})
         
-        self.ker_floor = 0.0003 
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.52)) 
+        self.ker_floors = {s: 0.0003 for s in symbols} 
+        self.hurst_breakouts = {s: float(phx_conf.get('hurst_breakout_threshold', 0.52)) for s in symbols} 
         self.hurst_veto = 0.65 
-        self.rvol_trigger = 0.8 
+        self.rvol_triggers = {s: 0.8 for s in symbols} 
         self.max_rvol_thresh = 35.0 
         self.adx_threshold = 0.0 
 
@@ -116,6 +118,7 @@ class MultiAssetPredictor:
             s_risk = risk_mult_conf
             s_reward = tbm_conf.get('barrier_width', 3.0) 
             s_horizon = tbm_conf.get('horizon_minutes', 720) 
+            s_drift = float(tbm_conf.get('drift_threshold', 1.5))
             s_horizon_type = tbm_conf.get('horizon_type', 'TIME')
             s_horizon_val = float(tbm_conf.get('horizon_threshold', 0.0))
             
@@ -128,17 +131,28 @@ class MultiAssetPredictor:
                         
                         if 'barrier_width' in bp: s_reward = max(float(bp['barrier_width']), 2.0)
                         if 'horizon_minutes' in bp: s_horizon = int(bp['horizon_minutes'])
+                        if 'drift_threshold' in bp: s_drift = float(bp['drift_threshold'])
                         
                         if 'risk_per_trade_percent' in bp:
                             if s not in self.optimized_params: self.optimized_params[s] = {}
                             self.optimized_params[s]['risk_per_trade_percent'] = float(bp['risk_per_trade_percent'])
+                            
+                        # 🚨 V20.18.2 FIX: Inject pair-specific thresholds
+                        if 'hurst_breakout_threshold' in bp:
+                            self.hurst_breakouts[s] = float(bp['hurst_breakout_threshold'])
+                        if 'rvol_volatility_trigger' in bp:
+                            self.rvol_triggers[s] = float(bp['rvol_volatility_trigger'])
+                        if 'bb_std_dev' in bp:
+                            self.bb_stds[s] = float(bp['bb_std_dev'])
+                        if 'ker_floor' in bp:
+                            self.ker_floors[s] = float(bp['ker_floor'])
                             
                 except Exception as e:
                     logger.warning(f"Failed to load optimized params for {s}: {e}")
 
             self.labelers[s] = AdaptiveTripleBarrier(
                 horizon_ticks=s_horizon, risk_mult=s_risk, reward_mult=s_reward,
-                drift_threshold=tbm_conf.get('drift_threshold', 1.5),
+                drift_threshold=s_drift,
                 horizon_type=s_horizon_type, horizon_value=s_horizon_val
             )
 
@@ -227,7 +241,6 @@ class MultiAssetPredictor:
             try:
                 df = load_real_data(sym, n_candles=500000, days=30)
                 if df is None or df.empty: 
-                    # V20.18 FIX: explicitly warn if DB is empty to inform user of cold start.
                     logger.warning(f"⚠️ {sym} Warm-Up Data Empty! Model will start completely cold and learn dynamically.")
                     continue
                 
@@ -286,7 +299,6 @@ class MultiAssetPredictor:
                 logger.error(f"❌ Warm-Up Failed for {sym}: {e}", exc_info=True)
 
     def _train_on_bar(self, symbol: str, bar: Any):
-        
         bar_close = bar.close if hasattr(bar, 'close') else bar.get('close', 0.0)
         bar_volume = bar.volume if hasattr(bar, 'volume') else bar.get('volume', 1.0)
         bar_high = bar.high if hasattr(bar, 'high') else bar.get('high', bar_close)
@@ -323,7 +335,8 @@ class MultiAssetPredictor:
         features = fe.update(
             price=bar_close, timestamp=bar_ts, volume=bar_volume,
             high=bar_high, low=bar_low, buy_vol=b_vol, sell_vol=s_vol,
-            time_feats={'sin_hour':0, 'cos_hour':0} 
+            time_feats={'sin_hour':0, 'cos_hour':0},
+            context_data={}  # 🚨 V20.18 FIX: Add context_data to signature for historical warm-up
         )
         
         if features is None: return
@@ -553,7 +566,8 @@ class MultiAssetPredictor:
         min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
         min_profit_dist = min_profit_pips * pip_val
 
-        is_trending = hurst >= self.hurst_breakout
+        # 🚨 V20.18.2 FIX: Use Pair-Specific Hurst Breakout
+        is_trending = hurst >= self.hurst_breakouts.get(symbol, 0.52)
         proposed_action = 0 
         
         regime_label = "TREND_BREAKOUT" if is_trending else "MEAN_REVERSION"
@@ -636,7 +650,8 @@ class MultiAssetPredictor:
                 logger.info(f"📐 {symbol} GATE: Negative EV | BuyEdge: {buy_edge:.2f} | SellEdge: {sell_edge:.2f}")
             return Signal(symbol, "HOLD", 0.0, {"reason": "Negative EV"})
 
-        effective_ker_thresh = max(0.0001, self.ker_floor + self.dynamic_ker_offsets[symbol])
+        # 🚨 V20.18.2 FIX: Use Pair-Specific KER Floor
+        effective_ker_thresh = max(0.0001, self.ker_floors.get(symbol, 0.0003) + self.dynamic_ker_offsets[symbol])
         if ker_val < effective_ker_thresh:
             stats["Low KER"] += 1
             if stats["Low KER"] % 50 == 0:
@@ -645,7 +660,7 @@ class MultiAssetPredictor:
 
         try:
             base_meta_thresh = self.optimized_params.get(symbol, {}).get('meta_labeling_threshold', 0.50)
-            meta_thresh = max(base_meta_thresh + (0.02 * streak), 0.40)
+            meta_thresh = max(base_meta_thresh + (0.02 * streak), 0.30)
             
             is_profitable = meta_labeler.predict(clean_features, proposed_action, threshold=meta_thresh)
             
@@ -703,7 +718,8 @@ class MultiAssetPredictor:
                 for f in imp_feats: self.feature_importance_counter[symbol][f] += 1
 
                 opt_risk = self.optimized_params.get(symbol, {}).get('risk_per_trade_percent')
-                tighten_stops = (rvol_val > self.rvol_trigger)
+                # 🚨 V20.18.2 FIX: Use Pair-Specific RVol Trigger
+                tighten_stops = (rvol_val > self.rvol_triggers.get(symbol, 0.8))
 
                 self.last_trade_bar[symbol] = self.bar_counters[symbol]
                 self.last_trade_direction[symbol] = proposed_action

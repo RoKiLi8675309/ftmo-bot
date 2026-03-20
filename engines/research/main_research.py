@@ -35,11 +35,10 @@ if project_root not in sys.path:
 
 # Import after path fix
 try:
-    from engines.research.backtester import BacktestBroker, MarketSnapshot
+    from engines.research.backtester import BacktestBroker, MarketSnapshot, process_data_into_bars
     from engines.research.strategy import ResearchStrategy
     from shared import CONFIG, setup_logging, load_real_data, LogSymbols, RiskManager
-    # V20.18 DRY FIX: Import the unified generator to ensure total feature parity with Live Engine
-    from shared.financial.features import AdaptiveImbalanceBarGenerator
+    from shared.data import batch_generate_volume_bars
 except ImportError as e:
     print(f"CRITICAL: Failed to import dependencies. Ensure you are running from the project root or 'shared' is accessible.\nError: {e}")
     sys.exit(1)
@@ -111,75 +110,6 @@ class EmojiCallback:
             else:
                 log.info(f"\n🔎 FAILURE AUTOPSY (Trial {trial.number}): {autopsy_text}\n" + ("-" * 80))
 
-def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
-    raw_ticks = load_real_data(symbol, n_candles=n_ticks, days=730 * 2)
-    if raw_ticks.empty: return pd.DataFrame()
-
-    config_threshold = CONFIG['data'].get('volume_bar_threshold', 10.0) 
-    alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
-    
-    first_ts = raw_ticks.index.min()
-    cal_cutoff = first_ts + timedelta(days=30)
-    cal_df = raw_ticks[raw_ticks.index < cal_cutoff]
-    if cal_df.empty: cal_df = raw_ticks
-        
-    current_thresh = config_threshold
-    min_bars = 500
-    final_thresh = config_threshold 
-    
-    for attempt in range(4):
-        # V20.18 FIX: Using the unified AdaptiveImbalanceBarGenerator
-        gen = AdaptiveImbalanceBarGenerator(symbol=symbol, initial_threshold=current_thresh, alpha=alpha)
-        count = 0
-        for row in cal_df.itertuples():
-            p = getattr(row, 'price', getattr(row, 'close', None))
-            v = getattr(row, 'volume', 1.0)
-            t = getattr(row, 'Index', getattr(row, 'time', None))
-            ts_val = t.timestamp() if isinstance(t, (datetime, pd.Timestamp)) else float(t)
-            if p is None: continue
-            if gen.process_tick(p, v, ts_val, 0.0, 0.0): count += 1
-        
-        if count >= min_bars:
-            final_thresh = current_thresh
-            break
-        else:
-            # V20.18 Parity: Slower backoff (x0.5) and higher minimum (10.0)
-            current_thresh = max(10.0, current_thresh * 0.5)
-            final_thresh = current_thresh
-
-    log.info(f"📊 {symbol}: Calibrated Imbalance Threshold to {final_thresh:.2f} (V20.18 Parity)")
-
-    gen = AdaptiveImbalanceBarGenerator(symbol=symbol, initial_threshold=final_thresh, alpha=alpha)
-    bars = []
-    for row in raw_ticks.itertuples():
-        p = getattr(row, 'price', getattr(row, 'close', None))
-        v = getattr(row, 'volume', 1.0)
-        t = getattr(row, 'Index', getattr(row, 'time', None))
-        ts_val = t.timestamp() if isinstance(t, (datetime, pd.Timestamp)) else float(t)
-        if p is None: continue
-        
-        bar = gen.process_tick(p, v, ts_val, 0.0, 0.0)
-        if bar: 
-            # Convert VolumeBar dataclass back to dict format for dataframe construction
-            bars.append({
-                'timestamp': bar.timestamp,
-                'open': bar.open,
-                'high': bar.high,
-                'low': bar.low,
-                'close': bar.close,
-                'volume': bar.volume,
-                'vwap': bar.vwap,
-                'tick_count': bar.tick_count,
-                'buy_vol': bar.buy_vol,
-                'sell_vol': bar.sell_vol
-            })
-
-    if not bars: return pd.DataFrame()
-    df_bars = pd.DataFrame(bars)
-    df_bars['time'] = pd.to_datetime(df_bars['timestamp'], unit='s', utc=True)
-    df_bars.set_index('time', inplace=True, drop=False)
-    return df_bars
-
 # --- 2. WORKER FUNCTIONS ---
 
 def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url: str) -> None:
@@ -215,12 +145,17 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             params['entropy_threshold'] = trial.suggest_float('entropy_threshold', space['entropy_threshold']['min'], space['entropy_threshold']['max'])
             params['vpin_threshold'] = trial.suggest_float('vpin_threshold', space['vpin_threshold']['min'], space['vpin_threshold']['max'])
             
-            # V20.18 FIX: Meta-Filter tuning & Edge Tuning
             params['meta_labeling_threshold'] = trial.suggest_float('meta_labeling_threshold', space['meta_labeling_threshold']['min'], space['meta_labeling_threshold']['max'])
             params['model_edge_threshold'] = trial.suggest_float('model_edge_threshold', space['model_edge_threshold']['min'], space['model_edge_threshold']['max'])
             
+            params['hurst_breakout_threshold'] = trial.suggest_float('hurst_breakout_threshold', 0.45, 0.65)
+            params['rvol_volatility_trigger'] = trial.suggest_float('rvol_volatility_trigger', 0.5, 2.5)
+            params['bb_std_dev'] = trial.suggest_float('bb_std_dev', 1.0, 3.0)
+            params['ker_floor'] = trial.suggest_float('ker_floor', 0.0001, 0.0010, log=True)
+            
             sl_atr_mult = float(CONFIG.get('risk_management', {}).get('stop_loss_atr_mult', 1.5))
-            min_barrier = max(sl_atr_mult * 2.0, float(space['tbm_barrier_width']['min']))
+            
+            min_barrier = max(sl_atr_mult * 1.5, float(space['tbm_barrier_width']['min']))
             max_barrier = max(min_barrier + 0.5, float(space['tbm_barrier_width']['max']))
             min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
             
@@ -240,7 +175,6 @@ def _worker_optimize_task(symbol: str, n_trials: int, train_candles: int, db_url
             
             broker = BacktestBroker(initial_balance=init_bal)
             
-            # V20.18 FIX: model is now a dict containing 'buy' and 'sell' pipelines
             model = pipeline_inst.get_fresh_model(params)
             
             strategy = ResearchStrategy(model, symbol, params, historical_df=warmup_df)
@@ -361,8 +295,14 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
                 params['meta_labeling_threshold'] = trial.suggest_float('meta_labeling_threshold', space['meta_labeling_threshold']['min'], space['meta_labeling_threshold']['max'])
                 params['model_edge_threshold'] = trial.suggest_float('model_edge_threshold', space['model_edge_threshold']['min'], space['model_edge_threshold']['max'])
                 
+                params['hurst_breakout_threshold'] = trial.suggest_float('hurst_breakout_threshold', 0.45, 0.65)
+                params['rvol_volatility_trigger'] = trial.suggest_float('rvol_volatility_trigger', 0.5, 2.5)
+                params['bb_std_dev'] = trial.suggest_float('bb_std_dev', 1.0, 3.0)
+                params['ker_floor'] = trial.suggest_float('ker_floor', 0.0001, 0.0010, log=True)
+                
                 sl_atr_mult = float(CONFIG.get('risk_management', {}).get('stop_loss_atr_mult', 1.5))
-                min_barrier = max(sl_atr_mult * 2.0, float(space['tbm_barrier_width']['min']))
+                
+                min_barrier = max(sl_atr_mult * 1.5, float(space['tbm_barrier_width']['min']))
                 max_barrier = max(min_barrier + 0.5, float(space['tbm_barrier_width']['max']))
                 min_profit_pips = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
 
@@ -428,17 +368,20 @@ def _worker_wfo_task(symbol: str, n_trials: int, db_url: str):
             study.optimize(wfo_objective, n_trials=n_trials)
             
             final_p = CONFIG['online_learning'].copy()
-            final_p.update(study.best_params)
+            best_params = study.best_params
+            final_p.update(best_params)
             
+            # 🚨 FIX: Hydrate the nested dictionaries to prevent global config overrides
             final_p['risk_management'] = CONFIG.get('risk_management', {}).copy()
             final_p['risk_management']['sizing_method'] = 'risk_percentage'
+            if 'risk_per_trade_percent' in best_params:
+                final_p['risk_management']['risk_per_trade_percent'] = best_params['risk_per_trade_percent']
+            
             if 'tbm' not in final_p: final_p['tbm'] = CONFIG['online_learning'].get('tbm', {}).copy()
-            final_p['tbm']['barrier_width'] = study.best_params.get('barrier_width', 3.0)
+            final_p['tbm']['barrier_width'] = best_params.get('barrier_width', 3.0)
             final_p['tbm']['min_profit_pips'] = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
-            if 'horizon_minutes' in study.best_params:
-                final_p['tbm']['horizon_minutes'] = study.best_params['horizon_minutes']
-            if 'drift_threshold' in study.best_params:
-                final_p['tbm']['drift_threshold'] = study.best_params['drift_threshold']
+            if 'horizon_minutes' in best_params: final_p['tbm']['horizon_minutes'] = best_params['horizon_minutes']
+            if 'drift_threshold' in best_params: final_p['tbm']['drift_threshold'] = best_params['drift_threshold']
             
             pipe = ResearchPipeline()
             broker_oos = BacktestBroker(initial_balance=50000.0)
@@ -499,21 +442,17 @@ def _worker_finalize_task(symbol: str, train_candles: int, db_url: str, models_d
         final_p = CONFIG['online_learning'].copy()
         final_p.update(best_params)
         
+        # 🚨 FIX: Hydrate the nested dictionaries to prevent global config overrides
         final_p['risk_management'] = CONFIG.get('risk_management', {}).copy()
         final_p['risk_management']['sizing_method'] = 'risk_percentage'
+        if 'risk_per_trade_percent' in best_params:
+            final_p['risk_management']['risk_per_trade_percent'] = best_params['risk_per_trade_percent']
         
         if 'tbm' not in final_p: final_p['tbm'] = CONFIG['online_learning'].get('tbm', {}).copy()
         final_p['tbm']['barrier_width'] = best_params.get('barrier_width', 3.0)
         final_p['tbm']['min_profit_pips'] = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
-        
-        if 'horizon_minutes' in best_params:
-            final_p['tbm']['horizon_minutes'] = best_params['horizon_minutes']
-        if 'drift_threshold' in best_params:
-            final_p['tbm']['drift_threshold'] = best_params['drift_threshold']
-        if 'meta_labeling_threshold' in best_params:
-            final_p['meta_labeling_threshold'] = best_params['meta_labeling_threshold']
-        if 'model_edge_threshold' in best_params:
-            final_p['model_edge_threshold'] = best_params['model_edge_threshold']
+        if 'horizon_minutes' in best_params: final_p['tbm']['horizon_minutes'] = best_params['horizon_minutes']
+        if 'drift_threshold' in best_params: final_p['tbm']['drift_threshold'] = best_params['drift_threshold']
         
         pipe = ResearchPipeline()
         model = pipe.get_fresh_model(final_p)
@@ -660,24 +599,28 @@ class ResearchPipeline:
             df = process_data_into_bars(s, n_ticks=self.train_candles)
             if df.empty: return []
             
-            # V20.18 FIX: Load Dual Models
-            buy_model_path = self.models_dir / f"river_pipeline_buy_{s}.pkl"
-            sell_model_path = self.models_dir / f"river_pipeline_sell_{s}.pkl"
-            if not buy_model_path.exists() or not sell_model_path.exists():
+            params = CONFIG['online_learning'].copy()
+            best_params_path = self.models_dir / f"best_params_{s}.json"
+            if not best_params_path.exists():
+                log.warning(f"No best_params found for {s}. Skipping backtest.")
                 return []
                 
-            with open(buy_model_path, "rb") as f: model_buy = pickle.load(f)
-            with open(sell_model_path, "rb") as f: model_sell = pickle.load(f)
-            model = {'buy': model_buy, 'sell': model_sell}
+            with open(best_params_path, "r") as f: 
+                best_params = json.load(f)
+                
+            params.update(best_params)
             
-            params = CONFIG['online_learning'].copy()
-            with open(self.models_dir / f"best_params_{s}.json", "r") as f: params.update(json.load(f))
-            
+            # 🚨 FIX: Hydrate the nested dictionaries to prevent global config overrides
             params['risk_management'] = CONFIG.get('risk_management', {}).copy()
             params['risk_management']['sizing_method'] = 'risk_percentage' 
+            if 'risk_per_trade_percent' in best_params:
+                params['risk_management']['risk_per_trade_percent'] = best_params['risk_per_trade_percent']
+            
             if 'tbm' not in params: params['tbm'] = CONFIG['online_learning'].get('tbm', {}).copy()
-            params['tbm']['barrier_width'] = params.get('barrier_width', 3.0)
+            params['tbm']['barrier_width'] = best_params.get('barrier_width', 3.0)
             params['tbm']['min_profit_pips'] = float(CONFIG.get('online_learning', {}).get('tbm', {}).get('min_profit_pips', 40.0))
+            if 'horizon_minutes' in best_params: params['tbm']['horizon_minutes'] = best_params['horizon_minutes']
+            if 'drift_threshold' in best_params: params['tbm']['drift_threshold'] = best_params['drift_threshold']
 
             if len(df) > 500:
                 warmup_df = df.head(500)
@@ -686,19 +629,21 @@ class ResearchPipeline:
                 warmup_df = df.iloc[:0]
                 eval_df = df
                 
+            model = self.get_fresh_model(params)    
             strat = ResearchStrategy(model, s, params, historical_df=warmup_df)
             broker = BacktestBroker(initial_balance=CONFIG['env'].get('initial_balance', 50000.0))
             
             for idx, row in eval_df.iterrows():
                 snap = MarketSnapshot(timestamp=idx, data=row)
-                broker.process_pending(snap); strat.on_data(snap, broker)
+                broker.process_pending(snap)
+                strat.on_data(snap, broker)
+                
             return broker.trade_log
-        except: return []
+        except Exception as e:
+            log.error(f"Backtest failed for {s}: {e}")
+            return []
 
     def _generate_report(self, trade_log: List[Dict]):
-        """
-        V20.18: Generates a beautiful, FTMO-centric console Tearsheet.
-        """
         if not trade_log:
             log.warning("No trades generated during backtest. Report aborted.")
             return
@@ -724,9 +669,8 @@ class ResearchPipeline:
         avg_loss = df[df['Net_PnL'] <= 0]['Net_PnL'].mean() if len(df[df['Net_PnL'] <= 0]) > 0 else 0.0
         expectancy = (win_rate * avg_win) + ((1 - win_rate) * avg_loss)
         
-        # FTMO Logic Checks
         target_profit = initial_balance * 0.10
-        max_loss_limit = 10.0 # 10%
+        max_loss_limit = 10.0 
         
         passed = (total_pnl >= target_profit) and (max_dd_pct < max_loss_limit)
         status_text = "✅ PASSED" if passed else "❌ FAILED"

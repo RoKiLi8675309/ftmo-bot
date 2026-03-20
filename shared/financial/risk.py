@@ -172,6 +172,16 @@ class RiskManager:
         elif any(x in s for x in ["US30", "GER30", "GER40", "NAS100", "SPX500", "US500", "DJI", "DAX", "UK100", "JP225"]):
             lev = float(lev_map.get('indices', 20.0))
 
+        # --- V20.18 FIX: FRIDAY LEVERAGE CLAMP (FTMO MARGIN STARVATION PREVENTION) ---
+        guard = SessionGuard()
+        if guard.is_friday_afternoon():
+            # FTMO dynamically slashes leverage over the weekend (e.g., 1:30 -> 1:10).
+            # By proactively dividing our perceived leverage by 3.0 heading into Friday, 
+            # we tightly clamp the free margin, preventing margin calls during the weekend squeeze.
+            original_lev = lev
+            lev = max(1.0, lev / 3.0)
+            logger.info(f"🛡️ WEEKEND MARGIN CLAMP: {symbol} Margin Requirements Adjusted (Effective Lev: {lev:.1f}x) to survive Friday Rollover.")
+
         if lev <= 0: return 0.0
 
         one_lot_margin = (contract_size * price * conversion_rate) / lev

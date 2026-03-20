@@ -399,7 +399,7 @@ class BacktestBroker:
         """
         Public API called by ResearchStrategy.
         Applies STRICT REALITY INJECTION (Volatility Penalty) AND FIXED LOT CLAMP.
-        V20.18: Enforces exact 1.40 R:R at the Metal Layer (Aligned with Windows Producer).
+        V20.18: Enforces exact 1.40 R:R at the Metal Layer (Aligned with Live Engine).
         """
         risk_conf = CONFIG.get('risk_management', {})
         if risk_conf.get('sizing_method') == 'fixed_lots':
@@ -719,7 +719,8 @@ def process_data_into_bars(symbol: str, n_ticks: int = 4000000) -> pd.DataFrame:
             break
         else:
             attempts += 1
-            new_threshold = max(10.0, current_threshold * 0.5) 
+            # 🚨 V20.18.2 FIX: Allow threshold to drop down to 1.0 to prevent data starvation on low-volume pairs
+            new_threshold = max(1.0, current_threshold * 0.5) 
             logger.warning(f"⚠️ {symbol}: Insufficient bars ({bar_count}). Retrying with threshold {new_threshold}...")
             current_threshold = new_threshold
             final_threshold = current_threshold

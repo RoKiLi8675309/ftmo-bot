@@ -1,22 +1,20 @@
 from __future__ import annotations
-import math
-import logging
-import sys
-import os
 import warnings
-import contextlib
-import io
-import copy
-import threading
-import numpy as np
 import pandas as pd
-from collections import deque
-from typing import Dict, Any, Optional, List, Tuple
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+import numpy as np
 import pytz
+import sys
+import logging
+import math
+import os
+import threading
+import copy
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional, Tuple
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
-# Shared Config
+# Shared Imports
 from shared.core.config import CONFIG
 from shared.domain.models import VolumeBar
 
@@ -338,6 +336,10 @@ class AdaptiveImbalanceBarGenerator:
     def __init__(self, symbol: str, initial_threshold: float = 10.0, alpha: float = 0.05):
         self.symbol = symbol
         
+        # 🚨 V20.18 FIX: Store the dynamic minimum threshold derived from the calibration phase.
+        # This prevents the hardcap bug from destroying retail FX dense data streams.
+        self.min_threshold = max(0.1, initial_threshold * 0.1)
+        
         # State variables for the current bar
         self.current_imbalance = 0.0
         self.ticks_in_bar = 0
@@ -408,7 +410,29 @@ class AdaptiveImbalanceBarGenerator:
 
         # 3. Check Threshold Condition
         if abs(self.current_imbalance) >= self.expected_imbalance or self.ticks_in_bar >= 1000:
-            return self._finalize_bar(timestamp, price)
+            # ⚠️ WARNING FIX: Calculate volume spillover to prevent data distortion
+            excess_imbalance = abs(self.current_imbalance) - self.expected_imbalance
+            spill_vol = 0.0
+            if abs(self.current_imbalance) > 0:
+                spill_ratio = excess_imbalance / abs(self.current_imbalance)
+                spill_vol = volume * spill_ratio
+
+            bar = self._finalize_bar(timestamp, price)
+            
+            # Apply spillover to next bar state
+            if excess_imbalance > 0:
+                self.current_imbalance = tick_rule * excess_imbalance
+                self.volume_accum = spill_vol
+                self.vwap_sum = price * spill_vol
+                self.ticks_in_bar = 1
+                self.open_price = price
+                if tick_rule == 1: self.current_buy_vol = spill_vol
+                elif tick_rule == -1: self.current_sell_vol = spill_vol
+                else:
+                    self.current_buy_vol = spill_vol / 2.0
+                    self.current_sell_vol = spill_vol / 2.0
+
+            return bar
 
         return None
 
@@ -435,7 +459,10 @@ class AdaptiveImbalanceBarGenerator:
 
         current_abs_imb = abs(self.current_imbalance)
         self.expected_imbalance = (self.alpha * current_abs_imb) + ((1 - self.alpha) * self.expected_imbalance)
-        self.expected_imbalance = max(10.0, min(self.expected_imbalance, 10000.0))
+        
+        # 🚨 V20.18 FIX: Utilize self.min_threshold instead of a hardcoded 10.0!
+        # This completely cures the Data Starvation bug on retail fractional tick volume feeds.
+        self.expected_imbalance = max(self.min_threshold, min(self.expected_imbalance, 10000.0))
 
         self.current_imbalance = 0.0
         self.ticks_in_bar = 0
@@ -449,45 +476,6 @@ class AdaptiveImbalanceBarGenerator:
         self.start_timestamp = timestamp
 
         return bar
-
-def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 10.0, alpha: Optional[float] = None) -> List[Dict[str, Any]]:
-    bars = []
-    if alpha is None:
-        alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
-
-    gen = AdaptiveImbalanceBarGenerator(symbol="BATCH", initial_threshold=volume_threshold, alpha=alpha)
-    
-    for row in tick_df.itertuples():
-        price = getattr(row, 'price', getattr(row, 'close', None))
-        vol = getattr(row, 'volume', 1.0)
-        ts = getattr(row, 'Index', getattr(row, 'time', None))
-        b_vol = getattr(row, 'buy_vol', 0.0)
-        s_vol = getattr(row, 'sell_vol', 0.0)
-        
-        if price is None: continue
-        
-        if isinstance(ts, (datetime, pd.Timestamp)):
-            ts_val = ts.timestamp()
-        else:
-            ts_val = float(ts)
-
-        bar = gen.process_tick(price, vol, ts_val, b_vol, s_vol)
-        
-        if bar:
-            bars.append({
-                'timestamp': bar.timestamp,
-                'open': bar.open,
-                'high': bar.high,
-                'low': bar.low,
-                'close': bar.close,
-                'volume': bar.volume,
-                'vwap': bar.vwap,
-                'tick_count': bar.tick_count,
-                'buy_vol': bar.buy_vol,
-                'sell_vol': bar.sell_vol
-            })
-            
-    return bars
 
 # --- 3. REGIME INDICATORS ---
 
@@ -542,11 +530,8 @@ class FractalDimensionIndex:
 class RegimeDetector:
     """
     Online Hidden Markov Model (HMM) for regime classification.
-    V20.6 FIX: Asynchronous fitting prevents the Python GIL from blocking
-    the live tick stream and triggering massive network latency drops.
-    V20.8 FIX: Added __getstate__ and __setstate__ to prevent threading.Lock pickle crashes.
     """
-    def __init__(self, n_states: int = 2, window: int = 100):
+    def __init__(self, n_states: int = 2, window: int = 100, executor: Optional[ThreadPoolExecutor] = None):
         self.n_states = n_states
         self.window = window
         self.returns = deque(maxlen=window)
@@ -558,7 +543,10 @@ class RegimeDetector:
         
         # Concurrency protections
         self.lock = threading.Lock()
-        self.executor = ThreadPoolExecutor(max_workers=1)
+        
+        # 🚨 V20.18 FIX: Track whether we own the executor or if it was injected
+        self._owns_executor = False
+        self.executor = executor
         self.is_fitting = False
         
         if HMM_AVAILABLE:
@@ -569,7 +557,7 @@ class RegimeDetector:
                 self.model = hmm.GaussianHMM(
                     n_components=n_states,
                     covariance_type="diag",
-                    n_iter=20, # V20.18 FIX: Reduced from 100 to prevent GIL blocking tick processing
+                    n_iter=20, # Reduced from 100 to prevent GIL blocking
                     random_state=42,
                     init_params="stmc",
                     verbose=False,
@@ -589,7 +577,8 @@ class RegimeDetector:
     def __setstate__(self, state):
         self.__dict__.update(state)
         self.lock = threading.Lock()
-        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.executor = None
+        self._owns_executor = False
         self.is_fitting = False
     
     def update(self, ret: float) -> int:
@@ -613,7 +602,14 @@ class RegimeDetector:
             if should_fit and not self.is_fitting:
                 self.is_fitting = True
                 fit_data = data.copy()
-                self.executor.submit(self._async_fit, fit_data)
+                
+                # 🚨 V20.18 FIX: Synchronous Execution during Backtests!
+                # If no executor is provided, we MUST run synchronously to prevent cross-trial
+                # state contamination and assure pure determinism during Optuna search.
+                if self.executor is not None:
+                    self.executor.submit(self._async_fit, fit_data)
+                else:
+                    self._async_fit(fit_data)
             
             with self.lock:
                 if hasattr(self.model, 'startprob_'):
@@ -632,13 +628,15 @@ class RegimeDetector:
     def _async_fit(self, data):
         try:
             with self.lock:
-                model_clone = copy.deepcopy(self.model)
+                model_clone = copy.deepcopy(self.model) if hasattr(self.model, 'startprob_') else self.model
             
             if self.fit_failures > 5:
                 model_clone.init_params = "stmc" # Re-init weights
             elif hasattr(model_clone, 'startprob_'):
                 model_clone.init_params = "" # Keep weights, refine them
                 
+            import contextlib
+            import io
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
@@ -1327,3 +1325,88 @@ def enrich_with_d1_data(features: Dict[str, float], d1_data: Dict[str, float], c
     features['dist_d1_high'] = (prev_high - current_price) / current_price
     features['dist_d1_low'] = (current_price - prev_low) / current_price
     return features
+
+# --- 8. GLOBAL FEATURE ORCHESTRATOR ---
+
+class OnlineFeatureEngineer:
+    """
+    Orchestrates all streaming indicators and quantitative models to build a cohesive feature vector.
+    🚨 CRITICAL FIX: The ThreadPoolExecutor is now instantiated dynamically strictly based on `live_mode` 
+    to prevent Optuna background thread contamination across independent Swarm Trials.
+    """
+    def __init__(self, window_size: int = 50, live_mode: bool = False):
+        self.window_size = window_size
+        
+        # Core monitors
+        self.vol_monitor = VolatilityMonitor(window=window_size)
+        vpin_bucket = CONFIG.get('phoenix_strategy', {}).get('vpin_bucket_size', 1000)
+        self.vpin_monitor = VPINMonitor(bucket_size=vpin_bucket)
+        entropy_win = CONFIG.get('features', {}).get('entropy_window', 100)
+        self.entropy_monitor = EntropyMonitor(window=entropy_win)
+        
+        # 🚨 CRITICAL FIX: Isolate HMM fitting. Use ThreadPoolExecutor ONLY in Live mode.
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="RegimeHMM") if live_mode else None
+        self.regime_detector = RegimeDetector(n_states=2, window=100, executor=self.executor)
+        
+        # Streaming features
+        self.bb = StreamingBollingerBands(window=20)
+        self.parkinson = StreamingParkinsonVolatility()
+        self.amihud = StreamingAmihudLiquidity()
+        self.rvol = StreamingRelativeVolume()
+        self.aggressor = StreamingAggressorRatio()
+        self.indicators = StreamingIndicators()
+        self.micro_analyzer = MicrostructureAnalyzer()
+        
+        self.prev_price = None
+
+    def update(self, price: float, timestamp: float, volume: float, high: float, low: float, 
+               buy_vol: float, sell_vol: float, time_feats: dict, context_data: dict) -> Optional[dict]:
+        
+        log_ret = math.log(price / self.prev_price) if self.prev_price and self.prev_price > 0 else 0.0
+        self.prev_price = price
+        
+        volatility = self.vol_monitor.update(log_ret)
+        vpin = self.vpin_monitor.update(volume, price, buy_vol, sell_vol)
+        entropy = self.entropy_monitor.update(price)
+        regime = self.regime_detector.update(log_ret)
+        
+        bb_feats = self.bb.update(price)
+        park_vol = self.parkinson.update(high, low)
+        amihud_val = self.amihud.update(abs(log_ret), price, volume)
+        rvol_val = self.rvol.update(timestamp)
+        agg_ratio = self.aggressor.update(high, low, price)
+        ind_feats = self.indicators.update(price, high, low)
+        ofi = self.micro_analyzer.process_bar(buy_vol, sell_vol)
+        
+        features = {
+            'log_ret': log_ret,
+            'volatility': volatility,
+            'vpin': vpin,
+            'entropy': entropy,
+            'hmm_regime': float(regime),
+            'parkinson_vol': park_vol,
+            'amihud': amihud_val,
+            'rvol': rvol_val,
+            'aggressor_ratio': agg_ratio,
+            'ofi': ofi
+        }
+        
+        features.update(bb_feats)
+        features.update(ind_feats)
+        features.update(time_feats)
+        
+        # Context Data (Clusters, MTF)
+        if context_data:
+            if 'cluster' in context_data:
+                features['cluster_flow'] = context_data['cluster'].get('cluster_flow', 0.0)
+                features['global_corr'] = context_data['cluster'].get('global_corr', 0.0)
+            features = enrich_with_d1_data(features, context_data.get('d1', {}), price)
+        
+        return features
+        
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Ensure safe unpickling without carrying over thread pool context
+        if hasattr(self, 'regime_detector'):
+            self.regime_detector.executor = None
+            self.regime_detector._owns_executor = False

@@ -10,14 +10,12 @@ from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime, timedelta
 import pandas as pd
 
-# Third-Party Imports
 try:
     from river import drift
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
 
-# Shared Imports
 from shared import (
     CONFIG,
     RiskManager,
@@ -31,15 +29,9 @@ from shared.financial.features import (
     MetaLabeler,
     AdaptiveTripleBarrier
 )
-
-# Local Imports
 from engines.research.backtester import MarketSnapshot, BacktestBroker, BacktestOrder
 
 logger = logging.getLogger("ResearchStrategy")
-
-# =============================================================================
-# STRATEGY ENGINE
-# =============================================================================
 
 class ResearchStrategy:
     """
@@ -47,23 +39,23 @@ class ResearchStrategy:
     Strictly implements the V20.18 Dual-Model EV Protocol.
     """
     def __init__(self, model: Dict[str, Any], symbol: str, params: dict[str, Any], historical_df: Optional[pd.DataFrame] = None):
-        self.model = model  # V20.18: Expects a dictionary {'buy': Pipeline, 'sell': Pipeline}
+        self.model = model  
         self.symbol = symbol
         self.params = params
         self.debug_mode = False 
         
-        # 1. Feature Engineer
+        # 🚨 FIX: Force live_mode=False to guarantee synchronous, deterministic backtesting.
+        # This completely cures the Optuna Cross-Talk state contamination bug.
         self.fe = OnlineFeatureEngineer(
-            window_size=params.get('window_size', 50)
+            window_size=params.get('window_size', 50),
+            live_mode=False
         )
         
-        # --- RISK CONFIGURATION ---
         self.risk_conf = params.get('risk_management', CONFIG.get('risk_management', {}))
         self.sl_atr_mult = float(self.risk_conf.get('stop_loss_atr_mult', 1.5))
         self.max_currency_exposure = int(self.risk_conf.get('max_currency_exposure', 4))
         self.cooldown_minutes = int(self.risk_conf.get('loss_cooldown_minutes', 15)) 
         
-        # 2. Adaptive Triple Barrier Labeler
         tbm_conf = params.get('tbm', {})
         self.optimized_reward_mult = float(tbm_conf.get('barrier_width', 3.0)) 
         
@@ -74,18 +66,15 @@ class ResearchStrategy:
             drift_threshold=float(tbm_conf.get('drift_threshold', 1.5))
         )
         
-        # 3. Meta Labeler & Calibrators
         self.meta_labeler = MetaLabeler()
         self.calibrator_buy = ProbabilityCalibrator()
         self.calibrator_sell = ProbabilityCalibrator()
         self.meta_label_events = 0 
         
-        # 4. Warm-up State
         self.burn_in_limit = params.get('burn_in_periods', 30)
         self.burn_in_counter = 0
         self.burn_in_complete = False
         
-        # State
         self.last_features = None
         self.last_price = 0.0
         self.last_price_map = {}
@@ -98,7 +87,6 @@ class ResearchStrategy:
         self.last_trade_bar = 0
         self.last_trade_direction = 0
         
-        # --- GOLDEN TRIO BUFFERS ---
         self.window_size_trio = 100
         self.closes_buffer = deque(maxlen=self.window_size_trio)
         self.volume_buffer = deque(maxlen=self.window_size_trio)
@@ -112,7 +100,6 @@ class ResearchStrategy:
         self.sma_window = deque(maxlen=200)
         self.returns_window = deque(maxlen=20)
         
-        # --- FORENSIC RECORDER ---
         self.decision_log = deque(maxlen=1000)
         self.trade_events = []
         self.rejection_stats = defaultdict(int) 
@@ -120,15 +107,13 @@ class ResearchStrategy:
         
         phx_conf = CONFIG.get('phoenix_strategy', {})
         self.bb_window = 20
-        self.bb_std = float(phx_conf.get('bb_std_dev', 1.5)) 
+        self.bb_std = float(params.get('bb_std_dev', phx_conf.get('bb_std_dev', 1.5))) 
         self.bb_buffer = deque(maxlen=self.bb_window)
         
-        self.ker_floor = 0.0003 
-        self.hurst_breakout = float(phx_conf.get('hurst_breakout_threshold', 0.52))
+        self.ker_floor = float(params.get('ker_floor', 0.0003)) 
+        self.hurst_breakout = float(params.get('hurst_breakout_threshold', phx_conf.get('hurst_breakout_threshold', 0.52)))
+        self.rvol_trigger = float(params.get('rvol_volatility_trigger', phx_conf.get('rvol_volatility_trigger', 0.8))) 
         
-        self.rvol_trigger = float(phx_conf.get('rvol_volatility_trigger', 0.8)) 
-        
-        # --- SESSION CONTROL ---
         session_conf = self.risk_conf.get('session_control', {})
         self.session_enabled = session_conf.get('enabled', False)
         self.start_hour = session_conf.get('start_hour_server', 10)
@@ -156,7 +141,7 @@ class ResearchStrategy:
         if historical_df.empty:
             return
             
-        warmup_df = historical_df.tail(500)
+        warmup_df = historical_df 
         logger.info(f"⏳ {self.symbol}: Pre-loading {len(warmup_df)} In-Sample candles to prevent OOS Starvation...")
         
         dummy_broker = BacktestBroker(initial_balance=50000.0)
@@ -233,18 +218,11 @@ class ResearchStrategy:
         return True
 
     def _check_revenge_guard(self, broker: BacktestBroker, current_time: datetime) -> bool:
-        """
-        V20.18 FIX: Exponential Revenge Guard.
-        Strictly enforces cooldowns after a loss and penalizes consecutive losses heavily.
-        Applies a tiny 5-minute breather after a win.
-        """
         my_closed_trades = [t for t in broker.closed_positions if t.symbol == self.symbol and t.close_time is not None]
         if not my_closed_trades: return False
             
-        # Sort trades by closing time descending
         sorted_trades = sorted(my_closed_trades, key=lambda x: x.close_time, reverse=True)
         
-        # Calculate consecutive losing streak
         consecutive_losses = 0
         for trade in sorted_trades:
             if trade.net_pnl < 0:
@@ -255,18 +233,16 @@ class ResearchStrategy:
         last_trade = sorted_trades[0]
         close_time = last_trade.close_time
         
-        # Ensure timezone consistency for timedelta math
         if close_time.tzinfo is None:
             close_time = close_time.replace(tzinfo=current_time.tzinfo)
         else:
             close_time = close_time.astimezone(current_time.tzinfo)
             
-        # Apply exponential multiplier for consecutive losses
         if consecutive_losses > 0:
             multiplier = 2 ** (consecutive_losses - 1)
             effective_cooldown_mins = self.cooldown_minutes * multiplier
         else:
-            effective_cooldown_mins = 5 # 5-minute breather after a win
+            effective_cooldown_mins = 5 
             
         cooldown_expiry = close_time + timedelta(minutes=effective_cooldown_mins)
         return current_time < cooldown_expiry
@@ -291,7 +267,7 @@ class ResearchStrategy:
             prev_p = self.sma_window[-2]
             if prev_p > 0:
                 self.returns_window.append(math.log(price / prev_p))
-        
+
         self.bb_buffer.append(price)
 
         self._inject_auxiliary_data()
@@ -355,9 +331,6 @@ class ResearchStrategy:
         prev_price = self.sma_window[-2] if len(self.sma_window) >= 2 else price
         self.last_price = price
 
-        # ============================================================
-        # A. FEATURE ENGINEERING
-        # ============================================================
         features = self.fe.update(
             price=price, timestamp=timestamp, volume=volume,
             high=high, low=low, buy_vol=buy_vol, sell_vol=sell_vol,
@@ -379,9 +352,6 @@ class ResearchStrategy:
             else:
                 self.dynamic_ker_offset = min(0.0, self.dynamic_ker_offset + 0.001)
 
-        # ============================================================
-        # B. DELAYED TRAINING (DUAL MODEL ASYMMETRY)
-        # ============================================================
         log_ret = features.get('log_ret', 0.0)
         
         resolved_labels = self.labeler.resolve_labels(
@@ -399,14 +369,12 @@ class ResearchStrategy:
                 w_pos = float(self.params.get('positive_class_weight', 1.0))
                 w_neg = float(self.params.get('negative_class_weight', 1.0))
                 
-                # Buy Model Training Weights
                 buy_base_weight = w_pos if buy_label == 1 else w_neg
                 buy_ret_scalar = math.log1p(abs(buy_ret) * 100.0)
                 buy_ret_scalar = max(0.5, min(buy_ret_scalar, 5.0))
                 hist_ker = stored_feats.get('ker', 0.5)
                 buy_final_weight = buy_base_weight * buy_ret_scalar * (hist_ker * 2.0)
                 
-                # Sell Model Training Weights
                 sell_base_weight = w_pos if sell_label == 1 else w_neg
                 sell_ret_scalar = math.log1p(abs(sell_ret) * 100.0)
                 sell_ret_scalar = max(0.5, min(sell_ret_scalar, 5.0))
@@ -425,9 +393,6 @@ class ResearchStrategy:
                     elif past_action == -1:
                         self.calibrator_sell.update(past_prob, 1 if past_ret > 0 else 0)
 
-        # ============================================================
-        # C. SMART SIGNAL MATRIX (V20.18 Dual-Model EV Protocol)
-        # ============================================================
         regime_label = "Neutral"
         proposed_action = 0 
         
@@ -458,13 +423,11 @@ class ResearchStrategy:
         if regime_label == "TREND_BREAKOUT":
             current_reward_target = max(current_reward_target, 3.0)
 
-        # PURE MATH: Is EV Positive? 
         break_even_wr = 1.0 / (1.0 + current_reward_target)
         
         streak = self.consecutive_losses
         tilt_penalty = 0.03 * streak
         
-        # V20.18 FIX: Use dynamic edge threshold from Optuna (defaults to strict 1%)
         edge_thresh = self.params.get('model_edge_threshold', 0.01)
         required_prob = break_even_wr + edge_thresh + tilt_penalty
         
@@ -474,7 +437,6 @@ class ResearchStrategy:
         buy_edge = cal_prob_buy - required_prob
         sell_edge = cal_prob_sell - required_prob
 
-        # Select action purely based on highest positive edge
         if buy_edge > 0 and buy_edge >= sell_edge:
             proposed_action = 1
             prob_success = prob_buy 
@@ -488,9 +450,6 @@ class ResearchStrategy:
             prob_success = 0.0
             confidence = max(cal_prob_buy, cal_prob_sell)
 
-        # ============================================================
-        # D. ADD TRADE OPPORTUNITY 
-        # ============================================================
         pip_val, _ = RiskManager.get_pip_info(self.symbol)
         if pip_val <= 0: pip_val = 0.0001
         
@@ -517,9 +476,6 @@ class ResearchStrategy:
         if is_warmup:
             return
 
-        # ============================================================
-        # E. SURVIVAL GATES
-        # ============================================================
         if self.burn_in_counter < self.burn_in_limit:
             self.burn_in_counter += 1
             if self.burn_in_counter == self.burn_in_limit: self.burn_in_complete = True
@@ -542,13 +498,9 @@ class ResearchStrategy:
                 if self.debug_mode: logger.info(f"🛡️ {self.symbol} GATE: Low Efficiency (KER {ker_val:.4f} < {effective_ker_thresh:.4f})")
             return
 
-        # ============================================================
-        # F. ML CONFIRMATION & EXECUTION
-        # ============================================================
         try:
-            # V20.18: Let Optuna perfectly balance the Meta-Filter strictness
             base_meta_thresh = self.params.get('meta_labeling_threshold', 0.50)
-            meta_thresh = max(base_meta_thresh + (0.02 * streak), 0.40)
+            meta_thresh = max(base_meta_thresh + (0.02 * streak), 0.30)
             
             is_profitable = self.meta_labeler.predict(clean_features, proposed_action, threshold=meta_thresh)
             if proposed_action != 0: self.meta_label_events += 1
@@ -757,10 +709,10 @@ class ResearchStrategy:
                     target_sl = pos.entry_price + (risk_dist * 0.5) 
                     if target_sl > pos.stop_loss:
                         new_sl, reason = target_sl, f"Trail ({r_multiple:.1f}R)"
-                elif r_multiple >= 1.0: # V20.18 FIX: Spread Choking Cure
-                    target_sl = pos.entry_price + (risk_dist * 0.25) 
+                elif r_multiple >= 0.75:
+                    target_sl = pos.entry_price + (risk_dist * 0.10) # Secure spread + tiny profit
                     if target_sl > pos.stop_loss:
-                        new_sl, reason = target_sl, "BE Lock (+0.25R)"
+                        new_sl, reason = target_sl, "BE Lock (+0.10R)"
                         
             else: 
                 r_multiple = (pos.entry_price - current_price) / risk_dist
@@ -769,10 +721,10 @@ class ResearchStrategy:
                     target_sl = pos.entry_price - (risk_dist * 0.5)
                     if target_sl < pos.stop_loss:
                         new_sl, reason = target_sl, f"Trail ({r_multiple:.1f}R)"
-                elif r_multiple >= 1.0: # V20.18 FIX: Spread Choking Cure
-                    target_sl = pos.entry_price - (risk_dist * 0.25)
+                elif r_multiple >= 0.75:
+                    target_sl = pos.entry_price - (risk_dist * 0.10) # Secure spread + tiny profit
                     if target_sl < pos.stop_loss:
-                        new_sl, reason = target_sl, "BE Lock (+0.25R)"
+                        new_sl, reason = target_sl, "BE Lock (+0.10R)"
             
             if new_sl is not None:
                 pos.stop_loss = new_sl

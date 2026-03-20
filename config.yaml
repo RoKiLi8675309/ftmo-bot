@@ -143,7 +143,7 @@ phoenix_strategy:
     AUDUSD: "TREND_BREAKOUT" 
     USDCAD: "TREND_BREAKOUT" 
 
-  enable_regime_a_entries: true          
+  enable_regime_a_entries: true         
   require_d1_trend: false  
   require_h4_alignment: false                  
   
@@ -151,11 +151,11 @@ phoenix_strategy:
   hurst_mean_reversion_threshold: 0.45    
   ker_trend_threshold: 0.0003         
   
-  bb_std_dev: 1.5                     
+  bb_std_dev: 1.5                      
   rvol_volatility_trigger: 0.8        
   
   max_relative_volume: 35.0          
-  volume_gate_ratio: 0.7            
+  volume_gate_ratio: 0.7             
   aggressor_threshold: 0.55          
   choppiness_threshold: 65.0       
   
@@ -190,8 +190,8 @@ optimization_search_space:
     max: 0.95
     
   meta_labeling_threshold:
-    min: 0.40
-    max: 0.70
+    min: 0.30
+    max: 0.60
     
   model_edge_threshold: # V20.18 FIX: Allow Swarm to tune the strictness of the required edge
     min: 0.01
@@ -255,7 +255,7 @@ risk_management:
   
   trailing_stop:
     enabled: true        
-    activation_r: 0.8        
+    activation_r: 0.75        
     trail_trigger_r: 2.0     
     trail_dist_r: 1.0        
   

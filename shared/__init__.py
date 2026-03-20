@@ -3,6 +3,7 @@ shared/__init__.py
 Exposes all shared components.
 COMPATIBILITY: Python 3.9 (Windows) & 3.11 (Linux)
 AUDIT FIX: Removed circular imports from 'engines'. Shared is a foundation library.
+V20.18 FIX: Removed legacy StreamingTripleBarrier to prevent cascading ImportErrors.
 """
 
 from shared.core.config import CONFIG
@@ -24,7 +25,6 @@ from shared.financial.risk import (
 
 from shared.financial.features import (
     OnlineFeatureEngineer,
-    StreamingTripleBarrier, # Kept for legacy compatibility if needed
     AdaptiveTripleBarrier,  # PHASE 2: New Volatility-Adaptive Labeler
     StreamingIndicators,    # PHASE 2: New Recursive Indicators
     ProbabilityCalibrator,

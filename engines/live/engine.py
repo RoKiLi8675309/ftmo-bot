@@ -39,7 +39,8 @@ from shared import (
     Trade,
     RiskManager,
     TradeContext,
-    load_real_data 
+    load_real_data,
+    ClusterContextBuilder
 )
 
 # Local Engine Modules
@@ -107,6 +108,11 @@ class LogicWorker(multiprocessing.Process):
         predictor = MultiAssetPredictor(self.symbols, threshold_map=threshold_map)
         latest_context = defaultdict(dict)
         
+        # 🚨 CRITICAL FIX: Initialize Cluster Context strictly in Linux logic scope
+        cluster_engine = ClusterContextBuilder(self.symbols)
+        closes_history = {s: deque(maxlen=50) for s in self.symbols}
+        last_corr_calc = time.time()
+        
         while self.running:
             try:
                 # Process Acknowledgment Queue
@@ -120,6 +126,19 @@ class LogicWorker(multiprocessing.Process):
                 try:
                     tick_data = self.tick_queue.get(timeout=1.0)
                 except queue.Empty:
+                    # Occasional correlation update even during quiet ticks
+                    now_ts = time.time()
+                    if now_ts - last_corr_calc > 60:
+                        try:
+                            df_closes = pd.DataFrame({k: pd.Series(list(v)) for k, v in closes_history.items()})
+                            if not df_closes.empty and len(df_closes) > 10:
+                                df_closes = df_closes.ffill().bfill()
+                                returns_df = np.log(df_closes / df_closes.shift(1)).dropna()
+                                corr_matrix = returns_df.corr()
+                                cluster_engine.update_correlations(corr_matrix)
+                        except Exception as e:
+                            worker_log.debug(f"Failed to update cluster correlations: {e}")
+                        last_corr_calc = now_ts
                     continue
                 
                 if tick_data == "STOP":
@@ -154,9 +173,27 @@ class LogicWorker(multiprocessing.Process):
                     
                     bid_vol = float(tick_data.get('bid_vol', 0.0))
                     ask_vol = float(tick_data.get('ask_vol', 0.0))
+                    
+                    # Track closes for local correlation construction
+                    closes_history[symbol].append(price)
+                    
                 except (ValueError, TypeError) as e:
                     worker_log.debug(f"Malformed tick data received: {e}")
                     continue
+
+                # Periodic correlation array calculations
+                now_ts = time.time()
+                if now_ts - last_corr_calc > 60:
+                    try:
+                        df_closes = pd.DataFrame({k: pd.Series(list(v)) for k, v in closes_history.items()})
+                        if not df_closes.empty and len(df_closes) > 10:
+                            df_closes = df_closes.ffill().bfill()
+                            returns_df = np.log(df_closes / df_closes.shift(1)).dropna()
+                            corr_matrix = returns_df.corr()
+                            cluster_engine.update_correlations(corr_matrix)
+                    except Exception as e:
+                        worker_log.debug(f"Failed to update cluster correlations: {e}")
+                    last_corr_calc = now_ts
 
                 # Aggregate
                 bar = aggregators[symbol].process_tick(
@@ -168,10 +205,22 @@ class LogicWorker(multiprocessing.Process):
                 )
 
                 if bar:
+                    # Dynamically inject the newly formed Cluster Features into the context map
+                    recent_rets = {}
+                    for s in self.symbols:
+                        if len(closes_history[s]) > 1 and closes_history[s][0] > 0:
+                            recent_rets[s] = (closes_history[s][-1] - closes_history[s][0]) / closes_history[s][0]
+                        else:
+                            recent_rets[s] = 0.0
+                            
+                    coherence = cluster_engine.calculate_cluster_coherence(recent_rets)
+                    ctx_features = cluster_engine.get_context_feature(symbol, coherence)
+                    
                     ctx = {
                         'd1': latest_context[symbol].get('d1', {}),
                         'h4': latest_context[symbol].get('h4', {}),
-                        'positions': tick_data.get('positions', {}) 
+                        'positions': tick_data.get('positions', {}),
+                        'cluster': ctx_features
                     }
                     
                     signal = predictor.process_bar(symbol, bar, context_data=ctx)
@@ -301,7 +350,8 @@ class LogicWorker(multiprocessing.Process):
                         break
                     else:
                         attempts += 1
-                        current_threshold = max(10.0, current_threshold * 0.5)
+                        # 🚨 V20.18.2 FIX: Allow threshold to drop down to 1.0 to prevent data starvation on low-volume pairs
+                        current_threshold = max(1.0, current_threshold * 0.5)
                         threshold_map[sym] = current_threshold
                 
                 log.info(f"✅ {sym} Worker Calibrated: {threshold_map[sym]:.1f}")
@@ -671,7 +721,6 @@ class LiveTradingEngine:
             
         current_equity = self.ftmo_guard.equity
         if current_equity > 0:
-            # V20.18 FIX: Replaced hardcoded 1% limit with config-driven FTMO daily loss limit (e.g. 4.0%)
             limit = current_equity * self.daily_max_loss_pct
             if pnl < -limit:
                 return True
@@ -768,8 +817,6 @@ class LiveTradingEngine:
                 with self.stats_lock:
                     if self.performance_stats[symbol]:
                         for trade in reversed(self.performance_stats[symbol]):
-                            # Only count consecutive losses if they were the SAME direction as proposed action
-                            # (or UNKNOWN if producer hasn't upgraded its payload yet)
                             if trade['action'] in [signal.action, 'UNKNOWN']:
                                 if trade['pnl'] < 0:
                                     consecutive_losses += 1
@@ -883,6 +930,12 @@ class LiveTradingEngine:
                 logger.error(f"Signal Listener Error: {e}", exc_info=True)
 
     def _manage_active_positions_loop(self):
+        """
+        V20.18.2 CRITICAL FIX (API SPAM BAN EVASION):
+        Aggregates liquidation intents into a dictionary so only ONE
+        CLOSE_ALL intent is dispatched per symbol rather than spamming
+        the C-extensions loop for pyramided positions.
+        """
         logger.info(f"{LogSymbols.INFO} Active Position Manager Started.")
         
         tbm_conf = CONFIG.get('online_learning', {}).get('tbm', {})
@@ -899,6 +952,8 @@ class LiveTradingEngine:
 
                 now_utc = datetime.now(pytz.utc)
                 session_liquidation = self.session_guard.should_liquidate(timestamp=now_utc)
+                
+                symbols_to_liquidate = {}
 
                 for sym, pos_list in positions_map.items():
                     for pos in pos_list:
@@ -918,110 +973,23 @@ class LiveTradingEngine:
                                     hours = int(horizon_minutes / 60)
                                     exit_reason = f"Time Stop ({hours}h)"
                                     logger.warning(f"⌛ TIME STOP: {sym} held for {duration/3600:.1f}h. Closing.")
-                            
-                        if exit_reason:
-                            close_intent = Trade(
-                                symbol=sym, 
-                                action="CLOSE_ALL", 
-                                volume=0.0, 
-                                entry_price=0.0, 
-                                stop_loss=0.0, 
-                                take_profit=0.0, 
-                                comment=exit_reason
-                            )
-                            self.dispatcher.send_order(close_intent, 0.0)
-                            continue
-
-                        current_price = self.latest_prices.get(sym, 0.0)
-                        if current_price <= 0: continue
-
-                        entry_price = float(pos.get('entry_price', 0.0))
-                        sl_price = float(pos.get('sl', 0.0))
-                        tp_price = float(pos.get('tp', 0.0))
-                        pos_type = pos.get('type') 
-                        ticket = pos.get('ticket')
                         
-                        if entry_price == 0 or sl_price == 0: continue
+                        # Store only ONE liquidation reason per symbol to prevent loop spamming
+                        if exit_reason and sym not in symbols_to_liquidate:
+                            symbols_to_liquidate[sym] = exit_reason
 
-                        risk_dist = 0.0
-                        try:
-                            comment = str(pos.get('comment', ''))
-                            short_id = None
-                            
-                            if "Auto_" in comment:
-                                parts = comment.split('_')
-                                if len(parts) >= 2: short_id = parts[1][:8]
-                            elif len(comment) >= 8:
-                                short_id = comment[:8]
-                                
-                            if short_id:
-                                stored_risk = self.stream_mgr.r.hget("bot:initial_risk", short_id)
-                                if stored_risk: 
-                                    risk_dist = float(stored_risk)
-                        except Exception as e:
-                            logger.warning(f"Failed to fetch initial risk from Redis for {sym}: {e}")
-
-                        if risk_dist <= 1e-5:
-                            risk_dist = abs(entry_price - sl_price)
-                            if risk_dist < 1e-5: continue
-                        
-                        new_sl = None
-                        reason = ""
-                        
-                        if pos_type == "BUY":
-                            dist_pnl = current_price - entry_price
-                            r_multiple = dist_pnl / risk_dist
-                            
-                            if r_multiple >= 1.5:
-                                target_sl = entry_price + (risk_dist * 0.5) 
-                                if target_sl > sl_price:
-                                    new_sl = target_sl
-                                    reason = f"Trail ({r_multiple:.1f}R)"
-                            elif r_multiple >= 1.0: # V20.18 FIX: Spread Choking Cure
-                                target_sl = entry_price + (risk_dist * 0.25) 
-                                if target_sl > sl_price:
-                                    new_sl = target_sl
-                                    reason = "BE Lock (+0.25R)"
-
-                        elif pos_type == "SELL":
-                            dist_pnl = entry_price - current_price
-                            r_multiple = dist_pnl / risk_dist
-                            
-                            if r_multiple >= 1.5:
-                                target_sl = entry_price - (risk_dist * 0.5)
-                                if target_sl < sl_price:
-                                    new_sl = target_sl
-                                    reason = f"Trail ({r_multiple:.1f}R)"
-                            elif r_multiple >= 1.0: # V20.18 FIX: Spread Choking Cure
-                                target_sl = entry_price - (risk_dist * 0.25)
-                                if target_sl < sl_price:
-                                    new_sl = target_sl
-                                    reason = "BE Lock (+0.25R)"
-
-                        if new_sl:
-                            comment_str = str(pos.get('comment', ''))
-                            if "Trail" not in comment_str and "BE Lock" not in comment_str:
-                                pass 
-                            
-                            logger.info(f"🛡️ TRAILING STOP: {sym} (R={r_multiple:.2f}) -> New SL {new_sl:.5f} ({reason})")
-                            modify_intent = Trade(
-                                symbol=sym,
-                                action="MODIFY",
-                                volume=0.0,
-                                entry_price=0.0,
-                                stop_loss=new_sl,
-                                take_profit=tp_price,
-                                ticket=ticket,
-                                comment=reason
-                            )
-                            self.dispatcher.send_order(modify_intent, 0.0)
+                # Dispatch EXACTLY ONE close signal per symbol
+                for sym, reason in symbols_to_liquidate.items():
+                    close_intent = Trade(
+                        symbol=sym, action="CLOSE_ALL", volume=0.0, 
+                        entry_price=0.0, stop_loss=0.0, take_profit=0.0, comment=reason
+                    )
+                    self.dispatcher.send_order(close_intent, 0.0)
 
             except Exception as e:
-                logger.error(f"Position Manager Error: {e}", exc_info=True)
+                logger.error(f"Active Position Manager Error: {e}", exc_info=True)
             
-            for _ in range(5):
-                if self.shutdown_flag: break
-                time.sleep(1)
+            time.sleep(5)
 
     def _reconcile_pending_orders(self, open_positions_map: Dict[str, List[Dict]]):
         try:
